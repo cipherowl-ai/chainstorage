@@ -1,6 +1,7 @@
 package client
 
 import (
+	"github.com/coinbase/chainstorage/internal/blockchain/client/xrp"
 	"go.uber.org/fx"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/aptos"
@@ -24,6 +25,7 @@ var Module = fx.Options(
 	ethereum.Module,
 	rosetta.Module,
 	solana.Module,
+	xrp.Module,
 )
 
 var (

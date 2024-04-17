@@ -11,7 +11,7 @@ import (
 )
 
 type XRPBlock struct {
-	LedgerHeader LedgerHeader         `json:"ledger"`
+	LedgerHeader *LedgerHeader        `json:"ledger"`
 	Transactions []*LedgerTransaction `json:"transactions,omitempty"`
 	LedgerIndex  uint32               `json:"ledger_index"`
 	Validated    bool                 `json:"validated"`
@@ -25,6 +25,8 @@ type LedgerHeader struct {
 	PreviousLedgerHash  string    `json:"previous_ledger_hash"`
 	LedgerIndex         uint32    `json:"ledger_index"`
 	TotalCoins          uint64    `json:"total_coins"`
+	ParentHash          string    `json:"parent_hash"`
+	Transactions        []string  `json:"transactions"`
 }
 
 type LedgerTransaction struct {

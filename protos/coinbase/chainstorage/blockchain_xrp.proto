@@ -6,7 +6,6 @@ option go_package = "github.com/coinbase/chainstorage/protos/coinbase/chainstora
 
 import "google/protobuf/timestamp.proto";
 
-
 message LedgerRequest {
   // A 20-byte hex string for identifying the ledger version
   string ledger_hash = 1;
@@ -168,7 +167,7 @@ message CreatedNode {
 }
 
 // TxResult represents the result of a transaction query.
-message LedgerTransaction {
+message XRPTransaction {
   string account = 1;            // The unique address of the account that initiated the transaction.
   string fee = 2;                 // The amount of XRP, in drops, to be destroyed as a cost for distributing this transaction to the network.
   uint32 flags = 3;                // The set of bit-flags for this transaction.
@@ -213,11 +212,12 @@ message Warning {
   string message = 2; // The warning message.
 }
 
-message XrpBlobdata {
+message XRPBlobdata {
   bytes header = 1;
-  repeated RepeatedBytes ledgerTransactions = 2;
+  repeated bytes xrpTransactions = 2;
 }
 
-message RepeatedBytes {
-  repeated bytes data = 1;
+message XRPBlock {
+  LedgerHeader header = 1;
+  repeated XRPTransaction transactions = 2;
 }
