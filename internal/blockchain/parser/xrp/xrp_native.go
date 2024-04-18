@@ -7,26 +7,25 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 	"github.com/go-playground/validator/v10"
 	"go.uber.org/zap"
-	"time"
 )
 
 type XRPBlock struct {
 	LedgerHeader *LedgerHeader        `json:"ledger"`
 	Transactions []*LedgerTransaction `json:"transactions,omitempty"`
-	LedgerIndex  uint32               `json:"ledger_index"`
+	LedgerIndex  string               `json:"ledger_index"`
 	Validated    bool                 `json:"validated"`
 }
 
 type LedgerHeader struct {
-	Closed              bool      `json:"closed"`
-	LedgerHash          string    `json:"ledger_hash"`
-	CloseTime           time.Time `json:"close_time"`
-	CloseTimeResolution uint32    `json:"close_time_resolution"`
-	PreviousLedgerHash  string    `json:"previous_ledger_hash"`
-	LedgerIndex         uint32    `json:"ledger_index"`
-	TotalCoins          uint64    `json:"total_coins"`
-	ParentHash          string    `json:"parent_hash"`
-	Transactions        []string  `json:"transactions"`
+	Closed              bool     `json:"closed"`
+	LedgerHash          string   `json:"ledger_hash"`
+	CloseTime           string   `json:"close_time_iso"`
+	CloseTimeResolution uint32   `json:"close_time_resolution"`
+	PreviousLedgerHash  string   `json:"previous_ledger_hash"`
+	LedgerIndex         string   `json:"ledger_index"`
+	TotalCoins          string   `json:"total_coins"`
+	ParentHash          string   `json:"parent_hash"`
+	Transactions        []string `json:"transactions"`
 }
 
 type LedgerTransaction struct {
@@ -125,8 +124,31 @@ type CreatedNode struct {
 
 // Warning represents a warning message associated with the transaction result.
 type Warning struct {
-	ID      string `json:"id"`      // The ID of the warning.
+	ID      uint64 `json:"id"`      // The ID of the warning.
 	Message string `json:"message"` // The warning message.
+}
+
+type LedgerResponse struct {
+	Result   LedgerResult `json:"result"`
+	Warnings []Warning    `json:"warnings"`
+}
+
+type LedgerResult struct {
+	LedgerHash   string       `json:"ledger_hash"`
+	LedgerIndex  int          `json:"ledger_index"`
+	Validated    bool         `json:"validated"`
+	LedgerHeader LedgerHeader `json:"ledger"`
+	Transactions []string     `json:"transactions"`
+	Status       string       `json:"status"`
+}
+
+type TransactionResponse struct {
+	Result   TransactionResult `json:"result"`
+	Warnings []Warning         `json:"warnings"`
+}
+
+type TransactionResult struct {
+	Result LedgerTransaction `json:"result"`
 }
 
 type (

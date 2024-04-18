@@ -48,7 +48,7 @@ var (
 		Name:    "ledger",
 		Timeout: time.Second * 10,
 	}
-	xrpGetRawTransactionMethod = &jsonrpc.RequestMethod{
+	xrpGetTransaction = &jsonrpc.RequestMethod{
 		Name:    "tx",
 		Timeout: time.Second * 30,
 	}
@@ -108,6 +108,10 @@ func makeRequestParams(totalLedger int, from uint64) []jsonrpc.Params {
 func convertLedgerHeadersToBlockMetadata(ledgerHeaders []*xrp.LedgerHeader, from uint64, tag uint32) ([]*api.BlockMetadata, error) {
 	results := make([]*api.BlockMetadata, len(ledgerHeaders))
 	for i, ledgerHeader := range ledgerHeaders {
+		closeTime, err := convertTime(ledgerHeader)
+		if err != nil {
+			panic(err)
+		}
 		hash := ledgerHeader.LedgerHash
 		height := from + uint64(i)
 
@@ -117,10 +121,18 @@ func convertLedgerHeadersToBlockMetadata(ledgerHeaders []*xrp.LedgerHeader, from
 			ParentHeight: internal.GetParentHeight(height),
 			Hash:         hash,
 			ParentHash:   ledgerHeader.ParentHash,
-			Timestamp:    timestamppb.New(ledgerHeader.CloseTime),
+			Timestamp:    timestamppb.New(closeTime),
 		}
 	}
 	return results, nil
+}
+
+func convertTime(ledgerHeader *xrp.LedgerHeader) (time.Time, error) {
+	closeTime, err := time.Parse(time.RFC3339, ledgerHeader.CloseTime)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return closeTime, nil
 }
 
 func assembleLedgerHeaders(responses []*jsonrpc.Response) ([]*xrp.LedgerHeader, error) {
@@ -137,10 +149,12 @@ func assembleLedgerHeaders(responses []*jsonrpc.Response) ([]*xrp.LedgerHeader, 
 }
 
 func assembleLedgerHeader(response *jsonrpc.Response) (*xrp.LedgerHeader, error) {
-	var header xrp.LedgerHeader
-	if err := response.Unmarshal(&header); err != nil {
+	xrpResponse := &xrp.LedgerResponse{}
+	if err := response.Unmarshal(xrpResponse); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal block header: %w", err)
 	}
+
+	header := xrpResponse.Result.LedgerHeader
 	return &header, nil
 }
 
@@ -175,17 +189,24 @@ func (b *xrpClient) makeBlock(ctx context.Context, tag uint32, params jsonrpc.Pa
 }
 
 func (b *xrpClient) toBlock(tag uint32, xrpBlock *xrp.XRPBlock, transactionResponses []*jsonrpc.Response, headerResponse *jsonrpc.Response) *api.Block {
-
+	t, err := time.Parse(time.RFC3339, xrpBlock.LedgerHeader.CloseTime)
+	if err != nil {
+		panic(err)
+	}
+	height, err := strconv.ParseUint(xrpBlock.LedgerIndex, 10, 64)
+	if err != nil {
+		panic(err)
+	}
 	return &api.Block{
 		Blockchain: b.config.Chain.Blockchain,
 		Network:    b.config.Chain.Network,
 		Metadata: &api.BlockMetadata{
 			Tag:          tag,
-			Height:       uint64(xrpBlock.LedgerIndex),
-			ParentHeight: internal.GetParentHeight(uint64(xrpBlock.LedgerIndex)),
+			Height:       height,
+			ParentHeight: internal.GetParentHeight(height),
 			Hash:         xrpBlock.LedgerHeader.LedgerHash,
 			ParentHash:   xrpBlock.LedgerHeader.ParentHash,
-			Timestamp:    timestamppb.New(xrpBlock.LedgerHeader.CloseTime),
+			Timestamp:    timestamppb.New(t),
 		},
 		Blobdata: &api.Block_Xrp{
 			Xrp: &api.XRPBlobdata{
@@ -207,7 +228,7 @@ func (b *xrpClient) extractResultsFromResponses(responses []*jsonrpc.Response) [
 
 func (b *xrpClient) getXRPBlockFromHeader(ctx context.Context, header *xrp.LedgerHeader) (*xrp.XRPBlock, []*jsonrpc.Response, error) {
 	transactionHashSet := header.Transactions
-	if transactionHashSet == nil {
+	if transactionHashSet == nil || len(transactionHashSet) == 0 {
 		return nil, nil, xerrors.Errorf("failed to find transactionHashSet for ledger header: %w", header.LedgerIndex)
 	}
 
@@ -220,7 +241,7 @@ func (b *xrpClient) getXRPBlockFromHeader(ctx context.Context, header *xrp.Ledge
 			},
 		}
 	}
-	responses, err := b.client.BatchCall(ctx, xrpGetRawTransactionMethod, params)
+	responses, err := b.client.BatchCall(ctx, xrpGetTransaction, params)
 	if err != nil {
 		return nil, nil, xerrors.Errorf("failed to get transactionHashSet for ledger header: %w", header.LedgerIndex)
 	}
@@ -252,7 +273,8 @@ func assembleTransactions(responses []*jsonrpc.Response) ([]*xrp.LedgerTransacti
 
 func assembleTransaction(response *jsonrpc.Response) (*xrp.LedgerTransaction, error) {
 	var transaction xrp.LedgerTransaction
-	if err := response.Unmarshal(&transaction); err != nil {
+	xrpResponse := &xrp.TransactionResponse{}
+	if err := response.Unmarshal(xrpResponse); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal transaction: %w", err)
 	}
 	return &transaction, nil
@@ -271,13 +293,13 @@ func (b *xrpClient) GetBlockByHash(ctx context.Context, tag uint32, height uint6
 }
 
 func (b *xrpClient) GetLatestHeight(ctx context.Context) (uint64, error) {
+
 	params := jsonrpc.Params{
 		ledgerRequest{
 			LedgerHash:   "current",
 			Transactions: true,
 		},
 	}
-
 	response, err := b.client.Call(ctx, xrpGetLedger, params)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to get the height of the most-work fully-validated chain: %w", err)
@@ -287,7 +309,11 @@ func (b *xrpClient) GetLatestHeight(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, xerrors.Errorf("failed to assemble ledger header: %w", err)
 	}
-	return uint64(ledgerHeader.LedgerIndex), nil
+	height, err := strconv.ParseUint(ledgerHeader.LedgerIndex, 10, 64)
+	if err != nil {
+		panic(err)
+	}
+	return height, nil
 }
 
 func (b *xrpClient) UpgradeBlock(ctx context.Context, block *api.Block, newTag uint32) (*api.Block, error) {

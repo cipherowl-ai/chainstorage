@@ -70,6 +70,7 @@ var (
 				"polygon-mainnet",
 				"polygon-testnet",
 				"solana-mainnet",
+				"xrp-mainnet",
 			},
 		},
 	}
