@@ -126,7 +126,9 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 				// Enable this option to allow worker to process sessions. Defaults to false.
 				EnableSessionWorker: true,
 				// If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
-				DeadlockDetectionTimeout: 2 * time.Second,
+				DeadlockDetectionTimeout:         2 * time.Second,
+				MaxConcurrentActivityTaskPollers: 4,
+				MaxConcurrentWorkflowTaskPollers: 4,
 			},
 		)
 	}
