@@ -4,8 +4,6 @@ aws:
   bucket: example-chainstorage-optimism-mainnet-dev
 cadence:
   address: temporal-dev.example.com:7233
-chain:
-  block_start_height: 37000000
 sdk:
   chainstorage_address: https://nft-api.coinbase.com/api/exp/chainstorage/optimism/mainnet/v1
 server:
