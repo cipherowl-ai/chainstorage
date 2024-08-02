@@ -4,8 +4,6 @@ aws:
   bucket: example-chainstorage-arbitrum-mainnet-dev
 cadence:
   address: temporal-dev.example.com:7233
-chain:
-  block_start_height: 15000000
 sdk:
   chainstorage_address: https://nft-api.coinbase.com/api/exp/chainstorage/arbitrum/mainnet/v1
 server:
