@@ -50,10 +50,11 @@ type (
 
 	EndpointProviderResult struct {
 		fx.Out
-		Master    EndpointProvider `name:"master"`
-		Slave     EndpointProvider `name:"slave"`
-		Validator EndpointProvider `name:"validator"`
-		Consensus EndpointProvider `name:"consensus"`
+		Master     EndpointProvider `name:"master"`
+		Slave      EndpointProvider `name:"slave"`
+		Validator  EndpointProvider `name:"validator"`
+		Consensus  EndpointProvider `name:"consensus"`
+		Additional EndpointProvider `name:"additional"`
 	}
 )
 
@@ -73,11 +74,12 @@ type (
 )
 
 const (
-	masterEndpointGroupName    = "master"
-	slaveEndpointGroupName     = "slave"
-	validatorEndpointGroupName = "validator"
-	consensusEndpointGroupName = "consensus"
-	contextKeyFailover         = "failover:"
+	masterEndpointGroupName     = "master"
+	slaveEndpointGroupName      = "slave"
+	validatorEndpointGroupName  = "validator"
+	consensusEndpointGroupName  = "consensus"
+	contextKeyFailover          = "failover:"
+	additionalEndpointGroupName = "additional"
 )
 
 var (
@@ -116,12 +118,16 @@ func NewEndpointProvider(params EndpointProviderParams) (EndpointProviderResult,
 			return EndpointProviderResult{}, xerrors.Errorf("failed to create consensus endpoint provider with slave endpoints: %w", err)
 		}
 	}
-
+	additional, err := newEndpointProvider(logger, params.Config, scope, &params.Config.Chain.Client.Additional.EndpointGroup, additionalEndpointGroupName)
+	if err != nil {
+		return EndpointProviderResult{}, xerrors.Errorf("failed to create additional endpoint provider: %w", err)
+	}
 	return EndpointProviderResult{
-		Master:    master,
-		Slave:     slave,
-		Validator: validator,
-		Consensus: consensus,
+		Master:     master,
+		Slave:      slave,
+		Validator:  validator,
+		Consensus:  consensus,
+		Additional: additional,
 	}, nil
 }
 

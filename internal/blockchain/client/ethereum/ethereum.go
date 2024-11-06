@@ -34,12 +34,17 @@ type (
 		config          *config.Config
 		logger          *zap.Logger
 		client          jsonrpc.Client
+		tracer          EthereumBlockTracer
 		dlq             dlq.DLQ
 		validate        *validator.Validate
 		metrics         *ethereumClientMetrics
 		nodeType        types.EthereumNodeType
 		traceType       types.TraceType
 		commitmentLevel types.CommitmentLevel
+	}
+
+	EthereumBlockTracer interface {
+		getBlockTraces(ctx context.Context, tag uint32, block *ethereum.EthereumBlockLit) ([][]byte, error)
 	}
 
 	EthereumClientOption func(client *EthereumClient)
@@ -490,8 +495,13 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 	if err != nil {
 		return nil, xerrors.Errorf("failed to fetch transaction receipts for block %v: %w", height, err)
 	}
-
-	transactionTraces, err := c.getBlockTraces(ctx, tag, headerResult.header)
+	var tracer EthereumBlockTracer
+	if c.tracer != nil {
+		tracer = c.tracer
+	} else {
+		tracer = c
+	}
+	transactionTraces, err := tracer.getBlockTraces(ctx, tag, headerResult.header)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to fetch traces for block %v: %w", height, err)
 	}
@@ -1234,8 +1244,13 @@ func (c *EthereumClient) UpgradeBlock(ctx context.Context, block *api.Block, new
 			if err != nil {
 				return nil, xerrors.Errorf("failed to fetch header result for block %v: %w", height, err)
 			}
-
-			transactionTraces, err := c.getBlockTraces(ctx, newTag, headerResult.header)
+			var tracer EthereumBlockTracer
+			if c.tracer != nil {
+				tracer = c.tracer
+			} else {
+				tracer = c
+			}
+			transactionTraces, err := tracer.getBlockTraces(ctx, newTag, headerResult.header)
 			if err != nil {
 				return nil, xerrors.Errorf("failed to fetch traces for block %v: %w", height, err)
 			}

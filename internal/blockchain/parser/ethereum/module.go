@@ -36,5 +36,8 @@ var Module = fx.Options(
 		Build(),
 	internal.NewParserBuilder("fantom", NewFantomNativeParser).
 		Build(),
+	internal.NewParserBuilder("tron", NewTronNativeParser).
+		SetValidatorFactory(NewBaseValidator).
+		Build(),
 	beacon.Module,
 )
