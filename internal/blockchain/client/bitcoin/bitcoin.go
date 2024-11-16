@@ -46,7 +46,7 @@ const (
 	bitcoinErrMessageBlockOutOfRange  = "Block height out of range"
 
 	// batch size
-	bitcoinGetInputTransactionsBatchSize = 100
+	bitcoinGetInputTransactionsBatchSize = 40
 )
 
 var _ internal.Client = (*bitcoinClient)(nil)
@@ -54,7 +54,7 @@ var _ internal.Client = (*bitcoinClient)(nil)
 var (
 	bitcoinGetBlockByHashMethod = &jsonrpc.RequestMethod{
 		Name:    "getblock",
-		Timeout: time.Second * 10,
+		Timeout: time.Second * 120,
 	}
 	bitcoinGetBlockHashMethod = &jsonrpc.RequestMethod{
 		Name:    "getblockhash",
@@ -62,7 +62,7 @@ var (
 	}
 	bitcoinGetRawTransactionMethod = &jsonrpc.RequestMethod{
 		Name:    "getrawtransaction",
-		Timeout: time.Second * 30,
+		Timeout: time.Second * 50,
 	}
 	bitcoinGetBlockCountMethod = &jsonrpc.RequestMethod{
 		Name:    "getblockcount",
