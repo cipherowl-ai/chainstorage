@@ -1,14 +1,29 @@
 package workflow
 
+// Replicator implements a workflow for replicating blockchain data with the following features:
+// - Parallel processing of blocks using configurable batch sizes and parallelism
+// - Three-phase execution:
+//   1. Parallel batch processing with automatic error detection
+//   2. Sequential reprocessing of failed batches for reliability
+//   3. Watermark updates to track progress
+// - Support for continuous sync mode with configurable intervals
+// - Built-in checkpointing for long-running operations
+// - Configurable compression and batch sizes
+// - Metrics tracking for monitoring replication progress and performance
+//
+// The workflow can be configured via ReplicatorRequest parameters or fall back to
+// configuration defaults for batch sizes, parallelism, and other settings.
+
 import (
 	"context"
+	"strconv"
+	"time"
+
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
-	"strconv"
-	"time"
 
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
