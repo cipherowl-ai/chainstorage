@@ -76,6 +76,7 @@ type (
 		Slave       JSONRPCConfig     `mapstructure:"slave"`
 		Validator   JSONRPCConfig     `mapstructure:"validator"`
 		Consensus   JSONRPCConfig     `mapstructure:"consensus"`
+		Additional  JSONRPCConfig     `mapstructure:"additional"`
 		Retry       ClientRetryConfig `mapstructure:"retry"`
 		HttpTimeout time.Duration     `mapstructure:"http_timeout"`
 	}

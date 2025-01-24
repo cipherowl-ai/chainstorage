@@ -39,5 +39,9 @@ var Module = fx.Options(
 		Name:   "polygon",
 		Target: NewPolygonClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "tron",
+		Target: NewTronClientFactory,
+	}),
 	beacon.Module,
 )
