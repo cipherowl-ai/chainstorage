@@ -288,6 +288,7 @@ const (
 	parseFailure              = "parse_failure"
 
 	arbitrumNITROUpgradeBlockNumber = 22_207_818
+	tronNoncePlaceHolder            = "0x0000000000000000"
 )
 
 func (v EthereumHexString) MarshalJSON() ([]byte, error) {
@@ -331,7 +332,7 @@ func (v *EthereumQuantity) UnmarshalJSON(input []byte) error {
 		return xerrors.Errorf("failed to unmarshal EthereumQuantity into string: %w", err)
 	}
 
-	if s == "" {
+	if s == "" || s == tronNoncePlaceHolder {
 		*v = 0
 		return nil
 	}
@@ -573,8 +574,14 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 
 	transactionToFlattenedTracesMap := make(map[string][]*api.EthereumTransactionFlattenedTrace, 0)
 	if isParityTrace {
-		if err := p.parseTransactionFlattenedParityTraces(blobdata, transactionToFlattenedTracesMap); err != nil {
-			return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
+		if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
+			if err := convertTxInfoToFlattenedTraces(blobdata, header, transactionToFlattenedTracesMap); err != nil {
+				return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
+			}
+		} else {
+			if err := p.parseTransactionFlattenedParityTraces(blobdata, transactionToFlattenedTracesMap); err != nil {
+				return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
+			}
 		}
 	}
 

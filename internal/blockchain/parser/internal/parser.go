@@ -61,6 +61,7 @@ type (
 		EthereumBeacon ParserFactory `name:"ethereum/beacon" optional:"true"`
 		CosmosStaking  ParserFactory `name:"cosmos/staking" optional:"true"`
 		CardanoStaking ParserFactory `name:"cardano/staking" optional:"true"`
+		Tron           ParserFactory `name:"tron" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -104,6 +105,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Fantom
 		case common.Blockchain_BLOCKCHAIN_APTOS:
 			factory = params.Aptos
+		case common.Blockchain_BLOCKCHAIN_TRON:
+			factory = params.Tron
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
