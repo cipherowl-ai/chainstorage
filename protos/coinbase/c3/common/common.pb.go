@@ -41,6 +41,7 @@ const (
 	Blockchain_BLOCKCHAIN_APTOS       Blockchain = 47 // L1 network using the Move language (originally created for Libra/Diem)
 	Blockchain_BLOCKCHAIN_FANTOM      Blockchain = 51
 	Blockchain_BLOCKCHAIN_BASE        Blockchain = 56 // Coinbase L2
+	Blockchain_BLOCKCHAIN_STORY       Blockchain = 57
 )
 
 // Enum value maps for Blockchain.
@@ -62,6 +63,7 @@ var (
 		47: "BLOCKCHAIN_APTOS",
 		51: "BLOCKCHAIN_FANTOM",
 		56: "BLOCKCHAIN_BASE",
+		57: "BLOCKCHAIN_STORY",
 	}
 	Blockchain_value = map[string]int32{
 		"BLOCKCHAIN_UNKNOWN":     0,
@@ -80,6 +82,7 @@ var (
 		"BLOCKCHAIN_APTOS":       47,
 		"BLOCKCHAIN_FANTOM":      51,
 		"BLOCKCHAIN_BASE":        56,
+		"BLOCKCHAIN_STORY":       57,
 	}
 )
 
@@ -148,6 +151,8 @@ const (
 	Network_NETWORK_BASE_MAINNET        Network = 123 // Coinbase L2 running on Ethereum mainnet
 	Network_NETWORK_BASE_GOERLI         Network = 125 // Coinbase L2 running on Ethereum Goerli
 	Network_NETWORK_ETHEREUM_HOLESKY    Network = 136
+	Network_NETWORK_STORY_MAINNET       Network = 137
+	Network_NETWORK_STORY_TESTNET       Network = 138
 )
 
 // Enum value maps for Network.
@@ -186,6 +191,8 @@ var (
 		123: "NETWORK_BASE_MAINNET",
 		125: "NETWORK_BASE_GOERLI",
 		136: "NETWORK_ETHEREUM_HOLESKY",
+		137: "NETWORK_STORY_MAINNET",
+		138: "NETWORK_STORY_TESTNET",
 	}
 	Network_value = map[string]int32{
 		"NETWORK_UNKNOWN":             0,
@@ -221,6 +228,8 @@ var (
 		"NETWORK_BASE_MAINNET":        123,
 		"NETWORK_BASE_GOERLI":         125,
 		"NETWORK_ETHEREUM_HOLESKY":    136,
+		"NETWORK_STORY_MAINNET":       137,
+		"NETWORK_STORY_TESTNET":       138,
 	}
 )
 

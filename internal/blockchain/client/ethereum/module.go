@@ -43,5 +43,9 @@ var Module = fx.Options(
 		Name:   "tron",
 		Target: NewTronClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "story",
+		Target: NewStoryClientFactory,
+	}),
 	beacon.Module,
 )
