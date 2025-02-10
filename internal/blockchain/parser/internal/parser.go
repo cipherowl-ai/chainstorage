@@ -107,6 +107,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Aptos
 		case common.Blockchain_BLOCKCHAIN_TRON:
 			factory = params.Tron
+		case common.Blockchain_BLOCKCHAIN_STORY:
+			factory = params.Tron
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
