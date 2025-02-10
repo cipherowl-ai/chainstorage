@@ -4,12 +4,5 @@ aws:
   bucket: example-chainstorage-story-mainnet-dev
 cadence:
   address: temporal-dev.example.com:7233
-chain:
-  block_start_height: 1
 server:
   bind_address: 0.0.0.0:9090
-sla:
-  expected_workflows:
-  - monitor
-  - poller
-  - streamer

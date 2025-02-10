@@ -38,7 +38,7 @@ chain:
   block_tag:
     latest: 1
     stable: 1
-  block_time: 300ms
+  block_time: 2s
   blockchain: BLOCKCHAIN_STORY
   client:
     consensus:
@@ -54,9 +54,11 @@ chain:
     latest: 1
     stable: 1
   feature:
+    block_validation_enabled: true
+    block_validation_muted: true
     default_stable_event: true
-    rosetta_parser: false
-  irreversible_distance: 1
+    rosetta_parser: true
+  irreversible_distance: 10
   network: NETWORK_STORY_MAINNET
 config_name: story_mainnet
 cron:
@@ -74,20 +76,19 @@ sdk:
 server:
   bind_address: localhost:9090
 sla:
-  block_height_delta: 200
-  block_time_delta: 1m
-  event_height_delta: 200
-  event_time_delta: 1m
+  block_height_delta: 60
+  block_time_delta: 2m
+  event_height_delta: 60
+  event_time_delta: 2m
   expected_workflows:
   - monitor
   - poller
   - streamer
   - cross_validator
-  out_of_sync_node_distance: 500
-  out_of_sync_validator_node_distance: 1200
-  tier: 2
-  time_since_last_block: 1m30s
-  time_since_last_event: 1m30s
+  out_of_sync_node_distance: 60
+  tier: 1
+  time_since_last_block: 2m30s
+  time_since_last_event: 2m30s
 workflows:
   backfiller:
     activity_retry:
@@ -96,12 +97,12 @@ workflows:
       maximum_attempts: 3
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
-    activity_start_to_close_timeout: 10m
+    activity_start_to_close_timeout: 20m
     batch_size: 2500
     checkpoint_size: 5000
     max_reprocessed_per_batch: 30
     mini_batch_size: 1
-    num_concurrent_extractors: 300
+    num_concurrent_extractors: 20
     task_list: default
     workflow_identity: workflow.backfiller
     workflow_run_timeout: 24h
@@ -125,14 +126,12 @@ workflows:
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
     activity_start_to_close_timeout: 10m
-    backoff_interval: 10s
-    batch_size: 1000
+    backoff_interval: 1s
+    batch_size: 100
     checkpoint_size: 1000
-    irreversible_distance: 500
-    parallelism: 4
+    parallelism: 10
     task_list: default
-    validation_percentage: 1
-    validation_start_height: 22207816
+    validation_percentage: 100
     workflow_identity: workflow.cross_validator
     workflow_retry:
       backoff_coefficient: 1
@@ -161,11 +160,12 @@ workflows:
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
     activity_start_to_close_timeout: 10m
-    backoff_interval: 1s
+    backoff_interval: 10s
     batch_size: 50
     block_gap_limit: 3000
     checkpoint_size: 500
     event_gap_limit: 300
+    failover_enabled: true
     parallelism: 4
     task_list: default
     workflow_identity: workflow.monitor
@@ -186,14 +186,17 @@ workflows:
     activity_start_to_close_timeout: 10m
     backoff_interval: 0s
     checkpoint_size: 1000
-    fast_sync: true
+    consensus_validation: true
+    consensus_validation_muted: true
+    failover_enabled: true
+    fast_sync: false
     liveness_check_enabled: true
     liveness_check_interval: 1m
     liveness_check_violation_limit: 10
-    max_blocks_to_sync_per_cycle: 200
-    parallelism: 50
+    max_blocks_to_sync_per_cycle: 100
+    parallelism: 10
     session_creation_timeout: 2m
-    session_enabled: false
+    session_enabled: true
     task_list: default
     workflow_identity: workflow.poller
     workflow_retry:
