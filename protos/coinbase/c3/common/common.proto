@@ -23,7 +23,7 @@ enum Blockchain {
     BLOCKCHAIN_APTOS = 47;   // L1 network using the Move language (originally created for Libra/Diem)
     BLOCKCHAIN_FANTOM = 51;
     BLOCKCHAIN_BASE = 56; // Coinbase L2
-    BLOCKCHAIN_STORY = 57;
+    BLOCKCHAIN_STORY = 60;
 }
 
 // Network defines an enumeration of supported networks.
@@ -80,5 +80,5 @@ enum Network {
 
     NETWORK_ETHEREUM_HOLESKY = 136;
 
-    NETWORK_STORY_MAINNET = 137;
+    NETWORK_STORY_MAINNET = 140;
 }
