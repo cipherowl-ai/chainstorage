@@ -237,6 +237,7 @@ func (c *restClient) makeRequest(ctx context.Context, method string, request pro
 		httpRequest.Header.Set("Accept", "application/json")
 		if c.authHeader != "" && c.authToken != "" {
 			httpRequest.Header.Set(c.authHeader, c.authToken)
+			httpRequest.Header.Set("cb-nft-api-token", c.authToken)
 		}
 
 		c.logger.Debug(
