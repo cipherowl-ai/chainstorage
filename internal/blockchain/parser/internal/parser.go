@@ -62,6 +62,7 @@ type (
 		CosmosStaking  ParserFactory `name:"cosmos/staking" optional:"true"`
 		CardanoStaking ParserFactory `name:"cardano/staking" optional:"true"`
 		Tron           ParserFactory `name:"tron" optional:"true"`
+		Story          ParserFactory `name:"story" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -107,6 +108,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Aptos
 		case common.Blockchain_BLOCKCHAIN_TRON:
 			factory = params.Tron
+		case common.Blockchain_BLOCKCHAIN_STORY:
+			factory = params.Story
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
