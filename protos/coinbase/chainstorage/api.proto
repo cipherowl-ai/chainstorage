@@ -12,6 +12,7 @@ enum Compression {
   NONE = 0;
   // Compressed using gzip.
   GZIP = 1;
+  ZSTD = 2;
 }
 
 enum InitialPosition {

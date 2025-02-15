@@ -27,7 +27,7 @@ aws:
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
-    data_compression: GZIP
+    data_compression: ZSTD
 cadence:
   address: ""
   domain: chainstorage-tron-mainnet
