@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"errors"
+	"fmt"
 	"io/ioutil"
 	"path/filepath"
 
@@ -21,6 +22,7 @@ const (
 type Compressor interface {
 	Compress(data []byte) ([]byte, error)
 	Decompress(data []byte) ([]byte, error)
+	GetObjectKey(key string) string
 }
 
 func GetCompressionType(fileURL string) api.Compression {
@@ -48,7 +50,7 @@ func CompressorFactory(compressionType api.Compression) (Compressor, error) {
 // ------ GZIP ------
 type GzipCompressor struct{}
 
-func (c *GzipCompressor) Compress(data []byte) ([]byte, error) {
+func (g *GzipCompressor) Compress(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
 
@@ -62,7 +64,7 @@ func (c *GzipCompressor) Compress(data []byte) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (c *GzipCompressor) Decompress(data []byte) ([]byte, error) {
+func (g *GzipCompressor) Decompress(data []byte) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewBuffer(data))
 	if err != nil {
 		return nil, xerrors.Errorf("failed to initiate gzip reader: %w", err)
@@ -77,10 +79,14 @@ func (c *GzipCompressor) Decompress(data []byte) ([]byte, error) {
 	return decoded, nil
 }
 
+func (g *GzipCompressor) GetObjectKey(key string) string {
+	return fmt.Sprintf("%s%s", key, GzipFileSuffix)
+}
+
 // ------ ZSTD ------
 type ZstdCompressor struct{}
 
-func (c *ZstdCompressor) Compress(data []byte) ([]byte, error) {
+func (z *ZstdCompressor) Compress(data []byte) ([]byte, error) {
 	writer, err := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.SpeedDefault))
 	if err != nil {
 		return nil, xerrors.Errorf("failed to write compressed data with zstd: %w", err)
@@ -91,7 +97,7 @@ func (c *ZstdCompressor) Compress(data []byte) ([]byte, error) {
 	return writer.EncodeAll(data, nil), nil
 }
 
-func (c *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
+func (z *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
 	decoder, err := zstd.NewReader(nil)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to initiate zstd reader: %w", err)
@@ -102,4 +108,8 @@ func (c *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
 		return nil, xerrors.Errorf("failed to read data with zstd: %w", err)
 	}
 	return decoded, nil
+}
+
+func (z *ZstdCompressor) GetObjectKey(key string) string {
+	return fmt.Sprintf("%s%s", key, ZstdFileSuffix)
 }
