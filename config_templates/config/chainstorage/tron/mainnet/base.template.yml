@@ -6,6 +6,8 @@ aws:
   dynamodb:
     event_table: example_chainstorage_block_events_{{blockchain}}_{{network}}
     event_table_height_index: example_chainstorage_block_events_by_height_{{blockchain}}_{{network}}
+  storage:
+    data_compression: ZSTD
 chain:
   client:
     consensus:
