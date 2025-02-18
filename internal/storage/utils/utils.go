@@ -1,8 +1,6 @@
 package utils
 
 import (
-	"fmt"
-
 	"golang.org/x/xerrors"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -40,15 +38,12 @@ func Decompress(data []byte, compression api.Compression) ([]byte, error) {
 }
 
 func GetObjectKey(key string, compression api.Compression) (string, error) {
-
-	switch compression {
-	case api.Compression_NONE:
+	if compression == api.Compression_NONE {
 		return key, nil
-	case api.Compression_GZIP:
-		return fmt.Sprintf("%s%s", key, GzipFileSuffix), nil
-	case api.Compression_ZSTD:
-		return fmt.Sprintf("%s%s", key, ZstdFileSuffix), nil
-	default:
-		return "", xerrors.Errorf("failed to get object key with unsupported type %v", compression.String())
 	}
+	compressor, err := CompressorFactory(compression)
+	if err != nil {
+		return "", xerrors.Errorf("failed to Get Object Key with: %w", err)
+	}
+	return compressor.GetObjectKey(key), nil
 }
