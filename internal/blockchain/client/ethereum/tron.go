@@ -50,6 +50,7 @@ type (
 
 type TronBlockTxInfoRequestData struct {
 	Num uint64 `json:"num"`
+	Visible bool `json:"visible"`
 }
 
 var tronTxInfoMethod = &restapi.RequestMethod{
@@ -117,6 +118,7 @@ func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethe
 
 	requestData := TronBlockTxInfoRequestData{
 		Num: blockNumber,
+		Visible: true, // get Hash and Account Address in Tron format
 	}
 	postData, err := json.Marshal(requestData)
 	if err != nil {
