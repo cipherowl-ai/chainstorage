@@ -571,7 +571,10 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 	if numTransactions != len(tokenTransfers) {
 		return nil, xerrors.Errorf("unexpected number of token transfers: expected=%v actual=%v", numTransactions, len(tokenTransfers))
 	}
-
+	// post process block data for Tron data, convert hash and account address
+	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
+		postProcessTronBlock(metadata, header, transactions, transactionReceipts, tokenTransfers)
+	}
 	transactionToFlattenedTracesMap := make(map[string][]*api.EthereumTransactionFlattenedTrace, 0)
 	if isParityTrace {
 		if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
