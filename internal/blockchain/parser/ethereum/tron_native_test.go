@@ -27,7 +27,8 @@ type tronParserTestSuite struct {
 }
 
 func TestTronParserTestSuite(t *testing.T) {
-	//suite.Run(t, new(tronParserTestSuite))
+	t.Skip()
+	suite.Run(t, new(tronParserTestSuite))
 }
 
 func (s *tronParserTestSuite) SetupTest() {
