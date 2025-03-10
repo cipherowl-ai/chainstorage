@@ -106,8 +106,9 @@ func (s *gcpBlobStorageTestSuite) TestIntegrationGcsBlobStorageIntegration_GzipF
 }
 
 func TestIntegrationGcsBlobStorageTestSuite(t *testing.T) {
-	//require := testutil.Require(t)
-	//cfg, err := config.New()
-	//require.NoError(err)
-	//suite.Run(t, &gcpBlobStorageTestSuite{config: cfg})
+	t.Skip()
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	suite.Run(t, &gcpBlobStorageTestSuite{config: cfg})
 }

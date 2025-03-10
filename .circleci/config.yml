@@ -41,7 +41,7 @@ jobs:
           name: Run functional tests
           command: |
             set +x
-            echo "run functional tests"
+            echo "functional tests skipped"
 
             # docker run --network chainstorage_default \
             #  --volumes-from chainstorage \
