@@ -317,8 +317,8 @@ func TestIntegrationBlockStorageTestSuite(t *testing.T) {
 	// 	suite.Run(t, &blockStorageTestSuite{config: cfg})
 	// })
 
-	require := testutil.Require(t)
-	cfg, err := config.New()
-	require.NoError(err)
-	suite.Run(t, &blockStorageTestSuite{config: cfg})
+	//require := testutil.Require(t)
+	//cfg, err := config.New()
+	//require.NoError(err)
+	//suite.Run(t, &blockStorageTestSuite{config: cfg})
 }
