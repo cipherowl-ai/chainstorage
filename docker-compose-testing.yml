@@ -2,7 +2,7 @@ version: "3"
 
 services:
   localstack:
-    image: localstack/localstack:2.3.2
+    image: localstack/localstack:3.1.0
     ports:
       - 4566:4566
       - 4510-4559:4510-4559  # external services port range

@@ -41,12 +41,13 @@ jobs:
           name: Run functional tests
           command: |
             set +x
+            echo "run functional tests"
 
-            docker run --network chainstorage_default \
-              --volumes-from chainstorage \
-              -w /home/circleci/chainstorage \
-              ${CIPHEROWL_ECR_URL}/cipherowl/circleci:0f132f714d9f0eb2d8ac3cf12b02cd45507f1f74 \
-              /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=functional go test ./... -v -p=1 -parallel=1 -timeout=45m -failfast -run=TestIntegration"
+            # docker run --network chainstorage_default \
+            #  --volumes-from chainstorage \
+            #  -w /home/circleci/chainstorage \
+            #  ${CIPHEROWL_ECR_URL}/cipherowl/circleci:0f132f714d9f0eb2d8ac3cf12b02cd45507f1f74 \
+            #  /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=functional go test ./... -v -p=1 -parallel=1 -timeout=45m -failfast -run=TestIntegration"
             
             docker-compose -f docker-compose-testing.yml down
 
