@@ -91,6 +91,7 @@ func init() {
 
 func startWorkflow() error {
 	workflowIdentity := workflow.GetWorkflowIdentify(workflowFlags.workflow)
+	workflowId := workflowFlags.workflowID
 	if workflowIdentity == workflow.UnknownIdentity {
 		return xerrors.Errorf("invalid workflow: %v", workflowFlags.workflow)
 	}
@@ -101,7 +102,7 @@ func startWorkflow() error {
 	}
 	defer app.Close()
 
-	ctx := context.Background()
+	ctx := context.WithValue(context.Background(), "workflowId", workflowId)
 	workflowIdentityString, err := workflowIdentity.String()
 	if err != nil {
 		return xerrors.Errorf("error parsing workflowIdentity: %w", err)
