@@ -368,6 +368,7 @@ type (
 
 	StorageConfig struct {
 		DataCompression api.Compression `mapstructure:"data_compression"`
+		ZstdDictVersion string          `mapstructure:"zstd_dict_version"`
 	}
 
 	SLAConfig struct {
@@ -1291,4 +1292,27 @@ func (c *AuthConfig) AsMap() map[string]*AuthClient {
 		res[client.Token] = client
 	}
 	return res
+}
+
+func (c *Config) GetConfigDir() string {
+	blockchainName := c.Chain.Blockchain.GetName()
+	networkName := strings.TrimPrefix(c.Chain.Network.GetName(), blockchainName+"-")
+	sidechainName := strings.TrimPrefix(c.Chain.Sidechain.GetName(), blockchainName+"-"+networkName+"-")
+
+	configRoot := GetConfigRoot()
+	if len(configRoot) == 0 {
+		_, filename, _, ok := runtime.Caller(0)
+		if !ok {
+			return ""
+		}
+		rootDir := strings.TrimSuffix(filename, CurrentFileName)
+		configRoot = fmt.Sprintf("%v/config", rootDir)
+	}
+
+	configDir := fmt.Sprintf("%v/%v/%v/%v", configRoot, c.namespace, blockchainName, networkName)
+	if c.Chain.Sidechain != api.SideChain_SIDECHAIN_NONE {
+		configDir = fmt.Sprintf("%v/%v", configDir, sidechainName)
+	}
+
+	return configDir
 }

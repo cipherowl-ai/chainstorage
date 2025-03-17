@@ -22,6 +22,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
+	"github.com/coinbase/chainstorage/internal/storage/compress"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
@@ -51,6 +52,7 @@ type (
 		client              s3.Client
 		downloader          s3.Downloader
 		uploader            s3.Uploader
+		compressProxy       compress.CompressProxy
 		blobStorageMetrics  *blobStorageMetrics
 		instrumentUpload    instrument.InstrumentWithResult[string]
 		instrumentUploadRaw instrument.InstrumentWithResult[string]
@@ -87,6 +89,11 @@ func New(params BlobStorageParams) (internal.BlobStorage, error) {
 	metrics := params.Metrics.SubScope("blob_storage").Tagged(map[string]string{
 		"storage_type": "s3",
 	})
+	compressProxy, err := compress.NewCompressProxy(params.Config, params.Uploader, params.Downloader)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get object key: %w", err)
+	}
+
 	return &blobStorageImpl{
 		logger:              log.WithPackage(params.Logger),
 		config:              params.Config,
@@ -94,6 +101,7 @@ func New(params BlobStorageParams) (internal.BlobStorage, error) {
 		client:              params.Client,
 		downloader:          params.Downloader,
 		uploader:            params.Uploader,
+		compressProxy:       *compressProxy,
 		blobStorageMetrics:  newBlobStorageMetrics(metrics),
 		instrumentUpload:    instrument.NewWithResult[string](metrics, "upload"),
 		instrumentUploadRaw: instrument.NewWithResult[string](metrics, "upload_raw"),
@@ -186,7 +194,7 @@ func (s *blobStorageImpl) Upload(ctx context.Context, block *api.Block, compress
 			return "", xerrors.Errorf("failed to marshal block: %w", err)
 		}
 
-		data, err = storage_utils.Compress(data, compression)
+		data, err = s.compressProxy.Compress(data)
 		if err != nil {
 			return "", xerrors.Errorf("failed to compress data with type %v: %w", compression.String(), err)
 		}
@@ -232,9 +240,8 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 
 		// a workaround to use timer
 		s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(size) * time.Millisecond)
-
 		compression := storage_utils.GetCompressionType(key)
-		blockData, err := storage_utils.Decompress(buf.Bytes(), compression)
+		blockData, err := s.compressProxy.Decompress(buf.Bytes(), compression)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", compression.String(), err)
 		}
