@@ -168,7 +168,32 @@ message EthereumTransactionReceipt {
   oneof optional_blob_gas_used {
     uint64 blob_gas_used = 21;
   }
+  oneof optional_fee {
+    uint64 fee = 22;
+  }
+  oneof optional_net_fee {
+    uint64 net_fee = 23;
+  }
+  oneof optional_net_usage {
+    uint64 net_usage = 24;
+  }
+  oneof optional_energy_usage {
+    uint64 energy_usage = 25;
+  }
+  oneof optional_energy_fee {
+    uint64 energy_fee = 26;
+  }
+  oneof optional_origin_energy_usage {
+    uint64 origin_energy_usage = 27;
+  }
+  oneof optional_energy_usage_total {
+    uint64 energy_usage_total = 28;
+  }
+  oneof optional_energy_penalty_total {
+    uint64 energy_penalty_total = 29;
+  }
 }
+
 
 message EthereumEventLog {
   bool removed = 1;

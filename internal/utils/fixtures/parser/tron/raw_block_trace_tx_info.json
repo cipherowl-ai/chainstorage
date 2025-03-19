@@ -71,12 +71,13 @@
             "0000000000000000000000000000000000000000000000000000000054e4691a"
         ],
         "blockTimeStamp": 1732627338000,
+        "fee": 379,
         "receipt": {
             "result": "SUCCESS",
             "energy_usage": 68976,
             "energy_usage_total": 74135,
             "origin_energy_usage": 5159,
-            "net_usage": 379
+            "net_fee": 379
         },
         "id": "e14935e6144007163609bb49292897ba81bf7ee93bf28ba4cc5ebd0d6b95f4b9",
         "contract_address": "41c60a6f5c81431c97ed01b61698b6853557f3afd4",
