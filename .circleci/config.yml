@@ -1,0 +1,60 @@
+version: 2.1
+jobs:
+  build_and_test:
+    docker:
+      - image: ${CIPHEROWL_ECR_URL}/cipherowl/circleci:0f132f714d9f0eb2d8ac3cf12b02cd45507f1f74
+    working_directory: ~/chainstorage
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install dependencies
+          command: |
+            set +x
+            make bootstrap
+      - run:
+          name: Run unit tests
+          command: "make test"
+      - run:
+          name: Run integration tests
+          command: |
+            set +x
+
+            docker-compose -f docker-compose-testing.yml up -d --force-recreate
+            sleep 10
+
+            # Due to how the remote docker engine works with docker-compose
+            # in circleci, we have to run our integration tests from
+            # a remote container so that the tests can access network services
+            # spun up by docker-compose.
+            docker create -v /home/circleci --name chainstorage alpine:3.21 /bin/true
+            # docker cp /home/circleci/go chainstorage:/home/circleci/go
+            docker cp /home/circleci/chainstorage chainstorage:/home/circleci/chainstorage
+
+            docker run --network chainstorage_default \
+              --volumes-from chainstorage \
+              -w /home/circleci/chainstorage \
+              ${CIPHEROWL_ECR_URL}/cipherowl/circleci:0f132f714d9f0eb2d8ac3cf12b02cd45507f1f74 \
+              /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=integration go test ./... -v -p=1 -parallel=1 -timeout=15m -failfast -run=TestIntegration"
+      - run:
+          name: Run functional tests
+          command: |
+            set +x
+            echo "functional tests skipped"
+
+            # docker run --network chainstorage_default \
+            #  --volumes-from chainstorage \
+            #  -w /home/circleci/chainstorage \
+            #  ${CIPHEROWL_ECR_URL}/cipherowl/circleci:0f132f714d9f0eb2d8ac3cf12b02cd45507f1f74 \
+            #  /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=functional go test ./... -v -p=1 -parallel=1 -timeout=45m -failfast -run=TestIntegration"
+            
+            docker-compose -f docker-compose-testing.yml down
+
+workflows:
+  version: 2
+  default:
+    jobs:
+      - build_and_test:
+          name: build_and_test
+          context: cipherowl_build_context

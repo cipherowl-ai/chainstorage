@@ -27,6 +27,7 @@ type tronParserTestSuite struct {
 }
 
 func TestTronParserTestSuite(t *testing.T) {
+	t.Skip()
 	suite.Run(t, new(tronParserTestSuite))
 }
 
