@@ -571,23 +571,25 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 	if numTransactions != len(tokenTransfers) {
 		return nil, xerrors.Errorf("unexpected number of token transfers: expected=%v actual=%v", numTransactions, len(tokenTransfers))
 	}
-	// post process block data for Tron data, convert hash and account address
-	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
-		postProcessTronBlock(metadata, header, transactions, transactionReceipts, tokenTransfers)
-	}
 	transactionToFlattenedTracesMap := make(map[string][]*api.EthereumTransactionFlattenedTrace, 0)
 	if isParityTrace {
-		if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
-			if err := convertTxInfoToFlattenedTraces(blobdata, header, transactionToFlattenedTracesMap); err != nil {
-				return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
-			}
-		} else {
+		if p.config.Blockchain() != common.Blockchain_BLOCKCHAIN_TRON {
 			if err := p.parseTransactionFlattenedParityTraces(blobdata, transactionToFlattenedTracesMap); err != nil {
 				return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
 			}
 		}
 	}
-
+	// post process block data for Tron data, convert hash and account address, and set flattened traces
+	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
+		postProcessTronBlock(
+			blobdata,
+			metadata,
+			header,
+			transactions,
+			transactionReceipts,
+			tokenTransfers,
+			transactionToFlattenedTracesMap)
+	}
 	for i, transaction := range transactions {
 		transaction.Receipt = transactionReceipts[i]
 		transaction.TokenTransfers = tokenTransfers[i]

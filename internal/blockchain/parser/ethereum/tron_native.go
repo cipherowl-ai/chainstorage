@@ -29,8 +29,22 @@ type TronCallValueInfo struct {
 type TronTransactionInfo struct {
 	InternalTransactions []TronInternalTransaction `json:"internal_transactions"`
 	Id                   string                    `json:"id"`
-	BlockNumber          int64                     `json:"blockNumber"`
+	BlockNumber          uint64                    `json:"blockNumber"`
 	TransactionHash      string                    `json:"transactionHash"`
+	Fee                  uint64                    `json:"fee"`
+	Receipt              TronReceipt               `json:"receipt"`
+}
+
+type TronReceipt struct {
+	Result string `json:"result"`
+	// Bandwidth is represented as either net_fee or net_usage, only one will exist in the response
+	NetFee             uint64 `json:"net_fee"`
+	NetUsage           uint64 `json:"net_usage"`
+	EnergyUsage        uint64 `json:"energy_usage"`
+	EnergyFee          uint64 `json:"energy_fee"`
+	OriginEnergyUsage  uint64 `json:"origin_energy_usage"`
+	EnergyUsageTotal   uint64 `json:"energy_usage_total"`
+	EnergyPenaltyTotal uint64 `json:"energy_penalty_total"`
 }
 
 type TronInternalTransaction struct {
@@ -64,26 +78,88 @@ func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.Ethere
 	} else {
 		trace.Status = 1
 	}
-	return trace
 
+	return trace
 }
 
-func convertTxInfoToFlattenedTraces(blobData *api.EthereumBlobdata, header *api.EthereumHeader, transactionToFlattenedTracesMap map[string][]*api.EthereumTransactionFlattenedTrace) error {
+func parseTronTxInfo(
+	blobData *api.EthereumBlobdata,
+	header *api.EthereumHeader,
+	transactionToFlattenedTracesMap map[string][]*api.EthereumTransactionFlattenedTrace,
+	txReceipts []*api.EthereumTransactionReceipt,
+) error {
 	if len(blobData.TransactionTraces) == 0 {
 		return nil
 	}
+
+	// Ensure we have matching number of receipts and traces
+	if len(blobData.TransactionTraces) != len(txReceipts) {
+		return xerrors.Errorf(
+			"mismatch between number of transaction traces (%d) and receipts (%d)",
+			len(blobData.TransactionTraces),
+			len(txReceipts),
+		)
+	}
+
 	for txIndex, rawTxInfo := range blobData.TransactionTraces {
 		var txInfo TronTransactionInfo
 		if err := json.Unmarshal(rawTxInfo, &txInfo); err != nil {
-			return xerrors.Errorf("failed to parse transaction trace: %w", err)
+			return xerrors.Errorf("failed to parse transaction trace at index %d: %w", txIndex, err)
 		}
+
 		traceTransactionHash := txInfo.Id
 		txIdx := uint64(txIndex)
+		fee := txInfo.Fee
+		receipt := txInfo.Receipt
+		// 1. enreach txReceipt with fee and net_fee (Bandwidth)fields from transactionInfo.receipt
+		txReceipt := txReceipts[txIndex]
+		if fee != 0 {
+			txReceipt.OptionalFee = &api.EthereumTransactionReceipt_Fee{
+				Fee: uint64(fee),
+			}
+		}
+		if receipt.NetFee != 0 {
+			txReceipt.OptionalNetFee = &api.EthereumTransactionReceipt_NetFee{
+				NetFee: uint64(receipt.NetFee),
+			}
+		}
+		if receipt.NetUsage != 0 {
+			txReceipt.OptionalNetUsage = &api.EthereumTransactionReceipt_NetUsage{
+				NetUsage: uint64(receipt.NetUsage),
+			}
+		}
+		if receipt.EnergyUsage != 0 {
+			txReceipt.OptionalEnergyUsage = &api.EthereumTransactionReceipt_EnergyUsage{
+				EnergyUsage: uint64(receipt.EnergyUsage),
+			}
+		}
+		if receipt.EnergyFee != 0 {
+			txReceipt.OptionalEnergyFee = &api.EthereumTransactionReceipt_EnergyFee{
+				EnergyFee: uint64(receipt.EnergyFee),
+			}
+		}
+		if receipt.OriginEnergyUsage != 0 {
+			txReceipt.OptionalOriginEnergyUsage = &api.EthereumTransactionReceipt_OriginEnergyUsage{
+				OriginEnergyUsage: uint64(receipt.OriginEnergyUsage),
+			}
+		}
+		if receipt.EnergyUsageTotal != 0 {
+			txReceipt.OptionalEnergyUsageTotal = &api.EthereumTransactionReceipt_EnergyUsageTotal{
+				EnergyUsageTotal: uint64(receipt.EnergyUsageTotal),
+			}
+		}
+		if receipt.EnergyPenaltyTotal != 0 {
+			txReceipt.OptionalEnergyPenaltyTotal = &api.EthereumTransactionReceipt_EnergyPenaltyTotal{
+				EnergyPenaltyTotal: uint64(receipt.EnergyPenaltyTotal),
+			}
+		}
+
+		// 2. mapping internalTransactions to trace
 		internalTxs := txInfo.InternalTransactions
 		traces := make([]*api.EthereumTransactionFlattenedTrace, len(internalTxs))
 		for i, internalTx := range internalTxs {
 			trace := convertInternalTransactionToTrace(&internalTx)
-			trace.BlockHash = header.Hash
+			trace.BlockHash = toTronHash(header.Hash)
 			trace.BlockNumber = header.Number
 			trace.TransactionHash = traceTransactionHash
 			trace.TransactionIndex = txIdx
@@ -95,15 +171,34 @@ func convertTxInfoToFlattenedTraces(blobData *api.EthereumBlobdata, header *api.
 }
 
 func toTronHash(hexHash string) string {
+	// if hexHash == "" {
+	// 	return ""
+	// }
+	// // Normalize the hash by ensuring it's lowercase and removing 0x prefix
+	// hexHash = strings.ToLower(hexHash)
 	return strings.Replace(hexHash, "0x", "", -1)
 }
 
 func hexToTronAddress(hexAddress string) string {
+	if hexAddress == "" {
+		return ""
+	}
+
+	// Ensure consistent format by cleaning the hex address
+	hexAddress = strings.ToLower(hexAddress)
 	if strings.HasPrefix(hexAddress, "0x") {
 		hexAddress = "41" + hexAddress[2:]
+	} else if !strings.HasPrefix(hexAddress, "41") {
+		hexAddress = "41" + hexAddress
 	}
-	// 
-	rawBytes, _ := hex.DecodeString(hexAddress)
+
+	// Decode hex string to bytes
+	rawBytes, err := hex.DecodeString(hexAddress)
+	if err != nil {
+		// If unable to decode, return the original address to avoid data loss
+		return hexAddress
+	}
+
 	// Compute double SHA-256 checksum
 	hash1 := sha256.Sum256(rawBytes)
 	hash2 := sha256.Sum256(hash1[:])
@@ -138,7 +233,18 @@ func convertTokenTransfer(data *api.EthereumTokenTransfer) {
 	}
 }
 
-func postProcessTronBlock(metaData *api.BlockMetadata, header *api.EthereumHeader, transactions []*api.EthereumTransaction, txReceipts []*api.EthereumTransactionReceipt, tokenTransfers [][]*api.EthereumTokenTransfer) {
+func postProcessTronBlock(
+	blobData *api.EthereumBlobdata,
+	metaData *api.BlockMetadata,
+	header *api.EthereumHeader,
+	transactions []*api.EthereumTransaction,
+	txReceipts []*api.EthereumTransactionReceipt,
+	tokenTransfers [][]*api.EthereumTokenTransfer,
+	transactionToFlattenedTracesMap map[string][]*api.EthereumTransactionFlattenedTrace,
+) error {
+	if err := parseTronTxInfo(blobData, header, transactionToFlattenedTracesMap, txReceipts); err != nil {
+		return xerrors.Errorf("failed to parse transaction parity traces: %w", err)
+	}
 	metaData.Hash = toTronHash(metaData.Hash)
 	metaData.ParentHash = toTronHash(metaData.ParentHash)
 
@@ -179,10 +285,10 @@ func postProcessTronBlock(metaData *api.BlockMetadata, header *api.EthereumHeade
 			}
 		}
 	}
-
 	for _, txTokenTransfers := range tokenTransfers {
 		for _, tokenTransfer := range txTokenTransfers {
 			convertTokenTransfer(tokenTransfer)
 		}
 	}
+	return nil
 }
