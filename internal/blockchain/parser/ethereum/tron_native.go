@@ -9,10 +9,11 @@ import (
 
 	"golang.org/x/xerrors"
 
+	"github.com/mr-tron/base58"
+
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/ethereum/types"
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	"github.com/mr-tron/base58"
 )
 
 func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
