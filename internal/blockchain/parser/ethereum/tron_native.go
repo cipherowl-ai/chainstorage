@@ -235,7 +235,6 @@ func convertTokenTransfer(data *api.EthereumTokenTransfer) {
 
 func postProcessTronBlock(
 	blobData *api.EthereumBlobdata,
-	metaData *api.BlockMetadata,
 	header *api.EthereumHeader,
 	transactions []*api.EthereumTransaction,
 	txReceipts []*api.EthereumTransactionReceipt,
@@ -245,8 +244,6 @@ func postProcessTronBlock(
 	if err := parseTronTxInfo(blobData, header, transactionToFlattenedTracesMap, txReceipts); err != nil {
 		return xerrors.Errorf("failed to parse transaction parity traces: %w", err)
 	}
-	metaData.Hash = toTronHash(metaData.Hash)
-	metaData.ParentHash = toTronHash(metaData.ParentHash)
 
 	header.Hash = toTronHash(header.Hash)
 	header.ParentHash = toTronHash(header.ParentHash)
