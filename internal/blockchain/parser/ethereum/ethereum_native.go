@@ -581,13 +581,15 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 	}
 	// post process block data for Tron data, convert hash and account address, and set flattened traces
 	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
-		postProcessTronBlock(
+		if err := postProcessTronBlock(
 			blobdata,
 			header,
 			transactions,
 			transactionReceipts,
 			tokenTransfers,
-			transactionToFlattenedTracesMap)
+			transactionToFlattenedTracesMap); err != nil {
+			return nil, xerrors.Errorf("failed to post process tron block: %w", err)
+		}
 	}
 	for i, transaction := range transactions {
 		transaction.Receipt = transactionReceipts[i]
@@ -908,7 +910,7 @@ func (p *ethereumNativeParserImpl) parseTransactionReceipts(blobdata *api.Ethere
 		}
 
 		// Field effectiveGasPrice is added to the eth_getTransactionReceipt call for EIP-1559.
-		// Pre-London, it is equal to the transaction’s gasPrice.
+		// Pre-London, it is equal to the transaction's gasPrice.
 		// Post-London, it is equal to the actual gas price paid for inclusion.
 		// Since it's hard to backfill all old blocks, set `effectiveGasPrice` as gasPrice for Pre-London blocks.
 		// Ref: https://hackmd.io/@timbeiko/1559-json-rpc
