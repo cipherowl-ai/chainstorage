@@ -614,7 +614,8 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 	if err != nil {
 		return nil, xerrors.Errorf("failed to parse uncles from block blobdata: %w", err)
 	}
-
+	p.Logger.Info("VERSION CHECK:>>>>",zap.String("block hash", header.Hash),
+)
 	nativeBlock := &api.NativeBlock{
 		Blockchain:      rawBlock.Blockchain,
 		Network:         rawBlock.Network,
