@@ -583,7 +583,6 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
 		if err := postProcessTronBlock(
 			blobdata,
-			metadata,
 			header,
 			transactions,
 			transactionReceipts,
@@ -620,8 +619,8 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 		Blockchain:      rawBlock.Blockchain,
 		Network:         rawBlock.Network,
 		Tag:             metadata.Tag,
-		Hash:            metadata.Hash,
-		ParentHash:      metadata.ParentHash,
+		Hash:            header.Hash,
+		ParentHash:      header.ParentHash,
 		Height:          metadata.Height,
 		ParentHeight:    metadata.ParentHeight,
 		Timestamp:       header.Timestamp,
