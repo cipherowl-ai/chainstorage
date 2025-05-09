@@ -35,6 +35,7 @@ const (
 	bitcoinScriptTypeNullData            string = "nulldata"
 	bitcoinScriptTypeWitnessUnknown      string = "witness_unknown"
 	bitcoinScriptTypeWitnessV1Taproot    string = "witness_v1_taproot"
+	bitcoinScriptTypeAnchor              string = "anchor"
 	// TODO, Create litecoin parser for LTC address
 	bitcoinScriptTypeMwebPegin   string = "witness_mweb_pegin"
 	bitcoinScriptTypeMwebHogaddr string = "witness_mweb_hogaddr"
@@ -193,7 +194,8 @@ func validateBitcoinScriptPubKey(sl validator.StructLevel) {
 			}
 		}
 	// Types that we expect to be able to parse address for
-	case bitcoinScriptTypePubKeyHash, bitcoinScriptTypeScriptHash, bitcoinScriptTypeWitnessV0PubKeyHash, bitcoinScriptTypeWitnessV0ScriptHash, bitcoinScriptTypeWitnessUnknown, bitcoinScriptTypeWitnessV1Taproot:
+	// https://github.com/bitcoin/bitcoin/commit/455fca86cfada1823aa28615b5683f9dc73dbb9a
+	case bitcoinScriptTypePubKeyHash, bitcoinScriptTypeScriptHash, bitcoinScriptTypeWitnessV0PubKeyHash, bitcoinScriptTypeWitnessV0ScriptHash, bitcoinScriptTypeWitnessUnknown, bitcoinScriptTypeWitnessV1Taproot, bitcoinScriptTypeAnchor:
 		if len(address) == 0 {
 			sl.ReportError(address, "Address[main]", "Address[main]", "bspk_a", "")
 		} // Types that we expect to be able to parse address for
