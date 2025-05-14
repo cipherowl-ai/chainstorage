@@ -2,15 +2,17 @@ package activity
 
 import (
 	"context"
+
+	"go.temporal.io/sdk/workflow"
+	"go.uber.org/fx"
+	"go.uber.org/zap"
+	"golang.org/x/xerrors"
+
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/gateway"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	"go.temporal.io/sdk/workflow"
-	"go.uber.org/fx"
-	"go.uber.org/zap"
-	"golang.org/x/xerrors"
 )
 
 type (
