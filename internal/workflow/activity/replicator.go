@@ -2,10 +2,11 @@ package activity
 
 import (
 	"context"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"io"
 	"net/http"
 	"time"
+
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
