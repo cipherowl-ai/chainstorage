@@ -4,11 +4,18 @@ gcp:
 sdk:
   chainstorage_address: localhost:9090
   restful: false
+aws:
+  storage:
+    data_compression: ZSTD
+    zstd_dict_version: zstd.dict
 storage_type:
   blob: S3
   dlq: SQS
   meta: DYNAMODB
 chain:
+  feature:
+    block_validation_enabled: false
+  block_start_height: 1
   client:
     additional:
       endpoint_group: 
