@@ -55,33 +55,52 @@ It aims to provide an efficient and flexible way to access the on-chain data:
 - Flexibility is improved by decoupling data interpretation from data ingestion. ChainStorage stores the raw data, and the parsing is deferred until the data is consumed. The parsers are shipped as part of the SDK and run on the consumer side. Thanks to the ELT (Extract, Load, Transform) architecture, we can quickly iterate on the parser without ingesting the data from the blockchain again.
 
 ## Quick Start
+This section will guide you through setting up ChainStorage on your local machine for development.
 
-Make sure your local go version is 1.22 by running the following commands:
-```shell
-brew install go@1.22
-brew unlink go
-brew link go@1.22
+### Prerequisites
+1.  **Go (version 1.22):**
+    ```shell
+    brew install go@1.22
+    brew unlink go
+    brew link go@1.22
+    ```
+    Verify your Go installation:
+    ```shell
+    go version
+    ```
+2.  **Protocol Buffer Compiler (protobuf):** Used for code generation based on `.proto` files.
+    ```shell
+    brew install protobuf@29
+    brew unlink protobuf
+    brew link protobuf@29
+    ```
+    Verify your installation:
+    ```shell
+    protoc --version
+    ```
 
-brew install protobuf@25.2
-brew unlink protobuf
-brew link protobuf
+### Initial Setup
 
-```
-
-To set up for the first time (only done once):
+This command (run only once) installs necessary Go tools for development, like linters and code generators.
 ```shell
 make bootstrap
 ```
 
-Rebuild everything:
+### Build the Project
+
+This command compiles the ChainStorage Go programs.
 ```shell
 make build
 ```
+You'll run this command whenever you make changes to the Go source code.
 
-Generate Protos:
+### Generate Protocol Buffers
+
+ChainStorage uses Protocol Buffers to define data structures. This command generates Go code from those definitions.
 ```shell
 make proto
 ```
+You'll need to run this if you change any `.proto` files (usually located in the `protos/` directory).
 
 ## Command Line
 
@@ -119,14 +138,24 @@ All sub-commands require the `blockchain`, `env`, `network` flags.
 
 ### Block Command
 
-Fetch a block from ethereum mainnet:
-```shell
-go run ./cmd/admin block --blockchain ethereum --network mainnet --env local --height 46147
-```
+This command allows you to fetch and inspect individual blocks from a specified blockchain and network.
 
-Fetch a block from ethereum goerli:
+**Usage Example:**
+
+Fetch block #46147 from Ethereum mainnet, using your local configuration:
 ```shell
-go run ./cmd/admin block --blockchain ethereum --network goerli --env local --height 46147
+go run ./cmd/admin/main.go block --blockchain ethereum --network mainnet --env local --height 46147
+```
+*   `block`: The command to fetch block data.
+*   `--blockchain ethereum --network mainnet --env local`: These flags specify the target (Ethereum mainnet) and the configuration environment (local).
+*   `--height 46147`: The specific block number you want to retrieve.
+
+You can also fetch blocks from other supported blockchains and networks by changing the flag values:
+
+Fetch a block from Ethereum Goerli testnet:
+```shell
+# Assuming Goerli is configured and data is available
+go run ./cmd/admin/main.go block --blockchain ethereum --network goerli --env local --height 12345
 ```
 
 ### Backfill Command (development)
@@ -187,19 +216,44 @@ make functional TARGET=internal/blockchain/... TEST_FILTER=TestIntegrationPolygo
 ```
 
 ## Configuration
-
+Configuration in ChainStorage tells the system:
+1. Which blockchain to connect to (like Ethereum, Bitcoin, etc.)
+2. How to connect to that blockchain (which nodes/servers to use)
+3. Where to store the data it collects
+4. How to process and manage the data
 ### Dependency overview
 
 To understand the structure and elements of ChainStorage's config, it's important to comprehend its dependencies.
 
-- **Temporal**: Temporal is a workflow engine that orchestrates the data ingestion workflow. It calls ChainStorage service endpoint to complete various of tasks.
-- **Blob storage** - current implementation is on AWS S3, and the local service is provied by localstack
-- **Key value storage** - current implemnentation is based on dynamodb and the local service is provied by localstack
-- **Dead Letter queue** - current implementation is on SQS and the local service is provied by localstack
+ChainStorage needs several services to work properly:
+
+1. **Blockchain Nodes**: These are servers that maintain a copy of the blockchain. ChainStorage connects to these to get blockchain data.
+   - Example: An Ethereum node that provides information about Ethereum transactions and blocks
+
+2. **Storage Systems**:
+    - **Blob storage** - current implementation is on AWS S3, and the local service is provied by localstack
+    - **Key value storage** - current implemnentation is based on dynamodb and the local service is provied by localstack
+    - **Dead Letter queue** - current implementation is on SQS and the local service is provied by localstack
+
+3. **Workflow Engine** (Temporal):Temporal is a workflow engine that orchestrates the data ingestion workflow. It calls ChainStorage service endpoint to complete various of tasks.
+
 
 ### Template location and generated config
 
 The config template directory is in `config_templates/config`, which `make config` reads this directory and generates the config into the `config/chainstorage` directory.
+### Creating New Configurations
+
+Every new asset in ChainStorage consists of ChainStorage configuration files.
+These configuration files are generated from `.template.yml` template files using:
+
+```shell
+make config
+```
+
+these templates will be under a directory dedicated to storing the config templates
+in a structure that mirrors the final config structure of the `config`
+directories. All configurations from this directory will be generated within the final
+respective config directories
 
 ### Environment Variables
 
@@ -218,19 +272,6 @@ The directory structure is as follows: `config/{namespace}/{blockchain}/{network
   This env var controls the `{environment}` in which the service is deployed. Possible values include `production`
   , `development`, and `local` (which is also the default value).
 
-### Creating New Configurations
-
-Every new asset in ChainStorage consists of ChainStorage configuration files.
-These configuration files are generated from `.template.yml` template files using:
-
-```shell
-make config
-```
-
-these templates will be under a directory dedicated to storing the config templates
-in a structure that mirrors the final config structure of the `config`
-directories. All configurations from this directory will be generated within the final
-respective config directories
 
 ### Template Format and Inheritance
 
@@ -325,7 +366,8 @@ chain:
 ```
 
 ### Overriding the Configuration
-
+You can override configurations in two ways:
+1. **Environment Variables**:
 You may override any configuration using an environment variable. The environment variable should be prefixed with
 "CHAINSTORAGE_". For nested dictionary, use underscore to separate the keys.
 
@@ -333,7 +375,7 @@ For example, you may override the endpoint group config at runtime by injecting 
 * master: CHAINSTORAGE_CHAIN_CLIENT_MASTER_ENDPOINT_GROUP
 * slave: CHAINSTORAGE_CHAIN_CLIENT_SLAVE_ENDPOINT_GROUP
 
-Alternatively, you may override the configuration by creating `secrets.yml` within the same directory. Its attributes
+2. **secrets.yml**: Alternatively, you may override the configuration by creating `secrets.yml` within the same directory. Its attributes
 will be merged into the runtime configuration and take the highest precedence. Note that this file may contain
 credentials and is excluded from check-in by `.gitignore`.
 
