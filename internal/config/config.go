@@ -40,6 +40,7 @@ type (
 		SLA            SLAConfig            `mapstructure:"sla"`
 		FunctionalTest FunctionalTestConfig `mapstructure:"functional_test"`
 		StatsD         *StatsDConfig        `mapstructure:"statsd"`
+		Prometheus     *PrometheusConfig    `mapstructure:"prometheus"`
 
 		namespace string
 		env       Env
@@ -416,6 +417,24 @@ type (
 	StatsDConfig struct {
 		Address string `mapstructure:"address" validate:"required"`
 		Prefix  string `mapstructure:"prefix"`
+	}
+
+	PrometheusConfig struct {
+		// Port is the port to listen on for the metrics server.
+		Port int `mapstructure:"port" validate:"required"`
+		// MetricsPath is the path to listen on for the metrics server.
+		MetricsPath string `mapstructure:"metrics_path"`
+		// Namespace is the namespace for the metrics.
+		Namespace string `mapstructure:"namespace"`
+		// GlobalLabels are labels that are applied to all metrics.
+		GlobalLabels map[string]string `mapstructure:"global_labels"`
+		// DefaultHistogramBuckets are the default buckets for histogram metrics
+		// if not specified in HistogramBuckets.
+		DefaultHistogramBuckets []float64 `mapstructure:"default_histogram_buckets"`
+		// HistogramBuckets are custom buckets for specific histogram metrics.
+		// This allows for more granular control over the histogram buckets on a
+		// per-metric basis.
+		HistogramBuckets map[string][]float64 `mapstructure:"histogram_buckets"`
 	}
 
 	ConfigOption func(options *configOptions)
