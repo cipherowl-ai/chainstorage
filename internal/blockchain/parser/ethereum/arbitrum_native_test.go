@@ -3,14 +3,17 @@ package ethereum
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"testing"
 
 	"github.com/golang/protobuf/ptypes/timestamp"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
+	"github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
@@ -526,6 +529,25 @@ func (s *arbitrumParserTestSuite) TestParseArbitrumNativeBlock_FlattenedTracesFo
 	}
 	s.flattenTraceVerifyHelper(flattenedTraces1, 0, len(flattenedTraces1)-1, true)
 	s.flattenTraceVerifyHelper(flattenedTraces2, 0, len(flattenedTraces2)-1, true)
+}
+
+func (s *arbitrumParserTestSuite) TestParseArbitrumNativeBlock_MaxPriorityFeePerGasOutOfRange() {
+	require := testutil.Require(s.T())
+
+	fileBytes := fixtures.MustReadFile("parser/arbitrum/arb_maxPriorityFeePerGasOutOfRange_317116119.gzip")
+	blockData, err := utils.Decompress(fileBytes, api.Compression_GZIP)
+	require.NoError(err)
+	rawBlock := new(api.Block)
+	err = proto.Unmarshal(blockData, rawBlock)
+	require.NoError(err)
+
+	nativeBlock, err := s.parser.ParseNativeBlock(context.Background(), rawBlock)
+	require.NoError(err)
+
+	actual := nativeBlock.GetEthereum()
+	require.NotNil(actual)
+	transaction := actual.Transactions[1]
+	require.Equal(transaction.GetMaxPriorityFeePerGas(), uint64(math.MaxUint64))
 }
 
 func (s *arbitrumParserTestSuite) fixtureTracesParsingHelper(filePath string) [][]byte {

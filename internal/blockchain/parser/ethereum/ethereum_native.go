@@ -122,7 +122,7 @@ type (
 		Type EthereumQuantity `json:"type"`
 		// The EIP-1559 related fields
 		MaxFeePerGas         *EthereumQuantity             `json:"maxFeePerGas"`
-		MaxPriorityFeePerGas *EthereumQuantity             `json:"maxPriorityFeePerGas"`
+		MaxPriorityFeePerGas *EthereumBigQuantity             `json:"maxPriorityFeePerGas"`
 		AccessList           *[]*EthereumTransactionAccess `json:"accessList"`
 		Mint                 *EthereumBigQuantity          `json:"mint"`
 		// The EIP-4844 related fields
@@ -712,11 +712,25 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 				MaxFeePerGas: transaction.MaxFeePerGas.Value(),
 			}
 		}
+		var maxPriorityFeePerGas uint64
 		if transaction.MaxPriorityFeePerGas != nil {
-			outTransaction.OptionalMaxPriorityFeePerGas = &api.EthereumTransaction_MaxPriorityFeePerGas{
-				MaxPriorityFeePerGas: transaction.MaxPriorityFeePerGas.Value(),
+			maxPriorityFeePerGas, err = transaction.MaxPriorityFeePerGas.Uint64()
+			if err != nil {
+				// Ignore parse error for arbitrum
+				if network == common.Network_NETWORK_ARBITRUM_MAINNET {
+					maxPriorityFeePerGas = math.MaxUint64
+					p.Logger.Error("MaxPriorityFeePerGasis out of max range",
+						zap.String("transaction hash", transaction.Hash.Value()),
+					)
+				} else {
+					return nil, nil, xerrors.Errorf("failed to parse transaction MaxPriorityFeePerGas to uint64 %v", transaction.MaxPriorityFeePerGas.Value())
+				}
 			}
-		}
+
+			outTransaction.OptionalMaxPriorityFeePerGas = &api.EthereumTransaction_MaxPriorityFeePerGas{
+				MaxPriorityFeePerGas: maxPriorityFeePerGas,
+			}
+		}	
 
 		if transaction.Mint != nil && transaction.Mint.Value() != "0" {
 			outTransaction.OptionalMint = &api.EthereumTransaction_Mint{
@@ -731,7 +745,6 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 			if transaction.MaxFeePerGas != nil && transaction.MaxPriorityFeePerGas != nil {
 				// EIP-1559 transaction
 				priorityFeePerGas = transaction.MaxFeePerGas.Value() - block.BaseFeePerGas.Value()
-				maxPriorityFeePerGas := transaction.MaxPriorityFeePerGas.Value()
 				if priorityFeePerGas > maxPriorityFeePerGas {
 					priorityFeePerGas = maxPriorityFeePerGas
 				}
