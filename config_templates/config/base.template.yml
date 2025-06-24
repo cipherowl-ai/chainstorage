@@ -30,6 +30,8 @@ aws:
     ssl_mode: require
     max_connections: 25 # Connection pool maximum size
     min_connections: 5  # Connection pool minimum size
+    connect_timeout: 30s     # Connection establishment timeout
+    statement_timeout: 60s   # Individual statement/transaction timeout
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
