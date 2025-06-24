@@ -63,7 +63,13 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		if err := parser.ValidateChain(blocks, lastBlock); err != nil {
 			return xerrors.Errorf("failed to validate chain: %w", err)
 		}
-		tx, err := b.db.BeginTx(ctx, nil)
+
+		// Create transaction with timeout context
+		// Use a reasonable timeout for block persistence operations
+		txCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		tx, err := b.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to begin transaction: %w", err)
 		}
@@ -122,7 +128,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				query = blockMetadataRegularQuery
 			}
 
-			err = tx.QueryRowContext(ctx, query,
+			err = tx.QueryRowContext(txCtx, query,
 				block.Height,
 				block.Tag,
 				block.Hash,
@@ -136,7 +142,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			}
 
 			// Insert ALL blocks (including skipped) into canonical_blocks
-			_, err = tx.ExecContext(ctx, canonicalQuery,
+			_, err = tx.ExecContext(txCtx, canonicalQuery,
 				block.Height,
 				blockId,
 				block.Tag,

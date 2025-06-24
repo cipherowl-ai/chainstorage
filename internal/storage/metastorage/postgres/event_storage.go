@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"golang.org/x/xerrors"
 
@@ -97,7 +98,11 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			return xerrors.Errorf("events failed validation: %w", err)
 		}
 
-		tx, err := e.db.BeginTx(ctx, nil)
+		// Create transaction with timeout context for event operations
+		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+
+		tx, err := e.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
@@ -270,7 +275,10 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 			return xerrors.Errorf("invalid max event id: %d", maxEventId)
 		}
 
-		tx, err := e.db.BeginTx(ctx, nil)
+		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+
+		tx, err := e.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
@@ -278,7 +286,7 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 
 		if maxEventId == model.EventIdDeleted {
 			// Delete all events for this tag
-			_, err = tx.ExecContext(ctx, `
+			_, err = tx.ExecContext(txCtx, `
 				DELETE FROM block_events WHERE event_tag = $1
 			`, eventTag)
 			if err != nil {
@@ -287,7 +295,7 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 		} else {
 			// Validate the new max event ID exists
 			var exists bool
-			err = tx.QueryRowContext(ctx, `
+			err = tx.QueryRowContext(txCtx, `
 				SELECT EXISTS(SELECT 1 FROM block_events WHERE event_tag = $1 AND event_sequence = $2)
 			`, eventTag, maxEventId).Scan(&exists)
 			if err != nil {
@@ -297,7 +305,7 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 				return xerrors.Errorf("event entry with max event id %d does not exist", maxEventId)
 			}
 			// Delete events beyond the max event ID
-			_, err = tx.ExecContext(ctx, `
+			_, err = tx.ExecContext(txCtx, `
 				DELETE FROM block_events WHERE event_tag = $1 AND event_sequence > $2
 			`, eventTag, maxEventId)
 			if err != nil {
