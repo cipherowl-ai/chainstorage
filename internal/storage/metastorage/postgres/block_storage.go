@@ -99,7 +99,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		canonicalQuery := `
 			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
 			VALUES ($1, $2, $3)
-			ON CONFLICT (height, tag, block_metadata_id) DO UPDATE
+			ON CONFLICT (height, tag) DO UPDATE
 			SET block_metadata_id = EXCLUDED.block_metadata_id`
 
 		for _, block := range blocks {
