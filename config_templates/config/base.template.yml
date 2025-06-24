@@ -27,7 +27,9 @@ aws:
     user: "" # Set via CHAINSTORAGE_AWS_POSTGRES_USER env var for security
     password: "" # Set via CHAINSTORAGE_AWS_POSTGRES_PASSWORD env var for security
     database: chainstorage_{{blockchain}}_{{network}}
-    ssl_mode: disable
+    ssl_mode: require
+    max_connections: 25 # Connection pool maximum size
+    min_connections: 5  # Connection pool minimum size
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
