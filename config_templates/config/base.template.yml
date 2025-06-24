@@ -24,8 +24,8 @@ aws:
   postgres:
     host: localhost
     port: 5432
-    user: temporal
-    password: temporal
+    user: "" # Set via CHAINSTORAGE_AWS_POSTGRES_USER env var for security
+    password: "" # Set via CHAINSTORAGE_AWS_POSTGRES_PASSWORD env var for security
     database: chainstorage_{{blockchain}}_{{network}}
     ssl_mode: disable
   presigned_url_expiration: 30m
