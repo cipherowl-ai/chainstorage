@@ -68,4 +68,4 @@ DROP TABLE IF EXISTS canonical_blocks;
 DROP TABLE IF EXISTS block_metadata;
 
 -- Drop custom types
-DROP TYPE IF EXISTS event_type_enum;
+DROP TYPE IF EXISTS event_type_enum; 
