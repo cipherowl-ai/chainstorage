@@ -362,26 +362,17 @@ func (m *DataMigrator) migrateEvents(ctx context.Context, params MigrationParams
 		return xerrors.Errorf("failed to get first event ID at start height %d: %w", params.StartHeight, err)
 	}
 
-	// Step 2: Get events at end height - 1 to find the last event ID
+	// Step 2: Find the last event ID within the height range [startHeight, endHeight)
 	var endEventId int64
-	if params.EndHeight > 0 {
-		endHeightForEvents := params.EndHeight - 1
-		eventsAtEndHeight, err := m.sourceStorage.GetEventsByBlockHeight(ctx, params.EventTag, endHeightForEvents)
+	if params.EndHeight > params.StartHeight {
+		endEventId, err = m.findLastEventIdInRange(ctx, params.EventTag, params.StartHeight, params.EndHeight)
 		if err != nil {
-			if xerrors.Is(err, storage.ErrItemNotFound) {
-				m.logger.Info("No events found at end height", zap.Uint64("endHeight", endHeightForEvents))
-				endEventId = startEventId // Just migrate starting from start event ID
-			} else {
-				return xerrors.Errorf("failed to get events at end height %d: %w", endHeightForEvents, err)
-			}
-		} else {
-			// Find the maximum event ID at end height
-			endEventId = startEventId // fallback
-			for _, event := range eventsAtEndHeight {
-				if event.EventId > endEventId {
-					endEventId = event.EventId
-				}
-			}
+			return xerrors.Errorf("failed to find last event ID in range [%d, %d): %w", params.StartHeight, params.EndHeight, err)
+		}
+
+		// If no events found in the range beyond startEventId, just process starting event
+		if endEventId < startEventId {
+			endEventId = startEventId
 		}
 	} else {
 		endEventId = startEventId
@@ -453,6 +444,46 @@ func (m *DataMigrator) migrateEvents(ctx context.Context, params MigrationParams
 	m.logger.Info("Event ID-based migration completed",
 		zap.Int64("totalEventsMigrated", processedEvents))
 	return nil
+}
+
+// findLastEventIdInRange finds the maximum event ID within the specified height range
+// by searching backwards from endHeight-1 until an event is found or reaching startHeight
+func (m *DataMigrator) findLastEventIdInRange(ctx context.Context, eventTag uint32, startHeight, endHeight uint64) (int64, error) {
+	m.logger.Debug("Finding last event ID in height range",
+		zap.Uint64("startHeight", startHeight),
+		zap.Uint64("endHeight", endHeight))
+
+	// Search backwards from endHeight-1 to startHeight to find the last event
+	for height := endHeight - 1; height >= startHeight; height-- {
+		events, err := m.sourceStorage.GetEventsByBlockHeight(ctx, eventTag, height)
+		if err != nil {
+			if xerrors.Is(err, storage.ErrItemNotFound) {
+				// No events at this height, continue searching backwards
+				m.logger.Debug("No events found at height", zap.Uint64("height", height))
+				continue
+			}
+			return 0, xerrors.Errorf("failed to get events at height %d: %w", height, err)
+		}
+
+		// Find the maximum event ID at this height
+		var maxEventId int64 = -1
+		for _, event := range events {
+			if event.EventId > maxEventId {
+				maxEventId = event.EventId
+			}
+		}
+
+		if maxEventId >= 0 {
+			m.logger.Debug("Found last event in range",
+				zap.Uint64("height", height),
+				zap.Int64("eventId", maxEventId))
+			return maxEventId, nil
+		}
+	}
+
+	// No events found in the entire range
+	m.logger.Debug("No events found in the specified height range")
+	return -1, storage.ErrItemNotFound
 }
 
 func init() {
