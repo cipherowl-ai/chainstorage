@@ -211,8 +211,6 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		}
 
-		block, err := model.BlockMetadataFromRow(b.db, row)
-
 		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
 			if err == sql.ErrNoRows {
