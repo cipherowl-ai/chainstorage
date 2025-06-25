@@ -508,7 +508,9 @@ The following environment variables can be used to configure PostgreSQL:
 | `CHAINSTORAGE_AWS_POSTGRES_SSL_MODE` | `aws.postgres.ssl_mode` | SSL mode | `require` |
 | `CHAINSTORAGE_AWS_POSTGRES_MAX_CONNECTIONS` | `aws.postgres.max_connections` | Maximum connection pool size | `25` |
 | `CHAINSTORAGE_AWS_POSTGRES_MIN_CONNECTIONS` | `aws.postgres.min_connections` | Minimum connection pool size | `5` |
-| `CHAINSTORAGE_STORAGE_TYPE_META` | `storage_type.meta` | Meta storage type |
+| `CHAINSTORAGE_AWS_POSTGRES_CONNECT_TIMEOUT` | `aws.postgres.connect_timeout` | Connection establishment timeout | `30s` |
+| `CHAINSTORAGE_AWS_POSTGRES_STATEMENT_TIMEOUT` | `aws.postgres.statement_timeout` | Statement/transaction timeout | `60s` |
+| `CHAINSTORAGE_STORAGE_TYPE_META` | `storage_type.meta` | Meta storage type | `DYNAMODB` |
 
 #### Database Schema
 
