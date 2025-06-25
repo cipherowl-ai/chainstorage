@@ -429,16 +429,17 @@ func (e *eventStorageImpl) createSkippedBlockMetadata(ctx context.Context, tx *s
 	// Create block metadata for skipped block with NULL values as specified
 	var blockMetadataId int64
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
-		VALUES ($1, $2, NULL, NULL, NULL, $3, true)
+		INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
+		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, true)
 		ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
 			hash = EXCLUDED.hash,
 			parent_hash = EXCLUDED.parent_hash,
+			parent_height = EXCLUDED.parent_height,
 			object_key_main = EXCLUDED.object_key_main,
 			timestamp = EXCLUDED.timestamp,
 			skipped = EXCLUDED.skipped
 		RETURNING id
-	`, eventEntry.BlockHeight, eventEntry.Tag, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
+	`, eventEntry.BlockHeight, eventEntry.Tag, 0, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to create block metadata for skipped block: %w", err)
 	}

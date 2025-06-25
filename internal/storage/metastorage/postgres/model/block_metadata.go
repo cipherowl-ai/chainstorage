@@ -7,32 +7,9 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-// getParentHeightFromHash looks up the parent height by finding the block with the given parent hash
-func getParentHeightFromHash(db *sql.DB, tag uint32, parentHash string, currentHeight uint64) (uint64, error) {
-	if parentHash == "" {
-		return 0, nil
-	}
-
-	query := `
-		SELECT height 
-		FROM block_metadata 
-		WHERE tag = $1 AND hash = $2`
-
-	var parentHeight uint64
-	err := db.QueryRow(query, tag, parentHash).Scan(&parentHeight)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			// If parent not found, fall back to height - 1
-			return currentHeight - 1, nil
-		}
-		return 0, err
-	}
-	return parentHeight, nil
-}
-
 // BlockMetadataFromRow converts a postgres row into a BlockMetadata proto
 // Used for direct block_metadata table queries
-// Schema: id, height, tag, hash, parent_hash, object_key_main, timestamp, skipped
+// Schema: id, height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped
 func BlockMetadataFromRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
@@ -43,6 +20,7 @@ func BlockMetadataFromRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) 
 		&block.Tag,
 		&block.Hash,
 		&block.ParentHash,
+		&block.ParentHeight,
 		&block.ObjectKeyMain,
 		&timestamp,
 		&block.Skipped,
@@ -51,16 +29,12 @@ func BlockMetadataFromRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) 
 		return nil, err
 	}
 	block.Timestamp = utils.ToTimestamp(timestamp)
-	block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
-	if err != nil {
-		return nil, err
-	}
 	return &block, nil
 }
 
 // BlockMetadataFromCanonicalRow converts a postgres row from canonical join into a BlockMetadata proto
 // Used for queries that join canonical_blocks with block_metadata
-// Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, bm.timestamp, bm.skipped
+// Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, bm.timestamp, bm.skipped
 func BlockMetadataFromCanonicalRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
@@ -71,6 +45,7 @@ func BlockMetadataFromCanonicalRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata
 		&block.Tag,
 		&block.Hash,
 		&block.ParentHash,
+		&block.ParentHeight,
 		&block.ObjectKeyMain,
 		&timestamp,
 		&block.Skipped,
@@ -79,10 +54,6 @@ func BlockMetadataFromCanonicalRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata
 		return nil, err
 	}
 	block.Timestamp = utils.ToTimestamp(timestamp)
-	block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
-	if err != nil {
-		return nil, err
-	}
 	return &block, nil
 }
 
@@ -100,6 +71,7 @@ func BlockMetadataFromRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMetadata, er
 			&block.Tag,
 			&block.Hash,
 			&block.ParentHash,
+			&block.ParentHeight,
 			&block.ObjectKeyMain,
 			&timestamp,
 			&block.Skipped,
@@ -108,10 +80,6 @@ func BlockMetadataFromRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMetadata, er
 			return nil, err
 		}
 		block.Timestamp = utils.ToTimestamp(timestamp)
-		block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
-		if err != nil {
-			return nil, err
-		}
 		blocks = append(blocks, &block)
 	}
 	return blocks, nil
@@ -131,6 +99,7 @@ func BlockMetadataFromCanonicalRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMet
 			&block.Tag,
 			&block.Hash,
 			&block.ParentHash,
+			&block.ParentHeight,
 			&block.ObjectKeyMain,
 			&timestamp,
 			&block.Skipped,
@@ -139,10 +108,6 @@ func BlockMetadataFromCanonicalRows(db *sql.DB, rows *sql.Rows) ([]*api.BlockMet
 			return nil, err
 		}
 		block.Timestamp = utils.ToTimestamp(timestamp)
-		block.ParentHeight, err = getParentHeightFromHash(db, block.Tag, block.ParentHash, block.Height)
-		if err != nil {
-			return nil, err
-		}
 		blocks = append(blocks, &block)
 	}
 	return blocks, nil
