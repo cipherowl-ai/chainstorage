@@ -201,16 +201,17 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 				LIMIT 1`
 			row = b.db.QueryRowContext(ctx, query, tag, height)
 		} else {
-			// Query canonical_blocks for specific hash
+			// Query block_metadata directly for the specific hash
 			query := `
-				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
-				FROM canonical_blocks cb
-				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
-				WHERE cb.tag = $1 AND cb.height = $2 AND bm.hash = $3
+				SELECT id, height, tag, hash, parent_hash, object_key_main, 
+					   EXTRACT(EPOCH FROM timestamp)::BIGINT, skipped
+				FROM block_metadata
+				WHERE tag = $1 AND height = $2 AND hash = $3
 				LIMIT 1`
 			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		}
+
+		block, err := model.BlockMetadataFromRow(b.db, row)
 
 		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
