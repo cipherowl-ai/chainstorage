@@ -56,7 +56,22 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		if len(blocks) == 0 {
 			return nil
 		}
-		// Sort blocks by height for chain validation
+
+		// Sort blocks by height for chain validation.
+		// IMPORTANT: When multiple blocks have the same height (e.g., during a reorg), their relative
+		// order after sorting is not guaranteed to be stable. However, this implementation follows the
+		// "last block wins" principle - the last block processed for a given height will become the
+		// canonical block for that height. This behavior is consistent with the DynamoDB implementation
+		// where the last block overwrites the canonical entry.
+		//
+		// The canonical_blocks table uses "ON CONFLICT (height, tag) DO UPDATE" which means:
+		// - If multiple blocks in the input have the same height, the last one processed will
+		//   overwrite previous entries in canonical_blocks
+		// - All blocks are still stored in block_metadata (allowing retrieval by specific hash)
+		// - Only the last block for each height becomes the canonical one
+		//
+		// Callers should ensure that when multiple blocks exist for the same height, the desired
+		// canonical block is placed last in the blocks array for that height.
 		sort.Slice(blocks, func(i, j int) bool {
 			return blocks[i].Height < blocks[j].Height
 		})
