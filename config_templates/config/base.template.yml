@@ -22,7 +22,7 @@ aws:
     versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_{{blockchain}}_{{network}}
     transaction_table: example_chainstorage_transactions_table_{{blockchain}}_{{network}}
   postgres:
-    host: localhost
+    host: localhost # Override with CHAINSTORAGE_AWS_POSTGRES_HOST for non-dev environments
     port: 5432
     user: "" # Set via CHAINSTORAGE_AWS_POSTGRES_USER env var for security
     password: "" # Set via CHAINSTORAGE_AWS_POSTGRES_PASSWORD env var for security
