@@ -12,13 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
+
+	"github.com/coinbase/chainstorage/internal/config"
 )
 
 var defaultBuckets = []float64{
