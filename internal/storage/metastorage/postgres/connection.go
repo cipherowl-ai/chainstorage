@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
 	"golang.org/x/xerrors"
+
+	"github.com/coinbase/chainstorage/internal/config"
 )
 
 func createDatabase(ctx context.Context, cfg *config.PostgresConfig) error {
@@ -27,7 +28,12 @@ func createDatabase(ctx context.Context, cfg *config.PostgresConfig) error {
 	if err != nil {
 		return err
 	}
-	defer admin.Close()
+	defer func() {
+		if closeErr := admin.Close(); closeErr != nil {
+			// Log the close error but don't override the original error
+			_ = closeErr
+		}
+	}()
 
 	_, err = admin.ExecContext(ctx, fmt.Sprintf(
 		`CREATE DATABASE "%s" OWNER "%s"`, cfg.Database, cfg.User))

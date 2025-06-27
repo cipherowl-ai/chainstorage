@@ -3,9 +3,9 @@ package postgres
 import (
 	"testing"
 
-	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 	pgmodel "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 func TestEventTypeToString(t *testing.T) {

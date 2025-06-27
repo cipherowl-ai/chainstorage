@@ -3,9 +3,10 @@ package postgres
 import (
 	"context"
 
+	"go.uber.org/fx"
+
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
-	"go.uber.org/fx"
 )
 
 type (

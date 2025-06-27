@@ -5,9 +5,9 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/dynamodb"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/firestore"
-	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
+	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 )
 
 type (
