@@ -132,8 +132,8 @@ type (
 		Host             string        `mapstructure:"host" validate:"required"`
 		Port             int           `mapstructure:"port" validate:"required"`
 		Database         string        `mapstructure:"database" validate:"required"`
-		User             string        `mapstructure:"user" validate:"required"`
-		Password         string        `mapstructure:"password" validate:"required"`
+		User             string        `mapstructure:"user"`
+		Password         string        `mapstructure:"password"`
 		SSLMode          string        `mapstructure:"ssl_mode" validate:"required"`
 		MaxConnections   int           `mapstructure:"max_connections"`
 		MinConnections   int           `mapstructure:"min_connections"`
