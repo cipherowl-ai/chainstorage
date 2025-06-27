@@ -72,6 +72,7 @@ type (
 		fxparams.Params
 		DynamoDB  MetaStorageFactory `name:"metastorage/dynamodb"`
 		Firestore MetaStorageFactory `name:"metastorage/firestore"`
+		Postgres  MetaStorageFactory `name:"metastorage/postgres"`
 	}
 )
 
@@ -83,6 +84,8 @@ func WithMetaStorageFactory(params MetaStorageFactoryParams) (Result, error) {
 		factory = params.DynamoDB
 	case config.MetaStorageType_FIRESTORE:
 		factory = params.Firestore
+	case config.MetaStorageType_POSTGRES:
+		factory = params.Postgres
 	}
 	if factory == nil {
 		return Result{}, xerrors.Errorf("meta storage type is not implemented: %v", storageType)
