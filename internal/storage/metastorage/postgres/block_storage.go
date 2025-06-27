@@ -8,14 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
+	"golang.org/x/xerrors"
+
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	"github.com/golang/protobuf/ptypes"
-	"golang.org/x/xerrors"
 )
 
 type (
@@ -91,7 +92,12 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		committed := false
 		defer func() {
 			if !committed {
-				tx.Rollback()
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					// In a production environment, you might want to use a proper logger here
+					// For now, we'll just ignore the rollback error as it's already a failure case
+					_ = rollbackErr
+				}
 			}
 		}()
 
@@ -294,7 +300,12 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by height range: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				// Log the close error but don't override the original error
+				_ = closeErr
+			}
+		}()
 
 		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {
@@ -352,7 +363,12 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by heights: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				// Log the close error but don't override the original error
+				_ = closeErr
+			}
+		}()
 
 		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {

@@ -106,7 +106,12 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				// Log the rollback error but don't override the original error
+				_ = rollbackErr
+			}
+		}()
 		//get or create block_metadata entries for each event
 		for _, eventEntry := range eventEntries {
 			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
@@ -216,7 +221,12 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events after event id: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				// Log the close error but don't override the original error
+				_ = closeErr
+			}
+		}()
 
 		return e.scanEventEntries(rows)
 	})
@@ -236,7 +246,12 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by event id range: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				// Log the close error but don't override the original error
+				_ = closeErr
+			}
+		}()
 
 		events, err := e.scanEventEntries(rows)
 		if err != nil {
@@ -282,7 +297,12 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
-		defer tx.Rollback()
+		defer func() {
+			if rollbackErr := tx.Rollback(); rollbackErr != nil {
+				// Log the rollback error but don't override the original error
+				_ = rollbackErr
+			}
+		}()
 
 		if maxEventId == model.EventIdDeleted {
 			// Delete all events for this tag
@@ -352,7 +372,12 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by block height: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil {
+				// Log the close error but don't override the original error
+				_ = closeErr
+			}
+		}()
 
 		events, err := e.scanEventEntries(rows)
 		if err != nil {

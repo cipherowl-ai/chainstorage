@@ -10,4 +10,3 @@ var Module = fx.Options(
 		Target: NewFactory,
 	}),
 )
-
