@@ -106,10 +106,13 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
+		committed := false
 		defer func() {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				// Log the rollback error but don't override the original error
-				_ = rollbackErr
+			if !committed {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					_ = rollbackErr
+				}
 			}
 		}()
 		//get or create block_metadata entries for each event
@@ -130,7 +133,12 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			}
 		}
 
-		return tx.Commit()
+		err = tx.Commit()
+		if err != nil {
+			return xerrors.Errorf("failed to commit transaction: %w", err)
+		}
+		committed = true
+		return nil
 	})
 }
 
@@ -221,14 +229,17 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events after event id: %w", err)
 		}
+
+		var result []*model.EventEntry
+		var scanErr error
 		defer func() {
-			if closeErr := rows.Close(); closeErr != nil {
-				// Log the close error but don't override the original error
-				_ = closeErr
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
 			}
 		}()
 
-		return e.scanEventEntries(rows)
+		result, scanErr = e.scanEventEntries(rows)
+		return result, scanErr
 	})
 }
 
@@ -246,16 +257,18 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by event id range: %w", err)
 		}
+
+		var events []*model.EventEntry
+		var scanErr error
 		defer func() {
-			if closeErr := rows.Close(); closeErr != nil {
-				// Log the close error but don't override the original error
-				_ = closeErr
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil && events != nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
 			}
 		}()
 
-		events, err := e.scanEventEntries(rows)
-		if err != nil {
-			return nil, err
+		events, scanErr = e.scanEventEntries(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		// Validate that we have all events in the range
@@ -263,6 +276,12 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if int64(len(events)) != expectedCount {
 			return nil, errors.ErrItemNotFound
 		}
+
+		// Check for close error one more time
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
 		return events, nil
 	})
 }
@@ -297,10 +316,13 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
+		committed := false
 		defer func() {
-			if rollbackErr := tx.Rollback(); rollbackErr != nil {
-				// Log the rollback error but don't override the original error
-				_ = rollbackErr
+			if !committed {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					_ = rollbackErr
+				}
 			}
 		}()
 
@@ -333,7 +355,12 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 			}
 		}
 
-		return tx.Commit()
+		err = tx.Commit()
+		if err != nil {
+			return xerrors.Errorf("failed to commit transaction: %w", err)
+		}
+		committed = true
+		return nil
 	})
 }
 
@@ -372,20 +399,27 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by block height: %w", err)
 		}
+
+		var events []*model.EventEntry
+		var scanErr error
 		defer func() {
-			if closeErr := rows.Close(); closeErr != nil {
-				// Log the close error but don't override the original error
-				_ = closeErr
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
 			}
 		}()
 
-		events, err := e.scanEventEntries(rows)
-		if err != nil {
-			return nil, err
+		events, scanErr = e.scanEventEntries(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		if len(events) == 0 {
 			return nil, errors.ErrItemNotFound
+		}
+
+		// Check for close error one more time
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		return events, nil
@@ -425,8 +459,7 @@ func (e *eventStorageImpl) getOrCreateBlockMetadataId(ctx context.Context, tx *s
 	// For non-skipped blocks, look up by tag and hash
 	// First try with the eventEntry.Tag
 	var blockMetadataId int64
-	err := tx.QueryRowContext(ctx, `
-		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
+	err := tx.QueryRowContext(ctx, `		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
 	`, eventEntry.Tag, eventEntry.BlockHash).Scan(&blockMetadataId)
 	if err == nil {
 		return blockMetadataId, nil

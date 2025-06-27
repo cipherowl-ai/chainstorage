@@ -301,9 +301,8 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 			return nil, xerrors.Errorf("failed to query blocks by height range: %w", err)
 		}
 		defer func() {
-			if closeErr := rows.Close(); closeErr != nil {
-				// Log the close error but don't override the original error
-				_ = closeErr
+			if closeErr := rows.Close(); closeErr != nil && err == nil {
+				err = xerrors.Errorf("failed to close rows: %w", closeErr)
 			}
 		}()
 
@@ -364,9 +363,8 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 			return nil, xerrors.Errorf("failed to query blocks by heights: %w", err)
 		}
 		defer func() {
-			if closeErr := rows.Close(); closeErr != nil {
-				// Log the close error but don't override the original error
-				_ = closeErr
+			if closeErr := rows.Close(); closeErr != nil && err == nil {
+				err = xerrors.Errorf("failed to close rows: %w", closeErr)
 			}
 		}()
 
