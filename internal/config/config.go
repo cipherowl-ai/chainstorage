@@ -118,6 +118,7 @@ type (
 	AwsConfig struct {
 		Region                 string         `mapstructure:"region" validate:"required"`
 		Bucket                 string         `mapstructure:"bucket" validate:"required"`
+		Postgres               PostgresConfig `mapstructure:"postgres" validate:"required"`
 		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb" validate:"required"`
 		IsLocalStack           bool           `mapstructure:"local_stack"`
 		IsResetLocal           bool           `mapstructure:"reset_local"`
@@ -125,6 +126,23 @@ type (
 		DLQ                    SQSConfig      `mapstructure:"dlq"`
 		Storage                StorageConfig  `mapstructure:"storage"`
 		AWSAccount             AWSAccount     `mapstructure:"aws_account" validate:"required"`
+	}
+
+	PostgresConfig struct {
+		Host             string        `mapstructure:"host" validate:"required"`
+		Port             int           `mapstructure:"port" validate:"required"`
+		Database         string        `mapstructure:"database" validate:"required"`
+		User             string        `mapstructure:"user" validate:"required"`
+		Password         string        `mapstructure:"password" validate:"required"`
+		SSLMode          string        `mapstructure:"ssl_mode" validate:"required"`
+		MaxConnections   int           `mapstructure:"max_connections"`
+		MinConnections   int           `mapstructure:"min_connections"`
+		MaxIdleTime      time.Duration `mapstructure:"max_idle_time"`
+		MaxLifetime      time.Duration `mapstructure:"max_lifetime"`
+		ConnectTimeout   time.Duration `mapstructure:"connect_timeout"`
+		StatementTimeout time.Duration `mapstructure:"statement_timeout"`
+		Schema           string        `mapstructure:"schema"`
+		TablePrefix      string        `mapstructure:"table_prefix"`
 	}
 
 	GcpConfig struct {
@@ -489,6 +507,7 @@ var (
 		"UNSPECIFIED": 0,
 		"DYNAMODB":    1,
 		"FIRESTORE":   2,
+		"POSTGRES":    3,
 	}
 
 	DLQType_value = map[string]int32{
@@ -525,6 +544,7 @@ const (
 	MetaStorageType_UNSPECIFIED MetaStorageType = 0
 	MetaStorageType_DYNAMODB    MetaStorageType = 1
 	MetaStorageType_FIRESTORE   MetaStorageType = 2
+	MetaStorageType_POSTGRES    MetaStorageType = 3
 
 	DLQType_UNSPECIFIED DLQType = 0
 	DLQType_SQS         DLQType = 1

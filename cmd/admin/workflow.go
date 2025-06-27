@@ -48,6 +48,7 @@ type executors struct {
 	CrossValidator  *workflow.CrossValidator
 	EventBackfiller *workflow.EventBackfiller
 	Replicator      *workflow.Replicator
+	Runtime         cadence.Runtime
 }
 
 var (
@@ -72,6 +73,14 @@ var (
 		},
 	}
 
+	listWorkflowCmd = &cobra.Command{
+		Use:   "list",
+		Short: "list running workflows",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return listWorkflows()
+		},
+	}
+
 	workflowFlags struct {
 		workflow   string
 		workflowID string
@@ -86,9 +95,34 @@ func init() {
 
 	workflowCmd.AddCommand(startWorkflowCmd)
 	workflowCmd.AddCommand(stopWorkflowCmd)
+	workflowCmd.AddCommand(listWorkflowCmd)
 	rootCmd.AddCommand(workflowCmd)
 }
 
+func listWorkflows() error {
+	app, executors, err := initApp()
+	if err != nil {
+		return xerrors.Errorf("failed to init app: %w", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	workflows, err := executors.Runtime.ListOpenWorkflows(ctx, app.Config().Cadence.Domain, 0) //list all workflows
+	if err != nil {
+		return xerrors.Errorf("failed to list workflows: %w", err)
+	} else {
+		logger.Info("\nlisting all workflows: ")
+	}
+	for _, workflow := range workflows.Executions { //print all workflows
+		logger.Info("\nworkflow",
+			zap.String("workflowID", workflow.Execution.GetWorkflowId()),
+			zap.String("runID", workflow.Execution.GetRunId()),
+			zap.String("type", workflow.Type.GetName()),
+			zap.Time("startTime", workflow.StartTime.AsTime()),
+			zap.String("status", workflow.Status.String()),
+		)
+	}
+	return nil
+}
 func startWorkflow() error {
 	workflowIdentity := workflow.GetWorkflowIdentify(workflowFlags.workflow)
 	workflowId := workflowFlags.workflowID
