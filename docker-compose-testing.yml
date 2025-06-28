@@ -12,6 +12,7 @@ services:
       - AWS_DEFAULT_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=requirednotused
       - AWS_SECRET_ACCESS_KEY=requirednotused
+      - CHAINSTORAGE_AWS_POSTGRES_HOST=postgres
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
   postgres:
