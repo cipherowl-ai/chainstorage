@@ -20,9 +20,10 @@ services:
     ports:
       - "5432:5432"
     environment:
-      - POSTGRES_USER=temporal
-      - POSTGRES_PASSWORD=temporal
-      - POSTGRES_DB=temporal
+      - CHAINSTORAGE_AWS_POSTGRES_HOST=postgres
+      - CHAINSTORAGE_AWS_POSTGRES_USER=temporal
+      - CHAINSTORAGE_AWS_POSTGRES_PASSWORD=temporal
+      - CHAINSTORAGE_AWS_POSTGRES_DB=temporal
     command: >
       postgres
       -c ssl=on
