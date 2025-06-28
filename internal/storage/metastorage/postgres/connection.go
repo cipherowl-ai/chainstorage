@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
@@ -23,6 +24,9 @@ func createDatabase(ctx context.Context, cfg *config.PostgresConfig) error {
 	if cfg.ConnectTimeout > 0 {
 		dsn += fmt.Sprintf(" connect_timeout=%d", int(cfg.ConnectTimeout.Seconds()))
 	}
+
+	// Debug output for CI troubleshooting
+	log.Printf("DEBUG: Creating database with DSN: host=%s port=%d dbname=postgres sslmode=%s", cfg.Host, cfg.Port, cfg.SSLMode)
 
 	admin, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -54,13 +58,18 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 		dsn += fmt.Sprintf(" connect_timeout=%d", int(cfg.ConnectTimeout.Seconds()))
 	}
 
+	// Debug output for CI troubleshooting
+	log.Printf("DEBUG: Connecting to PostgreSQL with DSN: host=%s port=%d dbname=%s sslmode=%s", cfg.Host, cfg.Port, cfg.Database, cfg.SSLMode)
+
 	// Open database connection
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
+		log.Printf("DEBUG: Failed to open connection: %v", err)
 		return nil, err
 	}
 
 	if pingErr := db.PingContext(ctx); pingErr != nil {
+		log.Printf("DEBUG: Failed to ping database: %v", pingErr)
 		// Detect "database does not exist"
 		if pgErr, ok := pingErr.(*pq.Error); ok && pgErr.Code == "3D000" {
 			if err := createDatabase(ctx, cfg); err != nil {
@@ -73,6 +82,8 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 		}
 		return nil, pingErr
 	}
+
+	log.Printf("DEBUG: Successfully connected to PostgreSQL")
 
 	// Configure connection pool and timeouts
 CONFIGURE:
