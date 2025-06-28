@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"time"
 
 	"golang.org/x/xerrors"
 
@@ -97,11 +98,23 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			return xerrors.Errorf("events failed validation: %w", err)
 		}
 
-		tx, err := e.db.BeginTx(ctx, nil)
+		// Create transaction with timeout context for event operations
+		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+
+		tx, err := e.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
-		defer tx.Rollback()
+		committed := false
+		defer func() {
+			if !committed {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					_ = rollbackErr
+				}
+			}
+		}()
 		//get or create block_metadata entries for each event
 		for _, eventEntry := range eventEntries {
 			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
@@ -120,7 +133,12 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			}
 		}
 
-		return tx.Commit()
+		err = tx.Commit()
+		if err != nil {
+			return xerrors.Errorf("failed to commit transaction: %w", err)
+		}
+		committed = true
+		return nil
 	})
 }
 
@@ -211,9 +229,17 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events after event id: %w", err)
 		}
-		defer rows.Close()
 
-		return e.scanEventEntries(rows)
+		var result []*model.EventEntry
+		var scanErr error
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
+			}
+		}()
+
+		result, scanErr = e.scanEventEntries(rows)
+		return result, scanErr
 	})
 }
 
@@ -231,11 +257,18 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by event id range: %w", err)
 		}
-		defer rows.Close()
 
-		events, err := e.scanEventEntries(rows)
-		if err != nil {
-			return nil, err
+		var events []*model.EventEntry
+		var scanErr error
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil && events != nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
+			}
+		}()
+
+		events, scanErr = e.scanEventEntries(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		// Validate that we have all events in the range
@@ -243,6 +276,12 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 		if int64(len(events)) != expectedCount {
 			return nil, errors.ErrItemNotFound
 		}
+
+		// Check for close error one more time
+		if scanErr != nil {
+			return nil, scanErr
+		}
+
 		return events, nil
 	})
 }
@@ -270,15 +309,26 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 			return xerrors.Errorf("invalid max event id: %d", maxEventId)
 		}
 
-		tx, err := e.db.BeginTx(ctx, nil)
+		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		defer cancel()
+
+		tx, err := e.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to start transaction: %w", err)
 		}
-		defer tx.Rollback()
+		committed := false
+		defer func() {
+			if !committed {
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					_ = rollbackErr
+				}
+			}
+		}()
 
 		if maxEventId == model.EventIdDeleted {
 			// Delete all events for this tag
-			_, err = tx.ExecContext(ctx, `
+			_, err = tx.ExecContext(txCtx, `
 				DELETE FROM block_events WHERE event_tag = $1
 			`, eventTag)
 			if err != nil {
@@ -287,7 +337,7 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 		} else {
 			// Validate the new max event ID exists
 			var exists bool
-			err = tx.QueryRowContext(ctx, `
+			err = tx.QueryRowContext(txCtx, `
 				SELECT EXISTS(SELECT 1 FROM block_events WHERE event_tag = $1 AND event_sequence = $2)
 			`, eventTag, maxEventId).Scan(&exists)
 			if err != nil {
@@ -297,7 +347,7 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 				return xerrors.Errorf("event entry with max event id %d does not exist", maxEventId)
 			}
 			// Delete events beyond the max event ID
-			_, err = tx.ExecContext(ctx, `
+			_, err = tx.ExecContext(txCtx, `
 				DELETE FROM block_events WHERE event_tag = $1 AND event_sequence > $2
 			`, eventTag, maxEventId)
 			if err != nil {
@@ -305,7 +355,12 @@ func (e *eventStorageImpl) SetMaxEventId(ctx context.Context, eventTag uint32, m
 			}
 		}
 
-		return tx.Commit()
+		err = tx.Commit()
+		if err != nil {
+			return xerrors.Errorf("failed to commit transaction: %w", err)
+		}
+		committed = true
+		return nil
 	})
 }
 
@@ -344,15 +399,27 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get events by block height: %w", err)
 		}
-		defer rows.Close()
 
-		events, err := e.scanEventEntries(rows)
-		if err != nil {
-			return nil, err
+		var events []*model.EventEntry
+		var scanErr error
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil && scanErr == nil {
+				scanErr = xerrors.Errorf("failed to close rows: %w", closeErr)
+			}
+		}()
+
+		events, scanErr = e.scanEventEntries(rows)
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		if len(events) == 0 {
 			return nil, errors.ErrItemNotFound
+		}
+
+		// Check for close error one more time
+		if scanErr != nil {
+			return nil, scanErr
 		}
 
 		return events, nil
@@ -392,8 +459,7 @@ func (e *eventStorageImpl) getOrCreateBlockMetadataId(ctx context.Context, tx *s
 	// For non-skipped blocks, look up by tag and hash
 	// First try with the eventEntry.Tag
 	var blockMetadataId int64
-	err := tx.QueryRowContext(ctx, `
-		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
+	err := tx.QueryRowContext(ctx, `		SELECT id FROM block_metadata WHERE tag = $1 AND hash = $2
 	`, eventEntry.Tag, eventEntry.BlockHash).Scan(&blockMetadataId)
 	if err == nil {
 		return blockMetadataId, nil
@@ -421,16 +487,17 @@ func (e *eventStorageImpl) createSkippedBlockMetadata(ctx context.Context, tx *s
 	// Create block metadata for skipped block with NULL values as specified
 	var blockMetadataId int64
 	err := tx.QueryRowContext(ctx, `
-		INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
-		VALUES ($1, $2, NULL, NULL, NULL, $3, true)
+		INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
+		VALUES ($1, $2, NULL, NULL, $3, NULL, $4, true)
 		ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
 			hash = EXCLUDED.hash,
 			parent_hash = EXCLUDED.parent_hash,
+			parent_height = EXCLUDED.parent_height,
 			object_key_main = EXCLUDED.object_key_main,
 			timestamp = EXCLUDED.timestamp,
 			skipped = EXCLUDED.skipped
 		RETURNING id
-	`, eventEntry.BlockHeight, eventEntry.Tag, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
+	`, eventEntry.BlockHeight, eventEntry.Tag, 0, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to create block metadata for skipped block: %w", err)
 	}

@@ -22,6 +22,7 @@
   - [Overriding the Configuration](#overriding-the-configuration)
 - [Development](#development)
   - [Running Server](#running-server)
+  - [Running with PostgreSQL](#running-with-postgresql)
   - [AWS localstack](#aws-localstack)
   - [Temporal Workflow](#temporal-workflow)
 - [Failover](#failover)
@@ -367,6 +368,7 @@ chain:
 
 ### Overriding the Configuration
 You can override configurations in two ways:
+
 1. **Environment Variables**:
 You may override any configuration using an environment variable. The environment variable should be prefixed with
 "CHAINSTORAGE_". For nested dictionary, use underscore to separate the keys.
@@ -375,9 +377,30 @@ For example, you may override the endpoint group config at runtime by injecting 
 * master: CHAINSTORAGE_CHAIN_CLIENT_MASTER_ENDPOINT_GROUP
 * slave: CHAINSTORAGE_CHAIN_CLIENT_SLAVE_ENDPOINT_GROUP
 
+**Security Best Practice - PostgreSQL Credentials:**
+For sensitive data like database passwords, always use environment variables instead of hardcoding them in config files:
+```shell
+# PostgreSQL credentials (never put these in config files!)
+export CHAINSTORAGE_AWS_POSTGRES_USER="your_username"
+export CHAINSTORAGE_AWS_POSTGRES_PASSWORD="your_secure_password"
+
+# Storage type configuration
+export CHAINSTORAGE_STORAGE_TYPE_META="POSTGRES"
+```
+
 2. **secrets.yml**: Alternatively, you may override the configuration by creating `secrets.yml` within the same directory. Its attributes
 will be merged into the runtime configuration and take the highest precedence. Note that this file may contain
 credentials and is excluded from check-in by `.gitignore`.
+
+Example `config/chainstorage/ethereum/mainnet/.secrets.yml`:
+```yaml
+storage_type:
+  meta: POSTGRES
+aws:
+  postgres:
+    user: your_username
+    password: your_secure_password
+```
 
 ## Development
 
@@ -403,6 +426,98 @@ make server
 # Use aws local stack
 make server CHAINSTORAGE_CONFIG=ethereum_goerli
 ```
+
+### Running with PostgreSQL
+
+ChainStorage supports PostgreSQL as an alternative to DynamoDB for metadata storage. Here's how to set it up:
+
+#### 1. Start PostgreSQL Database
+
+You can use Docker to run PostgreSQL locally:
+
+```shell
+# Start PostgreSQL container
+docker run --name chainstorage-postgres \
+  -e POSTGRES_USER=temporal \
+  -e POSTGRES_PASSWORD=temporal \
+  -e POSTGRES_DB=postgres \
+  -p 5432:5432 \
+  -d postgres:13
+```
+
+Or add it to your existing docker-compose setup.
+
+#### 2. Configure Meta Storage Type
+
+Create or modify your local config to use PostgreSQL instead of DynamoDB. You have two options:
+
+**Option A: Create a local secrets file (recommended for development)**
+
+Create `config/chainstorage/{blockchain}/{network}/.secrets.yml` (e.g., `config/chainstorage/ethereum/mainnet/.secrets.yml`):
+
+```yaml
+storage_type:
+  meta: POSTGRES
+```
+
+**Option B: Set via environment variable**
+
+```shell
+export CHAINSTORAGE_STORAGE_TYPE_META=POSTGRES
+```
+
+#### 3. Set PostgreSQL Credentials
+
+Since PostgreSQL credentials should not be hardcoded in config files, set them via environment variables:
+
+```shell
+# PostgreSQL connection details
+export CHAINSTORAGE_AWS_POSTGRES_USER="temporal"
+export CHAINSTORAGE_AWS_POSTGRES_PASSWORD="temporal"
+export CHAINSTORAGE_AWS_POSTGRES_HOST="localhost"
+export CHAINSTORAGE_AWS_POSTGRES_PORT="5432"
+export CHAINSTORAGE_AWS_POSTGRES_SSL_MODE="require"
+```
+
+#### 4. Run the Server
+
+Now start the server with PostgreSQL configuration:
+
+```shell
+# Method 1: Using exported environment variables
+make server
+
+# Method 2: Setting environment variables inline
+CHAINSTORAGE_STORAGE_TYPE_META=POSTGRES \
+CHAINSTORAGE_AWS_POSTGRES_USER="temporal" \
+CHAINSTORAGE_AWS_POSTGRES_PASSWORD="temporal" \
+make server
+```
+
+#### PostgreSQL Configuration Reference
+
+The following environment variables can be used to configure PostgreSQL:
+
+| Environment Variable | Config Path | Description | Default |
+|---------------------|-------------|-------------|---------|
+| `CHAINSTORAGE_AWS_POSTGRES_HOST` | `aws.postgres.host` | PostgreSQL hostname | `localhost` |
+| `CHAINSTORAGE_AWS_POSTGRES_PORT` | `aws.postgres.port` | PostgreSQL port | `5432` |
+| `CHAINSTORAGE_AWS_POSTGRES_USER` | `aws.postgres.user` | PostgreSQL username | (required) |
+| `CHAINSTORAGE_AWS_POSTGRES_PASSWORD` | `aws.postgres.password` | PostgreSQL password | (required) |
+| `CHAINSTORAGE_AWS_POSTGRES_DATABASE` | `aws.postgres.database` | Database name | `chainstorage_{blockchain}_{network}` |
+| `CHAINSTORAGE_AWS_POSTGRES_SSL_MODE` | `aws.postgres.ssl_mode` | SSL mode | `require` |
+| `CHAINSTORAGE_AWS_POSTGRES_MAX_CONNECTIONS` | `aws.postgres.max_connections` | Maximum connection pool size | `25` |
+| `CHAINSTORAGE_AWS_POSTGRES_MIN_CONNECTIONS` | `aws.postgres.min_connections` | Minimum connection pool size | `5` |
+| `CHAINSTORAGE_AWS_POSTGRES_CONNECT_TIMEOUT` | `aws.postgres.connect_timeout` | Connection establishment timeout | `30s` |
+| `CHAINSTORAGE_AWS_POSTGRES_STATEMENT_TIMEOUT` | `aws.postgres.statement_timeout` | Statement/transaction timeout | `60s` |
+| `CHAINSTORAGE_STORAGE_TYPE_META` | `storage_type.meta` | Meta storage type | `DYNAMODB` |
+
+#### Database Schema
+
+ChainStorage will automatically create the necessary database schema and run migrations when it starts up. The database will contain tables for:
+- `block_metadata` - Block metadata and headers
+- `canonical_blocks` - Canonical chain state
+- `block_events` - Blockchain event log
 
 ### AWS localstack
 
@@ -469,7 +584,7 @@ Using Temporal CLI to check the status of the workflow:
 brew install tctl
 
 tctl --address localhost:7233 --namespace chainstorage-ethereum-mainnet workflow show --workflow_id workflow.backfiller
-````
+```
 
 ## Failover
 

@@ -6,6 +6,7 @@ CREATE TABLE block_metadata (
     tag INT NOT NULL,
     hash VARCHAR(66), -- can hold a "0x"+64-hex string
     parent_hash VARCHAR(66),
+    parent_height BIGINT NOT NULL DEFAULT 0,
     object_key_main VARCHAR(255),
     timestamp TIMESTAMPTZ NOT NULL,
     skipped BOOLEAN NOT NULL DEFAULT FALSE
@@ -68,4 +69,4 @@ DROP TABLE IF EXISTS canonical_blocks;
 DROP TABLE IF EXISTS block_metadata;
 
 -- Drop custom types
-DROP TYPE IF EXISTS event_type_enum;
+DROP TYPE IF EXISTS event_type_enum; 

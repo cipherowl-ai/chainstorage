@@ -17,6 +17,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"golang.org/x/xerrors"
+
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
@@ -24,7 +26,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	"golang.org/x/xerrors"
 )
 
 const (

@@ -8,14 +8,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes"
+	"golang.org/x/xerrors"
+
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	"github.com/golang/protobuf/ptypes"
-	"golang.org/x/xerrors"
 )
 
 type (
@@ -56,41 +57,69 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		if len(blocks) == 0 {
 			return nil
 		}
-		// Sort blocks by height for chain validation
+
+		// Sort blocks by height for chain validation.
+		// IMPORTANT: When multiple blocks have the same height (e.g., during a reorg), their relative
+		// order after sorting is not guaranteed to be stable. However, this implementation follows the
+		// "last block wins" principle - the last block processed for a given height will become the
+		// canonical block for that height. This behavior is consistent with the DynamoDB implementation
+		// where the last block overwrites the canonical entry.
+		//
+		// The canonical_blocks table uses "ON CONFLICT (height, tag) DO UPDATE" which means:
+		// - If multiple blocks in the input have the same height, the last one processed will
+		//   overwrite previous entries in canonical_blocks
+		// - All blocks are still stored in block_metadata (allowing retrieval by specific hash)
+		// - Only the last block for each height becomes the canonical one
+		//
+		// Callers should ensure that when multiple blocks exist for the same height, the desired
+		// canonical block is placed last in the blocks array for that height.
 		sort.Slice(blocks, func(i, j int) bool {
 			return blocks[i].Height < blocks[j].Height
 		})
 		if err := parser.ValidateChain(blocks, lastBlock); err != nil {
 			return xerrors.Errorf("failed to validate chain: %w", err)
 		}
-		tx, err := b.db.BeginTx(ctx, nil)
+
+		// Create transaction with timeout context
+		// Use a reasonable timeout for block persistence operations
+		txCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		tx, err := b.db.BeginTx(txCtx, nil)
 		if err != nil {
 			return xerrors.Errorf("failed to begin transaction: %w", err)
 		}
 		committed := false
 		defer func() {
 			if !committed {
-				tx.Rollback()
+				if rollbackErr := tx.Rollback(); rollbackErr != nil {
+					// Log the rollback error but don't override the original error
+					// In a production environment, you might want to use a proper logger here
+					// For now, we'll just ignore the rollback error as it's already a failure case
+					_ = rollbackErr
+				}
 			}
 		}()
 
 		// Different queries for skipped vs non-skipped blocks due to different conflict resolution
 		blockMetadataSkippedQuery := `
-			INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
 				hash = EXCLUDED.hash,
 				parent_hash = EXCLUDED.parent_hash,
+				parent_height = EXCLUDED.parent_height,
 				object_key_main = EXCLUDED.object_key_main,
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped
 			RETURNING id`
 
 		blockMetadataRegularQuery := `
-			INSERT INTO block_metadata (height, tag, hash, parent_hash, object_key_main, timestamp, skipped) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
 				parent_hash = EXCLUDED.parent_hash,
+				parent_height = EXCLUDED.parent_height,
 				object_key_main = EXCLUDED.object_key_main,
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped
@@ -114,6 +143,14 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				}
 			}
 
+			var parentHeight uint64
+			if block.Height == 0 {
+				// Genesis block has no parent, set parent height to 0
+				parentHeight = 0
+			} else {
+				parentHeight = block.ParentHeight
+			}
+
 			var blockId int64
 			var query string
 			if block.Skipped {
@@ -122,11 +159,12 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				query = blockMetadataRegularQuery
 			}
 
-			err = tx.QueryRowContext(ctx, query,
+			err = tx.QueryRowContext(txCtx, query,
 				block.Height,
 				block.Tag,
 				block.Hash,
 				block.ParentHash,
+				parentHeight,
 				block.ObjectKeyMain,
 				goTime,
 				block.Skipped,
@@ -136,7 +174,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			}
 
 			// Insert ALL blocks (including skipped) into canonical_blocks
-			_, err = tx.ExecContext(ctx, canonicalQuery,
+			_, err = tx.ExecContext(txCtx, canonicalQuery,
 				block.Height,
 				blockId,
 				block.Tag,
@@ -159,7 +197,7 @@ func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api
 	return b.instrumentGetLatestBlock.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
 		// Get the latest canonical block by highest height
 		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
@@ -187,7 +225,7 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 		if blockHash == "" {
 			// Get the canonical block at this height (could be regular or skipped)
 			query := `
-				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 				FROM canonical_blocks cb
 				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
@@ -195,18 +233,17 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 				LIMIT 1`
 			row = b.db.QueryRowContext(ctx, query, tag, height)
 		} else {
-			// Query canonical_blocks for specific hash
+			// Query block_metadata directly for the specific hash
 			query := `
-				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
-				FROM canonical_blocks cb
-				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
-				WHERE cb.tag = $1 AND cb.height = $2 AND bm.hash = $3
+				SELECT id, height, tag, hash, parent_hash, parent_height, object_key_main, 
+					   EXTRACT(EPOCH FROM timestamp)::BIGINT, skipped
+				FROM block_metadata
+				WHERE tag = $1 AND height = $2 AND hash = $3
 				LIMIT 1`
 			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		}
 
-		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
+		block, err := model.BlockMetadataFromRow(b.db, row)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return nil, xerrors.Errorf("block not found: %w", errors.ErrItemNotFound)
@@ -224,7 +261,7 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 		}
 		// Get block from canonical_blocks table (includes both regular and skipped blocks)
 		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
@@ -253,7 +290,7 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 
 		// Get all blocks (canonical and skipped) from canonical_blocks table
 		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
@@ -263,7 +300,11 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by height range: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil && err == nil {
+				err = xerrors.Errorf("failed to close rows: %w", closeErr)
+			}
+		}()
 
 		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {
@@ -309,7 +350,7 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 			args[i+1] = height
 		}
 		query := fmt.Sprintf(`
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.object_key_main, 
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
 			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
@@ -321,7 +362,11 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by heights: %w", err)
 		}
-		defer rows.Close()
+		defer func() {
+			if closeErr := rows.Close(); closeErr != nil && err == nil {
+				err = xerrors.Errorf("failed to close rows: %w", closeErr)
+			}
+		}()
 
 		blocks, err := model.BlockMetadataFromCanonicalRows(b.db, rows)
 		if err != nil {

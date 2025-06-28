@@ -24,6 +24,17 @@ aws:
     transaction_table: example_chainstorage_transactions_table_polygon_mainnet
     versioned_event_table: example_chainstorage_versioned_block_events_polygon_mainnet
     versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_polygon_mainnet
+  postgres:
+    connect_timeout: 30s
+    database: chainstorage_polygon_mainnet
+    host: localhost
+    max_connections: 25
+    min_connections: 5
+    password: ""
+    port: 5432
+    ssl_mode: require
+    statement_timeout: 60s
+    user: ""
   presigned_url_expiration: 30m
   region: us-east-1
   storage:

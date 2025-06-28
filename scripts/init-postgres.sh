@@ -16,3 +16,5 @@ psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-'
   -- Grant necessary permissions to chainstorage role
   ALTER ROLE chainstorage CREATEDB;
 EOSQL
+
+echo "Chainstorage database initialization complete!"
