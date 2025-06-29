@@ -4,10 +4,52 @@
 
 ChainStorage is a distributed blockchain data storage and processing system that continuously replicates blockchain data and serves it through APIs.
 
+## High-Level Architecture (Simplified)
+
+```mermaid
+graph LR
+    %% External
+    BC[Blockchain<br/>Nodes] 
+    ExtClients[External<br/>Clients]
+    
+    %% Core Components
+    API[API Server]
+    WF[Workflow<br/>Engine]
+    BCC[Blockchain<br/>Clients]
+    P[Parsers]
+    
+    %% Storage
+    BS[Blob<br/>Storage]
+    MS[Meta<br/>Storage]
+    
+    %% Flow
+    ExtClients -->|REST/gRPC| API
+    API --> BS
+    API --> MS
+    
+    WF -->|Fetch| BCC
+    BCC -->|Raw Data| BC
+    BCC --> P
+    P --> BS
+    P --> MS
+    
+    %% Styling
+    style BC fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style ExtClients fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style API fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
+    style WF fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    style BCC fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style P fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style BS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style MS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+```
+
+## Detailed Architecture
+
 ```mermaid
 graph TB
     %% External Systems
-    subgraph "External Systems"
+    subgraph EXT["🌐 External Systems"]
         BC[Blockchain Nodes<br/>Bitcoin/Ethereum/Solana/etc]
         Client[External Clients<br/>SDK/REST/gRPC]
         Temporal[Temporal Server]
@@ -16,7 +58,7 @@ graph TB
     end
 
     %% Entry Points
-    subgraph "Entry Points (cmd/)"
+    subgraph ENTRY["🚀 Entry Points (cmd/)"]
         API[API Server<br/>REST/gRPC]
         Server[Main Server<br/>Workflow Manager]
         Worker[Worker<br/>Activity Executor]
@@ -24,46 +66,46 @@ graph TB
         Cron[Cron Jobs]
     end
 
-    %% Core Services
-    subgraph "Core Services"
-        subgraph "Storage Layer"
-            BlobStorage[BlobStorage<br/>Raw Block Data]
-            MetaStorage[MetaStorage<br/>Metadata & Indexes]
-        end
+    %% Storage Layer
+    subgraph STORAGE["💾 Storage Layer"]
+        BlobStorage[BlobStorage<br/>Raw Block Data]
+        MetaStorage[MetaStorage<br/>Metadata & Indexes]
+    end
 
-        subgraph "Blockchain Layer"
-            ClientFactory[Client Factory]
-            subgraph "Multi-Endpoint Clients"
-                Master[Master Client<br/>Sticky Sessions]
-                Slave[Slave Client<br/>Load Balanced]
-                Validator[Validator Client]
-                Consensus[Consensus Client]
-            end
-            
-            subgraph "Parsers"
-                NativeParser[Native Parser]
-                RosettaParser[Rosetta Parser]
-                TrustlessValidator[Trustless Validator]
-            end
+    %% Blockchain Layer
+    subgraph BLOCKCHAIN["⛓️ Blockchain Layer"]
+        ClientFactory[Client Factory]
+        subgraph CLIENTS["Multi-Endpoint Clients"]
+            Master[Master Client<br/>Sticky Sessions]
+            Slave[Slave Client<br/>Load Balanced]
+            Validator[Validator Client]
+            Consensus[Consensus Client]
         end
+        
+        subgraph PARSERS["Parsers"]
+            NativeParser[Native Parser]
+            RosettaParser[Rosetta Parser]
+            TrustlessValidator[Trustless Validator]
+        end
+    end
 
-        subgraph "Workflow Engine"
-            subgraph "Workflows"
-                Backfiller[Backfiller<br/>Historical Blocks]
-                Poller[Poller<br/>New Blocks]
-                Streamer[Streamer<br/>Real-time]
-                Monitor[Monitor<br/>Health Check]
-                CrossValidator[Cross Validator]
-                Replicator[Replicator]
-            end
-            
-            subgraph "Activities"
-                Extractor[Extractor]
-                Loader[Loader]
-                Syncer[Syncer]
-                Reader[Reader]
-                EventLoader[Event Loader]
-            end
+    %% Workflow Engine
+    subgraph WORKFLOW["⚙️ Workflow Engine"]
+        subgraph WORKFLOWS["Workflows"]
+            Backfiller[Backfiller<br/>Historical Blocks]
+            Poller[Poller<br/>New Blocks]
+            Streamer[Streamer<br/>Real-time]
+            Monitor[Monitor<br/>Health Check]
+            CrossValidator[Cross Validator]
+            Replicator[Replicator]
+        end
+        
+        subgraph ACTIVITIES["Activities"]
+            Extractor[Extractor]
+            Loader[Loader]
+            Syncer[Syncer]
+            Reader[Reader]
+            EventLoader[Event Loader]
         end
     end
 
@@ -74,10 +116,10 @@ graph TB
     
     Server -->|Schedule| Temporal
     Worker -->|Execute| Temporal
-    Temporal -->|Orchestrate| Workflows
+    Temporal -->|Orchestrate| WORKFLOWS
     
-    Workflows -->|Execute| Activities
-    Activities -->|Use| ClientFactory
+    WORKFLOWS -->|Execute| ACTIVITIES
+    ACTIVITIES -->|Use| ClientFactory
     ClientFactory -->|Create| Master
     ClientFactory -->|Create| Slave
     ClientFactory -->|Create| Validator
@@ -88,35 +130,123 @@ graph TB
     Validator -->|Validate| BC
     Consensus -->|Check| BC
     
-    Activities -->|Parse| NativeParser
+    ACTIVITIES -->|Parse| NativeParser
     NativeParser -->|Convert| RosettaParser
-    Activities -->|Validate| TrustlessValidator
+    ACTIVITIES -->|Validate| TrustlessValidator
     
-    Activities -->|Store Raw| BlobStorage
-    Activities -->|Store Meta| MetaStorage
+    ACTIVITIES -->|Store Raw| BlobStorage
+    ACTIVITIES -->|Store Meta| MetaStorage
     BlobStorage -->|S3/GCS| AWS
     BlobStorage -->|S3/GCS| GCP
     MetaStorage -->|DynamoDB| AWS
     MetaStorage -->|Firestore| GCP
     
-    Admin -->|Manual Ops| Workflows
+    Admin -->|Manual Ops| WORKFLOWS
     Admin -->|Direct Access| BlobStorage
     Admin -->|Direct Access| MetaStorage
     
-    Cron -->|Scheduled| Workflows
+    Cron -->|Scheduled| WORKFLOWS
 
-    %% Styling
-    classDef external fill:#f9f,stroke:#333,stroke-width:2px
-    classDef entry fill:#bbf,stroke:#333,stroke-width:2px
-    classDef storage fill:#bfb,stroke:#333,stroke-width:2px
-    classDef workflow fill:#fbf,stroke:#333,stroke-width:2px
-    classDef blockchain fill:#ffb,stroke:#333,stroke-width:2px
+    %% Styling with better colors
+    classDef external fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b
+    classDef entry fill:#f3e5f5,stroke:#4a148c,stroke-width:2px,color:#4a148c
+    classDef storage fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px,color:#1b5e20
+    classDef workflow fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100
+    classDef blockchain fill:#fce4ec,stroke:#880e4f,stroke-width:2px,color:#880e4f
+    classDef subgraphStyle fill:#f5f5f5,stroke:#424242,stroke-width:1px
     
     class BC,Client,Temporal,AWS,GCP external
     class API,Server,Worker,Admin,Cron entry
     class BlobStorage,MetaStorage storage
     class Backfiller,Poller,Streamer,Monitor,CrossValidator,Replicator,Extractor,Loader,Syncer,Reader,EventLoader workflow
     class ClientFactory,Master,Slave,Validator,Consensus,NativeParser,RosettaParser,TrustlessValidator blockchain
+    class EXT,ENTRY,STORAGE,BLOCKCHAIN,WORKFLOW,WORKFLOWS,ACTIVITIES,CLIENTS,PARSERS subgraphStyle
+```
+
+## Component Breakdown
+
+### Workflow Engine Detail
+
+```mermaid
+graph TB
+    T[Temporal Server]
+    
+    subgraph Workflows
+        BF[Backfiller]
+        PL[Poller]
+        ST[Streamer]
+        MN[Monitor]
+        CV[Cross Validator]
+        RP[Replicator]
+    end
+    
+    subgraph Activities
+        EX[Extractor]
+        LD[Loader]
+        SY[Syncer]
+        RD[Reader]
+        EL[Event Loader]
+    end
+    
+    T --> Workflows
+    Workflows --> Activities
+    
+    style T fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
+    style Workflows fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    style Activities fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+```
+
+### Blockchain Client Architecture
+
+```mermaid
+graph LR
+    CF[Client Factory]
+    
+    subgraph Endpoints
+        M[Master<br/>Sticky Sessions]
+        S[Slave<br/>Load Balanced]
+        V[Validator]
+        C[Consensus]
+    end
+    
+    subgraph Parsers
+        NP[Native Parser]
+        RP[Rosetta Parser]
+        TV[Trustless Validator]
+    end
+    
+    CF --> Endpoints
+    Endpoints --> Parsers
+    
+    style CF fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style Endpoints fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style Parsers fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+```
+
+### Storage Architecture
+
+```mermaid
+graph TB
+    subgraph BlobStorage
+        S3[AWS S3]
+        GCS[Google Cloud Storage]
+    end
+    
+    subgraph MetaStorage
+        DDB[DynamoDB]
+        FS[Firestore]
+    end
+    
+    BS[Blob Storage<br/>Interface] --> S3
+    BS --> GCS
+    
+    MS[Meta Storage<br/>Interface] --> DDB
+    MS --> FS
+    
+    style BlobStorage fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style MetaStorage fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    style BS fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px
+    style MS fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px
 ```
 
 ## Component Details
