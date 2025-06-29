@@ -33,15 +33,15 @@ graph LR
     P --> BS
     P --> MS
     
-    %% Styling
-    style BC fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    style ExtClients fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    style API fill:#f3e5f5,stroke:#6a1b9a,stroke-width:2px
-    style WF fill:#fff8e1,stroke:#f57f17,stroke-width:2px
-    style BCC fill:#fce4ec,stroke:#c2185b,stroke-width:2px
-    style P fill:#fce4ec,stroke:#c2185b,stroke-width:2px
-    style BS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style MS fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
+    %% Styling with Nord palette
+    style BC fill:#d8dee9,stroke:#2e3440,stroke-width:2px,color:#2e3440
+    style ExtClients fill:#d8dee9,stroke:#2e3440,stroke-width:2px,color:#2e3440
+    style API fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style WF fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style BCC fill:#4c566a,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style P fill:#4c566a,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style BS fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style MS fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
 ```
 
 ## Detailed Architecture
@@ -147,13 +147,13 @@ graph TB
     
     Cron -->|Scheduled| WORKFLOWS
 
-    %% Styling with better colors
-    classDef external fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#01579b
-    classDef entry fill:#f3e5f5,stroke:#4a148c,stroke-width:2px,color:#4a148c
-    classDef storage fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px,color:#1b5e20
-    classDef workflow fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#e65100
-    classDef blockchain fill:#fce4ec,stroke:#880e4f,stroke-width:2px,color:#880e4f
-    classDef subgraphStyle fill:#f5f5f5,stroke:#424242,stroke-width:1px
+    %% Styling with Nord palette
+    classDef external fill:#d8dee9,stroke:#2e3440,stroke-width:2px,color:#2e3440
+    classDef entry fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    classDef storage fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    classDef workflow fill:#4c566a,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    classDef blockchain fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    classDef subgraphStyle fill:#d8dee9,stroke:#2e3440,stroke-width:1px,color:#2e3440
     
     class BC,Client,Temporal,AWS,GCP external
     class API,Server,Worker,Admin,Cron entry
@@ -191,9 +191,9 @@ graph TB
     T --> Workflows
     Workflows --> Activities
     
-    style T fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
-    style Workflows fill:#fff8e1,stroke:#f57f17,stroke-width:2px
-    style Activities fill:#fff8e1,stroke:#f57f17,stroke-width:2px
+    style T fill:#d8dee9,stroke:#2e3440,stroke-width:2px,color:#2e3440
+    style Workflows fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style Activities fill:#4c566a,stroke:#2e3440,stroke-width:2px,color:#d8dee9
 ```
 
 ### Blockchain Client Architecture
@@ -218,9 +218,9 @@ graph LR
     CF --> Endpoints
     Endpoints --> Parsers
     
-    style CF fill:#fce4ec,stroke:#c2185b,stroke-width:2px
-    style Endpoints fill:#fce4ec,stroke:#c2185b,stroke-width:2px
-    style Parsers fill:#fce4ec,stroke:#c2185b,stroke-width:2px
+    style CF fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style Endpoints fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style Parsers fill:#4c566a,stroke:#2e3440,stroke-width:2px,color:#d8dee9
 ```
 
 ### Storage Architecture
@@ -243,10 +243,10 @@ graph TB
     MS[Meta Storage<br/>Interface] --> DDB
     MS --> FS
     
-    style BlobStorage fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style MetaStorage fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
-    style BS fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px
-    style MS fill:#c8e6c9,stroke:#1b5e20,stroke-width:2px
+    style BlobStorage fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style MetaStorage fill:#434c5e,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style BS fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
+    style MS fill:#3b4252,stroke:#2e3440,stroke-width:2px,color:#d8dee9
 ```
 
 ## Component Details
