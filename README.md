@@ -718,6 +718,36 @@ and out of order, the logical ordering guarantee is preserved.
 6. Update watermark once all the batches have been processed.
 7. Repeat above steps.
 
+## Data Migration Tool
+
+Tool to migrate blockchain data from DynamoDB to PostgreSQL with complete reorg support and data integrity preservation.
+
+### Overview
+
+The migration tool performs a comprehensive transfer of blockchain data:
+- **Block metadata** from DynamoDB to PostgreSQL (`block_metadata` + `canonical_blocks` tables)
+- **Events** from DynamoDB to PostgreSQL (`block_events` table)
+- **Complete reorg data** including both canonical and non-canonical blocks
+- **Event ID-based migration** for efficient sequential processing
+
+**Critical Requirements**: 
+1. Block metadata **must** be migrated before events (foreign key dependencies)
+2. Migration preserves complete blockchain history including all reorg blocks
+3. Canonical block identification is maintained through migration ordering
+
+### Basic Usage
+
+```bash
+# Migrate both blocks and events for a height range
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=1000000 \
+  --end-height=1001000 \
+  --tag=1 \
+  --event-tag=0
+```
 ## Contact Us
 
 We have set up a Discord server soon. Here is the link to join (limited 10) https://discord.com/channels/1079683467018764328/1079683467786334220.
