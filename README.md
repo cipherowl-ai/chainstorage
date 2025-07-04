@@ -569,6 +569,11 @@ Start the streamer workflow:
 go run ./cmd/admin workflow start --workflow streamer --input '{}' --blockchain ethereum --network goerli --env local
 ```
 
+Start the migration workflow:
+```shell
+go run cmd/admin/*.go migrate --env=local --blockchain=ethereum --network=mainnet --start-height=0 --end-height=100 --tag=2 
+```
+
 Stop the monitor workflow:
 ```shell
 go run ./cmd/admin workflow stop --workflow monitor --blockchain ethereum --network mainnet --env local
