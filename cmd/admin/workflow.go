@@ -48,6 +48,7 @@ type executors struct {
 	CrossValidator  *workflow.CrossValidator
 	EventBackfiller *workflow.EventBackfiller
 	Replicator      *workflow.Replicator
+	Migrator        *workflow.Migrator
 	Runtime         cadence.Runtime
 }
 
@@ -201,6 +202,12 @@ func startWorkflow() error {
 			return xerrors.Errorf("error converting to request type")
 		}
 		run, err = executors.Replicator.Execute(ctx, &request)
+	case workflow.MigratorIdentity:
+		request, ok := req.(workflow.MigratorRequest)
+		if !ok {
+			return xerrors.Errorf("error converting to request type")
+		}
+		run, err = executors.Migrator.Execute(ctx, &request)
 	default:
 		return xerrors.Errorf("unsupported workflow identity: %v", workflowIdentity)
 	}
@@ -271,6 +278,8 @@ func stopWorkflow() error {
 		err = executors.EventBackfiller.StopWorkflow(ctx, workflowIdentityString, reason)
 	case workflow.ReplicatorIdentity:
 		err = executors.Replicator.StopWorkflow(ctx, workflowIdentityString, reason)
+	case workflow.MigratorIdentity:
+		err = executors.Migrator.StopWorkflow(ctx, workflowIdentityString, reason)
 	default:
 		return xerrors.Errorf("unsupported workflow identity: %v", workflowIdentity)
 	}

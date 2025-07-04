@@ -20,4 +20,5 @@ var Module = fx.Options(
 	fx.Provide(NewReplicator),
 	fx.Provide(NewLatestBlock),
 	fx.Provide(NewUpdateWatermark),
+	fx.Provide(NewMigrator),
 )

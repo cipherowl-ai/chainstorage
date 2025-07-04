@@ -103,6 +103,20 @@ Note: Block metadata must be migrated before events since events reference block
 				return xerrors.New("cannot skip both events and blocks - nothing to migrate")
 			}
 
+			// Warn about skip-blocks requirements
+			if migrateFlags.skipBlocks && !migrateFlags.skipEvents {
+				logger.Warn("IMPORTANT: Using --skip-blocks (events-only migration)")
+				logger.Warn("Block metadata MUST already exist in PostgreSQL for the specified height range")
+				logger.Warn("If block metadata is missing, the migration will fail with foreign key errors")
+				logger.Warn("To fix: First migrate blocks with --skip-events, then migrate events with --skip-blocks")
+
+				prompt := "Are you sure block metadata already exists in PostgreSQL for this range? (y/N): "
+				if !confirm(prompt) {
+					logger.Info("Migration cancelled - migrate blocks first with --skip-events")
+					return nil
+				}
+			}
+
 			ctx := context.Background()
 
 			// Create DynamoDB client for direct queries

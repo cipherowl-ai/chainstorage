@@ -193,6 +193,7 @@ type (
 		CrossValidator  CrossValidatorWorkflowConfig  `mapstructure:"cross_validator"`
 		EventBackfiller EventBackfillerWorkflowConfig `mapstructure:"event_backfiller"`
 		Replicator      ReplicatorWorkflowConfig      `mapstructure:"replicator"`
+		Migrator        MigratorWorkflowConfig        `mapstructure:"migrator"`
 	}
 
 	WorkerConfig struct {
@@ -295,6 +296,13 @@ type (
 	}
 
 	StreamerWorkflowConfig struct {
+		WorkflowConfig  `mapstructure:",squash"`
+		BatchSize       uint64        `mapstructure:"batch_size" validate:"required"`
+		CheckpointSize  uint64        `mapstructure:"checkpoint_size" validate:"required"`
+		BackoffInterval time.Duration `mapstructure:"backoff_interval"`
+	}
+
+	MigratorWorkflowConfig struct {
 		WorkflowConfig  `mapstructure:",squash"`
 		BatchSize       uint64        `mapstructure:"batch_size" validate:"required"`
 		CheckpointSize  uint64        `mapstructure:"checkpoint_size" validate:"required"`
