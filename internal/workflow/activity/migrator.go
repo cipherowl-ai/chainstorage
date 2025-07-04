@@ -95,9 +95,8 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
 
 	// Validate batch size
-	batchSize := request.BatchSize
-	if batchSize <= 0 {
-		batchSize = 100
+	if request.BatchSize <= 0 {
+		request.BatchSize = 100
 	}
 
 	// Both skip flags cannot be true
