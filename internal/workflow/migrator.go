@@ -83,6 +83,11 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			return xerrors.Errorf("failed to read config: %w", err)
 		}
 
+		// Both skip flags cannot be true
+		if request.SkipEvents && request.SkipBlocks {
+			return xerrors.New("cannot skip both events and blocks - nothing to migrate")
+		}
+
 		batchSize := cfg.BatchSize
 		if request.BatchSize > 0 {
 			batchSize = request.BatchSize
@@ -110,6 +115,13 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			zap.Reflect("request", request),
 			zap.Reflect("config", cfg),
 		)
+
+		// Validate skip-blocks requirements (moved here after logger is available)
+		if request.SkipBlocks && !request.SkipEvents {
+			logger.Warn("Events-only migration requested (skip-blocks=true)")
+			logger.Warn("Block metadata must already exist in PostgreSQL for this height range")
+			logger.Warn("If validation fails, migrate blocks first with skip-events=true")
+		}
 
 		logger.Info("migrator workflow started")
 		ctx = w.withActivityOptions(ctx)
