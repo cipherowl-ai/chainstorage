@@ -328,6 +328,15 @@ func (a *Migrator) getCanonicalBlockAtHeight(ctx context.Context, data *Migratio
 func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
 	logger.Info("Starting event ID-based migration")
 
+	// If we're skipping blocks, validate that required block metadata exists in PostgreSQL
+	if request.SkipBlocks {
+		logger.Info("Skip-blocks enabled, validating that block metadata exists in PostgreSQL")
+		if err := a.validateBlockMetadataExists(ctx, data, request); err != nil {
+			return 0, xerrors.Errorf("block metadata validation failed: %w", err)
+		}
+		logger.Info("Block metadata validation passed")
+	}
+
 	// Step 1: Get the first event ID at start height
 	startEventId, err := data.SourceStorage.GetFirstEventIdByBlockHeight(ctx, request.EventTag, request.StartHeight)
 	if err != nil {
@@ -436,6 +445,73 @@ func (a *Migrator) findLastEventIdInRange(ctx context.Context, sourceStorage met
 	}
 
 	return -1, storage.ErrItemNotFound
+}
+
+// validateBlockMetadataExists checks if block metadata exists in PostgreSQL for the height range
+// This is critical when skip-blocks is enabled, as events depend on block metadata via foreign keys
+func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *MigrationData, request *MigratorRequest) error {
+	logger := a.getLogger(ctx)
+
+	// Sample a few heights to check if block metadata exists
+	sampleHeights := []uint64{
+		request.StartHeight,
+		request.StartHeight + (request.EndHeight-request.StartHeight)/2,
+		request.EndHeight - 1,
+	}
+
+	missingHeights := []uint64{}
+
+	for _, height := range sampleHeights {
+		if height >= request.EndHeight {
+			continue
+		}
+
+		// Check if block metadata exists at this height
+		_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, height)
+		if err != nil {
+			if xerrors.Is(err, storage.ErrItemNotFound) {
+				missingHeights = append(missingHeights, height)
+				logger.Warn("Block metadata missing at height", zap.Uint64("height", height))
+			} else {
+				return xerrors.Errorf("failed to check block metadata at height %d: %w", height, err)
+			}
+		}
+	}
+
+	if len(missingHeights) > 0 {
+		return xerrors.Errorf("cannot migrate events with skip-blocks=true: block metadata missing at heights %v. "+
+			"Block metadata must be migrated first (run migration with skip-blocks=false) before migrating events only",
+			missingHeights)
+	}
+
+	// Additionally, check a few specific heights that events will reference
+	// Get some events to check their referenced block heights
+	sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, request.StartHeight)
+	if err != nil && !xerrors.Is(err, storage.ErrItemNotFound) {
+		return xerrors.Errorf("failed to get sample events for validation: %w", err)
+	}
+
+	if len(sourceEvents) > 0 {
+		// Check first few events to see if their block metadata exists
+		checkCount := 3
+		if len(sourceEvents) < checkCount {
+			checkCount = len(sourceEvents)
+		}
+
+		for i := 0; i < checkCount; i++ {
+			event := sourceEvents[i]
+			_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, event.BlockHeight)
+			if err != nil {
+				if xerrors.Is(err, storage.ErrItemNotFound) {
+					return xerrors.Errorf("cannot migrate events with skip-blocks=true: block metadata missing for event at height %d. "+
+						"Block metadata must be migrated first before migrating events", event.BlockHeight)
+				}
+				return xerrors.Errorf("failed to validate block metadata for event at height %d: %w", event.BlockHeight, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 const (
