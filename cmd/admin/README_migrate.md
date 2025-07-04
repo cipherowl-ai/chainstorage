@@ -82,6 +82,33 @@ For each height in the range:
 3. **Establish foreign key relationships** to migrated block metadata
 4. **Handle missing events gracefully** (logged as debug)
 
+**CRITICAL REQUIREMENT for Events-Only Migration:**
+When using `--skip-blocks` (events-only migration), the corresponding block metadata **must already exist** in PostgreSQL. Events depend on block metadata through foreign key constraints (`block_events.block_metadata_id` → `block_metadata.id`). 
+
+If block metadata is missing, the migration will fail with an error. To resolve this:
+1. First run migration with `--skip-events` to migrate block metadata
+2. Then run migration with `--skip-blocks` to migrate events
+
+```bash
+# Step 1: Migrate blocks first
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=1000000 \
+  --end-height=1001000 \
+  --skip-events
+
+# Step 2: Migrate events (now that block metadata exists)
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=1000000 \
+  --end-height=1001000 \
+  --skip-blocks
+```
+
 ## PostgreSQL Schema Design
 
 ### Block Storage Tables
@@ -208,6 +235,9 @@ go run cmd/admin/*.go migrate \
 
 ### Event-Only Migration  
 ```bash
+# IMPORTANT: Block metadata must already exist in PostgreSQL!
+# Run this ONLY after blocks have been migrated for this height range
+
 # Migrate only events (requires blocks already migrated)
 go run cmd/admin/*.go migrate \
   --env=local \
@@ -217,6 +247,30 @@ go run cmd/admin/*.go migrate \
   --end-height=50001000 \
   --skip-blocks \
   --event-tag=2
+```
+
+### Two-Step Migration (Recommended for Large Ranges)
+```bash
+# Step 1: Migrate block metadata only
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=18000000 \
+  --end-height=18001000 \
+  --tag=1 \
+  --skip-events
+
+# Step 2: Migrate events only (now that blocks exist)
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=18000000 \
+  --end-height=18001000 \
+  --tag=1 \
+  --event-tag=3 \
+  --skip-blocks
 ```
 
 ### Large Range with Custom Batch Size
