@@ -23,11 +23,11 @@ aws:
     transaction_table: example_chainstorage_transactions_table_{{blockchain}}_{{network}}
   postgres:
     host: localhost # Override with CHAINSTORAGE_AWS_POSTGRES_HOST for non-dev environments
-    port: 5432
+    port: 5433
     user: "" # Set via CHAINSTORAGE_AWS_POSTGRES_USER env var for security
     password: "" # Set via CHAINSTORAGE_AWS_POSTGRES_PASSWORD env var for security
     database: chainstorage_{{blockchain}}_{{network}}
-    ssl_mode: require
+    ssl_mode: require # Use 'require' for production, 'disable' for local development
     max_connections: 25 # Connection pool maximum size
     min_connections: 5  # Connection pool minimum size
     connect_timeout: 30s     # Connection establishment timeout

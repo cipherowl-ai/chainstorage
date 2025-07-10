@@ -23,6 +23,9 @@
 - [Development](#development)
   - [Running Server](#running-server)
   - [Running with PostgreSQL](#running-with-postgresql)
+  - [PostgreSQL Role-Based Setup (Recommended)](#postgresql-role-based-setup-recommended)
+  - [Local Development Setup](#local-development-setup)
+  - [Admin CLI](#admin-cli)
   - [AWS localstack](#aws-localstack)
   - [Temporal Workflow](#temporal-workflow)
 - [Failover](#failover)
@@ -518,6 +521,118 @@ ChainStorage will automatically create the necessary database schema and run mig
 - `block_metadata` - Block metadata and headers
 - `canonical_blocks` - Canonical chain state
 - `block_events` - Blockchain event log
+
+### PostgreSQL Role-Based Setup (Recommended)
+
+ChainStorage supports role-based PostgreSQL access for enhanced security and separation of concerns.
+
+#### Quick Setup with Docker Compose
+
+The easiest way to get started with role-based PostgreSQL:
+
+```shell
+# Start all services including PostgreSQL with roles
+docker-compose -f docker-compose-local-dev.yml up -d
+
+# Load role-based environment variables
+source scripts/postgres-roles-local.env
+
+# Initialize database for your specific network
+go run ./cmd/admin setup-postgres \
+  --blockchain ethereum \
+  --network mainnet \
+  --env local \
+  --master-user postgres \
+  --master-password postgres \
+  --host localhost \
+  --port 5433
+
+# Start server with role-based config
+make server
+```
+
+#### Role-Based Architecture
+
+ChainStorage uses three distinct PostgreSQL roles:
+
+| Role | Purpose | Permissions | Used By |
+|------|---------|-------------|---------|
+| `postgres` | Master user | Full access | Database administration |
+| `chainstorage_worker` | Data ingestion | Read/Write | Worker services, backfill workflows |
+| `chainstorage_server` | Data serving | Read-only | API server, streaming services |
+
+#### Environment Variables for Role-Based Setup
+
+```shell
+# Master credentials (for admin operations)
+export CHAINSTORAGE_AWS_POSTGRES_MASTER_USER="postgres"
+export CHAINSTORAGE_AWS_POSTGRES_MASTER_PASSWORD="postgres"
+
+# Worker credentials (for data ingestion)
+export CHAINSTORAGE_AWS_POSTGRES_WORKER_USER="chainstorage_worker"
+export CHAINSTORAGE_AWS_POSTGRES_WORKER_PASSWORD="chainstorage_worker"
+
+# Server credentials (for data serving)
+export CHAINSTORAGE_AWS_POSTGRES_SERVER_USER="chainstorage_server"
+export CHAINSTORAGE_AWS_POSTGRES_SERVER_PASSWORD="chainstorage_server"
+
+# Connection settings
+export CHAINSTORAGE_AWS_POSTGRES_HOST="localhost"
+export CHAINSTORAGE_AWS_POSTGRES_PORT="5433"
+export CHAINSTORAGE_AWS_POSTGRES_SSL_MODE="disable"
+export CHAINSTORAGE_STORAGE_TYPE_META="POSTGRES"
+```
+
+### Local Development Setup
+
+#### Complete Local Environment
+
+Start the full local development stack:
+
+```shell
+# Start all services (PostgreSQL, Temporal, LocalStack)
+make localstack
+
+# Load environment variables
+source scripts/postgres-roles-local.env
+
+#### Available Commands
+
+**Database Operations:**
+```shell
+# Set up PostgreSQL database and roles for a new network
+go run ./cmd/admin setup-postgres \
+  --blockchain ethereum \
+  --network mainnet \
+  --env local \
+  --master-user postgres \
+  --master-password postgres \
+  --host localhost \
+  --port 5433
+
+# Initialize databases from AWS Secrets Manager (production)
+go run ./cmd/admin db-init \
+  --secret-name chainstorage/db-init/prod \
+  --aws-region us-east-1
+
+# Migrate data from DynamoDB to PostgreSQL
+go run ./cmd/admin migrate \
+  --start-height=1000000 \
+  --end-height=1001000 \
+  --tag=1 \
+  --event-tag=0 \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --env=local
+```
+
+#### Command Reference
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `setup-postgres` | Create database and roles | `setup-postgres --master-user postgres --master-password postgres` |
+| `db-init` | Initialize from AWS Secrets Manager | `db-init --secret-name chainstorage/db-init/prod` |
+| `migrate` | Migrate data between storage | `migrate --start-height 1000000 --end-height 1001000` |
 
 ### AWS localstack
 
