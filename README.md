@@ -522,66 +522,68 @@ ChainStorage will automatically create the necessary database schema and run mig
 - `canonical_blocks` - Canonical chain state
 - `block_events` - Blockchain event log
 
-### PostgreSQL Role-Based Setup (Recommended)
+### PostgreSQL Setup
 
-ChainStorage supports role-based PostgreSQL access for enhanced security and separation of concerns.
+ChainStorage supports PostgreSQL as an alternative to DynamoDB for metadata storage with role-based access for enhanced security.
 
-#### Quick Setup with Docker Compose
+#### Local Development
 
-The easiest way to get started with role-based PostgreSQL:
+**Quick Start:**
+```bash
+# Start PostgreSQL with automatic database initialization
+docker-compose -f docker-compose-local-dev.yml up -d chainstorage-postgres
+```
 
-```shell
-# Start all services including PostgreSQL with roles
-docker-compose -f docker-compose-local-dev.yml up -d
+This automatically creates:
+- Shared `chainstorage_worker` and `chainstorage_server` roles
+- Databases for all supported networks (ethereum_mainnet, bitcoin_mainnet, etc.)
+- Proper permissions (worker: read-write, server: read-only)
 
-# Load role-based environment variables
-source scripts/postgres-roles-local.env
+**Default Credentials:**
+- Worker: `chainstorage_worker` / `worker_password`
+- Server: `chainstorage_server` / `server_password`
 
-# Initialize database for your specific network
-go run ./cmd/admin setup-postgres \
+**Manual Setup:**
+```bash
+chainstorage admin setup-postgres \
   --blockchain ethereum \
   --network mainnet \
   --env local \
   --master-user postgres \
   --master-password postgres \
-  --host localhost \
-  --port 5433
-
-# Start server with role-based config
-make server
+  --worker-password worker_password \
+  --server-password server_password
 ```
 
-#### Role-Based Architecture
+#### Production Setup
 
-ChainStorage uses three distinct PostgreSQL roles:
+In production, databases are initialized using the `db-init` command:
 
-| Role | Purpose | Permissions | Used By |
-|------|---------|-------------|---------|
-| `postgres` | Master user | Full access | Database administration |
-| `chainstorage_worker` | Data ingestion | Read/Write | Worker services, backfill workflows |
-| `chainstorage_server` | Data serving | Read-only | API server, streaming services |
+```bash
+# Connect to admin pod
+kubectl exec -it deploy/chainstorage-admin-dev-console -c chainstorage-admin -- /bin/bash
 
-#### Environment Variables for Role-Based Setup
-
-```shell
-# Master credentials (for admin operations)
-export CHAINSTORAGE_AWS_POSTGRES_MASTER_USER="postgres"
-export CHAINSTORAGE_AWS_POSTGRES_MASTER_PASSWORD="postgres"
-
-# Worker credentials (for data ingestion)
-export CHAINSTORAGE_AWS_POSTGRES_WORKER_USER="chainstorage_worker"
-export CHAINSTORAGE_AWS_POSTGRES_WORKER_PASSWORD="chainstorage_worker"
-
-# Server credentials (for data serving)
-export CHAINSTORAGE_AWS_POSTGRES_SERVER_USER="chainstorage_server"
-export CHAINSTORAGE_AWS_POSTGRES_SERVER_PASSWORD="chainstorage_server"
-
-# Connection settings
-export CHAINSTORAGE_AWS_POSTGRES_HOST="localhost"
-export CHAINSTORAGE_AWS_POSTGRES_PORT="5433"
-export CHAINSTORAGE_AWS_POSTGRES_SSL_MODE="disable"
-export CHAINSTORAGE_STORAGE_TYPE_META="POSTGRES"
+# Initialize database for ethereum-mainnet
+./admin db-init --blockchain ethereum --network mainnet --env dev
 ```
+
+The `db-init` command:
+1. Reads master credentials from environment variables (injected by Kubernetes)
+2. Fetches network-specific credentials from AWS Secrets Manager (`chainstorage/db-creds/{env}`)
+3. Creates the database (e.g., `chainstorage_ethereum_mainnet`)
+4. Creates network-specific users with passwords from the secret
+5. Grants appropriate permissions
+
+#### Database Naming Convention
+
+Databases follow the pattern: `chainstorage_{blockchain}_{network}`
+
+Examples:
+- `chainstorage_ethereum_mainnet`
+- `chainstorage_bitcoin_mainnet`
+- `chainstorage_polygon_testnet`
+
+Note: Hyphens in blockchain/network names are replaced with underscores.
 
 ### Local Development Setup
 
@@ -616,14 +618,12 @@ go run ./cmd/admin db-init \
   --aws-region us-east-1
 
 # Migrate data from DynamoDB to PostgreSQL
-go run ./cmd/admin migrate \
-  --start-height=1000000 \
-  --end-height=1001000 \
-  --tag=1 \
-  --event-tag=0 \
-  --blockchain=ethereum \
-  --network=mainnet \
-  --env=local
+chainstorage admin migrate-dynamodb-to-postgres \
+  --blockchain ethereum \
+  --network mainnet \
+  --env local \
+  --start-height 1000000 \
+  --end-height 1001000
 ```
 
 #### Command Reference
@@ -631,8 +631,8 @@ go run ./cmd/admin migrate \
 | Command | Description | Example |
 |---------|-------------|---------|
 | `setup-postgres` | Create database and roles | `setup-postgres --master-user postgres --master-password postgres` |
-| `db-init` | Initialize from AWS Secrets Manager | `db-init --secret-name chainstorage/db-init/prod` |
-| `migrate` | Migrate data between storage | `migrate --start-height 1000000 --end-height 1001000` |
+| `db-init` | Initialize from AWS Secrets Manager | `db-init --blockchain ethereum --network mainnet --env dev` |
+| `migrate-dynamodb-to-postgres` | Migrate data from DynamoDB to PostgreSQL | `migrate-dynamodb-to-postgres --start-height 1000000 --end-height 1001000` |
 
 ### AWS localstack
 

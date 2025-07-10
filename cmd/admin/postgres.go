@@ -18,7 +18,9 @@ const (
 	hostFlag           = "host"
 	portFlag           = "port"
 	workerUserFlag     = "worker-user"
+	workerPassFlag     = "worker-password"
 	serverUserFlag     = "server-user"
+	serverPassFlag     = "server-password"
 	sslModeFlag        = "ssl-mode"
 	dbNameFlag         = "db-name"
 	connectTimeoutFlag = "connect-timeout"
@@ -70,7 +72,15 @@ Example usage:
 			if err != nil {
 				return err
 			}
+			workerPassword, err := cmd.Flags().GetString(workerPassFlag)
+			if err != nil {
+				return err
+			}
 			serverUser, err := cmd.Flags().GetString(serverUserFlag)
+			if err != nil {
+				return err
+			}
+			serverPassword, err := cmd.Flags().GetString(serverPassFlag)
 			if err != nil {
 				return err
 			}
@@ -103,8 +113,14 @@ Example usage:
 			if workerUser == "" {
 				return xerrors.New("worker-user is required")
 			}
+			if workerPassword == "" {
+				return xerrors.New("worker-password is required")
+			}
 			if serverUser == "" {
 				return xerrors.New("server-user is required")
+			}
+			if serverPassword == "" {
+				return xerrors.New("server-password is required")
 			}
 			if workerUser == serverUser {
 				return xerrors.New("worker-user and server-user must be different")
@@ -140,7 +156,7 @@ Example usage:
 			fmt.Printf("   Environment: %s\n", commonFlags.env)
 			fmt.Printf("\n")
 
-			return postgres.SetupDatabase(context.Background(), masterCfg, workerUser, serverUser, dbName)
+			return postgres.SetupDatabase(context.Background(), masterCfg, workerUser, workerPassword, serverUser, serverPassword, dbName)
 		},
 	}
 
@@ -150,13 +166,21 @@ Example usage:
 	cmd.Flags().String(hostFlag, "localhost", "PostgreSQL host")
 	cmd.Flags().Int(portFlag, 5432, "PostgreSQL port")
 	cmd.Flags().String(workerUserFlag, "chainstorage_worker", "Name for the read/write worker role")
+	cmd.Flags().String(workerPassFlag, "", "Password for the worker role")
 	cmd.Flags().String(serverUserFlag, "chainstorage_server", "Name for the read-only server role")
+	cmd.Flags().String(serverPassFlag, "", "Password for the server role")
 	cmd.Flags().String(dbNameFlag, "", "Directly specify the database name to create (overrides default naming)")
 	cmd.Flags().String(sslModeFlag, "disable", "PostgreSQL SSL mode (disable, require, verify-ca, verify-full)")
 	cmd.Flags().Duration(connectTimeoutFlag, 30*time.Second, "PostgreSQL connection timeout")
 
 	// Mark required flags
 	if err := cmd.MarkFlagRequired(masterPassFlag); err != nil {
+		return nil
+	}
+	if err := cmd.MarkFlagRequired(workerPassFlag); err != nil {
+		return nil
+	}
+	if err := cmd.MarkFlagRequired(serverPassFlag); err != nil {
 		return nil
 	}
 

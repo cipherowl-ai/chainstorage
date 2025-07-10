@@ -32,7 +32,7 @@ aws:
     port: 5433
     ssl_mode: require
     statement_timeout: 60s
-    user: ""
+    user: cs_story_mainnet_worker
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
