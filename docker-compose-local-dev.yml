@@ -1,7 +1,8 @@
 version: "3"
 volumes:
   localstack_data: {}
-  postgres_data: {}
+  temporal_postgres_data: {}
+  chainstorage_postgres_data: {}
 services:
   localstack:
     image: localstack/localstack:3.1.0
@@ -19,21 +20,32 @@ services:
       - ./bin/localstack:/docker-entrypoint-initaws.d
       - ./bin/localstack/policies:/policies
       - ./dev-data/localstack:/var/lib/localstack
-  postgresql:
+  temporal-postgres:
     image: postgres:15.6-alpine
     ports:
-      - ${CHAINSTORAGE_TEMPORAL_POSTGRES_PORT:-5432}:5432
+      - ${TEMPORAL_POSTGRES_PORT:-5432}:5432
     environment:
       - POSTGRES_USER=temporal
       - POSTGRES_PASSWORD=temporal
       - POSTGRES_DB=temporal
     volumes:
-      - ./dev-data/pg:/var/lib/postgresql/data
-      - ./scripts/init-postgres.sh:/docker-entrypoint-initdb.d/init-postgres.sh
+      - ./dev-data/temporal-pg:/var/lib/postgresql/data
+      - ./scripts/init-temporal-postgres.sh:/docker-entrypoint-initdb.d/init-temporal-postgres.sh
+
+  chainstorage-postgres:
+    image: postgres:15.6-alpine
+    ports:
+      - ${CHAINSTORAGE_POSTGRES_PORT:-5433}:5432
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - ./dev-data/chainstorage-pg:/var/lib/postgresql/data
+      - ./scripts/init-chainstorage-postgres.sh:/docker-entrypoint-initdb.d/init-chainstorage-postgres.sh
+
   temporal:
     image: temporalio/auto-setup:1.22.4
-    depends_on:
-      - postgresql
     ports:
       - 7233:7233
     labels:
@@ -43,9 +55,11 @@ services:
       - DB_PORT=5432
       - POSTGRES_USER=temporal
       - POSTGRES_PWD=temporal
-      - POSTGRES_SEEDS=postgresql
+      - POSTGRES_SEEDS=temporal-postgres
       - USE_HOSTNAME_IP=true
     restart: always
+    depends_on:
+      - temporal-postgres
   temporal-ui:
     image: temporalio/ui:2.23.0
     ports:
@@ -104,3 +118,6 @@ services:
   #     - temporal
   #   restart: always
   #   network_mode: host
+
+# SETUP: Just run 'docker-compose -f docker-compose-local-dev.yml up -d'
+# Everything is automatically set up - databases, roles, and permissions

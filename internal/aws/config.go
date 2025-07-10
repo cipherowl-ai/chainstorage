@@ -24,7 +24,7 @@ func NewConfig(params ConfigParams) *aws.Config {
 		cfg.Credentials = credentials.NewStaticCredentials("THESE", "ARE", "IGNORED")
 		cfg.S3ForcePathStyle = aws.Bool(true)
 		// TODO, how to dynamically set the endpoint?
-		cfg.Endpoint = aws.String("http://localstack:4566")
+		cfg.Endpoint = aws.String("http://localhost:4566")
 	}
 	return cfg
 }

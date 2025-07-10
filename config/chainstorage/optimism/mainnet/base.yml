@@ -29,7 +29,7 @@ aws:
     max_connections: 25
     min_connections: 5
     password: ""
-    port: 5432
+    port: 5433
     ssl_mode: require
     statement_timeout: 60s
     user: ""
