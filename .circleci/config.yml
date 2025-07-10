@@ -37,8 +37,9 @@ jobs:
               -w /home/circleci/chainstorage \
               -e CHAINSTORAGE_AWS_POSTGRES_HOST=postgres \
               -e CHAINSTORAGE_AWS_POSTGRES_PORT=5432 \
-              -e CHAINSTORAGE_AWS_POSTGRES_USER=cs_ethereum_mainnet_worker \
-              -e CHAINSTORAGE_AWS_POSTGRES_PASSWORD=cs_ethereum_mainnet_worker \
+              -e CHAINSTORAGE_AWS_POSTGRES_USER=postgres \
+              -e CHAINSTORAGE_AWS_POSTGRES_PASSWORD=postgres \
+              -e CHAINSTORAGE_AWS_POSTGRES_DATABASE=postgres \
               ${CIPHEROWL_ECR_URL}/cipherowl/circleci:1d37a87f73dd5dfb2c36b6ad25ab48ada1768717 \
               /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && \
                 echo '🔧 Test databases already set up by init script' && \
