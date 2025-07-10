@@ -156,10 +156,28 @@ func TestDerivedConfigValues(t *testing.T) {
 			Arn: "",
 		}
 
+		postgres := config.PostgresConfig{
+			Host:             cfg.AWS.Postgres.Host,
+			Port:             cfg.AWS.Postgres.Port,
+			Database:         cfg.AWS.Postgres.Database,
+			User:             cfg.AWS.Postgres.User,
+			Password:         cfg.AWS.Postgres.Password,
+			SSLMode:          cfg.AWS.Postgres.SSLMode,
+			MaxConnections:   cfg.AWS.Postgres.MaxConnections,
+			MinConnections:   cfg.AWS.Postgres.MinConnections,
+			MaxIdleTime:      cfg.AWS.Postgres.MaxIdleTime,
+			MaxLifetime:      cfg.AWS.Postgres.MaxLifetime,
+			ConnectTimeout:   cfg.AWS.Postgres.ConnectTimeout,
+			StatementTimeout: cfg.AWS.Postgres.StatementTimeout,
+			Schema:           cfg.AWS.Postgres.Schema,
+			TablePrefix:      cfg.AWS.Postgres.TablePrefix,
+		}
+
 		expectedAWS := config.AwsConfig{
 			Region:                 "us-east-1",
 			Bucket:                 fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
 			DynamoDB:               dynamoDB,
+			Postgres:               postgres,
 			IsLocalStack:           true,
 			IsResetLocal:           true,
 			PresignedUrlExpiration: 30 * time.Minute,

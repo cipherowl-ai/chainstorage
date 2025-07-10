@@ -7,6 +7,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/firestore"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
+	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 )
 
 type (
@@ -29,5 +30,6 @@ func NewEventsToChainAdaptor() *EventsToChainAdaptor {
 var Module = fx.Options(
 	dynamodb.Module,
 	firestore.Module,
+	postgres.Module,
 	fx.Provide(internal.WithMetaStorageFactory),
 )

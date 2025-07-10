@@ -38,6 +38,7 @@ type (
 		crossValidator  *CrossValidator
 		eventBackfiller *EventBackfiller
 		replicator      *Replicator
+		migrator        *Migrator
 	}
 
 	ManagerParams struct {
@@ -53,6 +54,7 @@ type (
 		CrossValidator  *CrossValidator
 		EventBackfiller *EventBackfiller
 		Replicator      *Replicator
+		Migrator        *Migrator
 	}
 
 	InstrumentedRequest interface {
@@ -90,6 +92,7 @@ func NewManager(params ManagerParams) *Manager {
 		crossValidator:  params.CrossValidator,
 		eventBackfiller: params.EventBackfiller,
 		replicator:      params.Replicator,
+		migrator:        params.Migrator,
 	}
 
 	params.Lifecycle.Append(fx.Hook{

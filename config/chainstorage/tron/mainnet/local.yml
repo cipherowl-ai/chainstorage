@@ -8,31 +8,3 @@ storage_type:
   blob: S3
   dlq: SQS
   meta: DYNAMODB
-chain:
-  client:
-    additional:
-      endpoint_group: 
-        endpoints:
-        - name: trongrid-restapi
-          rps: 1
-          url: https://api.trongrid.io
-          weight: 1
-    consensus:
-      endpoint_group: ""
-    http_timeout: 0s
-    master:
-      endpoint_group: 
-        endpoints:
-        - name: trongrid-jsonrpc-m
-          rps: 1
-          url: https://api.trongrid.io/jsonrpc
-          weight: 1
-    slave:
-      endpoint_group: 
-        endpoints:
-        - name: trongrid-jsonrpc-s
-          rps: 1
-          url: https://api.trongrid.io/jsonrpc
-          weight: 1
-    validator:
-      endpoint_group: ""
