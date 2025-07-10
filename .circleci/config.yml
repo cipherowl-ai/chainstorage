@@ -36,8 +36,8 @@ jobs:
               --volumes-from chainstorage \
               -w /home/circleci/chainstorage \
               -e CHAINSTORAGE_AWS_POSTGRES_HOST=postgres \
-              -e CHAINSTORAGE_AWS_POSTGRES_USER=postgres \
-              -e CHAINSTORAGE_AWS_POSTGRES_PASSWORD=postgres \
+              -e CHAINSTORAGE_AWS_POSTGRES_USER=chainstorage_worker \
+              -e CHAINSTORAGE_AWS_POSTGRES_PASSWORD=chainstorage_worker \
               ${CIPHEROWL_ECR_URL}/cipherowl/circleci:1d37a87f73dd5dfb2c36b6ad25ab48ada1768717 \
               /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && \
                 echo '🔧 Test databases already set up by init script' && \
