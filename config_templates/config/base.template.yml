@@ -24,7 +24,7 @@ aws:
   postgres:
     host: localhost # Override with CHAINSTORAGE_AWS_POSTGRES_HOST for non-dev environments
     port: 5433
-    user: "" # Set via CHAINSTORAGE_AWS_POSTGRES_USER env var for security
+    user: "cs_{{blockchain}}_{{network}}_worker" # Dynamically generated username based on blockchain and network
     password: "" # Set via CHAINSTORAGE_AWS_POSTGRES_PASSWORD env var for security
     database: chainstorage_{{blockchain}}_{{network}}
     ssl_mode: require # Use 'require' for production, 'disable' for local development

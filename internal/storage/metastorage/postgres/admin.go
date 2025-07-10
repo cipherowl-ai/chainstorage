@@ -14,7 +14,7 @@ import (
 
 // SetupDatabase creates a database and roles for a new network in PostgreSQL
 // This function is intended to be called by administrators during setup
-func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, workerUser string, serverUser string, dbName string) error {
+func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, workerUser string, workerPassword string, serverUser string, serverPassword string, dbName string) error {
 	log.Printf("Setting up PostgreSQL database: %s with roles: %s (worker), %s (server)", dbName, workerUser, serverUser)
 
 	// Connect to the default 'postgres' database with master credentials
@@ -42,11 +42,19 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 
 	log.Printf("Successfully connected to PostgreSQL as master user")
 
-	// Create worker role with LOGIN capability
+	// Create worker role with LOGIN capability and password
 	log.Printf("Creating worker role: %s", workerUser)
-	if _, err := adminDB.ExecContext(ctx, fmt.Sprintf("CREATE ROLE %s WITH LOGIN", pq.QuoteIdentifier(workerUser))); err != nil {
+	workerQuery := fmt.Sprintf("CREATE ROLE %s WITH LOGIN PASSWORD %s",
+		pq.QuoteIdentifier(workerUser), pq.QuoteLiteral(workerPassword))
+	if _, err := adminDB.ExecContext(ctx, workerQuery); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "duplicate_object" {
-			log.Printf("Worker role %s already exists, skipping creation", workerUser)
+			log.Printf("Worker role %s already exists, updating password", workerUser)
+			// Update password for existing role
+			alterQuery := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD %s",
+				pq.QuoteIdentifier(workerUser), pq.QuoteLiteral(workerPassword))
+			if _, err := adminDB.ExecContext(ctx, alterQuery); err != nil {
+				return xerrors.Errorf("failed to update password for worker role %s: %w", workerUser, err)
+			}
 		} else {
 			return xerrors.Errorf("failed to create worker role %s: %w", workerUser, err)
 		}
@@ -54,11 +62,19 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 		log.Printf("Successfully created worker role: %s", workerUser)
 	}
 
-	// Create server role with LOGIN capability
+	// Create server role with LOGIN capability and password
 	log.Printf("Creating server role: %s", serverUser)
-	if _, err := adminDB.ExecContext(ctx, fmt.Sprintf("CREATE ROLE %s WITH LOGIN", pq.QuoteIdentifier(serverUser))); err != nil {
+	serverQuery := fmt.Sprintf("CREATE ROLE %s WITH LOGIN PASSWORD %s",
+		pq.QuoteIdentifier(serverUser), pq.QuoteLiteral(serverPassword))
+	if _, err := adminDB.ExecContext(ctx, serverQuery); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "duplicate_object" {
-			log.Printf("Server role %s already exists, skipping creation", serverUser)
+			log.Printf("Server role %s already exists, updating password", serverUser)
+			// Update password for existing role
+			alterQuery := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD %s",
+				pq.QuoteIdentifier(serverUser), pq.QuoteLiteral(serverPassword))
+			if _, err := adminDB.ExecContext(ctx, alterQuery); err != nil {
+				return xerrors.Errorf("failed to update password for server role %s: %w", serverUser, err)
+			}
 		} else {
 			return xerrors.Errorf("failed to create server role %s: %w", serverUser, err)
 		}
@@ -139,10 +155,7 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 	}
 
 	log.Printf("✅ Successfully set up database %s with roles %s (worker) and %s (server)", dbName, workerUser, serverUser)
-	log.Printf("📋 Next steps:")
-	log.Printf("   1. Set passwords for the roles: ALTER ROLE %s PASSWORD 'your_password';", workerUser)
-	log.Printf("   2. Set passwords for the roles: ALTER ROLE %s PASSWORD 'your_password';", serverUser)
-	log.Printf("   3. Update your application configuration to use these credentials")
+	log.Printf("📋 Database ready for use with the provided credentials")
 
 	return nil
 }

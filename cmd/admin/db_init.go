@@ -6,7 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"sort"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
@@ -18,118 +19,133 @@ import (
 	_ "github.com/lib/pq"
 )
 
-type DBInitSecret struct {
-	ClusterEndpoint string `json:"cluster_endpoint"`
-	ClusterPort     int    `json:"cluster_port"`
-	MasterUsername  string `json:"master_username"`
-	MasterPassword  string `json:"master_password"`
-	WorkerUsername  string `json:"worker_username"`
-	WorkerPassword  string `json:"worker_password"`
-	ServerUsername  string `json:"server_username"`
-	ServerPassword  string `json:"server_password"`
-	Networks        map[string]struct {
-		DatabaseName string `json:"database_name"`
-		Username     string `json:"username"`
-		Password     string `json:"password"`
-	} `json:"networks"`
-}
+// DBInitSecret is no longer needed - we parse flat JSON directly
 
 func newDBInitCommand() *cobra.Command {
 	var (
-		secretName string
-		awsRegion  string
-		dryRun     bool
+		awsRegion string
+		dryRun    bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "db-init",
-		Short: "Initialize databases and users from AWS Secrets Manager",
-		Long: `Initialize PostgreSQL databases and users based on configuration stored in AWS Secrets Manager.
+		Short: "Initialize database and users for a specific network from AWS Secrets Manager",
+		Long: `Initialize PostgreSQL database and users for a specific blockchain network based on configuration stored in AWS Secrets Manager.
 
 This command:
-1. Fetches database initialization configuration from AWS Secrets Manager
-2. Creates role-based users (worker with read/write, server with read-only)
-3. Creates a database for each configured network
-4. Sets up proper permissions for each role
-5. Is idempotent - can be run multiple times safely
+1. Uses master credentials from environment variables (injected by Kubernetes)
+2. Fetches network-specific credentials from AWS Secrets Manager
+3. Creates a database for the specified network
+4. Creates network-specific server (read-only) and worker (read-write) users
+5. Sets up proper permissions for each role
+6. Is idempotent - can be run multiple times safely
 
 The command must be run from within the Kubernetes cluster (e.g., admin pod) 
 with proper IAM role attached to access the secret.
 
 Example usage:
-  # Initialize databases for dev environment
-  chainstorage admin db-init --secret-name=chainstorage/db-init/dev
+  # Initialize database for ethereum-mainnet
+  chainstorage admin db-init --blockchain ethereum --network mainnet --env dev
 
   # Dry run to preview changes
-  chainstorage admin db-init --secret-name=chainstorage/db-init/dev --dry-run
+  chainstorage admin db-init --blockchain ethereum --network mainnet --env dev --dry-run
 
   # Use specific AWS region
-  chainstorage admin db-init --secret-name=chainstorage/db-init/prod --aws-region=us-west-2`,
+  chainstorage admin db-init --blockchain ethereum --network mainnet --env prod --aws-region us-west-2`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDBInit(secretName, awsRegion, dryRun)
+			// Use commonFlags from common.go for blockchain, network, and env
+			return runDBInit(commonFlags.blockchain, commonFlags.network, commonFlags.env, awsRegion, dryRun)
 		},
 	}
 
-	cmd.Flags().StringVar(&secretName, "secret-name", "", "AWS Secrets Manager secret name")
 	cmd.Flags().StringVar(&awsRegion, "aws-region", "us-east-1", "AWS region")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Preview changes without applying them")
-
-	if err := cmd.MarkFlagRequired("secret-name"); err != nil {
-		return nil
-	}
 
 	return cmd
 }
 
-func runDBInit(secretName, awsRegion string, dryRun bool) error {
+func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 	ctx := context.Background()
 
-	log.Printf("🚀 Starting database initialization...")
-	log.Printf("   Secret: %s", secretName)
+	log.Printf("🚀 Starting database initialization for %s-%s...", blockchain, network)
+	log.Printf("   Environment: %s", env)
 	log.Printf("   Region: %s", awsRegion)
 	log.Printf("   Dry-run: %v", dryRun)
 	log.Printf("")
 
+	// Get master credentials from environment variables
+	masterHost := os.Getenv("CHAINSTORAGE_CLUSTER_ENDPOINT")
+	masterPortStr := os.Getenv("CHAINSTORAGE_CLUSTER_PORT")
+	masterUser := os.Getenv("CHAINSTORAGE_MASTER_USERNAME")
+	masterPassword := os.Getenv("CHAINSTORAGE_MASTER_PASSWORD")
+
+	if masterHost == "" || masterPortStr == "" || masterUser == "" || masterPassword == "" {
+		return xerrors.New("missing required environment variables: CHAINSTORAGE_CLUSTER_ENDPOINT, CHAINSTORAGE_CLUSTER_PORT, CHAINSTORAGE_MASTER_USERNAME, CHAINSTORAGE_MASTER_PASSWORD")
+	}
+
+	var masterPort int
+	if _, err := fmt.Sscanf(masterPortStr, "%d", &masterPort); err != nil {
+		return xerrors.Errorf("invalid port number: %s", masterPortStr)
+	}
+
+	// Construct secret name
+	secretName := fmt.Sprintf("chainstorage/db-creds/%s", env)
+
 	// Fetch secret from AWS Secrets Manager
-	secret, err := fetchSecret(ctx, secretName, awsRegion)
+	secretData, err := fetchSecret(ctx, secretName, awsRegion)
 	if err != nil {
 		return xerrors.Errorf("failed to fetch secret: %w", err)
 	}
 
-	log.Printf("✅ Successfully fetched secret from AWS Secrets Manager")
-	log.Printf("   Cluster: %s:%d", secret.ClusterEndpoint, secret.ClusterPort)
-	log.Printf("   Networks to configure: %d", len(secret.Networks))
+	// Construct lookup keys for this network
+	// Replace hyphens with underscores for the key lookup
+	networkKey := strings.ReplaceAll(fmt.Sprintf("%s_%s", blockchain, network), "-", "_")
+
+	// Extract network-specific values from flat secret
+	dbName, err := getStringFromSecret(secretData, fmt.Sprintf("%s_database_name", networkKey))
+	if err != nil {
+		return xerrors.Errorf("failed to get database name: %w", err)
+	}
+
+	serverUsername, err := getStringFromSecret(secretData, fmt.Sprintf("%s_server_username", networkKey))
+	if err != nil {
+		return xerrors.Errorf("failed to get server username: %w", err)
+	}
+
+	serverPassword, err := getStringFromSecret(secretData, fmt.Sprintf("%s_server_password", networkKey))
+	if err != nil {
+		return xerrors.Errorf("failed to get server password: %w", err)
+	}
+
+	workerUsername, err := getStringFromSecret(secretData, fmt.Sprintf("%s_worker_username", networkKey))
+	if err != nil {
+		return xerrors.Errorf("failed to get worker username: %w", err)
+	}
+
+	workerPassword, err := getStringFromSecret(secretData, fmt.Sprintf("%s_worker_password", networkKey))
+	if err != nil {
+		return xerrors.Errorf("failed to get worker password: %w", err)
+	}
+
+	log.Printf("✅ Successfully fetched credentials from AWS Secrets Manager")
+	log.Printf("   Database: %s", dbName)
+	log.Printf("   Server user: %s", serverUsername)
+	log.Printf("   Worker user: %s", workerUsername)
 	log.Printf("")
 
 	if dryRun {
 		log.Printf("🔍 DRY RUN MODE - No changes will be made")
 		log.Printf("")
-		log.Printf("Would create users:")
-		log.Printf("   - %s (worker with CREATEDB privilege)", secret.WorkerUsername)
-		log.Printf("   - %s (server with read-only access)", secret.ServerUsername)
-		log.Printf("")
-		log.Printf("Would create databases:")
-
-		// Sort networks for consistent output
-		var networkNames []string
-		for network := range secret.Networks {
-			networkNames = append(networkNames, network)
-		}
-		sort.Strings(networkNames)
-
-		for _, network := range networkNames {
-			cfg := secret.Networks[network]
-			log.Printf("   - %s for network %s", cfg.DatabaseName, network)
-			if cfg.Username != "" {
-				log.Printf("     with user: %s", cfg.Username)
-			}
-		}
+		log.Printf("Would create:")
+		log.Printf("   - Database: %s", dbName)
+		log.Printf("   - User: %s (read-only access)", serverUsername)
+		log.Printf("   - User: %s (read-write access)", workerUsername)
 		return nil
 	}
 
 	// Connect to PostgreSQL as master user
 	masterDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=postgres sslmode=require",
-		secret.ClusterEndpoint, secret.ClusterPort, secret.MasterUsername, secret.MasterPassword)
+		masterHost, masterPort, masterUser, masterPassword)
 
 	db, err := sql.Open("postgres", masterDSN)
 	if err != nil {
@@ -154,93 +170,61 @@ func runDBInit(secretName, awsRegion string, dryRun bool) error {
 	log.Printf("✅ Successfully connected to PostgreSQL cluster")
 	log.Printf("")
 
-	// Create role-based users
-	log.Printf("Creating role-based users...")
+	// Create users
+	log.Printf("Creating users...")
 
-	if err := createUser(db, secret.WorkerUsername, secret.WorkerPassword, true); err != nil {
-		return xerrors.Errorf("failed to create worker user %s: %w", secret.WorkerUsername, err)
+	if err := createUser(db, workerUsername, workerPassword, true); err != nil {
+		return xerrors.Errorf("failed to create worker user %s: %w", workerUsername, err)
 	}
-	log.Printf("   ✓ Created/verified worker user: %s", secret.WorkerUsername)
+	log.Printf("   ✓ Created/verified worker user: %s", workerUsername)
 
-	if err := createUser(db, secret.ServerUsername, secret.ServerPassword, false); err != nil {
-		return xerrors.Errorf("failed to create server user %s: %w", secret.ServerUsername, err)
+	if err := createUser(db, serverUsername, serverPassword, false); err != nil {
+		return xerrors.Errorf("failed to create server user %s: %w", serverUsername, err)
 	}
-	log.Printf("   ✓ Created/verified server user: %s", secret.ServerUsername)
+	log.Printf("   ✓ Created/verified server user: %s", serverUsername)
 	log.Printf("")
 
-	// Process each network
-	log.Printf("Setting up network databases...")
-	successCount := 0
-
-	// Sort networks for consistent processing order
-	var networkNames []string
-	for network := range secret.Networks {
-		networkNames = append(networkNames, network)
+	// Create database
+	log.Printf("Creating database...")
+	if err := createDatabase(db, dbName, workerUsername); err != nil {
+		return xerrors.Errorf("failed to create database %s: %w", dbName, err)
 	}
-	sort.Strings(networkNames)
+	log.Printf("   ✓ Created/verified database: %s", dbName)
 
-	for _, network := range networkNames {
-		netConfig := secret.Networks[network]
-		log.Printf("")
-		log.Printf("Processing network: %s", network)
+	// Grant permissions
+	log.Printf("Setting up permissions...")
 
-		// Create database
-		if err := createDatabase(db, netConfig.DatabaseName, secret.WorkerUsername); err != nil {
-			return xerrors.Errorf("failed to create database %s: %w", netConfig.DatabaseName, err)
-		}
-		log.Printf("   ✓ Created/verified database: %s", netConfig.DatabaseName)
-
-		// Grant CONNECT permission to server user
-		if err := grantConnectPermission(db, netConfig.DatabaseName, secret.ServerUsername); err != nil {
-			return xerrors.Errorf("failed to grant CONNECT permission on %s to %s: %w",
-				netConfig.DatabaseName, secret.ServerUsername, err)
-		}
-
-		// Connect to the network database to grant permissions
-		netDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
-			secret.ClusterEndpoint, secret.ClusterPort, secret.MasterUsername,
-			secret.MasterPassword, netConfig.DatabaseName)
-
-		netDB, err := sql.Open("postgres", netDSN)
-		if err != nil {
-			return xerrors.Errorf("failed to connect to database %s: %w", netConfig.DatabaseName, err)
-		}
-		defer func() {
-			if closeErr := netDB.Close(); closeErr != nil {
-				log.Printf("Warning: failed to close network database connection: %v", closeErr)
-			}
-		}()
-
-		// Grant permissions to server user
-		if err := grantReadOnlyAccess(netDB, secret.ServerUsername, secret.WorkerUsername); err != nil {
-			return xerrors.Errorf("failed to grant permissions on %s: %w", netConfig.DatabaseName, err)
-		}
-		log.Printf("   ✓ Granted read-only access to: %s", secret.ServerUsername)
-
-		// Create network-specific user if specified
-		if netConfig.Username != "" && netConfig.Username != secret.WorkerUsername && netConfig.Username != secret.ServerUsername {
-			if err := createUser(db, netConfig.Username, netConfig.Password, false); err != nil {
-				return xerrors.Errorf("failed to create user %s: %w", netConfig.Username, err)
-			}
-			log.Printf("   ✓ Created/verified network user: %s", netConfig.Username)
-
-			// Grant permissions to network-specific user
-			if err := grantConnectPermission(db, netConfig.DatabaseName, netConfig.Username); err != nil {
-				return xerrors.Errorf("failed to grant CONNECT permission to %s: %w", netConfig.Username, err)
-			}
-
-			if err := grantFullAccess(netDB, netConfig.Username); err != nil {
-				return xerrors.Errorf("failed to grant full access to %s: %w", netConfig.Username, err)
-			}
-			log.Printf("   ✓ Granted full access to network user: %s", netConfig.Username)
-		}
-
-		successCount++
+	// Grant CONNECT permission to server user
+	if err := grantConnectPermission(db, dbName, serverUsername); err != nil {
+		return xerrors.Errorf("failed to grant CONNECT permission on %s to %s: %w",
+			dbName, serverUsername, err)
 	}
+
+	// Connect to the network database to grant permissions
+	netDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+		masterHost, masterPort, masterUser, masterPassword, dbName)
+
+	netDB, err := sql.Open("postgres", netDSN)
+	if err != nil {
+		return xerrors.Errorf("failed to connect to database %s: %w", dbName, err)
+	}
+	defer func() {
+		if closeErr := netDB.Close(); closeErr != nil {
+			log.Printf("Warning: failed to close network database connection: %v", closeErr)
+		}
+	}()
+
+	// Grant permissions to server user
+	if err := grantReadOnlyAccess(netDB, serverUsername, workerUsername); err != nil {
+		return xerrors.Errorf("failed to grant permissions on %s: %w", dbName, err)
+	}
+	log.Printf("   ✓ Granted read-only access to: %s", serverUsername)
 
 	log.Printf("")
 	log.Printf("✅ Database initialization completed successfully!")
-	log.Printf("   Total networks configured: %d", successCount)
+	log.Printf("   Network: %s-%s", blockchain, network)
+	log.Printf("   Database: %s", dbName)
+	log.Printf("   Users created: %s (worker), %s (server)", workerUsername, serverUsername)
 	log.Printf("")
 	log.Printf("Next steps:")
 	log.Printf("   1. Deploy chainstorage worker pods to start data ingestion")
@@ -250,7 +234,7 @@ func runDBInit(secretName, awsRegion string, dryRun bool) error {
 	return nil
 }
 
-func fetchSecret(ctx context.Context, secretName, region string) (*DBInitSecret, error) {
+func fetchSecret(ctx context.Context, secretName, region string) (map[string]interface{}, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	if err != nil {
 		return nil, xerrors.Errorf("failed to load AWS config: %w", err)
@@ -267,12 +251,27 @@ func fetchSecret(ctx context.Context, secretName, region string) (*DBInitSecret,
 		return nil, xerrors.Errorf("failed to get secret value: %w", err)
 	}
 
-	var secret DBInitSecret
-	if err := json.Unmarshal([]byte(*result.SecretString), &secret); err != nil {
+	// Parse the flat JSON secret
+	var secretData map[string]interface{}
+	if err := json.Unmarshal([]byte(*result.SecretString), &secretData); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal secret: %w", err)
 	}
 
-	return &secret, nil
+	return secretData, nil
+}
+
+func getStringFromSecret(secret map[string]interface{}, key string) (string, error) {
+	value, ok := secret[key]
+	if !ok {
+		return "", xerrors.Errorf("key %s not found in secret", key)
+	}
+
+	strValue, ok := value.(string)
+	if !ok {
+		return "", xerrors.Errorf("value for key %s is not a string", key)
+	}
+
+	return strValue, nil
 }
 
 func createUser(db *sql.DB, username, password string, canCreateDB bool) error {
