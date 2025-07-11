@@ -48,13 +48,25 @@ type (
 	TronApiClientFactoryFn func(client jsonrpc.Client) internal.Client
 )
 
-type TronBlockTxInfoRequestData struct {
+type tronBlockNumRequestData struct {
 	Num uint64 `json:"num"`
+}
+
+type tronBlock struct {
+	BlockNumber  uint64   `json:"blockNumber"`
+	Transactions [][]byte `json:"transactions"`
 }
 
 var tronTxInfoMethod = &restapi.RequestMethod{
 	Name:       "GetTransactionInfoByBlockNum",
 	ParamsPath: "/wallet/gettransactioninfobyblocknum", // No parameter URls
+	Timeout:    6 * time.Second,
+	HTTPMethod: http.MethodPost,
+}
+
+var tronBlockTxMethod = &restapi.RequestMethod{
+	Name:       "GetBlockByNum",
+	ParamsPath: "/wallet/getblockbynum",
 	Timeout:    6 * time.Second,
 	HTTPMethod: http.MethodPost,
 }
@@ -112,27 +124,141 @@ func NewTronClientFactory(params TronClientParams) internal.ClientFactory {
 	})
 }
 
-func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethereum.EthereumBlockLit) ([][]byte, error) {
-	blockNumber := block.Number.Value()
-
-	requestData := TronBlockTxInfoRequestData{
-		Num: blockNumber,
-	}
+func (c *TronClient) makeTronHttpCall(ctx context.Context, httpMethod *restapi.RequestMethod, requestData tronBlockNumRequestData) ([]byte, error) {
 	postData, err := json.Marshal(requestData)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to Marshal Tron requestData: %w", err)
 	}
-	response, err := c.additionalClient.Call(ctx, tronTxInfoMethod, postData)
+	response, err := c.additionalClient.Call(ctx, httpMethod, postData)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to get Tron TransactionInfo: %w", err)
+		return nil, xerrors.Errorf("failed to call Tron API: %w", err)
 	}
-	var tmpResults []json.RawMessage
-	if err := json.Unmarshal(response, &tmpResults); err != nil {
+	return response, nil
+}
+
+func (c *TronClient) getBlockTxByNum(ctx context.Context, blockNumber uint64) ([]byte, error) {
+	requestData := tronBlockNumRequestData{
+		Num: blockNumber,
+	}
+	result, err := c.makeTronHttpCall(ctx, tronBlockTxMethod, requestData)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get Tron block: %w", err)
+	}
+	return result, nil
+}
+
+func (c *TronClient) getBlockTxInfoByNum(ctx context.Context, blockNumber uint64) ([]byte, error) {
+	requestData := tronBlockNumRequestData{
+		Num: blockNumber,
+	}
+	response, err := c.makeTronHttpCall(ctx, tronTxInfoMethod, requestData)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get Tron transaction info: %w", err)
+	}
+	return response, nil
+}
+
+func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethereum.EthereumBlockLit) ([][]byte, error) {
+	blockNumber := block.Number.Value()
+
+	// Get block transactions to extract types
+	blockTxData, err := c.getBlockTxByNum(ctx, blockNumber)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get block transactions: %w", err)
+	}
+
+	// Get transaction info
+	txInfoResponse, err := c.getBlockTxInfoByNum(ctx, blockNumber)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get transaction info: %w", err)
+	}
+
+	// Parse block data to extract transaction types by txID
+	txTypeMap, err := c.extractTransactionTypes(blockTxData)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to extract transaction types: %w", err)
+	}
+
+	// Merge txInfo with transaction types
+	results, err := c.mergeTxInfoWithTypes(txInfoResponse, txTypeMap)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to merge txInfo with types: %w", err)
+	}
+
+	return results, nil
+}
+
+// mergeTxInfoWithTypes parses txInfo response and adds transaction types based on txID matching
+func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[string]string) ([][]byte, error) {
+	// Parse txInfo response as array
+	var txInfoArray []json.RawMessage
+	if err := json.Unmarshal(txInfoResponse, &txInfoArray); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal TronTxInfo: %w", err)
 	}
-	results := make([][]byte, len(tmpResults))
-	for i, trace := range tmpResults {
-		results[i] = trace
+
+	// Merge each txInfo with its corresponding type
+	results := make([][]byte, 0, len(txInfoArray))
+	for _, txInfoBytes := range txInfoArray {
+		// Parse txInfo as map to allow dynamic field addition
+		var txInfo map[string]interface{}
+		if err := json.Unmarshal(txInfoBytes, &txInfo); err != nil {
+			return nil, xerrors.Errorf("failed to unmarshal txInfo: %w", err)
+		}
+
+		// Extract txID from txInfo (every transaction must have txID)
+		txID := txInfo["id"].(string)
+
+		// Add transaction type if found
+		if txType, exists := txTypeMap[txID]; exists {
+			txInfo["type"] = txType
+		}
+
+		// Re-serialize the modified txInfo
+		modifiedBytes, err := json.Marshal(txInfo)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to marshal modified txInfo: %w", err)
+		}
+
+		results = append(results, modifiedBytes)
 	}
+
 	return results, nil
+}
+
+// extractTransactionTypes extracts transaction types from block data, indexed by txID
+func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]string, error) {
+	if len(blockTxData) == 0 {
+		return make(map[string]string), nil
+	}
+
+	// Parse the block data
+	var blockData map[string]interface{}
+	if err := json.Unmarshal(blockTxData, &blockData); err != nil {
+		return nil, xerrors.Errorf("failed to unmarshal block data: %w", err)
+	}
+
+	txTypeMap := make(map[string]string)
+
+	// Extract transactions array
+	transactions, ok := blockData["transactions"].([]interface{})
+	if !ok {
+		return txTypeMap, nil // No transactions in block
+	}
+
+	for _, tx := range transactions {
+		txMap := tx.(map[string]interface{})
+
+		// Extract txID (every transaction must have txID)
+		txID := txMap["txID"].(string)
+
+		// Extract type from raw_data.contract[0].type
+		rawData := txMap["raw_data"].(map[string]interface{})
+		contracts := rawData["contract"].([]interface{})
+		contract := contracts[0].(map[string]interface{})
+		txType := contract["type"].(string)
+
+		txTypeMap[txID] = txType
+	}
+
+	return txTypeMap, nil
 }
