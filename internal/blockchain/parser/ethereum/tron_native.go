@@ -70,11 +70,7 @@ var TronTraceCallTypeMap = map[string]bool{
 	"DELEGATECALL": true,
 }
 
-func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
-	// Tron shares the same data schema as Ethereum since its an EVM chain except skip trace data
-	opts = append(opts, WithEthereumNodeType(types.EthereumNodeType_ARCHIVAL), WithTraceType(types.TraceType_PARITY))
-	return NewEthereumNativeParser(params, opts...)
-}
+const TronContractTypeUnknown = 999
 
 type TronCallValueInfo struct {
 	CallValue int64  `json:"callValue"`
@@ -112,6 +108,12 @@ type TronInternalTransaction struct {
 	Rejected          bool                `json:"rejected"`
 }
 
+func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
+	// Tron shares the same data schema as Ethereum since its an EVM chain except skip trace data
+	opts = append(opts, WithEthereumNodeType(types.EthereumNodeType_ARCHIVAL), WithTraceType(types.TraceType_PARITY))
+	return NewEthereumNativeParser(params, opts...)
+}
+
 func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.EthereumTransactionFlattenedTrace {
 	// only keep native values, ignore TRC10 token values
 	var nativeTokenValue int64
@@ -126,7 +128,7 @@ func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.Ethere
 	if err != nil {
 		note = ""
 	} else {
-		note = strings.ToUpper(string(noteBytes))
+		note = string(noteBytes)
 	}
 	rawType := strings.ToUpper(note)
 	trace := &api.EthereumTransactionFlattenedTrace{
@@ -256,7 +258,7 @@ func parseTronTxInfo(
 			tx.Type = typeValue
 		} else {
 			// If type is not found in map, set to 999 as default or log warning
-			tx.Type = 999
+			tx.Type = TronContractTypeUnknown
 		}
 	}
 	return nil

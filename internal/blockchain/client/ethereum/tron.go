@@ -201,8 +201,10 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 		}
 
 		// Extract txID from txInfo (every transaction must have txID)
-		txID := txInfo["id"].(string)
-
+		txID, ok := txInfo["id"].(string)
+		if !ok {
+			return nil, xerrors.Errorf("txInfo id is not a string or is missing: %+v", txInfo)
+		}
 		// Add transaction type if found
 		if txType, exists := txTypeMap[txID]; exists {
 			txInfo["type"] = txType
@@ -235,22 +237,49 @@ func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]str
 	txTypeMap := make(map[string]string)
 
 	// Extract transactions array
-	transactions, ok := blockData["transactions"].([]interface{})
+	transactions, ok := blockData["transactions"].([]any)
 	if !ok {
 		return txTypeMap, nil // No transactions in block
 	}
-
+	// Extract txID (every transaction must have txID)
 	for _, tx := range transactions {
-		txMap := tx.(map[string]interface{})
+		txMap, ok := tx.(map[string]any)
+		if !ok {
+			return nil, xerrors.Errorf("failed to assert transaction as map[string]interface{}: %+v", tx)
+		}
 
-		// Extract txID (every transaction must have txID)
-		txID := txMap["txID"].(string)
+		txID, ok := txMap["txID"].(string)
+		if !ok {
+			return nil, xerrors.Errorf("transaction is missing txID or it's not a string: %+v", txMap)
+		}
 
-		// Extract type from raw_data.contract[0].type
-		rawData := txMap["raw_data"].(map[string]interface{})
-		contracts := rawData["contract"].([]interface{})
-		contract := contracts[0].(map[string]interface{})
-		txType := contract["type"].(string)
+		rawDataVal, ok := txMap["raw_data"]
+		if !ok {
+			continue // Or return an error if raw_data is always expected
+		}
+		rawData, ok := rawDataVal.(map[string]any)
+		if !ok {
+			return nil, xerrors.Errorf("raw_data is not a map: %+v", rawDataVal)
+		}
+
+		contractsVal, ok := rawData["contract"]
+		if !ok {
+			continue
+		}
+		contracts, ok := contractsVal.([]any)
+		if !ok || len(contracts) == 0 {
+			continue
+		}
+
+		contract, ok := contracts[0].(map[string]any)
+		if !ok {
+			return nil, xerrors.Errorf("contract is not a map: %+v", contracts[0])
+		}
+
+		txType, ok := contract["type"].(string)
+		if !ok {
+			return nil, xerrors.Errorf("contract type is not a string: %+v", contract["type"])
+		}
 
 		txTypeMap[txID] = txType
 	}
