@@ -52,11 +52,6 @@ type tronBlockNumRequestData struct {
 	Num uint64 `json:"num"`
 }
 
-type tronBlock struct {
-	BlockNumber  uint64   `json:"blockNumber"`
-	Transactions [][]byte `json:"transactions"`
-}
-
 var tronTxInfoMethod = &restapi.RequestMethod{
 	Name:       "GetTransactionInfoByBlockNum",
 	ParamsPath: "/wallet/gettransactioninfobyblocknum", // No parameter URls

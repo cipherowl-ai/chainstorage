@@ -61,6 +61,15 @@ var TronContractTypeMap = map[string]uint64{
 	"CancelAllUnfreezeV2Contract":     59,
 }
 
+var TronTraceCallTypeMap = map[string]bool{
+	"CALL":         true,
+	"CREATE":       true,
+	"CREATE2":      true,
+	"STATICCALL":   true,
+	"CALLCODE":     true,
+	"DELEGATECALL": true,
+}
+
 func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
 	// Tron shares the same data schema as Ethereum since its an EVM chain except skip trace data
 	opts = append(opts, WithEthereumNodeType(types.EthereumNodeType_ARCHIVAL), WithTraceType(types.TraceType_PARITY))
@@ -112,16 +121,27 @@ func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.Ethere
 			nativeTokenValue += callValueInfoItem.CallValue
 		}
 	}
-
+	var note string
+	noteBytes, err := hex.DecodeString(itx.Note)
+	if err != nil {
+		note = ""
+	} else {
+		note = strings.ToUpper(string(noteBytes))
+	}
+	rawType := strings.ToUpper(note)
 	trace := &api.EthereumTransactionFlattenedTrace{
-		Type:          "CALL",
-		TraceType:     "CALL",
-		CallType:      "CALL",
+		Type:          rawType,
+		TraceType:     rawType,
 		From:          hexToTronAddress(itx.CallerAddress),
 		To:            hexToTronAddress(itx.TransferToAddress),
 		Value:         strconv.FormatInt(nativeTokenValue, 10),
 		TraceId:       itx.Hash,
 		CallValueInfo: convertTronCallValueInfo(itx.CallValueInfo),
+	}
+
+	if TronTraceCallTypeMap[rawType] {
+		trace.CallType = rawType
+		trace.TraceType = "CALL"
 	}
 	if itx.Rejected {
 		trace.Error = "Internal transaction is executed failed"
