@@ -1,5 +1,6 @@
 [
-    {
+    {   
+        "type": "TransferContract",
         "log": [
             {
                 "address": "a614f803b6fd780986a42c78ec9c7f77e6ded13c",
@@ -26,7 +27,8 @@
         "id": "d581afa9158fbed69fb10d6a2245ad45d912a3da03ff24d59f3d2f6df6fd9529",
         "contract_address": "41a614f803b6fd780986a42c78ec9c7f77e6ded13c"
     },
-    {
+    {   
+        "type": "TransferAssetContract",
         "log": [
             {
                 "address": "c60a6f5c81431c97ed01b61698b6853557f3afd4",

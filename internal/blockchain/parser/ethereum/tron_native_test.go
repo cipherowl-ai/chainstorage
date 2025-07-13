@@ -218,12 +218,12 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 			},
 		},
 		{
-			Type:             "CALL",
+			Type:             "UNDELEGATERESOURCEOFENERGY",
 			From:             "TU3kjFuhtEo42tsCBtfYUAZxoqQ4yuSLQ5",
 			To:               "TGzjkw66CtL49eKiQFDwJDuXG9HSQd69p2",
 			Value:            "822996311610",
-			TraceType:        "CALL",
-			CallType:         "CALL",
+			TraceType:        "UNDELEGATERESOURCEOFENERGY",
+			CallType:         "",
 			TraceId:          "14526162e31d969ef0dca9b902d51ecc0ffab87dc936dce62022f368119043af",
 			Status:           1,
 			BlockHash:        "0000000004034f5cd8946001c721db6457608ad887b3734c825d55826c3c3c87",
@@ -283,6 +283,7 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 			From:  "TDQFomPihdhP8Jzr2LMpdcXgg9qxKfZZmD",
 			To:    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
 			Index: 0,
+			Type:  1,
 			Receipt: &api.EthereumTransactionReceipt{
 				TransactionHash:   "d581afa9158fbed69fb10d6a2245ad45d912a3da03ff24d59f3d2f6df6fd9529",
 				BlockHash:         "0000000004034f5cd8946001c721db6457608ad887b3734c825d55826c3c3c87",
@@ -330,6 +331,7 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 			From:  "TNXC2YCSxhdxsVqhqu3gYZYme6n4i6T1C1",
 			To:    "TU2MJ5Veik1LRAgjeSzEdvmDYx7mefJZvd",
 			Index: 69,
+			Type:  2,
 			Receipt: &api.EthereumTransactionReceipt{
 				TransactionHash:   "e14935e6144007163609bb49292897ba81bf7ee93bf28ba4cc5ebd0d6b95f4b9",
 				BlockHash:         "0000000004034f5cd8946001c721db6457608ad887b3734c825d55826c3c3c87",
@@ -457,7 +459,7 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 		require.Equal(expected_tx.From, tx.From)
 		require.Equal(expected_tx.To, tx.To)
 		require.Equal(expected_tx.Index, tx.Index)
-
+		require.Equal(expected_tx.Type, tx.Type)
 		require.Equal(expected_tx.Receipt.From, tx.Receipt.From)
 		require.Equal(expected_tx.Receipt.To, tx.Receipt.To)
 		require.Equal(expected_tx.Receipt.TransactionHash, tx.Receipt.TransactionHash)

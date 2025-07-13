@@ -16,11 +16,61 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
-	// Tron shares the same data schema as Ethereum since its an EVM chain except skip trace data
-	opts = append(opts, WithEthereumNodeType(types.EthereumNodeType_ARCHIVAL), WithTraceType(types.TraceType_PARITY))
-	return NewEthereumNativeParser(params, opts...)
+// contractTypeMap maps contract type strings to their corresponding enum values
+var TronContractTypeMap = map[string]uint64{
+	"AccountCreateContract":           0,
+	"TransferContract":                1,
+	"TransferAssetContract":           2,
+	"VoteAssetContract":               3,
+	"VoteWitnessContract":             4,
+	"WitnessCreateContract":           5,
+	"AssetIssueContract":              6,
+	"WitnessUpdateContract":           8,
+	"ParticipateAssetIssueContract":   9,
+	"AccountUpdateContract":           10,
+	"FreezeBalanceContract":           11,
+	"UnfreezeBalanceContract":         12,
+	"WithdrawBalanceContract":         13,
+	"UnfreezeAssetContract":           14,
+	"UpdateAssetContract":             15,
+	"ProposalCreateContract":          16,
+	"ProposalApproveContract":         17,
+	"ProposalDeleteContract":          18,
+	"SetAccountIdContract":            19,
+	"CustomContract":                  20,
+	"CreateSmartContract":             30,
+	"TriggerSmartContract":            31,
+	"GetContract":                     32,
+	"UpdateSettingContract":           33,
+	"ExchangeCreateContract":          41,
+	"ExchangeInjectContract":          42,
+	"ExchangeWithdrawContract":        43,
+	"ExchangeTransactionContract":     44,
+	"UpdateEnergyLimitContract":       45,
+	"AccountPermissionUpdateContract": 46,
+	"ClearABIContract":                48,
+	"UpdateBrokerageContract":         49,
+	"ShieldedTransferContract":        51,
+	"MarketSellAssetContract":         52,
+	"MarketCancelOrderContract":       53,
+	"FreezeBalanceV2Contract":         54,
+	"UnfreezeBalanceV2Contract":       55,
+	"WithdrawExpireUnfreezeContract":  56,
+	"DelegateResourceContract":        57,
+	"UnDelegateResourceContract":      58,
+	"CancelAllUnfreezeV2Contract":     59,
 }
+
+var TronTraceCallTypeMap = map[string]bool{
+	"CALL":         true,
+	"CREATE":       true,
+	"CREATE2":      true,
+	"STATICCALL":   true,
+	"CALLCODE":     true,
+	"DELEGATECALL": true,
+}
+
+const TronContractTypeUnknown = 999
 
 type TronCallValueInfo struct {
 	CallValue int64  `json:"callValue"`
@@ -34,6 +84,7 @@ type TronTransactionInfo struct {
 	TransactionHash      string                    `json:"transactionHash"`
 	Fee                  uint64                    `json:"fee"`
 	Receipt              TronReceipt               `json:"receipt"`
+	Type                 string                    `json:"type"`
 }
 
 type TronReceipt struct {
@@ -57,6 +108,12 @@ type TronInternalTransaction struct {
 	Rejected          bool                `json:"rejected"`
 }
 
+func NewTronNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
+	// Tron shares the same data schema as Ethereum since its an EVM chain except skip trace data
+	opts = append(opts, WithEthereumNodeType(types.EthereumNodeType_ARCHIVAL), WithTraceType(types.TraceType_PARITY))
+	return NewEthereumNativeParser(params, opts...)
+}
+
 func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.EthereumTransactionFlattenedTrace {
 	// only keep native values, ignore TRC10 token values
 	var nativeTokenValue int64
@@ -66,16 +123,27 @@ func convertInternalTransactionToTrace(itx *TronInternalTransaction) *api.Ethere
 			nativeTokenValue += callValueInfoItem.CallValue
 		}
 	}
-
+	var note string
+	noteBytes, err := hex.DecodeString(itx.Note)
+	if err != nil {
+		note = ""
+	} else {
+		note = string(noteBytes)
+	}
+	rawType := strings.ToUpper(note)
 	trace := &api.EthereumTransactionFlattenedTrace{
-		Type:          "CALL",
-		TraceType:     "CALL",
-		CallType:      "CALL",
+		Type:          rawType,
+		TraceType:     rawType,
 		From:          hexToTronAddress(itx.CallerAddress),
 		To:            hexToTronAddress(itx.TransferToAddress),
 		Value:         strconv.FormatInt(nativeTokenValue, 10),
 		TraceId:       itx.Hash,
 		CallValueInfo: convertTronCallValueInfo(itx.CallValueInfo),
+	}
+
+	if TronTraceCallTypeMap[rawType] {
+		trace.CallType = rawType
+		trace.TraceType = "CALL"
 	}
 	if itx.Rejected {
 		trace.Error = "Internal transaction is executed failed"
@@ -103,6 +171,7 @@ func parseTronTxInfo(
 	header *api.EthereumHeader,
 	transactionToFlattenedTracesMap map[string][]*api.EthereumTransactionFlattenedTrace,
 	txReceipts []*api.EthereumTransactionReceipt,
+	transactions []*api.EthereumTransaction,
 ) error {
 	if len(blobData.TransactionTraces) == 0 {
 		return nil
@@ -182,6 +251,15 @@ func parseTronTxInfo(
 			traces[i] = trace
 		}
 		transactionToFlattenedTracesMap[traceTransactionHash] = traces
+
+		// add type to transaction
+		tx := transactions[txIndex]
+		if typeValue, exists := TronContractTypeMap[txInfo.Type]; exists {
+			tx.Type = typeValue
+		} else {
+			// If type is not found in map, set to 999 as default or log warning
+			tx.Type = TronContractTypeUnknown
+		}
 	}
 	return nil
 }
@@ -257,7 +335,7 @@ func postProcessTronBlock(
 	tokenTransfers [][]*api.EthereumTokenTransfer,
 	transactionToFlattenedTracesMap map[string][]*api.EthereumTransactionFlattenedTrace,
 ) error {
-	if err := parseTronTxInfo(blobData, header, transactionToFlattenedTracesMap, txReceipts); err != nil {
+	if err := parseTronTxInfo(blobData, header, transactionToFlattenedTracesMap, txReceipts, transactions); err != nil {
 		return xerrors.Errorf("failed to parse transaction parity traces: %w", err)
 	}
 
