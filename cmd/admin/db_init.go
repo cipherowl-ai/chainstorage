@@ -214,6 +214,12 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 		}
 	}()
 
+	// Grant full access to worker user (owner)
+	if err := grantFullAccess(netDB, workerUsername); err != nil {
+		return xerrors.Errorf("failed to grant full access on %s to %s: %w", dbName, workerUsername, err)
+	}
+	log.Printf("   ✓ Granted full access to: %s", workerUsername)
+
 	// Grant permissions to server user
 	if err := grantReadOnlyAccess(netDB, serverUsername, workerUsername); err != nil {
 		return xerrors.Errorf("failed to grant permissions on %s: %w", dbName, err)
@@ -317,16 +323,43 @@ func createDatabase(db *sql.DB, dbName, owner string) error {
 	}
 
 	if exists {
-		log.Printf("     Database %s already exists, skipping creation", dbName)
-		return nil
+		log.Printf("     Database %s already exists, checking ownership", dbName)
+		// Check current owner
+		var currentOwner string
+		ownerQuery := `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1`
+		if err := db.QueryRow(ownerQuery, dbName).Scan(&currentOwner); err != nil {
+			return xerrors.Errorf("failed to get database owner: %w", err)
+		}
+
+		if currentOwner == owner {
+			log.Printf("     Database %s already owned by %s", dbName, owner)
+			return nil
+		} else {
+			log.Printf("     Database %s owned by %s, transferring to %s", dbName, currentOwner, owner)
+			// Transfer ownership
+			alterQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s",
+				pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
+			if _, err := db.Exec(alterQuery); err != nil {
+				return xerrors.Errorf("failed to transfer database ownership: %w", err)
+			}
+			return nil
+		}
 	}
 
-	// Create database with proper quoting
-	createQuery := fmt.Sprintf("CREATE DATABASE %s OWNER %s ENCODING 'UTF8'",
-		pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
+	// Create database with master user as owner first, then transfer ownership
+	createQuery := fmt.Sprintf("CREATE DATABASE %s ENCODING 'UTF8'",
+		pq.QuoteIdentifier(dbName))
 
 	if _, err := db.Exec(createQuery); err != nil {
 		return xerrors.Errorf("failed to create database: %w", err)
+	}
+
+	// Transfer ownership to the specified owner
+	alterQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s",
+		pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
+
+	if _, err := db.Exec(alterQuery); err != nil {
+		return xerrors.Errorf("failed to transfer database ownership: %w", err)
 	}
 
 	return nil
