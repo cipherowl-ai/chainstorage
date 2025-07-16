@@ -456,7 +456,7 @@ func runMigrations(ctx context.Context, host string, port int, user, password, d
 	}
 
 	// Run migrations using the file system path
-	migrationsDir := "../../internal/storage/metastorage/postgres/db/migrations"
+	migrationsDir := "/app/migrations"
 	if err := goose.UpContext(ctx, migrationDB, migrationsDir); err != nil {
 		return xerrors.Errorf("failed to run migrations: %w", err)
 	}
