@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/lib/pq"
+	"github.com/pressly/goose/v3"
 	"github.com/spf13/cobra"
 	"golang.org/x/xerrors"
 
@@ -190,6 +191,13 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 		return xerrors.Errorf("failed to create database %s: %w", dbName, err)
 	}
 	log.Printf("   ✓ Created/verified database: %s", dbName)
+
+	// Run migrations on the network database
+	log.Printf("Running migrations...")
+	if err := runMigrations(ctx, masterHost, masterPort, masterUser, masterPassword, dbName); err != nil {
+		return xerrors.Errorf("failed to run migrations: %w", err)
+	}
+	log.Printf("   ✓ Migrations completed successfully")
 
 	// Grant permissions
 	log.Printf("Setting up permissions...")
@@ -417,6 +425,40 @@ func grantFullAccess(db *sql.DB, username string) error {
 			// Some permissions might already exist, log but don't fail
 			log.Printf("     Warning: %v (continuing...)", err)
 		}
+	}
+
+	return nil
+}
+
+func runMigrations(ctx context.Context, host string, port int, user, password, dbName string) error {
+	// Connect to the network database to run migrations
+	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require",
+		host, port, dbName, user, password)
+
+	migrationDB, err := sql.Open("postgres", migrationDSN)
+	if err != nil {
+		return xerrors.Errorf("failed to connect to database for migrations: %w", err)
+	}
+	defer func() {
+		if closeErr := migrationDB.Close(); closeErr != nil {
+			log.Printf("Warning: failed to close migration database connection: %v", closeErr)
+		}
+	}()
+
+	// Test connection
+	if err := migrationDB.PingContext(ctx); err != nil {
+		return xerrors.Errorf("failed to ping migration database: %w", err)
+	}
+
+	// Set dialect for goose
+	if err := goose.SetDialect("postgres"); err != nil {
+		return xerrors.Errorf("failed to set goose dialect: %w", err)
+	}
+
+	// Run migrations using the file system path
+	migrationsDir := "../../internal/storage/metastorage/postgres/db/migrations"
+	if err := goose.UpContext(ctx, migrationDB, migrationsDir); err != nil {
+		return xerrors.Errorf("failed to run migrations: %w", err)
 	}
 
 	return nil
