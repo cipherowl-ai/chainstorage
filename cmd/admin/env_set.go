@@ -63,7 +63,9 @@ The command will output the following environment variables:
 	cmd.Flags().BoolVar(&export, "export", false, "Output as shell export format (export VAR=value)")
 
 	// Mark role as required
-	cmd.MarkFlagRequired("role")
+	if err := cmd.MarkFlagRequired("role"); err != nil {
+		panic(err)
+	}
 
 	return cmd
 }
