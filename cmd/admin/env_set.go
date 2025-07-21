@@ -147,12 +147,24 @@ func runEnvSet(blockchain, network, env, awsRegion, role string) error {
 	}
 
 	// Set environment variables in the current process
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_USER", envVars.User)
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_PASSWORD", envVars.Password)
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_DATABASE", envVars.Database)
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_HOST", envVars.Host)
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_PORT", envVars.Port)
-	os.Setenv("CHAINSTORAGE_AWS_POSTGRES_SSL_MODE", envVars.SSLMode)
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_USER", envVars.User); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_USER: %w", err)
+	}
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_PASSWORD", envVars.Password); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_PASSWORD: %w", err)
+	}
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_DATABASE", envVars.Database); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_DATABASE: %w", err)
+	}
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_HOST", envVars.Host); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_HOST: %w", err)
+	}
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_PORT", envVars.Port); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_PORT: %w", err)
+	}
+	if err := os.Setenv("CHAINSTORAGE_AWS_POSTGRES_SSL_MODE", envVars.SSLMode); err != nil {
+		return xerrors.Errorf("failed to set CHAINSTORAGE_AWS_POSTGRES_SSL_MODE: %w", err)
+	}
 
 	// Output environment variables for reference
 	// Shell export format (for sourcing in bash)
