@@ -245,6 +245,11 @@ func (b *blockStorageImpl) validateHeight(height uint64) error {
 	return nil
 }
 
+func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*chainstorage.BlockMetadata, error) {
+	// Placeholder implementation - return error indicating not implemented
+	return nil, xerrors.New("GetBlockByTimestamp not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) getLatestBlockDocRef(tag uint32) *firestore.DocumentRef {
 	return b.client.Doc(fmt.Sprintf("env/%s/blocks/%d-latest", b.env, tag))
 }

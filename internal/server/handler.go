@@ -107,6 +107,37 @@ type (
 	contextKey string
 )
 
+// GetBlockByTimestamp implements chainstorage.ChainStorageServer.
+func (s *Server) GetBlockByTimestamp(ctx context.Context, req *api.GetBlockByTimestampRequest) (*api.GetBlockByTimestampResponse, error) {
+	clientID := getClientID(ctx)
+
+	tag := s.config.GetEffectiveBlockTag(req.GetTag())
+	if err := s.validateTag(tag); err != nil {
+		return nil, xerrors.Errorf("failed to validate tag: %w", err)
+	}
+
+	timestamp := req.GetTimestamp()
+	if timestamp == 0 {
+		return nil, status.Error(codes.InvalidArgument, "timestamp is required")
+	}
+
+	// Get block from meta storage using timestamp
+	block, err := s.metaStorage.GetBlockByTimestamp(ctx, tag, timestamp)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get block by timestamp: %w", err)
+	}
+
+	s.emitBlocksMetric("timestamp", clientID, 1)
+
+	return &api.GetBlockByTimestampResponse{
+		Tag:        block.Tag,
+		Hash:       block.Hash,
+		ParentHash: block.ParentHash,
+		Height:     block.Height,
+		Timestamp:  block.Timestamp,
+	}, nil
+}
+
 const (
 	// Custom interceptors
 	errorInterceptorID     = "xerror"
@@ -190,6 +221,7 @@ var rcuByMethod = map[string]int{
 	"GetRosettaBlocksByRange": 50,
 	"GetNativeTransaction":    10,
 	"GetVerifiedAccountState": 10,
+	"GetBlockByTimestamp":     5,
 }
 
 func NewServer(params ServerParams) *Server {

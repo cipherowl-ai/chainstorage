@@ -22,6 +22,8 @@ type (
 		// GetBlocksByHeights gets blocks by heights. Results is an ordered array that matches the order in `heights` array
 		// i.e. if the heights is [100,2,3], it will return the metadata in order: [block 100, block 2, block 3]
 		GetBlocksByHeights(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error)
+		// GetBlockByTimestamp gets the latest block before or at the given timestamp
+		GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error)
 	}
 
 	EventStorage interface {

@@ -272,6 +272,11 @@ func (a *blockStorageImpl) validateHeight(height uint64) error {
 	return nil
 }
 
+func (a *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
+	// Placeholder implementation - return error indicating not implemented
+	return nil, xerrors.New("GetBlockByTimestamp not implemented for DynamoDB")
+}
+
 func makeBlockMetaDataDDBEntry(block *api.BlockMetadata) *model.BlockMetaDataDDBEntry {
 	blockMetaDataDDBEntry := model.BlockMetaDataDDBEntry{
 		BlockPid:      getBlockPidForHeight(block.Tag, block.Height),

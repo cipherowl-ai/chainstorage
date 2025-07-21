@@ -10,6 +10,7 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
@@ -29,6 +30,7 @@ type (
 		instrumentGetBlockByHeight       instrument.InstrumentWithResult[*api.BlockMetadata]
 		instrumentGetBlocksByHeightRange instrument.InstrumentWithResult[[]*api.BlockMetadata]
 		instrumentGetBlocksByHeights     instrument.InstrumentWithResult[[]*api.BlockMetadata]
+		instrumentGetBlockByTimestamp    instrument.InstrumentWithResult[*api.BlockMetadata]
 	}
 )
 
@@ -45,6 +47,7 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 		instrumentGetBlockByHeight:       instrument.NewWithResult[*api.BlockMetadata](metrics, "get_block_by_height"),
 		instrumentGetBlocksByHeightRange: instrument.NewWithResult[[]*api.BlockMetadata](metrics, "get_blocks_by_height_range"),
 		instrumentGetBlocksByHeights:     instrument.NewWithResult[[]*api.BlockMetadata](metrics, "get_blocks_by_heights"),
+		instrumentGetBlockByTimestamp:    instrument.NewWithResult[*api.BlockMetadata](metrics, "get_block_by_timestamp"),
 	}
 	return &accessor, nil
 }
@@ -398,4 +401,59 @@ func (b *blockStorageImpl) validateHeight(height uint64) error {
 			height, b.blockStartHeight, errors.ErrInvalidHeight)
 	}
 	return nil
+}
+
+func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
+	return b.instrumentGetBlockByTimestamp.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
+		// Convert Unix timestamp to time.Time
+		targetTime := time.Unix(int64(timestamp), 0)
+
+		// Query to get the latest block before or at the given timestamp
+		query := `
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
+				   bm.timestamp, bm.skipped
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
+			WHERE cb.tag = $1 AND bm.timestamp <= $2
+			ORDER BY bm.timestamp DESC, bm.height DESC
+			LIMIT 1
+		`
+
+		var blockId int64
+		var height uint64
+		var blockTag uint32
+		var hash, parentHash, objectKeyMain sql.NullString
+		var parentHeight uint64
+		var blockTime sql.NullTime
+		var skipped bool
+
+		err := b.db.QueryRowContext(ctx, query, tag, targetTime).Scan(
+			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTime, &skipped)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return nil, xerrors.Errorf("no block found before timestamp %d: %w", timestamp, errors.ErrItemNotFound)
+			}
+			return nil, xerrors.Errorf("failed to get block by timestamp: %w", err)
+		}
+
+		// Convert time.Time back to protobuf timestamp
+		var protoTimestamp *timestamppb.Timestamp
+		if blockTime.Valid {
+			protoTimestamp, err = ptypes.TimestampProto(blockTime.Time)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to convert timestamp: %w", err)
+			}
+		}
+
+		return &api.BlockMetadata{
+			Tag:           blockTag,
+			Hash:          hash.String,
+			ParentHash:    parentHash.String,
+			Height:        height,
+			ParentHeight:  parentHeight,
+			ObjectKeyMain: objectKeyMain.String,
+			Timestamp:     protoTimestamp,
+			Skipped:       skipped,
+		}, nil
+	})
 }
