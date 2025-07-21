@@ -7,39 +7,4 @@ sdk:
 storage_type:
   blob: S3
   dlq: SQS
-  meta: POSTGRES
-aws:
-  postgres:
-    user: cs_ethereum_mainnet_worker
-    password: worker_password
-    ssl_mode: disable
-chain:
-  client:
-    master:
-      endpoint_group: |
-        {
-          "endpoints": [
-            {
-              "name": "quicknode-foo-bar-sticky",
-              "url": "https://sleek-nameless-lambo.quiknode.pro/22c3ef3d7e0570330fff89c6c577491500efc246/",
-              "password": "",
-              "weight": 1
-            }
-          ],
-          "sticky_session": {
-            "header_hash": "x-session-hash"
-          }
-        }
-    slave:
-      endpoint_group: |
-        {
-          "endpoints": [
-            {
-              "name": "quicknode-foo-bar-round-robin",
-              "url": "https://sleek-nameless-lambo.quiknode.pro/22c3ef3d7e0570330fff89c6c577491500efc246/",
-              "password": "",
-              "weight": 1
-            }
-          ]
-        }
-
+  meta: DYNAMODB
