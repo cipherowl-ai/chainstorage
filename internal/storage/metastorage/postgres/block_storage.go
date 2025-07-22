@@ -10,13 +10,13 @@ import (
 
 	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/xerrors"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
+	"github.com/coinbase/chainstorage/internal/utils/utils"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -411,11 +411,11 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		// Query to get the latest block before or at the given timestamp
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-				   bm.timestamp, bm.skipped
+			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND bm.timestamp <= $2
-			ORDER BY bm.timestamp DESC, bm.height DESC
+			ORDER BY bm.height DESC, bm.timestamp DESC
 			LIMIT 1
 		`
 
@@ -424,25 +424,23 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		var blockTag uint32
 		var hash, parentHash, objectKeyMain sql.NullString
 		var parentHeight uint64
-		var blockTime sql.NullTime
+		var blockTimestamp int64
 		var skipped bool
 
 		err := b.db.QueryRowContext(ctx, query, tag, targetTime).Scan(
-			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTime, &skipped)
+			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTimestamp, &skipped)
 		if err != nil {
 			if err == sql.ErrNoRows {
+				fmt.Printf("[DEBUG] No block found for tag=%d, timestamp=%d (%v)\n", tag, timestamp, targetTime)
 				return nil, xerrors.Errorf("no block found before timestamp %d: %w", timestamp, errors.ErrItemNotFound)
 			}
+			fmt.Printf("[DEBUG] Failed to get block by timestamp: %v\n", err)
 			return nil, xerrors.Errorf("failed to get block by timestamp: %w", err)
 		}
 
-		// Convert time.Time back to protobuf timestamp
-		var protoTimestamp *timestamppb.Timestamp
-		if blockTime.Valid {
-			protoTimestamp, err = ptypes.TimestampProto(blockTime.Time)
-			if err != nil {
-				return nil, xerrors.Errorf("failed to convert timestamp: %w", err)
-			}
+		if !hash.Valid || blockTimestamp == 0 {
+			fmt.Printf("[DEBUG] Invalid block data: height=%d, blockTimestamp=%d, hash.Valid=%v\n", height, blockTimestamp, hash.Valid)
+			return nil, xerrors.Errorf("invalid block data for tag=%d, timestamp=%d", tag, timestamp)
 		}
 
 		return &api.BlockMetadata{
@@ -452,7 +450,7 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 			Height:        height,
 			ParentHeight:  parentHeight,
 			ObjectKeyMain: objectKeyMain.String,
-			Timestamp:     protoTimestamp,
+			Timestamp:     utils.ToTimestamp(blockTimestamp),
 			Skipped:       skipped,
 		}, nil
 	})

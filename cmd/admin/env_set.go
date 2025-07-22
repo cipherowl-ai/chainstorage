@@ -14,25 +14,25 @@ import (
 func newEnvSetCommand() *cobra.Command {
 	var (
 		awsRegion string
+		quiet     bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "env-set",
 		Short: "Set environment variables for PostgreSQL credentials from AWS Secrets Manager",
-		Long: `Set environment variables for PostgreSQL credentials from AWS Secrets Manager in the current process.
+		Long: `Set environment variables for PostgreSQL credentials from AWS Secrets Manager.
 
-This command fetches database credentials from AWS Secrets Manager and sets them as environment
-variables in the current process. These variables will be available to subsequent commands.
+This command fetches database credentials from AWS Secrets Manager and outputs export commands
+that can be evaluated in your shell to set environment variables.
+
+To use this command and set the environment variables in your current shell session:
+  eval $(./admin env-set --blockchain ethereum --network mainnet --env dev --quiet)
 
 Example usage:
-  # Set environment variables for ethereum mainnet worker
-  chainstorage admin env-set --blockchain ethereum --network mainnet --env dev --role worker
+  # Set environment variables for ethereum mainnet (worker role)
+  eval $(./admin env-set --blockchain ethereum --network mainnet --env dev --quiet)
 
-Available roles:
-  - worker: Read-write access user
-  - server: Read-only access user
-
-The command will set the following environment variables:
+The command will output the following environment variables:
   - CHAINSTORAGE_AWS_POSTGRES_USER
   - CHAINSTORAGE_AWS_POSTGRES_PASSWORD
   - CHAINSTORAGE_AWS_POSTGRES_DATABASE
@@ -40,27 +40,14 @@ The command will set the following environment variables:
   - CHAINSTORAGE_AWS_POSTGRES_PORT (from master credentials)
   - CHAINSTORAGE_AWS_POSTGRES_SSL_MODE (default: require)`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Parse role flag
-			role, err := cmd.Flags().GetString("role")
-			if err != nil {
-				return err
-			}
-
-			if role != "worker" && role != "server" {
-				return xerrors.New("role must be either 'worker' or 'server'")
-			}
-
-			return runEnvSet(commonFlags.blockchain, commonFlags.network, commonFlags.env, awsRegion, role)
+			// Use worker role by default
+			role := "worker"
+			return runEnvSet(commonFlags.blockchain, commonFlags.network, commonFlags.env, awsRegion, role, quiet)
 		},
 	}
 
 	cmd.Flags().StringVar(&awsRegion, "aws-region", "us-east-1", "AWS region for Secrets Manager")
-	cmd.Flags().String("role", "", "Database role: worker (read-write) or server (read-only)")
-
-	// Mark role as required
-	if err := cmd.MarkFlagRequired("role"); err != nil {
-		panic(err)
-	}
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "Suppress log output (use with eval)")
 
 	return cmd
 }
@@ -74,14 +61,16 @@ type EnvVars struct {
 	SSLMode  string `json:"CHAINSTORAGE_AWS_POSTGRES_SSL_MODE"`
 }
 
-func runEnvSet(blockchain, network, env, awsRegion, role string) error {
+func runEnvSet(blockchain, network, env, awsRegion, role string, quiet bool) error {
 	ctx := context.Background()
 
-	log.Printf("🔧 Setting environment variables for %s-%s %s role...", blockchain, network, role)
-	log.Printf("   Environment: %s", env)
-	log.Printf("   AWS Region: %s", awsRegion)
-	log.Printf("   Role: %s", role)
-	log.Printf("")
+	if !quiet {
+		log.Printf("🔧 Setting environment variables for %s-%s %s role...", blockchain, network, role)
+		log.Printf("   Environment: %s", env)
+		log.Printf("   AWS Region: %s", awsRegion)
+		log.Printf("   Role: %s", role)
+		log.Printf("")
+	}
 
 	// Get master credentials from environment variables
 	masterHost := os.Getenv("CHAINSTORAGE_CLUSTER_ENDPOINT")
@@ -131,10 +120,12 @@ func runEnvSet(blockchain, network, env, awsRegion, role string) error {
 		}
 	}
 
-	log.Printf("✅ Successfully fetched credentials from AWS Secrets Manager")
-	log.Printf("   Database: %s", dbName)
-	log.Printf("   User: %s", username)
-	log.Printf("")
+	if !quiet {
+		log.Printf("✅ Successfully fetched credentials from AWS Secrets Manager")
+		log.Printf("   Database: %s", dbName)
+		log.Printf("   User: %s", username)
+		log.Printf("")
+	}
 
 	// Create environment variables
 	envVars := EnvVars{
@@ -175,9 +166,11 @@ func runEnvSet(blockchain, network, env, awsRegion, role string) error {
 	fmt.Printf("export CHAINSTORAGE_AWS_POSTGRES_PORT=\"%s\"\n", envVars.Port)
 	fmt.Printf("export CHAINSTORAGE_AWS_POSTGRES_SSL_MODE=\"%s\"\n", envVars.SSLMode)
 
-	log.Printf("")
-	log.Printf("✅ Environment variables set for %s-%s %s role", blockchain, network, role)
-	log.Printf("   Variables are now available in the current process")
+	if !quiet {
+		log.Printf("")
+		log.Printf("✅ Environment variables set for %s-%s %s role", blockchain, network, role)
+		log.Printf("   Variables are now available in the current process")
+	}
 
 	return nil
 }
