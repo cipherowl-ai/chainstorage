@@ -3132,7 +3132,7 @@ func (s *handlerTestSuite) TestGetBlockByTimestamp_Success() {
 	require.Equal(expectedBlock.Hash, resp.Hash)
 	require.Equal(expectedBlock.ParentHash, resp.ParentHash)
 	require.Equal(expectedBlock.Height, resp.Height)
-	require.Equal(expectedBlock.Timestamp.GetSeconds(), resp.Timestamp)
+	require.Equal(uint64(expectedBlock.Timestamp.GetSeconds()), resp.Timestamp)
 }
 
 func (s *handlerTestSuite) TestGetBlockByTimestamp_MissingTimestamp() {
