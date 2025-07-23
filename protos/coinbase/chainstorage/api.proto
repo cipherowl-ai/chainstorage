@@ -260,7 +260,7 @@ message GetBlockByTimestampResponse {
   string hash = 2;
   string parent_hash = 3;
   uint64 height = 4;
-  google.protobuf.Timestamp timestamp = 5;
+  uint64 timestamp = 5; // Unix timestamp in seconds
 }
 
 service ChainStorage {

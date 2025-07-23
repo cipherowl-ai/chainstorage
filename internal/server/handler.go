@@ -134,7 +134,7 @@ func (s *Server) GetBlockByTimestamp(ctx context.Context, req *api.GetBlockByTim
 		Hash:       block.Hash,
 		ParentHash: block.ParentHash,
 		Height:     block.Height,
-		Timestamp:  block.Timestamp,
+		Timestamp:  uint64(block.Timestamp.GetSeconds()),
 	}, nil
 }
 

@@ -154,7 +154,7 @@ func (e *eventStorageImpl) GetEventByEventId(ctx context.Context, eventTag uint3
 
 		err := e.db.QueryRowContext(ctx, `
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, 
-				   bm.tag, bm.parent_hash, bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
+				   bm.tag, bm.parent_hash, bm.skipped, bm.timestamp, be.event_tag
 			FROM block_events be
 			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence = $2
@@ -218,7 +218,7 @@ func (e *eventStorageImpl) GetEventsAfterEventId(ctx context.Context, eventTag u
 	return e.instrumentGetEventsAfterEventId.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
-				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
+				   bm.skipped, bm.timestamp, be.event_tag
 			FROM block_events be
 			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence > $2
@@ -247,7 +247,7 @@ func (e *eventStorageImpl) GetEventsByEventIdRange(ctx context.Context, eventTag
 	return e.instrumentGetEventsByEventIdRange.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
-				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
+				   bm.skipped, bm.timestamp, be.event_tag
 			FROM block_events be
 			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.event_sequence >= $2 AND be.event_sequence < $3
@@ -389,7 +389,7 @@ func (e *eventStorageImpl) GetEventsByBlockHeight(ctx context.Context, eventTag 
 	return e.instrumentGetEventsByBlockHeight.Instrument(ctx, func(ctx context.Context) ([]*model.EventEntry, error) {
 		rows, err := e.db.QueryContext(ctx, `
 			SELECT be.event_sequence, be.event_type, be.height, be.hash, bm.tag, bm.parent_hash, 
-				   bm.skipped, EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, be.event_tag
+				   bm.skipped, bm.timestamp, be.event_tag
 			FROM block_events be
 			LEFT JOIN block_metadata bm ON be.block_metadata_id = bm.id
 			WHERE be.event_tag = $1 AND be.height = $2
@@ -497,7 +497,7 @@ func (e *eventStorageImpl) createSkippedBlockMetadata(ctx context.Context, tx *s
 			timestamp = EXCLUDED.timestamp,
 			skipped = EXCLUDED.skipped
 		RETURNING id
-	`, eventEntry.BlockHeight, eventEntry.Tag, 0, "1970-01-01 00:00:00+00").Scan(&blockMetadataId)
+	`, eventEntry.BlockHeight, eventEntry.Tag, 0, 0).Scan(&blockMetadataId)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to create block metadata for skipped block: %w", err)
 	}

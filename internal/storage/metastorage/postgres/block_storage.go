@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
@@ -136,14 +135,11 @@ func (b *blockStorageImpl) PersistBlockMetas(
 
 		for _, block := range blocks {
 			tsProto := block.GetTimestamp()
-			var goTime time.Time
+			var unixTimestamp int64
 			if tsProto == nil { // special case for genesis block
-				goTime = time.Unix(0, 0)
+				unixTimestamp = 0
 			} else {
-				goTime, err = ptypes.Timestamp(tsProto) // convert timestamp to time.Time
-				if err != nil {
-					return xerrors.Errorf("invalid block timestamp at height %d: %w", block.Height, err)
-				}
+				unixTimestamp = tsProto.GetSeconds() // directly get seconds from protobuf timestamp
 			}
 
 			var parentHeight uint64
@@ -169,7 +165,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				block.ParentHash,
 				parentHeight,
 				block.ObjectKeyMain,
-				goTime,
+				unixTimestamp,
 				block.Skipped,
 			).Scan(&blockId)
 			if err != nil {
@@ -201,7 +197,7 @@ func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api
 		// Get the latest canonical block by highest height
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1
@@ -229,7 +225,7 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 			// Get the canonical block at this height (could be regular or skipped)
 			query := `
 				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 				FROM canonical_blocks cb
 				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 				WHERE cb.tag = $1 AND cb.height = $2
@@ -239,7 +235,7 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 			// Query block_metadata directly for the specific hash
 			query := `
 				SELECT id, height, tag, hash, parent_hash, parent_height, object_key_main, 
-					   EXTRACT(EPOCH FROM timestamp)::BIGINT, skipped
+					   timestamp, skipped
 				FROM block_metadata
 				WHERE tag = $1 AND height = $2 AND hash = $3
 				LIMIT 1`
@@ -265,7 +261,7 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 		// Get block from canonical_blocks table (includes both regular and skipped blocks)
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height = $2
@@ -294,7 +290,7 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		// Get all blocks (canonical and skipped) from canonical_blocks table
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height >= $2 AND cb.height < $3
@@ -354,7 +350,7 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 		}
 		query := fmt.Sprintf(`
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height IN (%s)
@@ -405,17 +401,14 @@ func (b *blockStorageImpl) validateHeight(height uint64) error {
 
 func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
 	return b.instrumentGetBlockByTimestamp.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
-		// Convert Unix timestamp to time.Time
-		targetTime := time.Unix(int64(timestamp), 0)
-
 		// Query to get the latest block before or at the given timestamp
 		query := `
 			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       EXTRACT(EPOCH FROM bm.timestamp)::BIGINT, bm.skipped
+			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND bm.timestamp <= $2
-			ORDER BY bm.height DESC, bm.timestamp DESC
+			ORDER BY bm.timestamp DESC, bm.height DESC
 			LIMIT 1
 		`
 
@@ -427,11 +420,11 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		var blockTimestamp int64
 		var skipped bool
 
-		err := b.db.QueryRowContext(ctx, query, tag, targetTime).Scan(
+		err := b.db.QueryRowContext(ctx, query, tag, timestamp).Scan(
 			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTimestamp, &skipped)
 		if err != nil {
 			if err == sql.ErrNoRows {
-				fmt.Printf("[DEBUG] No block found for tag=%d, timestamp=%d (%v)\n", tag, timestamp, targetTime)
+				fmt.Printf("[DEBUG] No block found for tag=%d, timestamp=%d\n", tag, timestamp)
 				return nil, xerrors.Errorf("no block found before timestamp %d: %w", timestamp, errors.ErrItemNotFound)
 			}
 			fmt.Printf("[DEBUG] Failed to get block by timestamp: %v\n", err)

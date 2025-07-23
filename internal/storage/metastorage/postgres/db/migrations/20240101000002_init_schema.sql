@@ -8,7 +8,7 @@ CREATE TABLE block_metadata (
     parent_hash VARCHAR(66),
     parent_height BIGINT NOT NULL DEFAULT 0,
     object_key_main VARCHAR(255),
-    timestamp TIMESTAMPTZ NOT NULL,
+    timestamp BIGINT NOT NULL, -- Unix timestamp in seconds
     skipped BOOLEAN NOT NULL DEFAULT FALSE
 );
 
