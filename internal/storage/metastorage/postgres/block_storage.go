@@ -433,7 +433,7 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 
 		if !hash.Valid || blockTimestamp == 0 {
 			fmt.Printf("[DEBUG] Invalid block data: height=%d, blockTimestamp=%d, hash.Valid=%v\n", height, blockTimestamp, hash.Valid)
-			return nil, xerrors.Errorf("invalid block data for tag=%d, timestamp=%d", tag, timestamp)
+			return nil, xerrors.Errorf("no block found before timestamp %d: %w", timestamp, errors.ErrItemNotFound)
 		}
 
 		return &api.BlockMetadata{

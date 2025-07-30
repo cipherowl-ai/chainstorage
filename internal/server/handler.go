@@ -124,7 +124,8 @@ func (s *Server) GetBlockByTimestamp(ctx context.Context, req *api.GetBlockByTim
 	// Get block from meta storage using timestamp
 	block, err := s.metaStorage.GetBlockByTimestamp(ctx, tag, timestamp)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to get block by timestamp: %w", err)
+		// Don't wrap the error to allow the interceptor to properly map it
+		return nil, err
 	}
 
 	s.emitBlocksMetric("timestamp", clientID, 1)
