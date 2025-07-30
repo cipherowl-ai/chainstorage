@@ -35,6 +35,15 @@ type (
 		metrics      tally.Scope
 	}
 
+	GetLatestBlockHeightActivity struct {
+		baseActivity
+		config       *config.Config
+		session      *session.Session
+		dynamoClient *dynamodb.DynamoDB
+		blockTable   string
+		metrics      tally.Scope
+	}
+
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
@@ -44,7 +53,7 @@ type (
 
 	MigratorRequest struct {
 		StartHeight uint64
-		EndHeight   uint64 `validate:"gtfield=StartHeight"`
+		EndHeight   uint64 // Optional. If not specified, will query latest block from DynamoDB
 		EventTag    uint32
 		Tag         uint32
 		BatchSize   int
@@ -71,6 +80,19 @@ type (
 func NewMigrator(params MigratorParams) *Migrator {
 	a := &Migrator{
 		baseActivity: newBaseActivity(ActivityMigrator, params.Runtime),
+		config:       params.Config,
+		session:      params.Session,
+		dynamoClient: dynamodb.New(params.Session),
+		blockTable:   params.Config.AWS.DynamoDB.BlockTable,
+		metrics:      params.Metrics,
+	}
+	a.register(a.execute)
+	return a
+}
+
+func NewGetLatestBlockHeightActivity(params MigratorParams) *GetLatestBlockHeightActivity {
+	a := &GetLatestBlockHeightActivity{
+		baseActivity: newBaseActivity(ActivityGetLatestBlockHeight, params.Runtime),
 		config:       params.Config,
 		session:      params.Session,
 		dynamoClient: dynamodb.New(params.Session),
@@ -513,6 +535,84 @@ func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *Migrat
 	return nil
 }
 
+type GetLatestBlockHeightRequest struct {
+	Tag uint32
+}
+
+type GetLatestBlockHeightResponse struct {
+	Height uint64
+}
+
+func (a *Migrator) GetLatestBlockHeight(ctx context.Context, req *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
+	migrationData, err := a.createStorageInstances(ctx)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create storage instances: %w", err)
+	}
+	latestBlock, err := migrationData.SourceStorage.GetLatestBlock(ctx, req.Tag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get latest block from DynamoDB: %w", err)
+	}
+	return &GetLatestBlockHeightResponse{Height: latestBlock.Height}, nil
+}
+
+func (a *GetLatestBlockHeightActivity) Execute(ctx workflow.Context, request *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
+	var response GetLatestBlockHeightResponse
+	err := a.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *GetLatestBlockHeightActivity) execute(ctx context.Context, request *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
+	migrationData, err := a.createStorageInstances(ctx)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create storage instances: %w", err)
+	}
+	latestBlock, err := migrationData.SourceStorage.GetLatestBlock(ctx, request.Tag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get latest block from DynamoDB: %w", err)
+	}
+	return &GetLatestBlockHeightResponse{Height: latestBlock.Height}, nil
+}
+
+func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Context) (*MigrationData, error) {
+	logger := a.getLogger(ctx)
+
+	// Create DynamoDB storage directly
+	dynamoDBParams := dynamodb_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+		Session: a.session,
+	}
+	sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create DynamoDB storage: %w", err)
+	}
+
+	// Create PostgreSQL storage directly
+	postgresParams := postgres_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+	}
+	destResult, err := postgres_storage.NewMetaStorage(postgresParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create PostgreSQL storage: %w", err)
+	}
+
+	return &MigrationData{
+		SourceStorage: sourceResult.MetaStorage,
+		DestStorage:   destResult.MetaStorage,
+		Config:        a.config,
+		DynamoClient:  a.dynamoClient,
+		BlockTable:    a.blockTable,
+	}, nil
+}
+
 const (
-	ActivityMigrator = "activity.migrator"
+	ActivityMigrator             = "activity.migrator"
+	ActivityGetLatestBlockHeight = "activity.migrator.GetLatestBlockHeight"
 )

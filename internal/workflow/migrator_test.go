@@ -268,18 +268,18 @@ func (s *migratorTestSuite) TestMigrator_ActivityFailure() {
 func (s *migratorTestSuite) TestMigrator_ValidateRequest() {
 	require := testutil.Require(s.T())
 
-	// StartHeight >= EndHeight should fail
+	// Test that EndHeight can be 0 (auto-detection)
 	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: 1200,
-		EndHeight:   1000,
+		StartHeight: 1000,
+		EndHeight:   0, // Should trigger auto-detection
 		Tag:         1,
 		EventTag:    0,
 	})
+	// This should fail because the mock environment doesn't have the GetLatestBlockHeight activity
 	require.Error(err)
-	require.Contains(err.Error(), "invalid workflow request")
-	require.Contains(err.Error(), "Field validation for 'EndHeight' failed on the 'gtfield' tag")
+	// But it shouldn't fail due to validation - it should fail due to missing activity mock
 
-	// StartHeight == EndHeight should fail
+	// StartHeight == EndHeight should fail (after auto-detection)
 	_, err = s.migrator.Execute(context.Background(), &MigratorRequest{
 		StartHeight: 1000,
 		EndHeight:   1000,
@@ -287,7 +287,7 @@ func (s *migratorTestSuite) TestMigrator_ValidateRequest() {
 		EventTag:    0,
 	})
 	require.Error(err)
-	require.Contains(err.Error(), "invalid workflow request")
+	require.Contains(err.Error(), "startHeight (1000) must be less than endHeight (1000)")
 }
 
 func (s *migratorTestSuite) TestMigrator_InvalidBackoffInterval() {
@@ -307,6 +307,38 @@ func (s *migratorTestSuite) TestMigrator_InvalidBackoffInterval() {
 	})
 	require.Error(err)
 	require.Contains(err.Error(), "failed to parse backoff interval")
+}
+
+func (s *migratorTestSuite) TestMigrator_AutoDetectionEndHeight() {
+	require := testutil.Require(s.T())
+
+	startHeight := uint64(1000)
+	tag := uint32(1)
+	eventTag := uint32(0)
+	expectedLatestHeight := uint64(1500)
+
+	// Mock the GetLatestBlockHeight activity
+	s.env.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestBlockHeightResponse{
+			Height: expectedLatestHeight,
+		}, nil)
+
+	// Mock the main migrator activity
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(&activity.MigratorResponse{
+			BlocksMigrated: 500,
+			EventsMigrated: 1000,
+			Success:        true,
+			Message:        "Migration completed successfully",
+		}, nil)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartHeight: startHeight,
+		EndHeight:   0, // Should trigger auto-detection
+		Tag:         tag,
+		EventTag:    eventTag,
+	})
+	require.NoError(err)
 }
 
 func (s *migratorTestSuite) TestMigrator_MultipleBatches() {

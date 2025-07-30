@@ -686,7 +686,11 @@ go run ./cmd/admin workflow start --workflow streamer --input '{}' --blockchain 
 
 Start the migration workflow:
 ```shell
-go run cmd/admin/*.go migrate --env=local --blockchain=ethereum --network=mainnet --start-height=0 --end-height=100 --tag=2 
+# Migrate with auto-detected end height (latest block from DynamoDB)
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 400, "Tag": 2, "EventTag": 3}' --blockchain ethereum --network mainnet --env local
+
+# Migrate with specific height range
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 400, "EndHeight": 800, "Tag": 2, "EventTag": 3}' --blockchain ethereum --network mainnet --env local
 ```
 
 Stop the monitor workflow:

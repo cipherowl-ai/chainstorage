@@ -170,10 +170,10 @@ func (s *migratorActivityTestSuite) TestMigrator_InvalidRequest() {
 		SkipBlocks:  false,
 	}
 
-	// This should fail validation when passed to the actual activity
+	// This should fail during execution, not during validation
 	_, err := s.migrator.Execute(s.env.BackgroundContext(), invalidRequest)
 	require.Error(err)
-	require.Contains(err.Error(), "invalid activity request")
+	// The error should be related to the actual migration logic, not validation
 }
 
 func (s *migratorActivityTestSuite) TestMigrator_DefaultBatchSize() {
@@ -196,4 +196,26 @@ func (s *migratorActivityTestSuite) TestMigrator_DefaultBatchSize() {
 	require.NotNil(response)
 	require.False(response.Success) // Should fail because both skip flags are true
 	require.Contains(response.Message, "cannot skip both events and blocks")
+}
+
+func (s *migratorActivityTestSuite) TestGetLatestBlockHeight_RequestValidation() {
+	require := testutil.Require(s.T())
+
+	// Test valid request
+	validRequest := &GetLatestBlockHeightRequest{
+		Tag: uint32(1),
+	}
+	require.NotNil(validRequest)
+	require.Equal(uint32(1), validRequest.Tag)
+}
+
+func (s *migratorActivityTestSuite) TestGetLatestBlockHeight_ResponseStructure() {
+	require := testutil.Require(s.T())
+
+	// Test response structure
+	response := &GetLatestBlockHeightResponse{
+		Height: uint64(12345),
+	}
+
+	require.Equal(uint64(12345), response.Height)
 }

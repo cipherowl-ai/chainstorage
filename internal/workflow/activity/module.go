@@ -21,4 +21,5 @@ var Module = fx.Options(
 	fx.Provide(NewLatestBlock),
 	fx.Provide(NewUpdateWatermark),
 	fx.Provide(NewMigrator),
+	fx.Provide(NewGetLatestBlockHeightActivity),
 )

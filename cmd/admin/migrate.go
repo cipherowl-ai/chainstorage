@@ -54,7 +54,54 @@ Event Migration:
 - Migrates events sequentially by event ID range in batches
 - Event IDs in DynamoDB correspond directly to event sequences in PostgreSQL
 
-Note: Block metadata must be migrated before events since events reference blocks via foreign keys.`,
+End Height:
+- If --end-height is not provided, the tool will automatically query the latest block
+  from DynamoDB and use that as the end height (exclusive)
+- Note: Auto-detection is only available in the migrate command, not in workflow mode
+
+Note: Block metadata must be migrated before events since events reference blocks via foreign keys.
+
+Examples:
+  # Migrate blocks and events from height 1000000 to latest block (auto-detected)
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=1000000 \
+    --tag=2 \
+    --event-tag=3
+
+  # Migrate specific height range
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=100 \
+    --end-height=152 \
+    --tag=2 \
+    --event-tag=3
+
+  # Migrate blocks only (skip events)
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=1000000 \
+    --end-height=1001000 \
+    --tag=2 \
+    --event-tag=3 \
+    --skip-events
+
+  # Migrate events only (requires blocks to exist first)
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=1000000 \
+    --end-height=1001000 \
+    --tag=2 \
+    --event-tag=3 \
+    --skip-blocks`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var deps struct {
 				fx.In
@@ -89,10 +136,7 @@ Note: Block metadata must be migrated before events since events reference block
 				return xerrors.Errorf("failed to create PostgreSQL storage: %w", err)
 			}
 
-			// Validate flags
-			if migrateFlags.startHeight >= migrateFlags.endHeight {
-				return xerrors.New("startHeight must be less than endHeight")
-			}
+			// Note: Validation will happen after end height auto-detection
 
 			if migrateFlags.batchSize <= 0 {
 				migrateFlags.batchSize = 100
@@ -118,6 +162,29 @@ Note: Block metadata must be migrated before events since events reference block
 			}
 
 			ctx := context.Background()
+
+			// Handle end height - if not provided, query latest block from DynamoDB
+			if migrateFlags.endHeight == 0 {
+				logger.Info("No end height provided, querying latest block from DynamoDB...")
+
+				// Query latest block from DynamoDB
+				latestBlock, err := sourceResult.MetaStorage.GetLatestBlock(ctx, migrateFlags.tag)
+				if err != nil {
+					return xerrors.Errorf("failed to get latest block from DynamoDB: %w", err)
+				}
+
+				migrateFlags.endHeight = latestBlock.Height + 1 // Make it exclusive
+				logger.Info("Found latest block in DynamoDB",
+					zap.Uint64("latestHeight", latestBlock.Height),
+					zap.Uint64("endHeight", migrateFlags.endHeight),
+					zap.String("latestHash", latestBlock.Hash))
+			}
+
+			// Validate flags after end height auto-detection
+			if migrateFlags.startHeight >= migrateFlags.endHeight {
+				return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
+					migrateFlags.startHeight, migrateFlags.endHeight)
+			}
 
 			// Create DynamoDB client for direct queries
 			dynamoClient := dynamodb.New(deps.Session)
@@ -502,7 +569,7 @@ func (m *DataMigrator) findLastEventIdInRange(ctx context.Context, eventTag uint
 
 func init() {
 	migrateCmd.Flags().Uint64Var(&migrateFlags.startHeight, "start-height", 0, "start block height (inclusive)")
-	migrateCmd.Flags().Uint64Var(&migrateFlags.endHeight, "end-height", 0, "end block height (exclusive)")
+	migrateCmd.Flags().Uint64Var(&migrateFlags.endHeight, "end-height", 0, "end block height (exclusive, optional - if not provided, will query latest block from DynamoDB)")
 	migrateCmd.Flags().Uint32Var(&migrateFlags.eventTag, "event-tag", 0, "event tag for migration")
 	migrateCmd.Flags().Uint32Var(&migrateFlags.tag, "tag", 1, "block tag for migration")
 	migrateCmd.Flags().IntVar(&migrateFlags.batchSize, "batch-size", 100, "number of blocks to process in each batch")
@@ -510,7 +577,7 @@ func init() {
 	migrateCmd.Flags().BoolVar(&migrateFlags.skipBlocks, "skip-blocks", false, "skip block migration (events only)")
 
 	_ = migrateCmd.MarkFlagRequired("start-height")
-	_ = migrateCmd.MarkFlagRequired("end-height")
+	// end-height is optional - if not provided, will query latest block from DynamoDB
 
 	rootCmd.AddCommand(migrateCmd)
 }

@@ -20,19 +20,21 @@ import (
 type (
 	Migrator struct {
 		baseWorkflow
-		migrator *activity.Migrator
+		migrator             *activity.Migrator
+		getLatestBlockHeight *activity.GetLatestBlockHeightActivity
 	}
 
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime  cadence.Runtime
-		Migrator *activity.Migrator
+		Runtime              cadence.Runtime
+		Migrator             *activity.Migrator
+		GetLatestBlockHeight *activity.GetLatestBlockHeightActivity
 	}
 
 	MigratorRequest struct {
 		StartHeight     uint64
-		EndHeight       uint64 `validate:"gtfield=StartHeight"`
+		EndHeight       uint64 // Optional. If not specified, will query latest block from DynamoDB
 		EventTag        uint32
 		Tag             uint32
 		BatchSize       uint64 // Optional. If not specified, it is read from the workflow config.
@@ -57,8 +59,9 @@ const (
 
 func NewMigrator(params MigratorParams) *Migrator {
 	w := &Migrator{
-		baseWorkflow: newBaseWorkflow(&params.Config.Workflows.Migrator, params.Runtime),
-		migrator:     params.Migrator,
+		baseWorkflow:         newBaseWorkflow(&params.Config.Workflows.Migrator, params.Runtime),
+		migrator:             params.Migrator,
+		getLatestBlockHeight: params.GetLatestBlockHeight,
 	}
 	w.registerWorkflow(w.execute)
 	return w
@@ -116,6 +119,26 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			zap.Reflect("config", cfg),
 		)
 
+		// Set up activity options early so we can use activities
+		ctx = w.withActivityOptions(ctx)
+
+		// Handle end height auto-detection if not provided
+		if request.EndHeight == 0 {
+			logger.Info("No end height provided, fetching latest block height from DynamoDB via activity...")
+			resp, err := w.getLatestBlockHeight.Execute(ctx, &activity.GetLatestBlockHeightRequest{Tag: tag})
+			if err != nil {
+				return xerrors.Errorf("failed to get latest block height from DynamoDB: %w", err)
+			}
+			request.EndHeight = resp.Height + 1
+			logger.Info("Auto-detected end height from DynamoDB", zap.Uint64("endHeight", request.EndHeight))
+		}
+
+		// Validate end height after auto-detection
+		if request.StartHeight >= request.EndHeight {
+			return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
+				request.StartHeight, request.EndHeight)
+		}
+
 		// Validate skip-blocks requirements (moved here after logger is available)
 		if request.SkipBlocks && !request.SkipEvents {
 			logger.Warn("Events-only migration requested (skip-blocks=true)")
@@ -124,7 +147,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		}
 
 		logger.Info("migrator workflow started")
-		ctx = w.withActivityOptions(ctx)
 
 		totalHeightRange := request.EndHeight - request.StartHeight
 		processedHeights := uint64(0)
