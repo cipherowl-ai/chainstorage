@@ -4,15 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 
 	_ "github.com/lib/pq"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/utils/log"
 )
 
 func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {
+	logger := log.WithPackage(log.NewDevelopment())
+
 	// Build PostgreSQL connection string with timeout
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode)
@@ -23,21 +26,25 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 	}
 
 	// Debug output for CI troubleshooting
-	log.Printf("DEBUG: Connecting to PostgreSQL with DSN: host=%s port=%d dbname=%s sslmode=%s", cfg.Host, cfg.Port, cfg.Database, cfg.SSLMode)
+	logger.Debug("Connecting to PostgreSQL",
+		zap.String("host", cfg.Host),
+		zap.Int("port", cfg.Port),
+		zap.String("database", cfg.Database),
+		zap.String("ssl_mode", cfg.SSLMode))
 
 	// Open database connection
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("DEBUG: Failed to open connection: %v", err)
+		logger.Error("Failed to open connection", zap.Error(err))
 		return nil, err
 	}
 
 	if pingErr := db.PingContext(ctx); pingErr != nil {
-		log.Printf("DEBUG: Failed to ping database: %v", pingErr)
+		logger.Error("Failed to ping database", zap.Error(pingErr))
 		return nil, pingErr
 	}
 
-	log.Printf("DEBUG: Successfully connected to PostgreSQL")
+	logger.Debug("Successfully connected to PostgreSQL")
 
 	// Configure connection pool and timeouts
 	db.SetMaxOpenConns(cfg.MaxConnections)
@@ -60,13 +67,13 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 	}
 
 	if !tablesExist {
-		log.Printf("DEBUG: Tables don't exist, running migrations...")
+		logger.Debug("Tables don't exist, running migrations")
 		if err := runMigrations(ctx, db); err != nil {
 			return nil, xerrors.Errorf("failed to run migrations: %w", err)
 		}
-		log.Printf("DEBUG: Migrations completed successfully")
+		logger.Debug("Migrations completed successfully")
 	} else {
-		log.Printf("DEBUG: Tables already exist, skipping migrations")
+		logger.Debug("Tables already exist, skipping migrations")
 	}
 
 	return db, nil

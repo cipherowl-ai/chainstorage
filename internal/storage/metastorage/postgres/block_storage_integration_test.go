@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
@@ -106,13 +107,14 @@ func (s *blockStorageTestSuite) runTestPersistBlockMetas(totalBlocks int) {
 	require := testutil.Require(s.T())
 	startHeight := s.config.Chain.BlockStartHeight
 	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, totalBlocks, tag)
-	log := zaptest.NewLogger(s.T())
+	zaptest.NewLogger(s.T())
 	ctx := context.TODO()
 
 	// shuffle it to make sure it still works
 	shuffleSeed := time.Now().UnixNano()
 	rand.Shuffle(len(blocks), func(i, j int) { blocks[i], blocks[j] = blocks[j], blocks[i] })
-	log.Info(fmt.Sprintf("shuffled blocks with seed %d", shuffleSeed))
+	logger := zaptest.NewLogger(s.T())
+	logger.Info("shuffled blocks", zap.Int64("seed", shuffleSeed))
 
 	fmt.Println("Persisting blocks")
 	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)

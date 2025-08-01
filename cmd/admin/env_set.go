@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
+
+	"github.com/coinbase/chainstorage/internal/utils/log"
 )
 
 func newEnvSetCommand() *cobra.Command {
@@ -63,13 +65,15 @@ type EnvVars struct {
 
 func runEnvSet(blockchain, network, env, awsRegion, role string, quiet bool) error {
 	ctx := context.Background()
+	logger := log.WithPackage(logger)
 
 	if !quiet {
-		log.Printf("🔧 Setting environment variables for %s-%s %s role...", blockchain, network, role)
-		log.Printf("   Environment: %s", env)
-		log.Printf("   AWS Region: %s", awsRegion)
-		log.Printf("   Role: %s", role)
-		log.Printf("")
+		logger.Info("Setting environment variables",
+			zap.String("blockchain", blockchain),
+			zap.String("network", network),
+			zap.String("environment", env),
+			zap.String("aws_region", awsRegion),
+			zap.String("role", role))
 	}
 
 	// Get master credentials from environment variables
@@ -121,10 +125,9 @@ func runEnvSet(blockchain, network, env, awsRegion, role string, quiet bool) err
 	}
 
 	if !quiet {
-		log.Printf("✅ Successfully fetched credentials from AWS Secrets Manager")
-		log.Printf("   Database: %s", dbName)
-		log.Printf("   User: %s", username)
-		log.Printf("")
+		logger.Info("Successfully fetched credentials from AWS Secrets Manager",
+			zap.String("database", dbName),
+			zap.String("user", username))
 	}
 
 	// Create environment variables
@@ -167,9 +170,12 @@ func runEnvSet(blockchain, network, env, awsRegion, role string, quiet bool) err
 	fmt.Printf("export CHAINSTORAGE_AWS_POSTGRES_SSL_MODE=\"%s\"\n", envVars.SSLMode)
 
 	if !quiet {
-		log.Printf("")
-		log.Printf("✅ Environment variables set for %s-%s %s role", blockchain, network, role)
-		log.Printf("   Variables are now available in the current process")
+		logger.Info("Environment variables set successfully",
+			zap.String("blockchain", blockchain),
+			zap.String("network", network),
+			zap.String("role", role),
+			zap.String("database", dbName),
+			zap.String("user", username))
 	}
 
 	return nil

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -15,8 +14,10 @@ import (
 	"github.com/lib/pq"
 	"github.com/pressly/goose/v3"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/utils/log"
 	_ "github.com/lib/pq"
 )
 
@@ -67,12 +68,14 @@ Example usage:
 
 func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 	ctx := context.Background()
+	logger := log.WithPackage(logger)
 
-	log.Printf("🚀 Starting database initialization for %s-%s...", blockchain, network)
-	log.Printf("   Environment: %s", env)
-	log.Printf("   Region: %s", awsRegion)
-	log.Printf("   Dry-run: %v", dryRun)
-	log.Printf("")
+	logger.Info("Starting database initialization",
+		zap.String("blockchain", blockchain),
+		zap.String("network", network),
+		zap.String("environment", env),
+		zap.String("region", awsRegion),
+		zap.Bool("dry_run", dryRun))
 
 	// Get master credentials from environment variables
 	masterHost := os.Getenv("CHAINSTORAGE_CLUSTER_ENDPOINT")
@@ -128,19 +131,16 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 		return xerrors.Errorf("failed to get worker password: %w", err)
 	}
 
-	log.Printf("✅ Successfully fetched credentials from AWS Secrets Manager")
-	log.Printf("   Database: %s", dbName)
-	log.Printf("   Server user: %s", serverUsername)
-	log.Printf("   Worker user: %s", workerUsername)
-	log.Printf("")
+	logger.Info("Successfully fetched credentials from AWS Secrets Manager",
+		zap.String("database", dbName),
+		zap.String("server_user", serverUsername),
+		zap.String("worker_user", workerUsername))
 
 	if dryRun {
-		log.Printf("🔍 DRY RUN MODE - No changes will be made")
-		log.Printf("")
-		log.Printf("Would create:")
-		log.Printf("   - Database: %s", dbName)
-		log.Printf("   - User: %s (read-only access)", serverUsername)
-		log.Printf("   - User: %s (read-write access)", workerUsername)
+		logger.Info("DRY RUN MODE - No changes will be made",
+			zap.String("database", dbName),
+			zap.String("server_user", serverUsername),
+			zap.String("worker_user", workerUsername))
 		return nil
 	}
 
@@ -154,7 +154,7 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 	}
 	defer func() {
 		if closeErr := db.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close database connection: %v", closeErr)
+			logger.Warn("Failed to close database connection", zap.Error(closeErr))
 		}
 	}()
 
@@ -168,42 +168,40 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 		return xerrors.Errorf("failed to ping database: %w", err)
 	}
 
-	log.Printf("✅ Successfully connected to PostgreSQL cluster")
-	log.Printf("")
+	logger.Info("Successfully connected to PostgreSQL cluster")
 
 	// Create users
-	log.Printf("Creating users...")
+	logger.Info("Creating users")
 
-	if err := createUser(db, workerUsername, workerPassword, true); err != nil {
+	if err := createUser(db, workerUsername, workerPassword, true, logger); err != nil {
 		return xerrors.Errorf("failed to create worker user %s: %w", workerUsername, err)
 	}
-	log.Printf("   ✓ Created/verified worker user: %s", workerUsername)
+	logger.Info("Created/verified worker user", zap.String("username", workerUsername))
 
-	if err := createUser(db, serverUsername, serverPassword, false); err != nil {
+	if err := createUser(db, serverUsername, serverPassword, false, logger); err != nil {
 		return xerrors.Errorf("failed to create server user %s: %w", serverUsername, err)
 	}
-	log.Printf("   ✓ Created/verified server user: %s", serverUsername)
-	log.Printf("")
+	logger.Info("Created/verified server user", zap.String("username", serverUsername))
 
 	// Create database
-	log.Printf("Creating database...")
-	if err := createDatabase(db, dbName, workerUsername); err != nil {
+	logger.Info("Creating database")
+	if err := createDatabase(db, dbName, workerUsername, logger); err != nil {
 		return xerrors.Errorf("failed to create database %s: %w", dbName, err)
 	}
-	log.Printf("   ✓ Created/verified database: %s", dbName)
+	logger.Info("Created/verified database", zap.String("database", dbName))
 
 	// Run migrations on the network database
-	log.Printf("Running migrations...")
-	if err := runMigrations(ctx, masterHost, masterPort, masterUser, masterPassword, dbName); err != nil {
+	logger.Info("Running migrations")
+	if err := runMigrations(ctx, masterHost, masterPort, masterUser, masterPassword, dbName, logger); err != nil {
 		return xerrors.Errorf("failed to run migrations: %w", err)
 	}
-	log.Printf("   ✓ Migrations completed successfully")
+	logger.Info("Migrations completed successfully")
 
 	// Grant permissions
-	log.Printf("Setting up permissions...")
+	logger.Info("Setting up permissions")
 
 	// Grant CONNECT permission to server user
-	if err := grantConnectPermission(db, dbName, serverUsername); err != nil {
+	if err := grantConnectPermission(db, dbName, serverUsername, logger); err != nil {
 		return xerrors.Errorf("failed to grant CONNECT permission on %s to %s: %w",
 			dbName, serverUsername, err)
 	}
@@ -218,32 +216,32 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 	}
 	defer func() {
 		if closeErr := netDB.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close network database connection: %v", closeErr)
+			logger.Warn("Failed to close network database connection", zap.Error(closeErr))
 		}
 	}()
 
 	// Grant full access to worker user (owner)
-	if err := grantFullAccess(netDB, workerUsername); err != nil {
+	if err := grantFullAccess(netDB, workerUsername, logger); err != nil {
 		return xerrors.Errorf("failed to grant full access on %s to %s: %w", dbName, workerUsername, err)
 	}
-	log.Printf("   ✓ Granted full access to: %s", workerUsername)
+	logger.Info("Granted full access to worker user", zap.String("username", workerUsername))
 
 	// Grant permissions to server user
-	if err := grantReadOnlyAccess(netDB, serverUsername, workerUsername); err != nil {
+	if err := grantReadOnlyAccess(netDB, serverUsername, workerUsername, logger); err != nil {
 		return xerrors.Errorf("failed to grant permissions on %s: %w", dbName, err)
 	}
-	log.Printf("   ✓ Granted read-only access to: %s", serverUsername)
+	logger.Info("Granted read-only access to server user", zap.String("username", serverUsername))
 
-	log.Printf("")
-	log.Printf("✅ Database initialization completed successfully!")
-	log.Printf("   Network: %s-%s", blockchain, network)
-	log.Printf("   Database: %s", dbName)
-	log.Printf("   Users created: %s (worker), %s (server)", workerUsername, serverUsername)
-	log.Printf("")
-	log.Printf("Next steps:")
-	log.Printf("   1. Deploy chainstorage worker pods to start data ingestion")
-	log.Printf("   2. Deploy chainstorage server pods for API access")
-	log.Printf("   3. Monitor logs for successful connections")
+	logger.Info("Database initialization completed successfully",
+		zap.String("network", fmt.Sprintf("%s-%s", blockchain, network)),
+		zap.String("database", dbName),
+		zap.String("worker_user", workerUsername),
+		zap.String("server_user", serverUsername))
+
+	logger.Info("Next steps",
+		zap.String("step1", "Deploy chainstorage worker pods to start data ingestion"),
+		zap.String("step2", "Deploy chainstorage server pods for API access"),
+		zap.String("step3", "Monitor logs for successful connections"))
 
 	return nil
 }
@@ -288,7 +286,7 @@ func getStringFromSecret(secret map[string]interface{}, key string) (string, err
 	return strValue, nil
 }
 
-func createUser(db *sql.DB, username, password string, canCreateDB bool) error {
+func createUser(db *sql.DB, username, password string, canCreateDB bool, logger *zap.Logger) error {
 	// Check if user exists
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM pg_user WHERE usename = $1)`
@@ -297,7 +295,7 @@ func createUser(db *sql.DB, username, password string, canCreateDB bool) error {
 	}
 
 	if exists {
-		log.Printf("     User %s already exists, updating password", username)
+		logger.Info("User already exists, updating password", zap.String("username", username))
 		// Update password for existing user
 		alterQuery := fmt.Sprintf("ALTER USER %s WITH PASSWORD %s",
 			pq.QuoteIdentifier(username), pq.QuoteLiteral(password))
@@ -322,7 +320,7 @@ func createUser(db *sql.DB, username, password string, canCreateDB bool) error {
 	return nil
 }
 
-func createDatabase(db *sql.DB, dbName, owner string) error {
+func createDatabase(db *sql.DB, dbName, owner string, logger *zap.Logger) error {
 	// Check if database exists
 	var exists bool
 	query := `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`
@@ -331,7 +329,7 @@ func createDatabase(db *sql.DB, dbName, owner string) error {
 	}
 
 	if exists {
-		log.Printf("     Database %s already exists, checking ownership", dbName)
+		logger.Info("Database already exists, checking ownership", zap.String("database", dbName))
 		// Check current owner
 		var currentOwner string
 		ownerQuery := `SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1`
@@ -340,10 +338,10 @@ func createDatabase(db *sql.DB, dbName, owner string) error {
 		}
 
 		if currentOwner == owner {
-			log.Printf("     Database %s already owned by %s", dbName, owner)
+			logger.Info("Database already owned by expected owner", zap.String("database", dbName), zap.String("owner", owner))
 			return nil
 		} else {
-			log.Printf("     Database %s owned by %s, transferring to %s", dbName, currentOwner, owner)
+			logger.Info("Transferring database ownership", zap.String("database", dbName), zap.String("current_owner", currentOwner), zap.String("new_owner", owner))
 			// Transfer ownership
 			alterQuery := fmt.Sprintf("ALTER DATABASE %s OWNER TO %s",
 				pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(owner))
@@ -373,20 +371,20 @@ func createDatabase(db *sql.DB, dbName, owner string) error {
 	return nil
 }
 
-func grantConnectPermission(db *sql.DB, dbName, username string) error {
+func grantConnectPermission(db *sql.DB, dbName, username string, logger *zap.Logger) error {
 	// Grant CONNECT permission on database
 	grantQuery := fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s",
 		pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(username))
 
 	if _, err := db.Exec(grantQuery); err != nil {
 		// This might fail if permission already exists, which is fine
-		log.Printf("     Warning: %v (continuing...)", err)
+		logger.Warn("Failed to grant CONNECT permission (continuing)", zap.Error(err))
 	}
 
 	return nil
 }
 
-func grantReadOnlyAccess(db *sql.DB, readUser, ownerUser string) error {
+func grantReadOnlyAccess(db *sql.DB, readUser, ownerUser string, logger *zap.Logger) error {
 	queries := []string{
 		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", pq.QuoteIdentifier(readUser)),
 		fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", pq.QuoteIdentifier(readUser)),
@@ -401,14 +399,14 @@ func grantReadOnlyAccess(db *sql.DB, readUser, ownerUser string) error {
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
 			// Some permissions might already exist, log but don't fail
-			log.Printf("     Warning: %v (continuing...)", err)
+			logger.Warn("Failed to grant read-only permission (continuing)", zap.Error(err))
 		}
 	}
 
 	return nil
 }
 
-func grantFullAccess(db *sql.DB, username string) error {
+func grantFullAccess(db *sql.DB, username string, logger *zap.Logger) error {
 	queries := []string{
 		fmt.Sprintf("GRANT ALL PRIVILEGES ON SCHEMA public TO %s", pq.QuoteIdentifier(username)),
 		fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO %s", pq.QuoteIdentifier(username)),
@@ -423,14 +421,14 @@ func grantFullAccess(db *sql.DB, username string) error {
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
 			// Some permissions might already exist, log but don't fail
-			log.Printf("     Warning: %v (continuing...)", err)
+			logger.Warn("Failed to grant full access permission (continuing)", zap.Error(err))
 		}
 	}
 
 	return nil
 }
 
-func runMigrations(ctx context.Context, host string, port int, user, password, dbName string) error {
+func runMigrations(ctx context.Context, host string, port int, user, password, dbName string, logger *zap.Logger) error {
 	// Connect to the network database to run migrations
 	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require",
 		host, port, dbName, user, password)
@@ -441,7 +439,7 @@ func runMigrations(ctx context.Context, host string, port int, user, password, d
 	}
 	defer func() {
 		if closeErr := migrationDB.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close migration database connection: %v", closeErr)
+			logger.Warn("Failed to close migration database connection", zap.Error(closeErr))
 		}
 	}()
 

@@ -4,18 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 
 	"github.com/lib/pq"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/utils/log"
 )
 
 // SetupDatabase creates a database and roles for a new network in PostgreSQL
 // This function is intended to be called by administrators during setup
 func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, workerUser string, workerPassword string, serverUser string, serverPassword string, dbName string) error {
-	log.Printf("Setting up PostgreSQL database: %s with roles: %s (worker), %s (server)", dbName, workerUser, serverUser)
+	logger := log.WithPackage(log.NewDevelopment())
+
+	logger.Info("Setting up PostgreSQL database",
+		zap.String("database", dbName),
+		zap.String("worker_user", workerUser),
+		zap.String("server_user", serverUser))
 
 	// Connect to the default 'postgres' database with master credentials
 	dsn := fmt.Sprintf(
@@ -32,7 +38,7 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 	}
 	defer func() {
 		if closeErr := adminDB.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close admin database connection: %v", closeErr)
+			logger.Warn("Failed to close admin database connection", zap.Error(closeErr))
 		}
 	}()
 
@@ -40,15 +46,15 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 		return xerrors.Errorf("failed to ping postgres db with master user: %w", err)
 	}
 
-	log.Printf("Successfully connected to PostgreSQL as master user")
+	logger.Info("Successfully connected to PostgreSQL as master user")
 
 	// Create worker role with LOGIN capability and password
-	log.Printf("Creating worker role: %s", workerUser)
+	logger.Info("Creating worker role", zap.String("username", workerUser))
 	workerQuery := fmt.Sprintf("CREATE ROLE %s WITH LOGIN PASSWORD %s",
 		pq.QuoteIdentifier(workerUser), pq.QuoteLiteral(workerPassword))
 	if _, err := adminDB.ExecContext(ctx, workerQuery); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "duplicate_object" {
-			log.Printf("Worker role %s already exists, updating password", workerUser)
+			logger.Info("Worker role already exists, updating password", zap.String("username", workerUser))
 			// Update password for existing role
 			alterQuery := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD %s",
 				pq.QuoteIdentifier(workerUser), pq.QuoteLiteral(workerPassword))
@@ -59,16 +65,16 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 			return xerrors.Errorf("failed to create worker role %s: %w", workerUser, err)
 		}
 	} else {
-		log.Printf("Successfully created worker role: %s", workerUser)
+		logger.Info("Successfully created worker role", zap.String("username", workerUser))
 	}
 
 	// Create server role with LOGIN capability and password
-	log.Printf("Creating server role: %s", serverUser)
+	logger.Info("Creating server role", zap.String("username", serverUser))
 	serverQuery := fmt.Sprintf("CREATE ROLE %s WITH LOGIN PASSWORD %s",
 		pq.QuoteIdentifier(serverUser), pq.QuoteLiteral(serverPassword))
 	if _, err := adminDB.ExecContext(ctx, serverQuery); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "duplicate_object" {
-			log.Printf("Server role %s already exists, updating password", serverUser)
+			logger.Info("Server role already exists, updating password", zap.String("username", serverUser))
 			// Update password for existing role
 			alterQuery := fmt.Sprintf("ALTER ROLE %s WITH PASSWORD %s",
 				pq.QuoteIdentifier(serverUser), pq.QuoteLiteral(serverPassword))
@@ -79,24 +85,24 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 			return xerrors.Errorf("failed to create server role %s: %w", serverUser, err)
 		}
 	} else {
-		log.Printf("Successfully created server role: %s", serverUser)
+		logger.Info("Successfully created server role", zap.String("username", serverUser))
 	}
 
 	// Create application database owned by the worker role
-	log.Printf("Creating database: %s", dbName)
+	logger.Info("Creating database", zap.String("database", dbName))
 	ownerOpt := fmt.Sprintf("OWNER = %s", pq.QuoteIdentifier(workerUser))
 	if _, err := adminDB.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE %s WITH %s`, pq.QuoteIdentifier(dbName), ownerOpt)); err != nil {
 		if pgErr, ok := err.(*pq.Error); ok && pgErr.Code.Name() == "duplicate_database" {
-			log.Printf("Database %s already exists, skipping creation", dbName)
+			logger.Info("Database already exists, skipping creation", zap.String("database", dbName))
 		} else {
 			return xerrors.Errorf("failed to create database %s: %w", dbName, err)
 		}
 	} else {
-		log.Printf("Successfully created database: %s", dbName)
+		logger.Info("Successfully created database", zap.String("database", dbName))
 	}
 
 	// Connect to the application database to set up permissions
-	log.Printf("Setting up permissions for database: %s", dbName)
+	logger.Info("Setting up permissions for database", zap.String("database", dbName))
 	appDsn := fmt.Sprintf(
 		"host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		masterCfg.Host, masterCfg.Port, dbName, masterCfg.User, masterCfg.Password, masterCfg.SSLMode,
@@ -111,7 +117,7 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 	}
 	defer func() {
 		if closeErr := appDB.Close(); closeErr != nil {
-			log.Printf("Warning: failed to close app database connection: %v", closeErr)
+			logger.Warn("Failed to close app database connection", zap.Error(closeErr))
 		}
 	}()
 
@@ -120,42 +126,49 @@ func SetupDatabase(ctx context.Context, masterCfg *config.PostgresConfig, worker
 	}
 
 	// Grant connect permissions to server role
-	log.Printf("Granting CONNECT permission on database %s to %s", dbName, serverUser)
+	logger.Info("Granting CONNECT permission on database to server role",
+		zap.String("database", dbName),
+		zap.String("server_user", serverUser))
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(serverUser))); err != nil {
 		return xerrors.Errorf("failed to grant connect on db %s to role %s: %w", dbName, serverUser, err)
 	}
 
 	// Grant usage on public schema
-	log.Printf("Granting USAGE on schema public to %s", serverUser)
+	logger.Info("Granting USAGE on schema public to server role", zap.String("server_user", serverUser))
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", pq.QuoteIdentifier(serverUser))); err != nil {
 		return xerrors.Errorf("failed to grant usage on schema public to role %s: %w", serverUser, err)
 	}
 
 	// Grant SELECT on all current tables to server role
-	log.Printf("Granting SELECT on all existing tables to %s", serverUser)
+	logger.Info("Granting SELECT on all existing tables to server role", zap.String("server_user", serverUser))
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", pq.QuoteIdentifier(serverUser))); err != nil {
 		// This might fail if no tables exist yet, which is fine
-		log.Printf("Warning: failed to grant select on existing tables (this is normal if no tables exist yet): %v", err)
+		logger.Warn("Failed to grant select on existing tables (this is normal if no tables exist yet)", zap.Error(err))
 	}
 
 	// Grant SELECT on all future tables to server role
-	log.Printf("Setting up default privileges for future tables for %s", serverUser)
+	logger.Info("Setting up default privileges for future tables for server role", zap.String("server_user", serverUser))
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO %s", pq.QuoteIdentifier(serverUser))); err != nil {
 		return xerrors.Errorf("failed to alter default privileges for role %s: %w", serverUser, err)
 	}
 
 	// Also need to ensure the worker role has the necessary permissions on the database
-	log.Printf("Ensuring worker role %s has full access to database %s", workerUser, dbName)
+	logger.Info("Ensuring worker role has full access to database",
+		zap.String("worker_user", workerUser),
+		zap.String("database", dbName))
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON DATABASE %s TO %s", pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(workerUser))); err != nil {
-		log.Printf("Warning: failed to grant all privileges on database to worker role: %v", err)
+		logger.Warn("Failed to grant all privileges on database to worker role", zap.Error(err))
 	}
 
 	if _, err := appDB.ExecContext(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON SCHEMA public TO %s", pq.QuoteIdentifier(workerUser))); err != nil {
-		log.Printf("Warning: failed to grant all privileges on schema to worker role: %v", err)
+		logger.Warn("Failed to grant all privileges on schema to worker role", zap.Error(err))
 	}
 
-	log.Printf("✅ Successfully set up database %s with roles %s (worker) and %s (server)", dbName, workerUser, serverUser)
-	log.Printf("📋 Database ready for use with the provided credentials")
+	logger.Info("Successfully set up database with roles",
+		zap.String("database", dbName),
+		zap.String("worker_user", workerUser),
+		zap.String("server_user", serverUser))
+	logger.Info("Database ready for use with the provided credentials")
 
 	return nil
 }
