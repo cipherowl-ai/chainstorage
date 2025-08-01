@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -190,15 +191,7 @@ Example usage:
 // replaceHyphensWithUnderscores converts network names like "ethereum-mainnet" to "ethereum_mainnet"
 // for valid PostgreSQL database naming
 func replaceHyphensWithUnderscores(s string) string {
-	result := make([]byte, len(s))
-	for i, c := range []byte(s) {
-		if c == '-' {
-			result[i] = '_'
-		} else {
-			result[i] = c
-		}
-	}
-	return string(result)
+	return strings.ReplaceAll(s, "-", "_")
 }
 
 func init() {

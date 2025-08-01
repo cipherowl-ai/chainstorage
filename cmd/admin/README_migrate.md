@@ -91,7 +91,7 @@ If block metadata is missing, the migration will fail with an error. To resolve 
 
 ```bash
 # Step 1: Migrate blocks first
-go run cmd/admin/*.go migrate \
+go run ./cmd/admin/*.go migrate \
   --env=local \
   --blockchain=ethereum \
   --network=mainnet \
@@ -100,7 +100,7 @@ go run cmd/admin/*.go migrate \
   --skip-events
 
 # Step 2: Migrate events (now that block metadata exists)
-go run cmd/admin/*.go migrate \
+go run ./cmd/admin/*.go migrate \
   --env=local \
   --blockchain=ethereum \
   --network=mainnet \

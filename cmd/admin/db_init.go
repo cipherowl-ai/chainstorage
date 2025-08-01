@@ -378,7 +378,7 @@ func grantConnectPermission(db *sql.DB, dbName, username string, logger *zap.Log
 
 	if _, err := db.Exec(grantQuery); err != nil {
 		// This might fail if permission already exists, which is fine
-		logger.Warn("Failed to grant CONNECT permission (continuing)", zap.Error(err))
+		return xerrors.Errorf("failed to grant connect permission: %w", err)
 	}
 
 	return nil
