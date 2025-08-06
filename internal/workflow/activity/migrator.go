@@ -3,6 +3,7 @@ package activity
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -42,6 +43,12 @@ type (
 		dynamoClient *dynamodb.DynamoDB
 		blockTable   string
 		metrics      tally.Scope
+	}
+
+	GetLatestBlockFromPostgresActivity struct {
+		baseActivity
+		config  *config.Config
+		metrics tally.Scope
 	}
 
 	MigratorParams struct {
@@ -98,6 +105,16 @@ func NewGetLatestBlockHeightActivity(params MigratorParams) *GetLatestBlockHeigh
 		session:      params.Session,
 		dynamoClient: dynamodb.New(params.Session),
 		blockTable:   params.Config.AWS.DynamoDB.BlockTable,
+		metrics:      params.Metrics,
+	}
+	a.register(a.execute)
+	return a
+}
+
+func NewGetLatestBlockFromPostgresActivity(params MigratorParams) *GetLatestBlockFromPostgresActivity {
+	a := &GetLatestBlockFromPostgresActivity{
+		baseActivity: newBaseActivity(ActivityGetLatestBlockFromPostgres, params.Runtime),
+		config:       params.Config,
 		metrics:      params.Metrics,
 	}
 	a.register(a.execute)
@@ -544,6 +561,15 @@ type GetLatestBlockHeightResponse struct {
 	Height uint64
 }
 
+type GetLatestBlockFromPostgresRequest struct {
+	Tag uint32
+}
+
+type GetLatestBlockFromPostgresResponse struct {
+	Height uint64
+	Found  bool // true if a block was found, false if no blocks exist yet
+}
+
 func (a *Migrator) GetLatestBlockHeight(ctx context.Context, req *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
 	migrationData, err := a.createStorageInstances(ctx)
 	if err != nil {
@@ -572,6 +598,53 @@ func (a *GetLatestBlockHeightActivity) execute(ctx context.Context, request *Get
 		return nil, xerrors.Errorf("failed to get latest block from DynamoDB: %w", err)
 	}
 	return &GetLatestBlockHeightResponse{Height: latestBlock.Height}, nil
+}
+
+func (a *GetLatestBlockFromPostgresActivity) Execute(ctx workflow.Context, request *GetLatestBlockFromPostgresRequest) (*GetLatestBlockFromPostgresResponse, error) {
+	var response GetLatestBlockFromPostgresResponse
+	err := a.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *GetLatestBlockFromPostgresActivity) execute(ctx context.Context, request *GetLatestBlockFromPostgresRequest) (*GetLatestBlockFromPostgresResponse, error) {
+	if err := a.validateRequest(request); err != nil {
+		return nil, err
+	}
+
+	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
+
+	// Create PostgreSQL storage using shared connection pool to query destination
+	postgresParams := postgres_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+	}
+	destResult, err := postgres_storage.NewMetaStorage(postgresParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create PostgreSQL storage: %w", err)
+	}
+
+	latestBlock, err := destResult.MetaStorage.GetLatestBlock(ctx, request.Tag)
+	if err != nil {
+		// Check if it's a "not found" error, which means no blocks migrated yet
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "not found") || strings.Contains(errStr, "no rows") {
+			logger.Info("No blocks found in PostgreSQL destination - starting from beginning")
+			return &GetLatestBlockFromPostgresResponse{
+				Height: 0,
+				Found:  false,
+			}, nil
+		}
+		return nil, xerrors.Errorf("failed to get latest block from PostgreSQL: %w", err)
+	}
+
+	logger.Info("Found latest block in PostgreSQL destination", zap.Uint64("height", latestBlock.Height))
+	return &GetLatestBlockFromPostgresResponse{
+		Height: latestBlock.Height,
+		Found:  true,
+	}, nil
 }
 
 func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Context) (*MigrationData, error) {
@@ -614,6 +687,7 @@ func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Contex
 }
 
 const (
-	ActivityMigrator             = "activity.migrator"
-	ActivityGetLatestBlockHeight = "activity.migrator.GetLatestBlockHeight"
+	ActivityMigrator                   = "activity.migrator"
+	ActivityGetLatestBlockHeight       = "activity.migrator.GetLatestBlockHeight"
+	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
 )

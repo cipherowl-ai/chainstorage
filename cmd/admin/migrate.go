@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
@@ -40,6 +41,7 @@ var (
 		continuousSync  bool
 		syncInterval    string
 		backoffInterval string
+		autoResume      bool
 	}
 )
 
@@ -154,8 +156,25 @@ Examples:
     --batch-size=1000 \
     --mini-batch-size=100 \
     --checkpoint-size=10000 \
-    --parallelism=8`,
+    --parallelism=8
+
+  # Auto-resume from where previous migration left off
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --auto-resume \
+    --tag=2 \
+    --event-tag=3`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Validate flag combinations
+			if !migrateFlags.autoResume && migrateFlags.startHeight == 0 {
+				return xerrors.New("start-height is required unless --auto-resume is enabled")
+			}
+			if migrateFlags.autoResume && migrateFlags.startHeight != 0 {
+				return xerrors.New("cannot specify both --auto-resume and --start-height (auto-resume will determine start height)")
+			}
+
 			var deps struct {
 				fx.In
 				Config  *config.Config
@@ -226,7 +245,7 @@ Examples:
 				logger.Warn("WARNING: Continuous sync is not supported in direct migration mode")
 				logger.Warn("Continuous sync is only available when using the migrator workflow")
 				logger.Warn("This tool will perform a one-time migration and exit")
-				
+
 				if migrateFlags.endHeight != 0 && migrateFlags.endHeight <= migrateFlags.startHeight {
 					return xerrors.Errorf("with continuous sync enabled, end height (%d) must be 0 OR greater than start height (%d)",
 						migrateFlags.endHeight, migrateFlags.startHeight)
@@ -249,6 +268,28 @@ Examples:
 
 			ctx := context.Background()
 
+			// Handle auto-resume functionality
+			if migrateFlags.autoResume && migrateFlags.startHeight == 0 {
+				logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated block")
+				latestBlock, err := destResult.MetaStorage.GetLatestBlock(ctx, migrateFlags.tag)
+				if err != nil {
+					// Check if it's a "not found" error, which means no blocks migrated yet
+					errStr := strings.ToLower(err.Error())
+					if strings.Contains(errStr, "not found") || strings.Contains(errStr, "no rows") {
+						logger.Info("Auto-resume: no blocks found in PostgreSQL destination, starting from beginning")
+						migrateFlags.startHeight = 0
+					} else {
+						return xerrors.Errorf("failed to get latest block height from PostgreSQL: %w", err)
+					}
+				} else {
+					// Resume from the next block after the latest migrated block
+					migrateFlags.startHeight = latestBlock.Height + 1
+					logger.Info("Auto-resume: found latest block in PostgreSQL destination",
+						zap.Uint64("latestHeight", latestBlock.Height),
+						zap.Uint64("resumeFromHeight", migrateFlags.startHeight))
+				}
+			}
+
 			// Handle end height - if not provided, query latest block from DynamoDB
 			if migrateFlags.endHeight == 0 {
 				logger.Info("No end height provided, querying latest block from DynamoDB...")
@@ -266,8 +307,15 @@ Examples:
 					zap.String("latestHash", latestBlock.Hash))
 			}
 
-			// Validate flags after end height auto-detection
+			// Validate flags after end height auto-detection and auto-resume
 			if !migrateFlags.continuousSync && migrateFlags.startHeight >= migrateFlags.endHeight {
+				// Special case: if auto-resume found we're already caught up
+				if migrateFlags.autoResume && migrateFlags.startHeight >= migrateFlags.endHeight {
+					logger.Info("Auto-resume detected: already caught up, no migration needed",
+						zap.Uint64("startHeight", migrateFlags.startHeight),
+						zap.Uint64("endHeight", migrateFlags.endHeight))
+					return nil // Successfully completed with no work to do
+				}
 				return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
 					migrateFlags.startHeight, migrateFlags.endHeight)
 			}
@@ -313,6 +361,7 @@ Examples:
 				ContinuousSync:  migrateFlags.continuousSync,
 				SyncInterval:    migrateFlags.syncInterval,
 				BackoffInterval: migrateFlags.backoffInterval,
+				AutoResume:      migrateFlags.autoResume,
 			}
 
 			return migrator.Migrate(ctx, migrateParams)
@@ -334,6 +383,7 @@ type MigrationParams struct {
 	ContinuousSync  bool
 	SyncInterval    string
 	BackoffInterval string
+	AutoResume      bool
 }
 
 type DataMigrator struct {
@@ -685,8 +735,9 @@ func init() {
 	migrateCmd.Flags().BoolVar(&migrateFlags.continuousSync, "continuous-sync", false, "enable continuous sync mode (infinite loop, workflow only)")
 	migrateCmd.Flags().StringVar(&migrateFlags.syncInterval, "sync-interval", "1m", "time duration to wait between continuous sync cycles (e.g., '1m', '30s')")
 	migrateCmd.Flags().StringVar(&migrateFlags.backoffInterval, "backoff-interval", "", "time duration to wait between batches (e.g., '1s', '500ms')")
+	migrateCmd.Flags().BoolVar(&migrateFlags.autoResume, "auto-resume", false, "automatically determine start height from latest block in PostgreSQL destination")
 
-	_ = migrateCmd.MarkFlagRequired("start-height")
+	// start-height is required unless auto-resume is enabled
 	// end-height is optional - if not provided, will query latest block from DynamoDB
 
 	rootCmd.AddCommand(migrateCmd)

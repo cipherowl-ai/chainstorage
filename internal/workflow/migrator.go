@@ -20,21 +20,23 @@ import (
 type (
 	Migrator struct {
 		baseWorkflow
-		migrator             *activity.Migrator
-		getLatestBlockHeight *activity.GetLatestBlockHeightActivity
+		migrator                   *activity.Migrator
+		getLatestBlockHeight       *activity.GetLatestBlockHeightActivity
+		getLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 	}
 
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime              cadence.Runtime
-		Migrator             *activity.Migrator
-		GetLatestBlockHeight *activity.GetLatestBlockHeightActivity
+		Runtime                    cadence.Runtime
+		Migrator                   *activity.Migrator
+		GetLatestBlockHeight       *activity.GetLatestBlockHeightActivity
+		GetLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 	}
 
 	MigratorRequest struct {
 		StartHeight     uint64
-		EndHeight       uint64 `validate:"eq=0|gtfield=StartHeight"` // Optional. If not specified, will query latest block from DynamoDB. Must be 0 OR greater than StartHeight when ContinuousSync is enabled.
+		EndHeight       uint64 // Optional. If not specified, will query latest block from DynamoDB.
 		EventTag        uint32
 		Tag             uint32
 		BatchSize       uint64 // Optional. If not specified, it is read from the workflow config.
@@ -46,13 +48,13 @@ type (
 		BackoffInterval string // Optional. If not specified, it is read from the workflow config.
 		ContinuousSync  bool   // Optional. Whether to continuously sync data in infinite loop mode
 		SyncInterval    string // Optional. Interval for continuous sync (e.g., "1m", "30s"). Defaults to 1 minute if not specified or invalid.
+		AutoResume      bool   // Optional. Automatically determine StartHeight from latest block in PostgreSQL destination
 	}
 )
 
 var (
 	_ InstrumentedRequest = (*MigratorRequest)(nil)
 )
-
 
 const (
 	// migrator metrics. need to have `workflow.migrator` as prefix
@@ -64,9 +66,10 @@ const (
 
 func NewMigrator(params MigratorParams) *Migrator {
 	w := &Migrator{
-		baseWorkflow:         newBaseWorkflow(&params.Config.Workflows.Migrator, params.Runtime),
-		migrator:             params.Migrator,
-		getLatestBlockHeight: params.GetLatestBlockHeight,
+		baseWorkflow:               newBaseWorkflow(&params.Config.Workflows.Migrator, params.Runtime),
+		migrator:                   params.Migrator,
+		getLatestBlockHeight:       params.GetLatestBlockHeight,
+		getLatestBlockFromPostgres: params.GetLatestBlockFromPostgres,
 	}
 	w.registerWorkflow(w.execute)
 	return w
@@ -130,7 +133,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 
 		// Use config's continuous sync setting as default if not explicitly set in request
 		continuousSync := cfg.ContinuousSync || request.ContinuousSync
-		
+
 		syncInterval := defaultSyncInterval
 		if cfg.SyncInterval > 0 {
 			syncInterval = cfg.SyncInterval
@@ -154,6 +157,27 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Set up activity options early so we can use activities
 		ctx = w.withActivityOptions(ctx)
 
+		// Handle auto-resume functionality
+		if request.AutoResume && request.StartHeight == 0 {
+			logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated block")
+			postgresResp, err := w.getLatestBlockFromPostgres.Execute(ctx, &activity.GetLatestBlockFromPostgresRequest{Tag: tag})
+			if err != nil {
+				return xerrors.Errorf("failed to get latest block height from PostgreSQL: %w", err)
+			}
+
+			if postgresResp.Found {
+				// Resume from the next block after the latest migrated block
+				request.StartHeight = postgresResp.Height + 1
+				logger.Info("Auto-resume: found latest block in PostgreSQL destination",
+					zap.Uint64("latestHeight", postgresResp.Height),
+					zap.Uint64("resumeFromHeight", request.StartHeight))
+			} else {
+				// No blocks found in destination, start from the beginning
+				request.StartHeight = 0
+				logger.Info("Auto-resume: no blocks found in PostgreSQL destination, starting from beginning")
+			}
+		}
+
 		// Handle end height auto-detection if not provided
 		if request.EndHeight == 0 {
 			logger.Info("No end height provided, fetching latest block height from DynamoDB via activity...")
@@ -161,7 +185,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			if err != nil {
 				return xerrors.Errorf("failed to get latest block height from DynamoDB: %w", err)
 			}
-			
+
 			if continuousSync {
 				// For continuous sync, set end height to current latest block
 				request.EndHeight = resp.Height + 1
@@ -172,7 +196,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			}
 		}
 
-		// Validate end height after auto-detection
+		// Validate end height after auto-detection and auto-resume
 		if !continuousSync && request.StartHeight >= request.EndHeight {
 			return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
 				request.StartHeight, request.EndHeight)
@@ -182,6 +206,14 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		if continuousSync && request.EndHeight != 0 && request.EndHeight <= request.StartHeight {
 			return xerrors.Errorf("with ContinuousSync enabled, EndHeight (%d) must be 0 OR greater than StartHeight (%d)",
 				request.EndHeight, request.StartHeight)
+		}
+
+		// Special case: if auto-resume found we're already caught up
+		if request.AutoResume && request.StartHeight >= request.EndHeight {
+			logger.Info("Auto-resume detected: already caught up, no migration needed",
+				zap.Uint64("startHeight", request.StartHeight),
+				zap.Uint64("endHeight", request.EndHeight))
+			return nil // Successfully completed with no work to do
 		}
 
 		// Validate skip-blocks requirements (moved here after logger is available)

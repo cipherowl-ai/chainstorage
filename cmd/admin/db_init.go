@@ -12,13 +12,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/lib/pq"
+	_ "github.com/lib/pq"
 	"github.com/pressly/goose/v3"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/utils/log"
-	_ "github.com/lib/pq"
 )
 
 // DBInitSecret is no longer needed - we parse flat JSON directly

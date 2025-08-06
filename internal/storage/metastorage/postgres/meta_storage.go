@@ -33,7 +33,7 @@ func NewMetaStorage(params Params) (internal.Result, error) {
 	if err != nil {
 		return internal.Result{}, err
 	}
-	
+
 	db := pool.DB()
 	if db == nil {
 		return internal.Result{}, xerrors.New("connection pool returned nil database connection")

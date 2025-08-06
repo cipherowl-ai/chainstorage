@@ -44,7 +44,7 @@ func GetConnectionPool(ctx context.Context, cfg *config.PostgresConfig) (*Connec
 func (cpm *ConnectionPoolManager) GetOrCreate(ctx context.Context, cfg *config.PostgresConfig) (*ConnectionPool, error) {
 	// Create a unique key for this configuration
 	key := fmt.Sprintf("%s:%d/%s?user=%s", cfg.Host, cfg.Port, cfg.Database, cfg.User)
-	
+
 	cpm.mu.RLock()
 	if pool, exists := cpm.pools[key]; exists && !pool.closed {
 		cpm.mu.RUnlock()
@@ -82,7 +82,7 @@ func (cpm *ConnectionPoolManager) CloseAll() error {
 			errors = append(errors, xerrors.Errorf("failed to close pool %s: %w", key, err))
 		}
 	}
-	
+
 	// Clear the pools map
 	cpm.pools = make(map[string]*ConnectionPool)
 
@@ -95,7 +95,7 @@ func (cpm *ConnectionPoolManager) CloseAll() error {
 // NewConnectionPool creates a new connection pool
 func NewConnectionPool(ctx context.Context, cfg *config.PostgresConfig) (*ConnectionPool, error) {
 	logger := log.WithPackage(log.NewDevelopment())
-	
+
 	db, err := newDBConnection(ctx, cfg)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create database connection: %w", err)
@@ -107,7 +107,7 @@ func NewConnectionPool(ctx context.Context, cfg *config.PostgresConfig) (*Connec
 		logger: logger,
 	}
 
-	logger.Debug("Created new connection pool", 
+	logger.Debug("Created new connection pool",
 		zap.String("host", cfg.Host),
 		zap.Int("port", cfg.Port),
 		zap.String("database", cfg.Database),
@@ -121,7 +121,7 @@ func NewConnectionPool(ctx context.Context, cfg *config.PostgresConfig) (*Connec
 func (cp *ConnectionPool) DB() *sql.DB {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
-	
+
 	if cp.closed {
 		return nil
 	}
@@ -138,7 +138,7 @@ func (cp *ConnectionPool) Close() error {
 	}
 
 	cp.closed = true
-	
+
 	if cp.db != nil {
 		if err := cp.db.Close(); err != nil {
 			cp.logger.Error("Failed to close database connection", zap.Error(err))
@@ -154,11 +154,11 @@ func (cp *ConnectionPool) Close() error {
 func (cp *ConnectionPool) Stats() sql.DBStats {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
-	
+
 	if cp.closed || cp.db == nil {
 		return sql.DBStats{}
 	}
-	
+
 	return cp.db.Stats()
 }
 
@@ -166,15 +166,15 @@ func (cp *ConnectionPool) Stats() sql.DBStats {
 func (cp *ConnectionPool) Health(ctx context.Context) error {
 	cp.mu.RLock()
 	defer cp.mu.RUnlock()
-	
+
 	if cp.closed {
 		return xerrors.New("connection pool is closed")
 	}
-	
+
 	if cp.db == nil {
 		return xerrors.New("database connection is nil")
 	}
-	
+
 	return cp.db.PingContext(ctx)
 }
 

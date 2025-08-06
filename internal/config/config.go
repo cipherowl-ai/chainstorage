@@ -303,14 +303,15 @@ type (
 	}
 
 	MigratorWorkflowConfig struct {
-		WorkflowConfig    `mapstructure:",squash"`
-		BatchSize         uint64        `mapstructure:"batch_size" validate:"required"`
-		MiniBatchSize     uint64        `mapstructure:"mini_batch_size"`
-		CheckpointSize    uint64        `mapstructure:"checkpoint_size" validate:"required"`
-		Parallelism       int           `mapstructure:"parallelism"`
-		BackoffInterval   time.Duration `mapstructure:"backoff_interval"`
-		ContinuousSync    bool          `mapstructure:"continuous_sync"`
-		SyncInterval      time.Duration `mapstructure:"sync_interval"`
+		WorkflowConfig  `mapstructure:",squash"`
+		BatchSize       uint64        `mapstructure:"batch_size" validate:"required"`
+		MiniBatchSize   uint64        `mapstructure:"mini_batch_size"`
+		CheckpointSize  uint64        `mapstructure:"checkpoint_size" validate:"required"`
+		Parallelism     int           `mapstructure:"parallelism"`
+		BackoffInterval time.Duration `mapstructure:"backoff_interval"`
+		ContinuousSync  bool          `mapstructure:"continuous_sync"`
+		SyncInterval    time.Duration `mapstructure:"sync_interval"`
+		AutoResume      bool          `mapstructure:"auto_resume"`
 	}
 
 	RosettaConfig struct {

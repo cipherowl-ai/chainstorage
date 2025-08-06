@@ -53,14 +53,14 @@ func startManager(opts ...fx.Option) services.SystemManager {
 	}
 	manager.AddPreShutdownHook(func() {
 		logger.Info("shutting down api server")
-		
+
 		// Close all PostgreSQL connection pools before stopping the app
 		if err := postgres_storage.CloseAllConnectionPools(); err != nil {
 			logger.Error("failed to close PostgreSQL connection pools", zap.Error(err))
 		} else {
 			logger.Info("PostgreSQL connection pools closed successfully")
 		}
-		
+
 		if err := app.Stop(ctx); err != nil {
 			logger.Error("failed to stop app", zap.Error(err))
 		}

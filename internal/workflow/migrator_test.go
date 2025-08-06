@@ -45,9 +45,7 @@ func (s *migratorTestSuite) SetupTest() {
 	cfg.Workflows.Migrator.CheckpointSize = migratorCheckpointSize
 	cfg.Workflows.Migrator.BackoffInterval = time.Second
 	s.cfg = cfg
-}
 
-func (s *migratorTestSuite) setupTestEnv() {
 	s.env = cadence.NewTestEnv(s)
 	s.app = testapp.New(
 		s.T(),
@@ -59,17 +57,12 @@ func (s *migratorTestSuite) setupTestEnv() {
 }
 
 func (s *migratorTestSuite) TearDownTest() {
-	if s.app != nil {
-		s.app.Close()
-	}
-	if s.env != nil {
-		s.env.AssertExpectations(s.T())
-	}
+	s.app.Close()
+	s.env.AssertExpectations(s.T())
 }
 
 func (s *migratorTestSuite) TestMigrator_Success() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -105,7 +98,6 @@ func (s *migratorTestSuite) TestMigrator_Success() {
 
 func (s *migratorTestSuite) TestMigrator_WithCheckpoint() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(startHeight + migratorCheckpointSize + 100) // Exceed checkpoint
@@ -132,7 +124,6 @@ func (s *migratorTestSuite) TestMigrator_WithCheckpoint() {
 
 func (s *migratorTestSuite) TestMigrator_SkipBlocks() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -163,7 +154,6 @@ func (s *migratorTestSuite) TestMigrator_SkipBlocks() {
 
 func (s *migratorTestSuite) TestMigrator_SkipEvents() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -194,7 +184,6 @@ func (s *migratorTestSuite) TestMigrator_SkipEvents() {
 
 func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -226,7 +215,6 @@ func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
 
 func (s *migratorTestSuite) TestMigrator_CustomBackoffInterval() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -253,7 +241,6 @@ func (s *migratorTestSuite) TestMigrator_CustomBackoffInterval() {
 
 func (s *migratorTestSuite) TestMigrator_ActivityFailure() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -280,7 +267,6 @@ func (s *migratorTestSuite) TestMigrator_ActivityFailure() {
 
 func (s *migratorTestSuite) TestMigrator_ValidateRequest_AutoDetection() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	// Test that EndHeight can be 0 (auto-detection) - mock the GetLatestBlockHeight activity
 	s.env.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
@@ -308,7 +294,6 @@ func (s *migratorTestSuite) TestMigrator_ValidateRequest_AutoDetection() {
 
 func (s *migratorTestSuite) TestMigrator_ValidateRequest_InvalidRange() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	// StartHeight == EndHeight should fail (after auto-detection)
 	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
@@ -323,7 +308,6 @@ func (s *migratorTestSuite) TestMigrator_ValidateRequest_InvalidRange() {
 
 func (s *migratorTestSuite) TestMigrator_InvalidBackoffInterval() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1200)
@@ -343,7 +327,6 @@ func (s *migratorTestSuite) TestMigrator_InvalidBackoffInterval() {
 
 func (s *migratorTestSuite) TestMigrator_AutoDetectionEndHeight() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	tag := uint32(1)
@@ -376,7 +359,6 @@ func (s *migratorTestSuite) TestMigrator_AutoDetectionEndHeight() {
 
 func (s *migratorTestSuite) TestMigrator_MultipleBatches() {
 	require := testutil.Require(s.T())
-	s.setupTestEnv()
 
 	startHeight := uint64(1000)
 	endHeight := uint64(1300) // 3 batches of 100
