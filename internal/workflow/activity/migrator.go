@@ -57,6 +57,7 @@ type (
 		EventTag    uint32
 		Tag         uint32
 		BatchSize   int
+		Parallelism int
 		SkipEvents  bool
 		SkipBlocks  bool
 	}
@@ -184,7 +185,7 @@ func (a *Migrator) createStorageInstances(ctx context.Context) (*MigrationData, 
 		return nil, xerrors.Errorf("failed to create DynamoDB storage: %w", err)
 	}
 
-	// Create PostgreSQL storage directly
+	// Create PostgreSQL storage using shared connection pool
 	postgresParams := postgres_storage.Params{
 		Params: fxparams.Params{
 			Config:  a.config,
@@ -590,7 +591,7 @@ func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Contex
 		return nil, xerrors.Errorf("failed to create DynamoDB storage: %w", err)
 	}
 
-	// Create PostgreSQL storage directly
+	// Create PostgreSQL storage using shared connection pool
 	postgresParams := postgres_storage.Params{
 		Params: fxparams.Params{
 			Config:  a.config,

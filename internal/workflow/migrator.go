@@ -34,20 +34,25 @@ type (
 
 	MigratorRequest struct {
 		StartHeight     uint64
-		EndHeight       uint64 // Optional. If not specified, will query latest block from DynamoDB
+		EndHeight       uint64 `validate:"eq=0|gtfield=StartHeight"` // Optional. If not specified, will query latest block from DynamoDB. Must be 0 OR greater than StartHeight when ContinuousSync is enabled.
 		EventTag        uint32
 		Tag             uint32
 		BatchSize       uint64 // Optional. If not specified, it is read from the workflow config.
+		MiniBatchSize   uint64 // Optional. If not specified, it is read from the workflow config.
 		CheckpointSize  uint64 // Optional. If not specified, it is read from the workflow config.
+		Parallelism     int    // Optional. If not specified, it is read from the workflow config.
 		SkipEvents      bool   // Optional. Skip event migration (blocks only)
 		SkipBlocks      bool   // Optional. Skip block migration (events only)
 		BackoffInterval string // Optional. If not specified, it is read from the workflow config.
+		ContinuousSync  bool   // Optional. Whether to continuously sync data in infinite loop mode
+		SyncInterval    string // Optional. Interval for continuous sync (e.g., "1m", "30s"). Defaults to 1 minute if not specified or invalid.
 	}
 )
 
 var (
 	_ InstrumentedRequest = (*MigratorRequest)(nil)
 )
+
 
 const (
 	// migrator metrics. need to have `workflow.migrator` as prefix
@@ -96,9 +101,22 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			batchSize = request.BatchSize
 		}
 
+		miniBatchSize := batchSize / 10 // Default mini-batch size
+		if miniBatchSize == 0 {
+			miniBatchSize = 10 // Minimum mini-batch size
+		}
+		if request.MiniBatchSize > 0 {
+			miniBatchSize = request.MiniBatchSize
+		}
+
 		checkpointSize := cfg.CheckpointSize
 		if request.CheckpointSize > 0 {
 			checkpointSize = request.CheckpointSize
+		}
+
+		parallelism := 1 // Default parallelism
+		if request.Parallelism > 0 {
+			parallelism = request.Parallelism
 		}
 
 		backoffInterval := cfg.BackoffInterval
@@ -108,6 +126,20 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				return xerrors.Errorf("failed to parse backoff interval: %w", err)
 			}
 			backoffInterval = parsedInterval
+		}
+
+		// Use config's continuous sync setting as default if not explicitly set in request
+		continuousSync := cfg.ContinuousSync || request.ContinuousSync
+		
+		syncInterval := defaultSyncInterval
+		if cfg.SyncInterval > 0 {
+			syncInterval = cfg.SyncInterval
+		}
+		if request.SyncInterval != "" {
+			interval, err := time.ParseDuration(request.SyncInterval)
+			if err == nil {
+				syncInterval = interval
+			}
 		}
 
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
@@ -129,14 +161,27 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			if err != nil {
 				return xerrors.Errorf("failed to get latest block height from DynamoDB: %w", err)
 			}
-			request.EndHeight = resp.Height + 1
-			logger.Info("Auto-detected end height from DynamoDB", zap.Uint64("endHeight", request.EndHeight))
+			
+			if continuousSync {
+				// For continuous sync, set end height to current latest block
+				request.EndHeight = resp.Height + 1
+				logger.Info("Auto-detected end height for continuous sync", zap.Uint64("endHeight", request.EndHeight))
+			} else {
+				request.EndHeight = resp.Height + 1
+				logger.Info("Auto-detected end height from DynamoDB", zap.Uint64("endHeight", request.EndHeight))
+			}
 		}
 
 		// Validate end height after auto-detection
-		if request.StartHeight >= request.EndHeight {
+		if !continuousSync && request.StartHeight >= request.EndHeight {
 			return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
 				request.StartHeight, request.EndHeight)
+		}
+
+		// Additional validation for continuous sync
+		if continuousSync && request.EndHeight != 0 && request.EndHeight <= request.StartHeight {
+			return xerrors.Errorf("with ContinuousSync enabled, EndHeight (%d) must be 0 OR greater than StartHeight (%d)",
+				request.EndHeight, request.StartHeight)
 		}
 
 		// Validate skip-blocks requirements (moved here after logger is available)
@@ -177,7 +222,8 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				EndHeight:   batchEnd,
 				EventTag:    request.EventTag,
 				Tag:         tag,
-				BatchSize:   int(batchSize / 10), // Internal activity batch size should be smaller
+				BatchSize:   int(miniBatchSize), // Use miniBatchSize for activity batch size
+				Parallelism: parallelism,
 				SkipEvents:  request.SkipEvents,
 				SkipBlocks:  request.SkipBlocks,
 			}
@@ -225,6 +271,20 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			if backoffInterval > 0 {
 				_ = workflow.Sleep(ctx, backoffInterval)
 			}
+		}
+
+		if continuousSync {
+			logger.Info("continuous sync enabled, starting new sync cycle")
+			newRequest := *request
+			newRequest.StartHeight = request.EndHeight
+			newRequest.EndHeight = 0
+			// Wait for syncInterval before starting a new continuous sync workflow
+			err := workflow.Sleep(ctx, syncInterval)
+			if err != nil {
+				return xerrors.Errorf("workflow sleep failed during continuous sync: %w", err)
+			}
+			logger.Info("starting new continuous sync workflow", zap.Reflect("newRequest", newRequest))
+			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
 		logger.Info("migrator workflow finished",

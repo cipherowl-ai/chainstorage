@@ -46,6 +46,7 @@ go run cmd/admin/*.go migrate \
 
 ## Command Line Flags
 
+### Basic Parameters
 | Flag | Required | Description | Default |
 |------|----------|-------------|---------|
 | `--start-height` | ✅ | Start block height (inclusive) | - |
@@ -55,9 +56,76 @@ go run cmd/admin/*.go migrate \
 | `--network` | ✅ | Network name (e.g., mainnet, testnet) | - |
 | `--tag` | | Block tag for migration | 1 |
 | `--event-tag` | | Event tag for migration | 0 |
-| `--batch-size` | | Events per batch | 100 |
+
+### Performance & Batch Parameters  
+| Flag | Required | Description | Default |
+|------|----------|-------------|---------|
+| `--batch-size` | | Number of blocks to process in each workflow batch | 100 |
+| `--mini-batch-size` | | Number of blocks to process in each activity mini-batch | batch-size/10 |
+| `--checkpoint-size` | | Number of blocks to process before creating a workflow checkpoint | 10000 |
+| `--parallelism` | | Number of parallel workers for processing mini-batches | 1 |
+| `--backoff-interval` | | Time duration to wait between batches (e.g., '1s', '500ms') | - |
+
+### Migration Mode Parameters
+| Flag | Required | Description | Default |
+|------|----------|-------------|---------|
 | `--skip-blocks` | | Skip block migration (events only) | false |
 | `--skip-events` | | Skip event migration (blocks only) | false |
+| `--continuous-sync` | | Enable continuous sync mode (workflow only, not supported in direct mode) | false |
+| `--sync-interval` | | Time duration to wait between continuous sync cycles (e.g., '1m', '30s') | 1m |
+
+## Continuous Sync Mode
+
+The migrator supports **continuous sync mode** for real-time data synchronization. This mode is designed for workflow-based migrations and enables:
+
+- **Infinite loop operation**: Automatically restarts migration when current batch completes
+- **Dynamic end height**: Sets new StartHeight to current EndHeight and resets EndHeight to 0 (sync to latest)  
+- **Configurable sync intervals**: Wait duration between continuous sync cycles
+- **Automatic workflow continuation**: Uses Temporal's ContinueAsNewError for seamless restarts
+
+### Continuous Sync Process
+1. Complete current migration batch (StartHeight → EndHeight)
+2. Set new StartHeight = previous EndHeight
+3. Reset EndHeight = 0 (query latest block from source)
+4. Wait for SyncInterval duration  
+5. Restart workflow with new parameters using ContinueAsNewError
+6. Repeat indefinitely
+
+### Validation Rules for Continuous Sync
+- `EndHeight` must be 0 OR greater than `StartHeight` when `ContinuousSync` is enabled
+- When `EndHeight = 0`, the tool automatically queries the latest block from DynamoDB
+- `SyncInterval` defaults to 1 minute if not specified or invalid
+
+### Continuous Sync Examples
+
+```bash
+# Basic continuous sync - syncs every minute from height 1000000 to latest
+go run cmd/admin/*.go migrate \
+  --env=local \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=1000000 \
+  --tag=2 \
+  --event-tag=3 \
+  --continuous-sync
+
+# High-performance continuous sync with custom parameters  
+go run cmd/admin/*.go migrate \
+  --env=production \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=18000000 \
+  --tag=1 \
+  --event-tag=0 \
+  --continuous-sync \
+  --sync-interval=30s \
+  --batch-size=500 \
+  --mini-batch-size=50 \
+  --parallelism=4 \
+  --checkpoint-size=5000
+```
+
+**Note**: Continuous sync is only available when using the Temporal workflow system. The direct migration command will show a warning and perform a one-time migration if `--continuous-sync` is specified.
 
 ## Migration Phases
 
@@ -273,9 +341,23 @@ go run cmd/admin/*.go migrate \
   --skip-blocks
 ```
 
-### Large Range with Custom Batch Size
+### Large Range with Custom Performance Parameters
 ```bash
-# Migrate large range with smaller batches for memory efficiency
+# Migrate large range with optimized batch sizes and parallelism
+go run cmd/admin/*.go migrate \
+  --env=production \
+  --blockchain=ethereum \
+  --network=mainnet \
+  --start-height=15000000 \
+  --end-height=16000000 \
+  --batch-size=1000 \
+  --mini-batch-size=100 \
+  --parallelism=8 \
+  --checkpoint-size=50000 \
+  --tag=2 \
+  --event-tag=3
+
+# Memory-efficient migration with smaller batches
 go run cmd/admin/*.go migrate \
   --env=production \
   --blockchain=ethereum \
@@ -283,6 +365,9 @@ go run cmd/admin/*.go migrate \
   --start-height=15000000 \
   --end-height=16000000 \
   --batch-size=50 \
+  --mini-batch-size=10 \
+  --parallelism=2 \
+  --backoff-interval=1s \
   --tag=2 \
   --event-tag=3
 ```
@@ -301,10 +386,71 @@ go run cmd/admin/*.go migrate \
 - **Progress tracking**: Every 1000 events migrated
 - **Range optimization**: Determines exact event ID bounds
 
+### Performance Tuning Parameters
+
+#### Batch Size Configuration
+- **`--batch-size`**: Controls workflow-level batching (default: 100)
+  - Higher values = fewer checkpoints, more memory usage
+  - Lower values = more checkpoints, less memory usage
+  - Recommended: 100-1000 for most use cases
+
+- **`--mini-batch-size`**: Controls activity-level batching (default: batch-size/10)
+  - Used for parallel processing within a workflow batch  
+  - Should be 5-20% of batch-size for optimal parallelism
+  - Recommended: 10-100 for most use cases
+
+#### Parallelism & Checkpointing
+- **`--parallelism`**: Number of parallel workers (default: 1)
+  - Higher values = faster processing, more resource usage
+  - Limited by database connection pool and activity concurrency
+  - Recommended: 2-8 for most use cases, up to 16 for high-throughput
+
+- **`--checkpoint-size`**: Blocks processed before workflow checkpoint (default: 10000)
+  - Higher values = fewer workflow restarts, more memory usage
+  - Lower values = more frequent checkpoints, better recovery
+  - Recommended: 5000-50000 depending on batch size
+
+#### Timing Controls
+- **`--backoff-interval`**: Wait time between batches
+  - Useful for rate limiting to reduce database load
+  - Format: Go duration string (e.g., "1s", "500ms", "2m")
+  - Recommended: 100ms-5s for rate limiting scenarios
+
 ### Typical Performance
-- **Blocks**: ~1000 heights/minute (varies by reorg frequency)
-- **Events**: ~10,000 events/minute (varies by event density)
-- **Memory usage**: Low due to streaming approach
+- **Blocks**: ~1000-5000 heights/minute (varies by reorg frequency and parallelism)
+- **Events**: ~10,000-50,000 events/minute (varies by event density and parallelism)
+- **Memory usage**: Low due to streaming approach, scales with batch size
+- **Database connections**: Scales with parallelism setting
+
+### Performance Examples
+
+#### High Throughput Configuration
+```bash
+# Optimized for maximum throughput
+--batch-size=2000 \
+--mini-batch-size=200 \
+--parallelism=8 \
+--checkpoint-size=50000
+```
+
+#### Memory Efficient Configuration  
+```bash
+# Optimized for low memory usage
+--batch-size=100 \
+--mini-batch-size=20 \
+--parallelism=2 \
+--checkpoint-size=5000 \
+--backoff-interval=1s
+```
+
+#### Balanced Configuration
+```bash
+# Good balance of performance and resource usage
+--batch-size=500 \
+--mini-batch-size=50 \
+--parallelism=4 \
+--checkpoint-size=20000
+```
 
 ## Error Handling & Recovery
 

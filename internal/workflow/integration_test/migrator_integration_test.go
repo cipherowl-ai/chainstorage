@@ -5,8 +5,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
+	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/internal/workflow"
+	"github.com/coinbase/chainstorage/internal/workflow/activity"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -33,7 +36,7 @@ type MigratorIntegrationTestSuite struct {
 	testsuite.WorkflowTestSuite
 }
 
-type migratorDependencies struct {
+type testDependencies struct {
 	fx.In
 	Migrator      *workflow.Migrator
 	BlobStorage   blobstorage.BlobStorage
@@ -47,22 +50,11 @@ func TestIntegrationMigratorTestSuite(t *testing.T) {
 	suite.Run(t, new(MigratorIntegrationTestSuite))
 }
 
-func (s *MigratorIntegrationTestSuite) TestMigratorIntegration() {
-	const (
-		timeout     = 30 * time.Minute
-		tag         = uint32(1)
-		eventTag    = uint32(0)
-		startHeight = uint64(17035140)
-		endHeight   = uint64(17035145) // Small range for integration test
-		batchSize   = 3
-	)
-
-	require := testutil.Require(s.T())
-
-	// Create app context and test data directly (no workflows)
-	var deps migratorDependencies
-	env := cadence.NewTestEnv(s)
+// Helper function to create test app with common dependencies
+func (s *MigratorIntegrationTestSuite) createTestApp(env *cadence.TestEnv, timeout time.Duration) (testapp.TestApp, *testDependencies) {
+	var deps testDependencies
 	env.SetTestTimeout(timeout)
+
 	app := testapp.New(
 		s.T(),
 		testapp.WithFunctional(),
@@ -80,7 +72,6 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration() {
 		fx.Provide(fx.Annotated{
 			Name: "pg",
 			Target: func(params postgres.Params) (metastorage.MetaStorage, error) {
-				// Create PostgreSQL MetaStorage directly
 				result, err := postgres.NewMetaStorage(params)
 				if err != nil {
 					return nil, err
@@ -90,68 +81,96 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration() {
 		}),
 		fx.Populate(&deps),
 	)
-	defer app.Close()
 
-	ctx := context.Background()
+	return app, &deps
+}
 
-	// Step 1: Create test data directly using blockchain client and storage
-	app.Logger().Info("Step 1: Creating test data directly for migration test")
+// Helper function to create test blocks
+func (s *MigratorIntegrationTestSuite) createTestBlocks(
+	ctx context.Context,
+	deps *testDependencies,
+	tag uint32,
+	startHeight, endHeight uint64,
+	storeBoth bool, // If true, store in both DynamoDB and PostgreSQL
+) error {
+	require := testutil.Require(s.T())
 
 	for height := startHeight; height < endHeight; height++ {
 		// Fetch block from blockchain
 		block, err := deps.Client.GetBlockByHeight(ctx, tag, height)
-		require.NoError(err, "Failed to fetch block from blockchain at height %d", height)
+		require.NoError(err, "Failed to fetch block at height %d", height)
 
 		// Upload to blob storage
 		objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
-		require.NoError(err, "Failed to upload block to blob storage at height %d", height)
+		require.NoError(err, "Failed to upload block at height %d", height)
 
 		// Update metadata with object key
 		block.Metadata.ObjectKeyMain = objectKey
 
 		// Store in DynamoDB metadata storage (source for migration)
 		err = deps.MetaStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
-		require.NoError(err, "Failed to store block metadata in DynamoDB at height %d", height)
+		require.NoError(err, "Failed to store block in DynamoDB at height %d", height)
 
-		// Store in PostgreSQL metadata storage (ensures validation passes)
-		err = deps.MetaStoragePG.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
-		require.NoError(err, "Failed to store block metadata in PostgreSQL at height %d", height)
-
-		app.Logger().Info("Created test data for block", zap.Uint64("height", height))
+		// Optionally store in PostgreSQL (for validation)
+		if storeBoth {
+			err = deps.MetaStoragePG.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
+			require.NoError(err, "Failed to store block in PostgreSQL at height %d", height)
+		}
 	}
 
-	// Step 2: Execute migrator workflow (the ONLY workflow in this test)
-	app.Logger().Info("Step 2: Executing migrator workflow for complete migration (blocks + events)")
+	return nil
+}
 
+// Simplified test for complete migration (blocks + events)
+func (s *MigratorIntegrationTestSuite) TestMigratorIntegration() {
+	const (
+		tag         = uint32(1)
+		eventTag    = uint32(0)
+		startHeight = uint64(17035140)
+		endHeight   = uint64(17035145)
+		batchSize   = 3
+	)
+
+	require := testutil.Require(s.T())
+
+	// Setup
+	env := cadence.NewTestEnv(s)
+	app, deps := s.createTestApp(env, 30*time.Minute)
+	defer app.Close()
+
+	ctx := context.Background()
+
+	// Create test data
+	err := s.createTestBlocks(ctx, deps, tag, startHeight, endHeight, true)
+	require.NoError(err)
+
+	// Execute migrator workflow
 	migratorRequest := &workflow.MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
-		BatchSize:   uint64(batchSize),
-		SkipEvents:  false, // Migrate both blocks and events
-		SkipBlocks:  false,
+		StartHeight:   startHeight,
+		EndHeight:     endHeight,
+		Tag:           tag,
+		EventTag:      eventTag,
+		BatchSize:     uint64(batchSize),
+		MiniBatchSize: uint64(batchSize / 2),
+		Parallelism:   2,
+		SkipEvents:    false,
+		SkipBlocks:    false,
 	}
 
 	migratorRun, err := deps.Migrator.Execute(ctx, migratorRequest)
-	require.NoError(err, "Failed to start migrator workflow")
+	require.NoError(err)
 
 	err = migratorRun.Get(ctx, nil)
-	require.NoError(err, "Migrator workflow should complete successfully")
+	require.NoError(err)
 
-	// Step 3: Verify migration completed successfully
-	app.Logger().Info("Step 3: Migration workflow completed successfully",
+	app.Logger().Info("Complete migration test passed",
 		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("heightRange", endHeight-startHeight),
-		zap.String("type", "complete migration"))
-
-	app.Logger().Info("Complete migration integration test passed")
+		zap.Uint64("endHeight", endHeight))
 }
 
+// Simplified test for blocks-only migration
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_BlocksOnly() {
 	const (
-		timeout     = 20 * time.Minute
 		tag         = uint32(1)
 		eventTag    = uint32(0)
 		startHeight = uint64(17035145)
@@ -161,99 +180,42 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_BlocksOnly() {
 
 	require := testutil.Require(s.T())
 
-	// Create app context and test data directly
-	var deps migratorDependencies
+	// Setup
 	env := cadence.NewTestEnv(s)
-	env.SetTestTimeout(timeout)
-	app := testapp.New(
-		s.T(),
-		testapp.WithFunctional(),
-		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_ETHEREUM, common.Network_NETWORK_ETHEREUM_MAINNET),
-		cadence.WithTestEnv(env),
-		workflow.Module,
-		client.Module,
-		jsonrpc.Module,
-		restapi.Module,
-		s3.Module,
-		storage.Module,
-		parser.Module,
-		dlq.Module,
-		// Provide PostgreSQL MetaStorage with name "pg" for migration tests
-		fx.Provide(fx.Annotated{
-			Name: "pg",
-			Target: func(params postgres.Params) (metastorage.MetaStorage, error) {
-				// Create PostgreSQL MetaStorage directly
-				result, err := postgres.NewMetaStorage(params)
-				if err != nil {
-					return nil, err
-				}
-				return result.MetaStorage, nil
-			},
-		}),
-		fx.Populate(&deps),
-	)
+	app, deps := s.createTestApp(env, 20*time.Minute)
 	defer app.Close()
 
 	ctx := context.Background()
 
-	// Step 1: Create test data directly
-	app.Logger().Info("Step 1: Creating test data for blocks-only migration")
+	// Create test data
+	err := s.createTestBlocks(ctx, deps, tag, startHeight, endHeight, true)
+	require.NoError(err)
 
-	for height := startHeight; height < endHeight; height++ {
-		// Fetch block from blockchain
-		block, err := deps.Client.GetBlockByHeight(ctx, tag, height)
-		require.NoError(err, "Failed to fetch block from blockchain at height %d", height)
-
-		// Upload to blob storage
-		objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
-		require.NoError(err, "Failed to upload block to blob storage at height %d", height)
-
-		// Update metadata with object key
-		block.Metadata.ObjectKeyMain = objectKey
-
-		// Store in DynamoDB metadata storage (source for migration)
-		err = deps.MetaStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
-		require.NoError(err, "Failed to store block metadata in DynamoDB at height %d", height)
-
-		// Store in PostgreSQL metadata storage (ensures validation passes)
-		err = deps.MetaStoragePG.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
-		require.NoError(err, "Failed to store block metadata in PostgreSQL at height %d", height)
-
-		app.Logger().Info("Created test data for block", zap.Uint64("height", height))
-	}
-
-	// Step 2: Execute blocks-only migration workflow
-	app.Logger().Info("Step 2: Executing migrator workflow for blocks-only migration")
-
+	// Execute blocks-only migration
 	migratorRequest := &workflow.MigratorRequest{
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
 		Tag:         tag,
 		EventTag:    eventTag,
 		BatchSize:   uint64(batchSize),
-		SkipEvents:  true, // Skip events, migrate blocks only
+		SkipEvents:  true, // Skip events
 		SkipBlocks:  false,
 	}
 
 	migratorRun, err := deps.Migrator.Execute(ctx, migratorRequest)
-	require.NoError(err, "Failed to start blocks-only migrator workflow")
+	require.NoError(err)
 
 	err = migratorRun.Get(ctx, nil)
-	require.NoError(err, "Blocks-only migrator workflow should complete successfully")
+	require.NoError(err)
 
-	// Step 3: Verify migration completed successfully
-	app.Logger().Info("Step 3: Blocks-only migration workflow completed successfully",
+	app.Logger().Info("Blocks-only migration test passed",
 		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("heightRange", endHeight-startHeight),
-		zap.String("type", "blocks-only migration"))
-
-	app.Logger().Info("Blocks-only migration integration test passed")
+		zap.Uint64("endHeight", endHeight))
 }
 
+// Simplified test for events-only migration
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_EventsOnly() {
 	const (
-		timeout     = 25 * time.Minute
 		tag         = uint32(1)
 		eventTag    = uint32(0)
 		startHeight = uint64(17035148)
@@ -263,75 +225,18 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_EventsOnly() {
 
 	require := testutil.Require(s.T())
 
-	// Create app context
-	var deps migratorDependencies
+	// Setup
 	env := cadence.NewTestEnv(s)
-	env.SetTestTimeout(timeout)
-	app := testapp.New(
-		s.T(),
-		testapp.WithFunctional(),
-		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_ETHEREUM, common.Network_NETWORK_ETHEREUM_MAINNET),
-		cadence.WithTestEnv(env),
-		workflow.Module,
-		client.Module,
-		jsonrpc.Module,
-		restapi.Module,
-		s3.Module,
-		storage.Module,
-		parser.Module,
-		dlq.Module,
-		// Provide PostgreSQL MetaStorage with name "pg" for migration tests
-		fx.Provide(fx.Annotated{
-			Name: "pg",
-			Target: func(params postgres.Params) (metastorage.MetaStorage, error) {
-				// Create PostgreSQL MetaStorage directly
-				result, err := postgres.NewMetaStorage(params)
-				if err != nil {
-					return nil, err
-				}
-				return result.MetaStorage, nil
-			},
-		}),
-		fx.Populate(&deps),
-	)
+	app, deps := s.createTestApp(env, 25*time.Minute)
 	defer app.Close()
 
 	ctx := context.Background()
 
-	// Step 1: Create test data for events-only migration
-	app.Logger().Info("Step 1: Creating test data for events-only migration")
+	// Create test data (blocks must exist for events migration)
+	err := s.createTestBlocks(ctx, deps, tag, startHeight, endHeight, true)
+	require.NoError(err)
 
-	var allBlockMetas []*api.BlockMetadata
-
-	for height := startHeight; height < endHeight; height++ {
-		// Fetch block from blockchain
-		block, err := deps.Client.GetBlockByHeight(ctx, tag, height)
-		require.NoError(err, "Failed to fetch block from blockchain at height %d", height)
-
-		// Upload to blob storage
-		objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
-		require.NoError(err, "Failed to upload block to blob storage at height %d", height)
-
-		// Update metadata with object key
-		block.Metadata.ObjectKeyMain = objectKey
-		allBlockMetas = append(allBlockMetas, block.Metadata)
-
-		app.Logger().Info("Prepared test data for block", zap.Uint64("height", height))
-	}
-
-	// Store in DynamoDB metadata storage (source for migration)
-	err := deps.MetaStorage.PersistBlockMetas(ctx, true, allBlockMetas, nil)
-	require.NoError(err, "Failed to store block metadata in DynamoDB")
-
-	// Store in PostgreSQL metadata storage (required for events-only migrator validation)
-	err = deps.MetaStoragePG.PersistBlockMetas(ctx, true, allBlockMetas, nil)
-	require.NoError(err, "Failed to store block metadata in PostgreSQL")
-
-	app.Logger().Info("Successfully created test data for events-only migration")
-
-	// Step 2: Execute events-only migration workflow
-	app.Logger().Info("Step 2: Executing events-only migrator workflow")
-
+	// Execute events-only migration
 	migratorRequest := &workflow.MigratorRequest{
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
@@ -339,109 +244,53 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_EventsOnly() {
 		EventTag:    eventTag,
 		BatchSize:   uint64(batchSize),
 		SkipEvents:  false, // Migrate events
-		SkipBlocks:  true,  // Skip blocks (they should already exist)
+		SkipBlocks:  true,  // Skip blocks
 	}
 
 	migratorRun, err := deps.Migrator.Execute(ctx, migratorRequest)
-	require.NoError(err, "Failed to start events-only migrator workflow")
+	require.NoError(err)
 
 	err = migratorRun.Get(ctx, nil)
-	require.NoError(err, "Events-only migrator workflow should complete successfully")
+	require.NoError(err)
 
-	// Step 3: Verify migration completed successfully
-	app.Logger().Info("Step 3: Events-only migration workflow completed successfully",
+	app.Logger().Info("Events-only migration test passed",
 		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("heightRange", endHeight-startHeight),
-		zap.String("type", "events-only migration"))
-
-	app.Logger().Info("Events-only migration integration test passed")
+		zap.Uint64("endHeight", endHeight))
 }
 
+// Simplified test for auto-detection
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_AutoDetection() {
 	const (
-		timeout     = 30 * time.Minute
 		tag         = uint32(1)
 		eventTag    = uint32(0)
 		startHeight = uint64(17035140)
-		endHeight   = uint64(17035142) // Small range for auto-detection test
+		endHeight   = uint64(17035142)
 		batchSize   = 2
 	)
 
 	require := testutil.Require(s.T())
 
-	// Create app context
-	var deps migratorDependencies
+	// Setup
 	env := cadence.NewTestEnv(s)
-	env.SetTestTimeout(timeout)
-	app := testapp.New(
-		s.T(),
-		testapp.WithFunctional(),
-		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_ETHEREUM, common.Network_NETWORK_ETHEREUM_MAINNET),
-		cadence.WithTestEnv(env),
-		workflow.Module,
-		client.Module,
-		jsonrpc.Module,
-		restapi.Module,
-		s3.Module,
-		storage.Module,
-		parser.Module,
-		dlq.Module,
-		// Provide PostgreSQL MetaStorage with name "pg" for migration tests
-		fx.Provide(fx.Annotated{
-			Name: "pg",
-			Target: func(params postgres.Params) (metastorage.MetaStorage, error) {
-				// Create PostgreSQL MetaStorage directly
-				result, err := postgres.NewMetaStorage(params)
-				if err != nil {
-					return nil, err
-				}
-				return result.MetaStorage, nil
-			},
-		}),
-		fx.Populate(&deps),
-	)
+	app, deps := s.createTestApp(env, 30*time.Minute)
 	defer app.Close()
 
 	ctx := context.Background()
 
-	// Step 1: Create test data for auto-detection test
-	app.Logger().Info("Step 1: Creating test data for auto-detection test")
+	// Create test data
+	err := s.createTestBlocks(ctx, deps, tag, startHeight, endHeight, true)
+	require.NoError(err)
 
-	var allBlockMetas []*api.BlockMetadata
+	// Mock GetLatestBlockHeight for auto-detection
+	env.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestBlockHeightResponse{
+			Height: endHeight - 1,
+		}, nil)
 
-	for height := startHeight; height < endHeight; height++ {
-		// Fetch block from blockchain
-		block, err := deps.Client.GetBlockByHeight(ctx, tag, height)
-		require.NoError(err, "Failed to fetch block from blockchain at height %d", height)
-
-		// Upload to blob storage
-		objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
-		require.NoError(err, "Failed to upload block to blob storage at height %d", height)
-
-		// Update metadata with object key
-		block.Metadata.ObjectKeyMain = objectKey
-		allBlockMetas = append(allBlockMetas, block.Metadata)
-
-		app.Logger().Info("Prepared test data for block", zap.Uint64("height", height))
-	}
-
-	// Store in DynamoDB metadata storage (source for migration)
-	err := deps.MetaStorage.PersistBlockMetas(ctx, true, allBlockMetas, nil)
-	require.NoError(err, "Failed to store block metadata in DynamoDB")
-
-	// Store in PostgreSQL metadata storage (destination for migration)
-	err = deps.MetaStoragePG.PersistBlockMetas(ctx, true, allBlockMetas, nil)
-	require.NoError(err, "Failed to store block metadata in PostgreSQL")
-
-	app.Logger().Info("Successfully created test data for auto-detection test")
-
-	// Step 2: Execute migrator workflow with auto-detection (EndHeight = 0)
-	app.Logger().Info("Step 2: Executing migrator workflow with auto-detection")
-
+	// Execute with auto-detection (EndHeight = 0)
 	migratorRequest := &workflow.MigratorRequest{
 		StartHeight: startHeight,
-		EndHeight:   0, // Should trigger auto-detection
+		EndHeight:   0, // Triggers auto-detection
 		Tag:         tag,
 		EventTag:    eventTag,
 		BatchSize:   uint64(batchSize),
@@ -450,17 +299,131 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_AutoDetection() {
 	}
 
 	migratorRun, err := deps.Migrator.Execute(ctx, migratorRequest)
-	require.NoError(err, "Failed to start migrator workflow with auto-detection")
+	require.NoError(err)
 
 	err = migratorRun.Get(ctx, nil)
-	require.NoError(err, "Migrator workflow with auto-detection should complete successfully")
+	require.NoError(err)
 
-	// Step 3: Verify migration completed successfully
-	app.Logger().Info("Step 3: Auto-detection migration workflow completed successfully",
+	app.Logger().Info("Auto-detection migration test passed",
 		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("heightRange", endHeight-startHeight),
-		zap.String("type", "auto-detection migration"))
+		zap.Uint64("detectedEndHeight", endHeight-1))
+}
 
-	app.Logger().Info("Auto-detection migration integration test passed")
+// Optimized continuous sync test focusing on height progression and cycle validation
+func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_ContinuousSync() {
+	const (
+		tag               = uint32(1)
+		eventTag          = uint32(0)
+		cycle1StartHeight = uint64(17035151)
+		cycle1EndHeight   = uint64(17035153)
+		cycle2StartHeight = uint64(17035153) // Should continue from where cycle 1 ended
+		cycle2EndHeight   = uint64(17035155)
+		batchSize         = 1
+	)
+
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+
+	// ========== CYCLE 1: Initial migration with continuous sync ==========
+
+	// Setup for cycle 1
+	env1 := cadence.NewTestEnv(s)
+	app1, deps1 := s.createTestApp(env1, 10*time.Minute)
+	defer app1.Close()
+
+	// Create test data for cycle 1
+	err := s.createTestBlocks(ctx, deps1, tag, cycle1StartHeight, cycle1EndHeight, true)
+	require.NoError(err)
+
+	app1.Logger().Info("Starting cycle 1 of continuous sync",
+		zap.Uint64("startHeight", cycle1StartHeight),
+		zap.Uint64("endHeight", cycle1EndHeight))
+
+	// Mock GetLatestBlockHeight for cycle 1
+	env1.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestBlockHeightResponse{
+			Height: cycle1EndHeight - 1,
+		}, nil)
+
+	// Execute cycle 1 with continuous sync
+	cycle1Request := &workflow.MigratorRequest{
+		StartHeight:    cycle1StartHeight,
+		EndHeight:      cycle1EndHeight,
+		Tag:            tag,
+		EventTag:       eventTag,
+		BatchSize:      uint64(batchSize),
+		ContinuousSync: true,
+		SyncInterval:   "1s",
+	}
+
+	// Cycle 1 should complete and return continue-as-new
+	_, err = deps1.Migrator.Execute(ctx, cycle1Request)
+	require.NotNil(err, "Cycle 1 should return continue-as-new error")
+	require.True(temporalworkflow.IsContinueAsNewError(err), "Expected continue-as-new for cycle 1")
+
+	// Verify cycle 1 migrated correctly
+	for height := cycle1StartHeight; height < cycle1EndHeight; height++ {
+		metadata, err := deps1.MetaStoragePG.GetBlockByHeight(ctx, tag, height)
+		require.NoError(err, "Cycle 1 block should exist at height %d", height)
+		require.Equal(height, metadata.Height)
+	}
+
+	app1.Logger().Info("Cycle 1 completed successfully with continue-as-new")
+
+	// ========== CYCLE 2: Verify height progression and new data migration ==========
+
+	// Setup for cycle 2 (simulating a new workflow execution)
+	env2 := cadence.NewTestEnv(s)
+	app2, deps2 := s.createTestApp(env2, 10*time.Minute)
+	defer app2.Close()
+
+	// Create new blocks for cycle 2 (simulating new blocks arriving)
+	err = s.createTestBlocks(ctx, deps2, tag, cycle2StartHeight, cycle2EndHeight, true)
+	require.NoError(err)
+
+	app2.Logger().Info("Starting cycle 2 of continuous sync",
+		zap.Uint64("expectedStartHeight", cycle2StartHeight),
+		zap.Uint64("newEndHeight", cycle2EndHeight))
+
+	// Mock GetLatestBlockHeight for cycle 2 to return the new height
+	env2.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestBlockHeightResponse{
+			Height: cycle2EndHeight - 1,
+		}, nil)
+
+	// Execute cycle 2 - should detect the new height and migrate new blocks
+	cycle2Request := &workflow.MigratorRequest{
+		StartHeight:    cycle2StartHeight, // Continue from where cycle 1 ended
+		EndHeight:      0,                 // Auto-detect to find new blocks
+		Tag:            tag,
+		EventTag:       eventTag,
+		BatchSize:      uint64(batchSize),
+		ContinuousSync: true,
+		SyncInterval:   "1s",
+	}
+
+	// Cycle 2 should also complete and return continue-as-new
+	_, err = deps2.Migrator.Execute(ctx, cycle2Request)
+	require.NotNil(err, "Cycle 2 should return continue-as-new error")
+	require.True(temporalworkflow.IsContinueAsNewError(err), "Expected continue-as-new for cycle 2")
+
+	// Verify cycle 2 migrated the new blocks correctly
+	for height := cycle2StartHeight; height < cycle2EndHeight; height++ {
+		metadata, err := deps2.MetaStoragePG.GetBlockByHeight(ctx, tag, height)
+		require.NoError(err, "Cycle 2 block should exist at height %d", height)
+		require.Equal(height, metadata.Height)
+	}
+
+	app2.Logger().Info("Cycle 2 completed successfully",
+		zap.Uint64("migratedFrom", cycle2StartHeight),
+		zap.Uint64("migratedTo", cycle2EndHeight-1))
+
+	// ========== FINAL VALIDATION ==========
+
+	totalBlocksMigrated := (cycle1EndHeight - cycle1StartHeight) + (cycle2EndHeight - cycle2StartHeight)
+	app2.Logger().Info("Continuous sync test completed successfully",
+		zap.Uint64("cycle1Range", cycle1EndHeight-cycle1StartHeight),
+		zap.Uint64("cycle2Range", cycle2EndHeight-cycle2StartHeight),
+		zap.Uint64("totalBlocksMigrated", totalBlocksMigrated),
+		zap.String("result", "Both cycles correctly detected new heights and migrated data"))
 }

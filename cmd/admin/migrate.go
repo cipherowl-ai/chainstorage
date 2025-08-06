@@ -27,20 +27,26 @@ import (
 
 var (
 	migrateFlags struct {
-		startHeight uint64
-		endHeight   uint64
-		eventTag    uint32
-		tag         uint32
-		batchSize   int
-		skipEvents  bool
-		skipBlocks  bool
+		startHeight     uint64
+		endHeight       uint64
+		eventTag        uint32
+		tag             uint32
+		batchSize       int
+		miniBatchSize   int
+		checkpointSize  int
+		parallelism     int
+		skipEvents      bool
+		skipBlocks      bool
+		continuousSync  bool
+		syncInterval    string
+		backoffInterval string
 	}
 )
 
 var (
 	migrateCmd = &cobra.Command{
 		Use:   "migrate",
-		Short: "Migrate data from DynamoDB to PostgreSQL",
+		Short: "Migrate data from DynamoDB to PostgreSQL with optional continuous sync",
 		Long: `Migrate block metadata and events from DynamoDB to PostgreSQL.
 
 Block Migration:
@@ -53,6 +59,21 @@ Event Migration:
 - Gets first event ID from start height, last event ID from end height
 - Migrates events sequentially by event ID range in batches
 - Event IDs in DynamoDB correspond directly to event sequences in PostgreSQL
+
+Continuous Sync Mode:
+- Enables infinite loop mode for real-time data synchronization
+- When enabled and current batch completes:
+  - Sets new StartHeight to current EndHeight
+  - Resets EndHeight to 0 (meaning "sync to latest")
+  - Waits for SyncInterval duration
+  - Restarts migration with new parameters
+- Validation: EndHeight must be 0 OR greater than StartHeight when ContinuousSync is enabled
+
+Performance Parameters:
+- BatchSize: Number of blocks to process in each workflow batch
+- MiniBatchSize: Number of blocks to process in each activity mini-batch (for parallelism)
+- CheckpointSize: Number of blocks to process before creating a workflow checkpoint
+- Parallelism: Number of parallel workers for processing mini-batches
 
 End Height:
 - If --end-height is not provided, the tool will automatically query the latest block
@@ -71,7 +92,7 @@ Examples:
     --tag=2 \
     --event-tag=3
 
-  # Migrate specific height range
+  # Migrate specific height range with custom batch sizes
   go run cmd/admin/*.go migrate \
     --env=local \
     --blockchain=ethereum \
@@ -79,7 +100,24 @@ Examples:
     --start-height=100 \
     --end-height=152 \
     --tag=2 \
-    --event-tag=3
+    --event-tag=3 \
+    --batch-size=50 \
+    --mini-batch-size=10 \
+    --parallelism=4
+
+  # Continuous sync mode - syncs continuously with 30 second intervals
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=1000000 \
+    --tag=2 \
+    --event-tag=3 \
+    --continuous-sync \
+    --sync-interval=30s \
+    --batch-size=100 \
+    --mini-batch-size=20 \
+    --parallelism=2
 
   # Migrate blocks only (skip events)
   go run cmd/admin/*.go migrate \
@@ -101,7 +139,22 @@ Examples:
     --end-height=1001000 \
     --tag=2 \
     --event-tag=3 \
-    --skip-blocks`,
+    --skip-blocks \
+    --backoff-interval=1s
+
+  # High throughput migration with checkpoints
+  go run cmd/admin/*.go migrate \
+    --env=local \
+    --blockchain=ethereum \
+    --network=mainnet \
+    --start-height=1000000 \
+    --end-height=2000000 \
+    --tag=2 \
+    --event-tag=3 \
+    --batch-size=1000 \
+    --mini-batch-size=100 \
+    --checkpoint-size=10000 \
+    --parallelism=8`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var deps struct {
 				fx.In
@@ -115,7 +168,13 @@ Examples:
 				storage.Module,
 				fx.Populate(&deps),
 			)
-			defer app.Close()
+			defer func() {
+				// Close all PostgreSQL connection pools before closing the app
+				if err := postgres_storage.CloseAllConnectionPools(); err != nil {
+					logger.Error("failed to close PostgreSQL connection pools", zap.Error(err))
+				}
+				app.Close()
+			}()
 
 			// Create DynamoDB storage directly
 			dynamoDBParams := dynamodb_storage.Params{
@@ -142,9 +201,36 @@ Examples:
 				migrateFlags.batchSize = 100
 			}
 
+			if migrateFlags.miniBatchSize <= 0 {
+				migrateFlags.miniBatchSize = migrateFlags.batchSize / 10
+				if migrateFlags.miniBatchSize <= 0 {
+					migrateFlags.miniBatchSize = 10
+				}
+			}
+
+			if migrateFlags.checkpointSize <= 0 {
+				migrateFlags.checkpointSize = 10000
+			}
+
+			if migrateFlags.parallelism <= 0 {
+				migrateFlags.parallelism = 1
+			}
+
 			// Both skip flags cannot be true
 			if migrateFlags.skipEvents && migrateFlags.skipBlocks {
 				return xerrors.New("cannot skip both events and blocks - nothing to migrate")
+			}
+
+			// Validate continuous sync parameters
+			if migrateFlags.continuousSync {
+				logger.Warn("WARNING: Continuous sync is not supported in direct migration mode")
+				logger.Warn("Continuous sync is only available when using the migrator workflow")
+				logger.Warn("This tool will perform a one-time migration and exit")
+				
+				if migrateFlags.endHeight != 0 && migrateFlags.endHeight <= migrateFlags.startHeight {
+					return xerrors.Errorf("with continuous sync enabled, end height (%d) must be 0 OR greater than start height (%d)",
+						migrateFlags.endHeight, migrateFlags.startHeight)
+				}
 			}
 
 			// Warn about skip-blocks requirements
@@ -181,9 +267,15 @@ Examples:
 			}
 
 			// Validate flags after end height auto-detection
-			if migrateFlags.startHeight >= migrateFlags.endHeight {
+			if !migrateFlags.continuousSync && migrateFlags.startHeight >= migrateFlags.endHeight {
 				return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
 					migrateFlags.startHeight, migrateFlags.endHeight)
+			}
+
+			// Additional validation for continuous sync
+			if migrateFlags.continuousSync && migrateFlags.endHeight != 0 && migrateFlags.endHeight <= migrateFlags.startHeight {
+				return xerrors.Errorf("with continuous sync enabled, EndHeight (%d) must be 0 OR greater than StartHeight (%d)",
+					migrateFlags.endHeight, migrateFlags.startHeight)
 			}
 
 			// Create DynamoDB client for direct queries
@@ -208,13 +300,19 @@ Examples:
 			}
 
 			migrateParams := MigrationParams{
-				StartHeight: migrateFlags.startHeight,
-				EndHeight:   migrateFlags.endHeight,
-				EventTag:    migrateFlags.eventTag,
-				Tag:         migrateFlags.tag,
-				BatchSize:   migrateFlags.batchSize,
-				SkipEvents:  migrateFlags.skipEvents,
-				SkipBlocks:  migrateFlags.skipBlocks,
+				StartHeight:     migrateFlags.startHeight,
+				EndHeight:       migrateFlags.endHeight,
+				EventTag:        migrateFlags.eventTag,
+				Tag:             migrateFlags.tag,
+				BatchSize:       migrateFlags.batchSize,
+				MiniBatchSize:   migrateFlags.miniBatchSize,
+				CheckpointSize:  migrateFlags.checkpointSize,
+				Parallelism:     migrateFlags.parallelism,
+				SkipEvents:      migrateFlags.skipEvents,
+				SkipBlocks:      migrateFlags.skipBlocks,
+				ContinuousSync:  migrateFlags.continuousSync,
+				SyncInterval:    migrateFlags.syncInterval,
+				BackoffInterval: migrateFlags.backoffInterval,
 			}
 
 			return migrator.Migrate(ctx, migrateParams)
@@ -223,13 +321,19 @@ Examples:
 )
 
 type MigrationParams struct {
-	StartHeight uint64
-	EndHeight   uint64
-	EventTag    uint32
-	Tag         uint32
-	BatchSize   int
-	SkipEvents  bool
-	SkipBlocks  bool
+	StartHeight     uint64
+	EndHeight       uint64
+	EventTag        uint32
+	Tag             uint32
+	BatchSize       int
+	MiniBatchSize   int
+	CheckpointSize  int
+	Parallelism     int
+	SkipEvents      bool
+	SkipBlocks      bool
+	ContinuousSync  bool
+	SyncInterval    string
+	BackoffInterval string
 }
 
 type DataMigrator struct {
@@ -572,9 +676,15 @@ func init() {
 	migrateCmd.Flags().Uint64Var(&migrateFlags.endHeight, "end-height", 0, "end block height (exclusive, optional - if not provided, will query latest block from DynamoDB)")
 	migrateCmd.Flags().Uint32Var(&migrateFlags.eventTag, "event-tag", 0, "event tag for migration")
 	migrateCmd.Flags().Uint32Var(&migrateFlags.tag, "tag", 1, "block tag for migration")
-	migrateCmd.Flags().IntVar(&migrateFlags.batchSize, "batch-size", 100, "number of blocks to process in each batch")
+	migrateCmd.Flags().IntVar(&migrateFlags.batchSize, "batch-size", 100, "number of blocks to process in each workflow batch")
+	migrateCmd.Flags().IntVar(&migrateFlags.miniBatchSize, "mini-batch-size", 0, "number of blocks to process in each activity mini-batch (default: batch-size/10)")
+	migrateCmd.Flags().IntVar(&migrateFlags.checkpointSize, "checkpoint-size", 10000, "number of blocks to process before creating a workflow checkpoint")
+	migrateCmd.Flags().IntVar(&migrateFlags.parallelism, "parallelism", 1, "number of parallel workers for processing mini-batches")
 	migrateCmd.Flags().BoolVar(&migrateFlags.skipEvents, "skip-events", false, "skip event migration (blocks only)")
 	migrateCmd.Flags().BoolVar(&migrateFlags.skipBlocks, "skip-blocks", false, "skip block migration (events only)")
+	migrateCmd.Flags().BoolVar(&migrateFlags.continuousSync, "continuous-sync", false, "enable continuous sync mode (infinite loop, workflow only)")
+	migrateCmd.Flags().StringVar(&migrateFlags.syncInterval, "sync-interval", "1m", "time duration to wait between continuous sync cycles (e.g., '1m', '30s')")
+	migrateCmd.Flags().StringVar(&migrateFlags.backoffInterval, "backoff-interval", "", "time duration to wait between batches (e.g., '1s', '500ms')")
 
 	_ = migrateCmd.MarkFlagRequired("start-height")
 	// end-height is optional - if not provided, will query latest block from DynamoDB

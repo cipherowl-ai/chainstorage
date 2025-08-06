@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
@@ -27,9 +28,15 @@ type (
 )
 
 func NewMetaStorage(params Params) (internal.Result, error) {
-	db, err := newDBConnection(context.Background(), &params.Config.AWS.Postgres)
+	// Use shared connection pool instead of creating new connections
+	pool, err := GetConnectionPool(context.Background(), &params.Config.AWS.Postgres)
 	if err != nil {
 		return internal.Result{}, err
+	}
+	
+	db := pool.DB()
+	if db == nil {
+		return internal.Result{}, xerrors.New("connection pool returned nil database connection")
 	}
 	// Create storage implementations with database connection
 	blockStorage, err := newBlockStorage(db, params)
