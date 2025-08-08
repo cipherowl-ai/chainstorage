@@ -322,8 +322,10 @@ Examples:
 
 			// Additional validation for continuous sync
 			if migrateFlags.continuousSync && migrateFlags.endHeight != 0 && migrateFlags.endHeight <= migrateFlags.startHeight {
-				return xerrors.Errorf("with continuous sync enabled, EndHeight (%d) must be 0 OR greater than StartHeight (%d)",
-					migrateFlags.endHeight, migrateFlags.startHeight)
+				logger.Info("Continuous sync: already caught up at CLI, scheduling next cycle via workflow",
+					zap.Uint64("startHeight", migrateFlags.startHeight),
+					zap.Uint64("endHeight", migrateFlags.endHeight))
+				// Let the workflow auto-detect EndHeight on the next cycle; don’t error here.
 			}
 
 			// Create DynamoDB client for direct queries

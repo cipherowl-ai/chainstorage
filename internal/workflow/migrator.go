@@ -202,10 +202,36 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				request.StartHeight, request.EndHeight)
 		}
 
-		// Additional validation for continuous sync
+		// Additional handling for continuous sync:
+		// If EndHeight <= StartHeight, we are caught up. Instead of erroring, schedule next cycle.
 		if continuousSync && request.EndHeight != 0 && request.EndHeight <= request.StartHeight {
-			return xerrors.Errorf("with ContinuousSync enabled, EndHeight (%d) must be 0 OR greater than StartHeight (%d)",
-				request.EndHeight, request.StartHeight)
+			logger.Info("Continuous sync: caught up (no-op). Running event catch-up before next cycle",
+				zap.Uint64("startHeight", request.StartHeight),
+				zap.Uint64("endHeight", request.EndHeight))
+
+			// Run a one-shot activity to catch up events to current Postgres block height.
+			catchUpReq := &activity.MigratorRequest{
+				StartHeight:    request.StartHeight,
+				EndHeight:      request.StartHeight, // no block range; activity will do event catch-up internally
+				EventTag:       request.EventTag,
+				Tag:            tag,
+				BatchSize:      int(miniBatchSize),
+				Parallelism:    parallelism,
+				SkipEvents:     false,
+				SkipBlocks:     true, // ensure we don't attempt block writes here
+				DoEventCatchUp: true,
+			}
+			_, _ = w.migrator.Execute(ctx, catchUpReq)
+
+			newRequest := *request
+			newRequest.StartHeight = request.EndHeight
+			newRequest.EndHeight = 0 // re-detect on next cycle
+			// Wait for syncInterval before starting a new continuous sync workflow
+			err := workflow.Sleep(ctx, syncInterval)
+			if err != nil {
+				return xerrors.Errorf("workflow sleep failed during caught-up continuous sync: %w", err)
+			}
+			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
 		// Special case: if auto-resume found we're already caught up
