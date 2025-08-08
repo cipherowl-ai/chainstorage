@@ -555,7 +555,7 @@ chainstorage admin setup-postgres \
   --server-password server_password
 ```
 
-#### Production Setup
+#### Production/Development Setup
 
 In production, databases are initialized using the `db-init` command:
 
@@ -597,6 +597,7 @@ make localstack
 
 # Load environment variables
 source scripts/postgres-roles-local.env
+```
 
 #### Available Commands
 
@@ -691,6 +692,21 @@ go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 4
 
 # Migrate with specific height range
 go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 400, "EndHeight": 800, "Tag": 2, "EventTag": 3}' --blockchain ethereum --network mainnet --env local
+```
+
+Start the cross validator workflow:
+```shell
+go run ./cmd/admin workflow start --workflow cross_validator --input '{"StartHeight": 15500000, "Tag": 0}' --blockchain ethereum --network mainnet --env local
+```
+
+Start the event backfiller workflow:
+```shell
+go run ./cmd/admin workflow start --workflow event_backfiller --input '{"Tag": 0, "EventTag": 0, "StartSequence": 1000, "EndSequence": 2000}' --blockchain ethereum --network mainnet --env local
+```
+
+Start the replicator workflow:
+```shell
+go run ./cmd/admin workflow start --workflow replicator --input '{"Tag": 0, "StartHeight": 1000000, "EndHeight": 1001000}' --blockchain ethereum --network mainnet --env local
 ```
 
 Stop the monitor workflow:
