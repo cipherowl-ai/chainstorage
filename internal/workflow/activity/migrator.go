@@ -2,14 +2,17 @@ package activity
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/uber-go/tally/v4"
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -129,6 +132,7 @@ func (a *Migrator) Execute(ctx workflow.Context, request *MigratorRequest) (*Mig
 }
 
 func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*MigratorResponse, error) {
+	startTime := time.Now()
 	if err := a.validateRequest(request); err != nil {
 		return nil, err
 	}
@@ -142,6 +146,23 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	}
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
+	logger.Info("Migrator activity started",
+		zap.Uint64("startHeight", request.StartHeight),
+		zap.Uint64("endHeight", request.EndHeight),
+		zap.Uint64("totalBlocks", request.EndHeight-request.StartHeight),
+		zap.Bool("skipBlocks", request.SkipBlocks),
+		zap.Bool("skipEvents", request.SkipEvents))
+
+	// Add heartbeat mechanism
+	heartbeatTicker := time.NewTicker(30 * time.Second)
+	defer heartbeatTicker.Stop()
+
+	go func() {
+		for range heartbeatTicker.C {
+			activity.RecordHeartbeat(ctx, fmt.Sprintf("Processing batch [%d, %d), elapsed: %v",
+				request.StartHeight, request.EndHeight, time.Since(startTime)))
+		}
+	}()
 
 	// Validate batch size
 	if request.BatchSize <= 0 {
@@ -193,9 +214,12 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		eventsMigrated = count
 	}
 
+	totalDuration := time.Since(startTime)
 	logger.Info("Migration completed successfully",
 		zap.Int("blocksMigrated", blocksMigrated),
-		zap.Int("eventsMigrated", eventsMigrated))
+		zap.Int("eventsMigrated", eventsMigrated),
+		zap.Duration("totalDuration", totalDuration),
+		zap.Float64("blocksPerSecond", float64(blocksMigrated)/totalDuration.Seconds()))
 
 	return &MigratorResponse{
 		BlocksMigrated: blocksMigrated,
@@ -245,73 +269,132 @@ func (a *Migrator) createStorageInstances(ctx context.Context) (*MigrationData, 
 }
 
 func (a *Migrator) migrateBlocks(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
-	logger.Info("Starting height-by-height block metadata migration with complete reorg support")
+	migrateBlocksStart := time.Now()
+	logger.Info("Starting height-by-height block metadata migration with complete reorg support",
+		zap.Uint64("startHeight", request.StartHeight),
+		zap.Uint64("endHeight", request.EndHeight),
+		zap.Uint64("totalHeights", request.EndHeight-request.StartHeight))
 
 	totalNonCanonicalBlocks := 0
 	totalHeights := request.EndHeight - request.StartHeight
 
 	for height := request.StartHeight; height < request.EndHeight; height++ {
+		heightStartTime := time.Now()
+
 		nonCanonicalCount, err := a.migrateBlocksAtHeight(ctx, data, request, height)
 		if err != nil {
+			logger.Error("Failed to migrate blocks at height",
+				zap.Uint64("height", height),
+				zap.Duration("heightDuration", time.Since(heightStartTime)),
+				zap.Error(err))
 			return 0, xerrors.Errorf("failed to migrate blocks at height %d: %w", height, err)
 		}
 
 		totalNonCanonicalBlocks += nonCanonicalCount
 
-		// Progress logging every 100 heights
-		if (height-request.StartHeight+1)%100 == 0 {
+		// Progress logging every 10 heights for detailed monitoring
+		if (height-request.StartHeight+1)%10 == 0 {
 			percentage := float64(height-request.StartHeight+1) / float64(totalHeights) * 100
 			logger.Info("Block migration progress",
+				zap.Uint64("currentHeight", height),
 				zap.Uint64("processed", height-request.StartHeight+1),
 				zap.Uint64("total", totalHeights),
 				zap.Float64("percentage", percentage),
+				zap.Duration("avgPerHeight", time.Since(migrateBlocksStart)/time.Duration(height-request.StartHeight+1)),
 				zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
 		}
 	}
 
+	totalDuration := time.Since(migrateBlocksStart)
 	logger.Info("Height-by-height block metadata migration completed",
-		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
+		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks),
+		zap.Duration("totalDuration", totalDuration),
+		zap.Float64("avgSecondsPerHeight", totalDuration.Seconds()/float64(totalHeights)))
 
 	return int(totalHeights), nil
 }
 
 func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationData, request *MigratorRequest, height uint64) (int, error) {
 	blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
+	logger := a.getLogger(ctx)
 
 	// Phase 1: Get and persist non-canonical blocks first
+	nonCanonicalStart := time.Now()
 	nonCanonicalBlocks, err := a.getNonCanonicalBlocksAtHeight(ctx, data, blockPid)
-	if err != nil && !xerrors.Is(err, storage.ErrItemNotFound) {
+	nonCanonicalQueryDuration := time.Since(nonCanonicalStart)
+
+	if err != nil && !errors.Is(err, storage.ErrItemNotFound) {
+		logger.Error("Failed to get non-canonical blocks",
+			zap.Uint64("height", height),
+			zap.Duration("queryDuration", nonCanonicalQueryDuration),
+			zap.Error(err))
 		return 0, xerrors.Errorf("failed to get non-canonical blocks at height %d: %w", height, err)
 	}
 
 	nonCanonicalCount := len(nonCanonicalBlocks)
 	if nonCanonicalCount > 0 {
 		// Persist non-canonical blocks FIRST
+		persistStart := time.Now()
 		err = data.DestStorage.PersistBlockMetas(ctx, false, nonCanonicalBlocks, nil)
+		persistDuration := time.Since(persistStart)
+
 		if err != nil {
+			logger.Error("Failed to persist non-canonical blocks",
+				zap.Uint64("height", height),
+				zap.Int("blockCount", nonCanonicalCount),
+				zap.Duration("persistDuration", persistDuration),
+				zap.Error(err))
 			return 0, xerrors.Errorf("failed to persist non-canonical blocks at height %d: %w", height, err)
 		}
+
+		logger.Debug("Persisted non-canonical blocks",
+			zap.Uint64("height", height),
+			zap.Int("blockCount", nonCanonicalCount),
+			zap.Duration("persistDuration", persistDuration))
 	}
 
 	// Phase 2: Get and persist canonical block LAST
+	canonicalStart := time.Now()
 	canonicalBlock, err := a.getCanonicalBlockAtHeight(ctx, data, blockPid)
+	canonicalQueryDuration := time.Since(canonicalStart)
+
 	if err != nil {
-		if xerrors.Is(err, storage.ErrItemNotFound) {
+		if errors.Is(err, storage.ErrItemNotFound) {
+			logger.Debug("No canonical block found at height",
+				zap.Uint64("height", height),
+				zap.Duration("queryDuration", canonicalQueryDuration))
 			return nonCanonicalCount, nil
 		}
+		logger.Error("Failed to get canonical block",
+			zap.Uint64("height", height),
+			zap.Duration("queryDuration", canonicalQueryDuration),
+			zap.Error(err))
 		return 0, xerrors.Errorf("failed to get canonical block at height %d: %w", height, err)
 	}
 
 	// Persist canonical block LAST - this ensures it becomes canonical in PostgreSQL
+	persistCanonicalStart := time.Now()
 	err = data.DestStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{canonicalBlock}, nil)
+	persistCanonicalDuration := time.Since(persistCanonicalStart)
+
 	if err != nil {
+		logger.Error("Failed to persist canonical block",
+			zap.Uint64("height", height),
+			zap.Duration("persistDuration", persistCanonicalDuration),
+			zap.Error(err))
 		return 0, xerrors.Errorf("failed to persist canonical block at height %d: %w", height, err)
 	}
+
+	logger.Debug("Persisted canonical block",
+		zap.Uint64("height", height),
+		zap.Duration("persistDuration", persistCanonicalDuration))
 
 	return nonCanonicalCount, nil
 }
 
 func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *MigrationData, blockPid string) ([]*api.BlockMetadata, error) {
+	logger := a.getLogger(ctx)
+
 	input := &dynamodb.QueryInput{
 		TableName:              awssdk.String(data.BlockTable),
 		KeyConditionExpression: awssdk.String("block_pid = :blockPid"),
@@ -323,8 +406,20 @@ func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *Migr
 		ConsistentRead: awssdk.Bool(true),
 	}
 
+	queryStart := time.Now()
 	result, err := data.DynamoClient.QueryWithContext(ctx, input)
+	queryDuration := time.Since(queryStart)
+
+	logger.Debug("DynamoDB query for non-canonical blocks",
+		zap.String("blockPid", blockPid),
+		zap.Duration("queryDuration", queryDuration),
+		zap.Bool("success", err == nil))
+
 	if err != nil {
+		logger.Error("DynamoDB query failed for non-canonical blocks",
+			zap.String("blockPid", blockPid),
+			zap.Duration("queryDuration", queryDuration),
+			zap.Error(err))
 		return nil, xerrors.Errorf("failed to query blocks at height: %w", err)
 	}
 
@@ -348,6 +443,8 @@ func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *Migr
 }
 
 func (a *Migrator) getCanonicalBlockAtHeight(ctx context.Context, data *MigrationData, blockPid string) (*api.BlockMetadata, error) {
+	logger := a.getLogger(ctx)
+
 	input := &dynamodb.QueryInput{
 		TableName:              awssdk.String(data.BlockTable),
 		KeyConditionExpression: awssdk.String("block_pid = :blockPid AND block_rid = :canonical"),
@@ -362,8 +459,20 @@ func (a *Migrator) getCanonicalBlockAtHeight(ctx context.Context, data *Migratio
 		ConsistentRead: awssdk.Bool(true),
 	}
 
+	queryStart := time.Now()
 	result, err := data.DynamoClient.QueryWithContext(ctx, input)
+	queryDuration := time.Since(queryStart)
+
+	logger.Debug("DynamoDB query for canonical block",
+		zap.String("blockPid", blockPid),
+		zap.Duration("queryDuration", queryDuration),
+		zap.Bool("success", err == nil))
+
 	if err != nil {
+		logger.Error("DynamoDB query failed for canonical block",
+			zap.String("blockPid", blockPid),
+			zap.Duration("queryDuration", queryDuration),
+			zap.Error(err))
 		return nil, xerrors.Errorf("failed to query canonical block: %w", err)
 	}
 
@@ -433,7 +542,7 @@ func (a *Migrator) catchUpEventsToPostgresBlockHeight(
 	for h := startHeight; h <= targetHeight; h++ {
 		sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, h)
 		if err != nil {
-			if xerrors.Is(err, storage.ErrItemNotFound) {
+			if errors.Is(err, storage.ErrItemNotFound) {
 				continue // No events at this height in source; skip
 			}
 			return eventsCaught, xerrors.Errorf("failed to get events at height %d from source: %w", h, err)
@@ -512,7 +621,7 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 	for h := startHeight; h <= endHeightInclusive; h++ {
 		sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, h)
 		if err != nil {
-			if xerrors.Is(err, storage.ErrItemNotFound) {
+			if errors.Is(err, storage.ErrItemNotFound) {
 				continue // No events at this height in source; skip
 			}
 			return 0, xerrors.Errorf("failed to get events at height %d: %w", h, err)
@@ -560,7 +669,7 @@ func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *Migrat
 		// Check if block metadata exists at this height
 		_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, height)
 		if err != nil {
-			if xerrors.Is(err, storage.ErrItemNotFound) {
+			if errors.Is(err, storage.ErrItemNotFound) {
 				missingHeights = append(missingHeights, height)
 				logger.Warn("Block metadata missing at height", zap.Uint64("height", height))
 			} else {
@@ -578,7 +687,7 @@ func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *Migrat
 	// Additionally, check a few specific heights that events will reference
 	// Get some events to check their referenced block heights
 	sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, request.StartHeight)
-	if err != nil && !xerrors.Is(err, storage.ErrItemNotFound) {
+	if err != nil && !errors.Is(err, storage.ErrItemNotFound) {
 		return xerrors.Errorf("failed to get sample events for validation: %w", err)
 	}
 
@@ -593,7 +702,7 @@ func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *Migrat
 			event := sourceEvents[i]
 			_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, event.BlockHeight)
 			if err != nil {
-				if xerrors.Is(err, storage.ErrItemNotFound) {
+				if errors.Is(err, storage.ErrItemNotFound) {
 					return xerrors.Errorf("cannot migrate events with skip-blocks=true: block metadata missing for event at height %d. "+
 						"Block metadata must be migrated first before migrating events", event.BlockHeight)
 				}

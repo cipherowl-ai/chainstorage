@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -76,10 +77,17 @@ func NewMigrator(params MigratorParams) *Migrator {
 }
 
 func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (client.WorkflowRun, error) {
+	// Use a consistent workflow ID to prevent multiple migrator workflows
 	workflowId := w.name
 	if v, ok := ctx.Value("workflowId").(string); ok && v != "" {
 		workflowId = v
 	}
+
+	// For migrator workflows, ensure we use a deterministic ID to prevent duplicates
+	if workflowId == "workflow.migrator" {
+		workflowId = fmt.Sprintf("workflow.migrator.tag-%d", request.Tag)
+	}
+
 	return w.startWorkflow(ctx, workflowId, request)
 }
 
@@ -205,32 +213,48 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Additional handling for continuous sync:
 		// If EndHeight <= StartHeight, we are caught up. Instead of erroring, schedule next cycle.
 		if continuousSync && request.EndHeight != 0 && request.EndHeight <= request.StartHeight {
-			logger.Info("Continuous sync: caught up (no-op). Running event catch-up before next cycle",
+			logger.Info("Continuous sync: caught up (no new blocks). Running event catch-up before next cycle",
 				zap.Uint64("startHeight", request.StartHeight),
 				zap.Uint64("endHeight", request.EndHeight))
 
-			// Run a one-shot activity to catch up events to current Postgres block height.
-			catchUpReq := &activity.MigratorRequest{
-				StartHeight:    request.StartHeight,
-				EndHeight:      request.StartHeight, // no block range; activity will do event catch-up internally
-				EventTag:       request.EventTag,
-				Tag:            tag,
-				BatchSize:      int(miniBatchSize),
-				Parallelism:    parallelism,
-				SkipEvents:     false,
-				SkipBlocks:     true, // ensure we don't attempt block writes here
-				DoEventCatchUp: true,
+			// Run a one-shot activity to catch up events to current Postgres block height
+			// This ensures we don't miss any events while we were caught up
+			if !request.SkipEvents {
+				catchUpReq := &activity.MigratorRequest{
+					StartHeight:    request.StartHeight,
+					EndHeight:      request.StartHeight, // no block range; activity will do event catch-up internally
+					EventTag:       request.EventTag,
+					Tag:            tag,
+					BatchSize:      int(miniBatchSize),
+					Parallelism:    parallelism,
+					SkipEvents:     false,
+					SkipBlocks:     true, // ensure we don't attempt block writes here
+					DoEventCatchUp: true,
+				}
+				catchUpResp, err := w.migrator.Execute(ctx, catchUpReq)
+				if err != nil {
+					logger.Warn("Event catch-up failed, continuing anyway", zap.Error(err))
+				} else if catchUpResp != nil && catchUpResp.EventsMigrated > 0 {
+					logger.Info("Event catch-up completed",
+						zap.Int("eventsMigrated", catchUpResp.EventsMigrated))
+				}
 			}
-			_, _ = w.migrator.Execute(ctx, catchUpReq)
 
+			// Prepare for next cycle
 			newRequest := *request
 			newRequest.StartHeight = request.EndHeight
 			newRequest.EndHeight = 0 // re-detect on next cycle
+
 			// Wait for syncInterval before starting a new continuous sync workflow
+			logger.Info("waiting for sync interval before next catch-up cycle",
+				zap.Duration("syncInterval", syncInterval))
 			err := workflow.Sleep(ctx, syncInterval)
 			if err != nil {
 				return xerrors.Errorf("workflow sleep failed during caught-up continuous sync: %w", err)
 			}
+
+			logger.Info("starting next continuous sync cycle after catch-up",
+				zap.Uint64("nextStartHeight", newRequest.StartHeight))
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
@@ -255,15 +279,13 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		processedHeights := uint64(0)
 
 		for batchStart := request.StartHeight; batchStart < request.EndHeight; batchStart += batchSize {
-			// Check for checkpoint
-			if batchStart-request.StartHeight >= checkpointSize {
+			// Check for checkpoint - only check after processing at least one batch
+			processedSoFar := batchStart - request.StartHeight
+			if processedSoFar > 0 && processedSoFar >= checkpointSize {
 				newRequest := *request
 				newRequest.StartHeight = batchStart
-				logger.Info(
-					"checkpoint reached",
-					zap.Reflect("newRequest", newRequest),
-				)
-				return w.continueAsNew(ctx, &newRequest)
+				logger.Info("checkpoint reached", zap.Reflect("newRequest", newRequest))
+				return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 			}
 
 			batchEnd := batchStart + batchSize
@@ -332,16 +354,22 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		}
 
 		if continuousSync {
-			logger.Info("continuous sync enabled, starting new sync cycle")
+			logger.Info("continuous sync enabled, preparing for next sync cycle")
 			newRequest := *request
 			newRequest.StartHeight = request.EndHeight
-			newRequest.EndHeight = 0
+			newRequest.EndHeight = 0 // Will be auto-detected on next cycle
+
 			// Wait for syncInterval before starting a new continuous sync workflow
+			logger.Info("waiting for sync interval before next cycle",
+				zap.Duration("syncInterval", syncInterval))
 			err := workflow.Sleep(ctx, syncInterval)
 			if err != nil {
 				return xerrors.Errorf("workflow sleep failed during continuous sync: %w", err)
 			}
-			logger.Info("starting new continuous sync workflow", zap.Reflect("newRequest", newRequest))
+
+			logger.Info("starting new continuous sync workflow",
+				zap.Uint64("nextStartHeight", newRequest.StartHeight),
+				zap.Reflect("newRequest", newRequest))
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
