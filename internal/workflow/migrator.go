@@ -77,18 +77,13 @@ func NewMigrator(params MigratorParams) *Migrator {
 }
 
 func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (client.WorkflowRun, error) {
-	// Use a consistent workflow ID to prevent multiple migrator workflows
-	workflowId := w.name
-	if v, ok := ctx.Value("workflowId").(string); ok && v != "" {
-		workflowId = v
+	// Follow poller/streamer pattern: one workflow instance per tag
+	// This prevents race conditions and multiple concurrent migrations for the same tag
+	workflowID := w.name
+	if request.Tag != 0 {
+		workflowID = fmt.Sprintf("%s/block_tag=%d", w.name, request.Tag)
 	}
-
-	// For migrator workflows, ensure we use a deterministic ID to prevent duplicates
-	if workflowId == "workflow.migrator" {
-		workflowId = fmt.Sprintf("workflow.migrator.tag-%d", request.Tag)
-	}
-
-	return w.startWorkflow(ctx, workflowId, request)
+	return w.startWorkflow(ctx, workflowID, request)
 }
 
 func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error {

@@ -170,7 +170,7 @@ func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, req
 		ID:                                       workflowID,
 		TaskQueue:                                cfg.TaskList,
 		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
-		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
+		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
 		RetryPolicy:                              w.getRetryPolicy(cfg.WorkflowRetry),
 	}
