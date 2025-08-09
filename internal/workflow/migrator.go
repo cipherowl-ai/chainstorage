@@ -293,14 +293,15 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				zap.Uint64("batchEnd", batchEnd))
 
 			migratorRequest := &activity.MigratorRequest{
-				StartHeight: batchStart,
-				EndHeight:   batchEnd,
-				EventTag:    request.EventTag,
-				Tag:         tag,
-				BatchSize:   int(miniBatchSize), // Use miniBatchSize for activity batch size
-				Parallelism: parallelism,
-				SkipEvents:  request.SkipEvents,
-				SkipBlocks:  request.SkipBlocks,
+				StartHeight:    batchStart,
+				EndHeight:      batchEnd,
+				EventTag:       request.EventTag,
+				Tag:            tag,
+				BatchSize:      int(miniBatchSize), // Use miniBatchSize for activity batch size
+				Parallelism:    parallelism,
+				SkipEvents:     request.SkipEvents,
+				SkipBlocks:     request.SkipBlocks,
+				DoEventCatchUp: request.AutoResume && batchStart == request.StartHeight, // Only do catch-up on first batch when auto-resuming
 			}
 
 			response, err := w.migrator.Execute(ctx, migratorRequest)
@@ -353,6 +354,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			newRequest := *request
 			newRequest.StartHeight = request.EndHeight
 			newRequest.EndHeight = 0 // Will be auto-detected on next cycle
+			newRequest.AutoResume = false // AutoResume should only happen on first workflow run
 
 			// Wait for syncInterval before starting a new continuous sync workflow
 			logger.Info("waiting for sync interval before next cycle",
