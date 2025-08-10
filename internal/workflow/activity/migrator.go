@@ -319,81 +319,90 @@ func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationDat
 	blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
 	logger := a.getLogger(ctx)
 
-	// Phase 1: Get and persist non-canonical blocks first
-	nonCanonicalStart := time.Now()
-	nonCanonicalBlocks, err := a.getNonCanonicalBlocksAtHeight(ctx, data, blockPid)
-	nonCanonicalQueryDuration := time.Since(nonCanonicalStart)
-
-	if err != nil && !errors.Is(err, storage.ErrItemNotFound) {
-		logger.Error("Failed to get non-canonical blocks",
-			zap.Uint64("height", height),
-			zap.Duration("queryDuration", nonCanonicalQueryDuration),
-			zap.Error(err))
-		return 0, xerrors.Errorf("failed to get non-canonical blocks at height %d: %w", height, err)
-	}
-
-	nonCanonicalCount := len(nonCanonicalBlocks)
-	if nonCanonicalCount > 0 {
-		// Persist non-canonical blocks FIRST
-		persistStart := time.Now()
-		err = data.DestStorage.PersistBlockMetas(ctx, false, nonCanonicalBlocks, nil)
-		persistDuration := time.Since(persistStart)
-
-		if err != nil {
-			logger.Error("Failed to persist non-canonical blocks",
-				zap.Uint64("height", height),
-				zap.Int("blockCount", nonCanonicalCount),
-				zap.Duration("persistDuration", persistDuration),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to persist non-canonical blocks at height %d: %w", height, err)
-		}
-
-		logger.Debug("Persisted non-canonical blocks",
-			zap.Uint64("height", height),
-			zap.Int("blockCount", nonCanonicalCount),
-			zap.Duration("persistDuration", persistDuration))
-	}
-
-	// Phase 2: Get and persist canonical block LAST
-	canonicalStart := time.Now()
-	canonicalBlock, err := a.getCanonicalBlockAtHeight(ctx, data, blockPid)
-	canonicalQueryDuration := time.Since(canonicalStart)
+	// Get ALL blocks at this height (canonical + non-canonical) in one DynamoDB query
+	queryStart := time.Now()
+	allBlocks, err := a.getAllBlocksAtHeight(ctx, data, blockPid)
+	queryDuration := time.Since(queryStart)
 
 	if err != nil {
 		if errors.Is(err, storage.ErrItemNotFound) {
-			logger.Debug("No canonical block found at height",
+			logger.Debug("No blocks found at height",
 				zap.Uint64("height", height),
-				zap.Duration("queryDuration", canonicalQueryDuration))
-			return nonCanonicalCount, nil
+				zap.Duration("queryDuration", queryDuration))
+			return 0, nil
 		}
-		logger.Error("Failed to get canonical block",
+		logger.Error("Failed to get blocks at height",
 			zap.Uint64("height", height),
-			zap.Duration("queryDuration", canonicalQueryDuration),
+			zap.Duration("queryDuration", queryDuration),
 			zap.Error(err))
-		return 0, xerrors.Errorf("failed to get canonical block at height %d: %w", height, err)
+		return 0, xerrors.Errorf("failed to get blocks at height %d: %w", height, err)
 	}
 
-	// Persist canonical block LAST - this ensures it becomes canonical in PostgreSQL
-	persistCanonicalStart := time.Now()
-	err = data.DestStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{canonicalBlock}, nil)
-	persistCanonicalDuration := time.Since(persistCanonicalStart)
-
-	if err != nil {
-		logger.Error("Failed to persist canonical block",
-			zap.Uint64("height", height),
-			zap.Duration("persistDuration", persistCanonicalDuration),
-			zap.Error(err))
-		return 0, xerrors.Errorf("failed to persist canonical block at height %d: %w", height, err)
+	if len(allBlocks) == 0 {
+		logger.Debug("No blocks found at height", zap.Uint64("height", height))
+		return 0, nil
 	}
 
-	logger.Debug("Persisted canonical block",
+	// Separate canonical and non-canonical blocks
+	var canonicalBlocks []*api.BlockMetadata
+	var nonCanonicalBlocks []*api.BlockMetadata
+
+	for _, blockWithInfo := range allBlocks {
+		if blockWithInfo.IsCanonical {
+			canonicalBlocks = append(canonicalBlocks, blockWithInfo.BlockMetadata)
+		} else {
+			nonCanonicalBlocks = append(nonCanonicalBlocks, blockWithInfo.BlockMetadata)
+		}
+	}
+
+	// Persist each block individually to avoid chain validation issues between different blocks at same height
+	persistStart := time.Now()
+
+	// First persist non-canonical blocks (won't become canonical in PostgreSQL)
+	for _, block := range nonCanonicalBlocks {
+		err = data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
+		if err != nil {
+			logger.Error("Failed to persist non-canonical block",
+				zap.Uint64("height", height),
+				zap.String("blockHash", block.Hash),
+				zap.Error(err))
+			return 0, xerrors.Errorf("failed to persist non-canonical block at height %d: %w", height, err)
+		}
+	}
+
+	// Then persist canonical blocks (will become canonical in PostgreSQL due to "last block wins")
+	for _, block := range canonicalBlocks {
+		err = data.DestStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil)
+		if err != nil {
+			logger.Error("Failed to persist canonical block",
+				zap.Uint64("height", height),
+				zap.String("blockHash", block.Hash),
+				zap.Error(err))
+			return 0, xerrors.Errorf("failed to persist canonical block at height %d: %w", height, err)
+		}
+	}
+
+	persistDuration := time.Since(persistStart)
+	totalBlocks := len(allBlocks)
+	nonCanonicalCount := len(nonCanonicalBlocks)
+
+	logger.Debug("Persisted all blocks at height",
 		zap.Uint64("height", height),
-		zap.Duration("persistDuration", persistCanonicalDuration))
+		zap.Int("totalBlocks", totalBlocks),
+		zap.Int("canonicalBlocks", len(canonicalBlocks)),
+		zap.Int("nonCanonicalBlocks", nonCanonicalCount),
+		zap.Duration("persistDuration", persistDuration))
 
 	return nonCanonicalCount, nil
 }
 
-func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *MigrationData, blockPid string) ([]*api.BlockMetadata, error) {
+// BlockWithCanonicalInfo wraps BlockMetadata with canonical information
+type BlockWithCanonicalInfo struct {
+	*api.BlockMetadata
+	IsCanonical bool
+}
+
+func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData, blockPid string) ([]BlockWithCanonicalInfo, error) {
 	logger := a.getLogger(ctx)
 
 	input := &dynamodb.QueryInput{
@@ -411,20 +420,24 @@ func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *Migr
 	result, err := data.DynamoClient.QueryWithContext(ctx, input)
 	queryDuration := time.Since(queryStart)
 
-	logger.Debug("DynamoDB query for non-canonical blocks",
+	logger.Debug("DynamoDB query for all blocks at height",
 		zap.String("blockPid", blockPid),
 		zap.Duration("queryDuration", queryDuration),
 		zap.Bool("success", err == nil))
 
 	if err != nil {
-		logger.Error("DynamoDB query failed for non-canonical blocks",
+		logger.Error("DynamoDB query failed for all blocks at height",
 			zap.String("blockPid", blockPid),
 			zap.Duration("queryDuration", queryDuration),
 			zap.Error(err))
-		return nil, xerrors.Errorf("failed to query blocks at height: %w", err)
+		return nil, xerrors.Errorf("failed to query all blocks at height: %w", err)
 	}
 
-	var nonCanonicalBlocks []*api.BlockMetadata
+	if len(result.Items) == 0 {
+		return nil, storage.ErrItemNotFound
+	}
+
+	var allBlocks []BlockWithCanonicalInfo
 	for _, item := range result.Items {
 		var blockEntry dynamodb_model.BlockMetaDataDDBEntry
 		err := dynamodbattribute.UnmarshalMap(item, &blockEntry)
@@ -432,66 +445,17 @@ func (a *Migrator) getNonCanonicalBlocksAtHeight(ctx context.Context, data *Migr
 			return nil, xerrors.Errorf("failed to unmarshal DynamoDB item: %w", err)
 		}
 
-		// Skip canonical blocks (BlockRid = "canonical")
-		if blockEntry.BlockRid == "canonical" {
-			continue
+		// Determine if this block is canonical based on block_rid
+		isCanonical := blockEntry.BlockRid == "canonical"
+
+		blockWithInfo := BlockWithCanonicalInfo{
+			BlockMetadata: dynamodb_model.BlockMetadataToProto(&blockEntry),
+			IsCanonical:   isCanonical,
 		}
-
-		nonCanonicalBlocks = append(nonCanonicalBlocks, dynamodb_model.BlockMetadataToProto(&blockEntry))
+		allBlocks = append(allBlocks, blockWithInfo)
 	}
 
-	return nonCanonicalBlocks, nil
-}
-
-func (a *Migrator) getCanonicalBlockAtHeight(ctx context.Context, data *MigrationData, blockPid string) (*api.BlockMetadata, error) {
-	logger := a.getLogger(ctx)
-
-	input := &dynamodb.QueryInput{
-		TableName:              awssdk.String(data.BlockTable),
-		KeyConditionExpression: awssdk.String("block_pid = :blockPid AND block_rid = :canonical"),
-		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":blockPid": {
-				S: awssdk.String(blockPid),
-			},
-			":canonical": {
-				S: awssdk.String("canonical"),
-			},
-		},
-		ConsistentRead: awssdk.Bool(true),
-	}
-
-	queryStart := time.Now()
-	result, err := data.DynamoClient.QueryWithContext(ctx, input)
-	queryDuration := time.Since(queryStart)
-
-	logger.Debug("DynamoDB query for canonical block",
-		zap.String("blockPid", blockPid),
-		zap.Duration("queryDuration", queryDuration),
-		zap.Bool("success", err == nil))
-
-	if err != nil {
-		logger.Error("DynamoDB query failed for canonical block",
-			zap.String("blockPid", blockPid),
-			zap.Duration("queryDuration", queryDuration),
-			zap.Error(err))
-		return nil, xerrors.Errorf("failed to query canonical block: %w", err)
-	}
-
-	if len(result.Items) == 0 {
-		return nil, storage.ErrItemNotFound
-	}
-
-	if len(result.Items) > 1 {
-		return nil, xerrors.Errorf("multiple canonical blocks found for %s", blockPid)
-	}
-
-	var blockEntry dynamodb_model.BlockMetaDataDDBEntry
-	err = dynamodbattribute.UnmarshalMap(result.Items[0], &blockEntry)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to unmarshal canonical block: %w", err)
-	}
-
-	return dynamodb_model.BlockMetadataToProto(&blockEntry), nil
+	return allBlocks, nil
 }
 
 func (a *Migrator) catchUpEventsToPostgresBlockHeight(

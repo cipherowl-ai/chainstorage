@@ -353,7 +353,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			logger.Info("continuous sync enabled, preparing for next sync cycle")
 			newRequest := *request
 			newRequest.StartHeight = request.EndHeight
-			newRequest.EndHeight = 0 // Will be auto-detected on next cycle
+			newRequest.EndHeight = 0      // Will be auto-detected on next cycle
 			newRequest.AutoResume = false // AutoResume should only happen on first workflow run
 
 			// Wait for syncInterval before starting a new continuous sync workflow
