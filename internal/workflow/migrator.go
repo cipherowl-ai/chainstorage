@@ -25,6 +25,7 @@ type (
 		migrator                   *activity.Migrator
 		getLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		getLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
+		getLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
 	}
 
 	MigratorParams struct {
@@ -34,6 +35,7 @@ type (
 		Migrator                   *activity.Migrator
 		GetLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		GetLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
+		GetLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
 	}
 
 	MigratorRequest struct {
@@ -72,17 +74,18 @@ func NewMigrator(params MigratorParams) *Migrator {
 		migrator:                   params.Migrator,
 		getLatestBlockHeight:       params.GetLatestBlockHeight,
 		getLatestBlockFromPostgres: params.GetLatestBlockFromPostgres,
+		getLatestEventFromPostgres: params.GetLatestEventFromPostgres,
 	}
 	w.registerWorkflow(w.execute)
 	return w
 }
 
 func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (client.WorkflowRun, error) {
-	// Follow poller/streamer pattern: one workflow instance per tag
-	// This prevents race conditions and multiple concurrent migrations for the same tag
-	workflowID := w.name
+	// Add timestamp to workflow ID to avoid ALLOW_DUPLICATE_FAILED_ONLY policy conflicts
+	timestamp := time.Now().Unix()
+	workflowID := fmt.Sprintf("%s-%d", w.name, timestamp)
 	if request.Tag != 0 {
-		workflowID = fmt.Sprintf("%s/block_tag=%d", w.name, request.Tag)
+		workflowID = fmt.Sprintf("%s-%d/block_tag=%d", w.name, timestamp, request.Tag)
 	}
 	return w.startMigratorWorkflow(ctx, workflowID, request)
 }
@@ -183,24 +186,24 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Set up activity options early so we can use activities
 		ctx = w.withActivityOptions(ctx)
 
-		// Handle auto-resume functionality
+		// Handle auto-resume functionality - use latest event height instead of block height
 		if request.AutoResume && request.StartHeight == 0 {
-			logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated block")
-			postgresResp, err := w.getLatestBlockFromPostgres.Execute(ctx, &activity.GetLatestBlockFromPostgresRequest{Tag: tag})
+			logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated event")
+			postgresEventResp, err := w.getLatestEventFromPostgres.Execute(ctx, &activity.GetLatestEventFromPostgresRequest{EventTag: request.EventTag})
 			if err != nil {
-				return xerrors.Errorf("failed to get latest block height from PostgreSQL: %w", err)
+				return xerrors.Errorf("failed to get latest event height from PostgreSQL: %w", err)
 			}
 
-			if postgresResp.Found {
-				// Resume from the next block after the latest migrated block
-				request.StartHeight = postgresResp.Height + 1
-				logger.Info("Auto-resume: found latest block in PostgreSQL destination",
-					zap.Uint64("latestHeight", postgresResp.Height),
+			if postgresEventResp.Found {
+				// Resume from the latest event height (blocks will be remigrated if needed, PostgreSQL handles duplicates)
+				request.StartHeight = postgresEventResp.Height
+				logger.Info("Auto-resume: found latest event in PostgreSQL destination",
+					zap.Uint64("latestEventHeight", postgresEventResp.Height),
 					zap.Uint64("resumeFromHeight", request.StartHeight))
 			} else {
-				// No blocks found in destination, start from the beginning
+				// No events found in destination, start from the beginning
 				request.StartHeight = 0
-				logger.Info("Auto-resume: no blocks found in PostgreSQL destination, starting from beginning")
+				logger.Info("Auto-resume: no events found in PostgreSQL destination, starting from beginning")
 			}
 		}
 
@@ -235,28 +238,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				zap.Uint64("startHeight", request.StartHeight),
 				zap.Uint64("endHeight", request.EndHeight))
 
-			// Run a one-shot activity to catch up events to current Postgres block height
-			// This ensures we don't miss any events while we were caught up
-			if !request.SkipEvents {
-				catchUpReq := &activity.MigratorRequest{
-					StartHeight:    request.StartHeight,
-					EndHeight:      request.StartHeight, // no block range; activity will do event catch-up internally
-					EventTag:       request.EventTag,
-					Tag:            tag,
-					BatchSize:      int(miniBatchSize),
-					Parallelism:    parallelism,
-					SkipEvents:     false,
-					SkipBlocks:     true, // ensure we don't attempt block writes here
-					DoEventCatchUp: true,
-				}
-				catchUpResp, err := w.migrator.Execute(ctx, catchUpReq)
-				if err != nil {
-					logger.Warn("Event catch-up failed, continuing anyway", zap.Error(err))
-				} else if catchUpResp != nil && catchUpResp.EventsMigrated > 0 {
-					logger.Info("Event catch-up completed",
-						zap.Int("eventsMigrated", catchUpResp.EventsMigrated))
-				}
-			}
+			// No special event catch-up needed - normal migration handles this
 
 			// Prepare for next cycle
 			newRequest := *request
@@ -316,15 +298,14 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				zap.Uint64("batchEnd", batchEnd))
 
 			migratorRequest := &activity.MigratorRequest{
-				StartHeight:    batchStart,
-				EndHeight:      batchEnd,
-				EventTag:       request.EventTag,
-				Tag:            tag,
-				BatchSize:      int(miniBatchSize), // Use miniBatchSize for activity batch size
-				Parallelism:    parallelism,
-				SkipEvents:     request.SkipEvents,
-				SkipBlocks:     request.SkipBlocks,
-				DoEventCatchUp: request.AutoResume && batchStart == request.StartHeight, // Only do catch-up on first batch when auto-resuming
+				StartHeight: batchStart,
+				EndHeight:   batchEnd,
+				EventTag:    request.EventTag,
+				Tag:         tag,
+				BatchSize:   int(miniBatchSize), // Use miniBatchSize for activity batch size
+				Parallelism: parallelism,
+				SkipEvents:  request.SkipEvents,
+				SkipBlocks:  request.SkipBlocks,
 			}
 
 			response, err := w.migrator.Execute(ctx, migratorRequest)

@@ -55,6 +55,12 @@ type (
 		metrics tally.Scope
 	}
 
+	GetLatestEventFromPostgresActivity struct {
+		baseActivity
+		config  *config.Config
+		metrics tally.Scope
+	}
+
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
@@ -63,15 +69,14 @@ type (
 	}
 
 	MigratorRequest struct {
-		StartHeight    uint64
-		EndHeight      uint64 // Optional. If not specified, will query latest block from DynamoDB
-		EventTag       uint32
-		Tag            uint32
-		BatchSize      int
-		Parallelism    int
-		SkipEvents     bool
-		SkipBlocks     bool
-		DoEventCatchUp bool // If true, perform smart event catch-up to match Postgres block height (manual start only)
+		StartHeight uint64
+		EndHeight   uint64 // Optional. If not specified, will query latest block from DynamoDB
+		EventTag    uint32
+		Tag         uint32
+		BatchSize   int
+		Parallelism int
+		SkipEvents  bool
+		SkipBlocks  bool
 	}
 
 	MigratorResponse struct {
@@ -126,6 +131,16 @@ func NewGetLatestBlockFromPostgresActivity(params MigratorParams) *GetLatestBloc
 	return a
 }
 
+func NewGetLatestEventFromPostgresActivity(params MigratorParams) *GetLatestEventFromPostgresActivity {
+	a := &GetLatestEventFromPostgresActivity{
+		baseActivity: newBaseActivity(ActivityGetLatestEventFromPostgres, params.Runtime),
+		config:       params.Config,
+		metrics:      params.Metrics,
+	}
+	a.register(a.execute)
+	return a
+}
+
 func (a *Migrator) Execute(ctx workflow.Context, request *MigratorRequest) (*MigratorResponse, error) {
 	var response MigratorResponse
 	err := a.executeActivity(ctx, request, &response)
@@ -139,11 +154,8 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	}
 
 	// Validate height range early to fail fast and avoid expensive setup.
-	// Allow equal or inverted ranges when doing event-only catch-up scenarios.
 	if request.EndHeight <= request.StartHeight {
-		if !(request.SkipBlocks || request.DoEventCatchUp) {
-			return nil, xerrors.Errorf("invalid request: EndHeight (%d) must be greater than StartHeight (%d)", request.EndHeight, request.StartHeight)
-		}
+		return nil, xerrors.Errorf("invalid request: EndHeight (%d) must be greater than StartHeight (%d)", request.EndHeight, request.StartHeight)
 	}
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
@@ -447,135 +459,6 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 	return allBlocks, nil
 }
 
-// smartEventCatchUp performs efficient sequential event catch-up when there's a gap between event height and block height
-func (a *Migrator) smartEventCatchUp(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
-	// Get current PostgreSQL block height
-	destLatestBlock, err := data.DestStorage.GetLatestBlock(ctx, request.Tag)
-	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "not found") || strings.Contains(strings.ToLower(err.Error()), "no rows") {
-			// No blocks in destination yet, no catch-up needed
-			return 0, nil
-		}
-		return 0, xerrors.Errorf("failed to get latest block from postgres: %w", err)
-	}
-
-	// Get current PostgreSQL event height
-	latestEventHeight, hasEvents, err := a.getLatestEventHeightFromPostgres(ctx, data, request.EventTag)
-	if err != nil {
-		return 0, xerrors.Errorf("failed to get latest event height from postgres: %w", err)
-	}
-
-	// Calculate the gap
-	blockHeight := destLatestBlock.Height
-	eventHeight := uint64(0)
-	if hasEvents {
-		eventHeight = latestEventHeight
-	}
-
-	if blockHeight <= eventHeight {
-		// Events are caught up or ahead, no catch-up needed
-		return 0, nil
-	}
-
-	gap := blockHeight - eventHeight
-	logger.Info("Detected event gap, performing sequential catch-up",
-		zap.Uint64("currentBlockHeight", blockHeight),
-		zap.Uint64("currentEventHeight", eventHeight),
-		zap.Uint64("gap", gap))
-
-	// Use sequential batches to ensure event sequence continuity during catch-up
-	batchSize := uint64(100) // Default batch size for catch-up
-	if request.BatchSize > 0 {
-		batchSize = uint64(request.BatchSize)
-	}
-
-	totalEventsCaughtUp := 0
-	catchUpStart := eventHeight + 1
-	catchUpEnd := blockHeight
-
-	for batchStart := catchUpStart; batchStart <= catchUpEnd; batchStart += batchSize {
-		batchEnd := batchStart + batchSize - 1
-		if batchEnd > catchUpEnd {
-			batchEnd = catchUpEnd
-		}
-
-		logger.Info("Catching up event batch sequentially",
-			zap.Uint64("batchStart", batchStart),
-			zap.Uint64("batchEnd", batchEnd))
-
-		// Process this batch sequentially to preserve DynamoDB sequence mapping
-		batchEvents, err := a.migrateEventsRangeSequential(ctx, data, request, batchStart, batchEnd)
-		if err != nil {
-			return totalEventsCaughtUp, xerrors.Errorf("failed to catch up events batch [%d-%d]: %w", batchStart, batchEnd, err)
-		}
-
-		totalEventsCaughtUp += batchEvents
-		progress := float64(batchEnd-catchUpStart+1) / float64(gap) * 100
-
-		logger.Info("Event catch-up batch completed",
-			zap.Uint64("batchStart", batchStart),
-			zap.Uint64("batchEnd", batchEnd),
-			zap.Int("batchEvents", batchEvents),
-			zap.Int("totalCaughtUp", totalEventsCaughtUp),
-			zap.Float64("progress", progress))
-	}
-
-	return totalEventsCaughtUp, nil
-}
-
-// migrateEventsRangeSequential processes events for a height range sequentially (no mini-batch parallelism)
-// Used for catch-up scenarios where event sequence continuity is critical
-// Preserves original DynamoDB sequence numbers for 1:1 mapping
-func (a *Migrator) migrateEventsRangeSequential(ctx context.Context, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64) (int, error) {
-	allEvents := make([]*model.EventEntry, 0, (endHeight-startHeight+1)*2) // Estimate 2 events per block
-
-	// Collect all events in this range sequentially
-	for h := startHeight; h <= endHeight; h++ {
-		sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, h)
-		if err != nil {
-			if errors.Is(err, storage.ErrItemNotFound) {
-				continue // No events at this height; skip
-			}
-			return 0, xerrors.Errorf("failed to get events at height %d: %w", h, err)
-		}
-		if len(sourceEvents) > 0 {
-			allEvents = append(allEvents, sourceEvents...)
-		}
-	}
-
-	// Insert events as-is to preserve DynamoDB sequence mapping
-	if len(allEvents) > 0 {
-		if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, allEvents); err != nil {
-			return 0, xerrors.Errorf("failed to add sequential events for range [%d-%d]: %w",
-				startHeight, endHeight, err)
-		}
-	}
-
-	return len(allEvents), nil
-}
-
-// getLatestEventHeightFromPostgres returns the block height of the latest event currently stored in PostgreSQL.
-// If there is no event history yet, it returns hasEvents=false with height=0.
-func (a *Migrator) getLatestEventHeightFromPostgres(
-	ctx context.Context,
-	data *MigrationData,
-	eventTag uint32,
-) (uint64, bool, error) {
-	maxEventId, err := data.DestStorage.GetMaxEventId(ctx, eventTag)
-	if err != nil {
-		// No events yet in destination
-		if strings.Contains(strings.ToLower(err.Error()), "no event history") || strings.Contains(strings.ToLower(err.Error()), "not found") {
-			return 0, false, nil
-		}
-		return 0, false, xerrors.Errorf("failed to get max event id from postgres: %w", err)
-	}
-	event, err := data.DestStorage.GetEventByEventId(ctx, eventTag, maxEventId)
-	if err != nil {
-		return 0, false, xerrors.Errorf("failed to get event by id from postgres: %w", err)
-	}
-	return event.BlockHeight, true, nil
-}
-
 func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
 	logger.Info("Starting batched event migration with parallelism",
 		zap.Int("parallelism", request.Parallelism),
@@ -592,32 +475,8 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 
 	totalEventsMigrated := 0
 
-	// Smart catch-up: only on manual start (DoEventCatchUp=true), not on continue-as-new
-	if request.DoEventCatchUp && !request.SkipEvents {
-		catchUpCount, err := a.smartEventCatchUp(ctx, logger, data, request)
-		if err != nil {
-			return 0, xerrors.Errorf("failed to perform smart event catch-up: %w", err)
-		}
-		totalEventsMigrated += catchUpCount
-		if catchUpCount > 0 {
-			logger.Info("Smart event catch-up completed", zap.Int("eventsCaughtUp", catchUpCount))
-		}
-	}
-
-	// Resume events from the current latest event height in Postgres, but clamp to the requested range.
-	latestEventHeight, hasEvents, err := a.getLatestEventHeightFromPostgres(ctx, data, request.EventTag)
-	if err != nil {
-		return 0, xerrors.Errorf("failed to get latest event height from postgres: %w", err)
-	}
-
-	// Determine start height: default to requested StartHeight
+	// Simplified migration logic - migrate events for the requested height range
 	startHeight := request.StartHeight
-	if hasEvents {
-		candidate := latestEventHeight + 1
-		if candidate > startHeight {
-			startHeight = candidate
-		}
-	}
 	// Determine inclusive end height: EndHeight is exclusive in requests
 	if request.EndHeight == 0 {
 		return 0, nil
@@ -866,6 +725,15 @@ type GetLatestBlockFromPostgresResponse struct {
 	Found  bool // true if a block was found, false if no blocks exist yet
 }
 
+type GetLatestEventFromPostgresRequest struct {
+	EventTag uint32
+}
+
+type GetLatestEventFromPostgresResponse struct {
+	Height uint64
+	Found  bool // true if events were found, false if no events exist yet
+}
+
 func (a *Migrator) GetLatestBlockHeight(ctx context.Context, req *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
 	migrationData, err := a.createStorageInstances(ctx)
 	if err != nil {
@@ -943,6 +811,71 @@ func (a *GetLatestBlockFromPostgresActivity) execute(ctx context.Context, reques
 	}, nil
 }
 
+func (a *GetLatestEventFromPostgresActivity) Execute(ctx workflow.Context, request *GetLatestEventFromPostgresRequest) (*GetLatestEventFromPostgresResponse, error) {
+	var response GetLatestEventFromPostgresResponse
+	err := a.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *GetLatestEventFromPostgresActivity) execute(ctx context.Context, request *GetLatestEventFromPostgresRequest) (*GetLatestEventFromPostgresResponse, error) {
+	if err := a.validateRequest(request); err != nil {
+		return nil, err
+	}
+
+	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
+
+	// Create PostgreSQL storage using shared connection pool to query destination
+	postgresParams := postgres_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+	}
+
+	destResult, err := postgres_storage.NewMetaStorage(postgresParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create PostgreSQL storage: %w", err)
+	}
+
+	// Get the latest event height from PostgreSQL by querying max event_sequence and its corresponding height
+	latestEventHeight, err := a.getLatestEventHeight(ctx, destResult.MetaStorage, request.EventTag)
+	if err != nil {
+		// Check if it's a "no event history" error, which means no events migrated yet
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "no event history") || strings.Contains(errStr, "not found") || strings.Contains(errStr, "no rows") {
+			logger.Info("No events found in PostgreSQL destination - starting from beginning")
+			return &GetLatestEventFromPostgresResponse{
+				Height: 0,
+				Found:  false,
+			}, nil
+		}
+		return nil, xerrors.Errorf("failed to get latest event height from PostgreSQL: %w", err)
+	}
+
+	logger.Info("Found latest event in PostgreSQL destination", zap.Uint64("height", latestEventHeight))
+	return &GetLatestEventFromPostgresResponse{
+		Height: latestEventHeight,
+		Found:  true,
+	}, nil
+}
+
+func (a *GetLatestEventFromPostgresActivity) getLatestEventHeight(ctx context.Context, storage metastorage.MetaStorage, eventTag uint32) (uint64, error) {
+	// Get the max event sequence (equivalent to max event ID)
+	maxEventId, err := storage.GetMaxEventId(ctx, eventTag)
+	if err != nil {
+		return 0, err
+	}
+
+	// Get the event entry for that max event sequence to get its height
+	eventEntry, err := storage.GetEventByEventId(ctx, eventTag, maxEventId)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to get event entry for max event sequence %d: %w", maxEventId, err)
+	}
+
+	return eventEntry.BlockHeight, nil
+}
+
 func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Context) (*MigrationData, error) {
 	logger := a.getLogger(ctx)
 
@@ -986,4 +919,5 @@ const (
 	ActivityMigrator                   = "activity.migrator"
 	ActivityGetLatestBlockHeight       = "activity.migrator.GetLatestBlockHeight"
 	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
+	ActivityGetLatestEventFromPostgres = "activity.migrator.GetLatestEventFromPostgres"
 )
