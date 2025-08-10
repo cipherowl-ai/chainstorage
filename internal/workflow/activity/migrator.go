@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -628,6 +629,13 @@ func (a *Migrator) migrateEventsRange(ctx context.Context, data *MigrationData, 
 		if len(sourceEvents) > 0 {
 			allEvents = append(allEvents, sourceEvents...)
 		}
+	}
+
+	// Sort events by event_sequence to ensure proper ordering and prevent gaps
+	if len(allEvents) > 0 {
+		sort.Slice(allEvents, func(i, j int) bool {
+			return allEvents[i].EventId < allEvents[j].EventId
+		})
 	}
 
 	// Bulk insert all events at once if we have any
