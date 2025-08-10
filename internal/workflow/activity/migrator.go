@@ -459,7 +459,7 @@ func (a *Migrator) smartEventCatchUp(ctx context.Context, logger *zap.Logger, da
 		return 0, xerrors.Errorf("failed to get latest block from postgres: %w", err)
 	}
 
-	// Get current PostgreSQL event height  
+	// Get current PostgreSQL event height
 	latestEventHeight, hasEvents, err := a.getLatestEventHeightFromPostgres(ctx, data, request.EventTag)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to get latest event height from postgres: %w", err)
@@ -670,10 +670,11 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 			zap.Float64("progress", progress))
 	}
 
+	totalEventsMigrated += totalEvents
 	logger.Info("Batched event migration completed",
-		zap.Int("totalEventsMigrated", totalEvents),
+		zap.Int("totalEventsMigrated", totalEventsMigrated),
 		zap.Uint64("totalHeights", totalHeights))
-	return totalEvents, nil
+	return totalEventsMigrated, nil
 }
 
 // migrateEventsBatch processes a batch of events with parallelism, similar to block migration approach
