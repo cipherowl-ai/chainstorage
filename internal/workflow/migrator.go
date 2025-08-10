@@ -133,9 +133,12 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			batchSize = request.BatchSize
 		}
 
-		miniBatchSize := batchSize / 10 // Default mini-batch size
-		if miniBatchSize == 0 {
-			miniBatchSize = 10 // Minimum mini-batch size
+		miniBatchSize := cfg.MiniBatchSize
+		if miniBatchSize <= 0 {
+			miniBatchSize = batchSize / 10 // Calculate from batch size
+			if miniBatchSize == 0 {
+				miniBatchSize = 10 // Minimum fallback
+			}
 		}
 		if request.MiniBatchSize > 0 {
 			miniBatchSize = request.MiniBatchSize
@@ -146,7 +149,10 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			checkpointSize = request.CheckpointSize
 		}
 
-		parallelism := 1 // Default parallelism
+		parallelism := cfg.Parallelism
+		if parallelism <= 0 {
+			parallelism = 1 // Fallback default if config not set
+		}
 		if request.Parallelism > 0 {
 			parallelism = request.Parallelism
 		}
