@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
@@ -83,7 +84,29 @@ func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (clien
 	if request.Tag != 0 {
 		workflowID = fmt.Sprintf("%s/block_tag=%d", w.name, request.Tag)
 	}
-	return w.startWorkflow(ctx, workflowID, request)
+	return w.startMigratorWorkflow(ctx, workflowID, request)
+}
+
+// startMigratorWorkflow starts a migrator workflow with a custom reuse policy
+// that allows restarting failed workflows but prevents concurrent execution
+func (w *Migrator) startMigratorWorkflow(ctx context.Context, workflowID string, request *MigratorRequest) (client.WorkflowRun, error) {
+	if err := w.validateRequestCtx(ctx, request); err != nil {
+		return nil, err
+	}
+	cfg := w.config.Base()
+	workflowOptions := client.StartWorkflowOptions{
+		ID:                                       workflowID,
+		TaskQueue:                                cfg.TaskList,
+		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
+		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+		WorkflowExecutionErrorWhenAlreadyStarted: true,
+		RetryPolicy:                              w.getRetryPolicy(cfg.WorkflowRetry),
+	}
+	execution, err := w.runtime.ExecuteWorkflow(ctx, workflowOptions, w.name, request)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to execute workflow: %w", err)
+	}
+	return execution, nil
 }
 
 func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error {
