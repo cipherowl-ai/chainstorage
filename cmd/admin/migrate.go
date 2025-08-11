@@ -188,10 +188,6 @@ Examples:
 				fx.Populate(&deps),
 			)
 			defer func() {
-				// Close all PostgreSQL connection pools before closing the app
-				if err := postgres_storage.CloseAllConnectionPools(); err != nil {
-					logger.Error("failed to close PostgreSQL connection pools", zap.Error(err))
-				}
 				app.Close()
 			}()
 
@@ -310,7 +306,7 @@ Examples:
 			// Validate flags after end height auto-detection and auto-resume
 			if !migrateFlags.continuousSync && migrateFlags.startHeight >= migrateFlags.endHeight {
 				// Special case: if auto-resume found we're already caught up
-				if migrateFlags.autoResume && migrateFlags.startHeight >= migrateFlags.endHeight {
+				if migrateFlags.autoResume {
 					logger.Info("Auto-resume detected: already caught up, no migration needed",
 						zap.Uint64("startHeight", migrateFlags.startHeight),
 						zap.Uint64("endHeight", migrateFlags.endHeight))
@@ -319,15 +315,6 @@ Examples:
 				return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
 					migrateFlags.startHeight, migrateFlags.endHeight)
 			}
-
-			// Additional validation for continuous sync
-			if migrateFlags.continuousSync && migrateFlags.endHeight != 0 && migrateFlags.endHeight <= migrateFlags.startHeight {
-				logger.Info("Continuous sync: already caught up at CLI, scheduling next cycle via workflow",
-					zap.Uint64("startHeight", migrateFlags.startHeight),
-					zap.Uint64("endHeight", migrateFlags.endHeight))
-				// Let the workflow auto-detect EndHeight on the next cycle; don’t error here.
-			}
-
 			// Create DynamoDB client for direct queries
 			dynamoClient := dynamodb.New(deps.Session)
 			blockTable := deps.Config.AWS.DynamoDB.BlockTable
