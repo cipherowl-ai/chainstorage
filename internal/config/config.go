@@ -118,6 +118,7 @@ type (
 	AwsConfig struct {
 		Region                 string         `mapstructure:"region" validate:"required"`
 		Bucket                 string         `mapstructure:"bucket" validate:"required"`
+		Postgres               PostgresConfig `mapstructure:"postgres" validate:"required"`
 		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb" validate:"required"`
 		IsLocalStack           bool           `mapstructure:"local_stack"`
 		IsResetLocal           bool           `mapstructure:"reset_local"`
@@ -125,6 +126,23 @@ type (
 		DLQ                    SQSConfig      `mapstructure:"dlq"`
 		Storage                StorageConfig  `mapstructure:"storage"`
 		AWSAccount             AWSAccount     `mapstructure:"aws_account" validate:"required"`
+	}
+
+	PostgresConfig struct {
+		Host             string        `mapstructure:"host" validate:"required"`
+		Port             int           `mapstructure:"port" validate:"required"`
+		Database         string        `mapstructure:"database" validate:"required"`
+		User             string        `mapstructure:"user"`
+		Password         string        `mapstructure:"password"`
+		SSLMode          string        `mapstructure:"ssl_mode" validate:"required"`
+		MaxConnections   int           `mapstructure:"max_connections"`
+		MinConnections   int           `mapstructure:"min_connections"`
+		MaxIdleTime      time.Duration `mapstructure:"max_idle_time"`
+		MaxLifetime      time.Duration `mapstructure:"max_lifetime"`
+		ConnectTimeout   time.Duration `mapstructure:"connect_timeout"`
+		StatementTimeout time.Duration `mapstructure:"statement_timeout"`
+		Schema           string        `mapstructure:"schema"`
+		TablePrefix      string        `mapstructure:"table_prefix"`
 	}
 
 	GcpConfig struct {
@@ -175,6 +193,7 @@ type (
 		CrossValidator  CrossValidatorWorkflowConfig  `mapstructure:"cross_validator"`
 		EventBackfiller EventBackfillerWorkflowConfig `mapstructure:"event_backfiller"`
 		Replicator      ReplicatorWorkflowConfig      `mapstructure:"replicator"`
+		Migrator        MigratorWorkflowConfig        `mapstructure:"migrator"`
 	}
 
 	WorkerConfig struct {
@@ -281,6 +300,18 @@ type (
 		BatchSize       uint64        `mapstructure:"batch_size" validate:"required"`
 		CheckpointSize  uint64        `mapstructure:"checkpoint_size" validate:"required"`
 		BackoffInterval time.Duration `mapstructure:"backoff_interval"`
+	}
+
+	MigratorWorkflowConfig struct {
+		WorkflowConfig  `mapstructure:",squash"`
+		BatchSize       uint64        `mapstructure:"batch_size" validate:"required"`
+		MiniBatchSize   uint64        `mapstructure:"mini_batch_size"`
+		CheckpointSize  uint64        `mapstructure:"checkpoint_size" validate:"required"`
+		Parallelism     int           `mapstructure:"parallelism"`
+		BackoffInterval time.Duration `mapstructure:"backoff_interval"`
+		ContinuousSync  bool          `mapstructure:"continuous_sync"`
+		SyncInterval    time.Duration `mapstructure:"sync_interval"`
+		AutoResume      bool          `mapstructure:"auto_resume"`
 	}
 
 	RosettaConfig struct {
@@ -489,6 +520,7 @@ var (
 		"UNSPECIFIED": 0,
 		"DYNAMODB":    1,
 		"FIRESTORE":   2,
+		"POSTGRES":    3,
 	}
 
 	DLQType_value = map[string]int32{
@@ -525,6 +557,7 @@ const (
 	MetaStorageType_UNSPECIFIED MetaStorageType = 0
 	MetaStorageType_DYNAMODB    MetaStorageType = 1
 	MetaStorageType_FIRESTORE   MetaStorageType = 2
+	MetaStorageType_POSTGRES    MetaStorageType = 3
 
 	DLQType_UNSPECIFIED DLQType = 0
 	DLQType_SQS         DLQType = 1

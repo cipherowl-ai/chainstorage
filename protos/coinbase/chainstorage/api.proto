@@ -250,6 +250,19 @@ message GetVerifiedAccountStateResponse {
   ValidateAccountStateResponse response = 1;
 }
 
+message GetBlockByTimestampRequest {
+  uint32 tag = 1;
+  uint64 timestamp = 2; // Unix timestamp in seconds
+}
+
+message GetBlockByTimestampResponse {
+  uint32 tag = 1;
+  string hash = 2;
+  string parent_hash = 3;
+  uint64 height = 4;
+  uint64 timestamp = 5; // Unix timestamp in seconds
+}
+
 service ChainStorage {
   rpc GetLatestBlock (GetLatestBlockRequest) returns (GetLatestBlockResponse);
   rpc GetBlockFile(GetBlockFileRequest) returns (GetBlockFileResponse);
@@ -267,4 +280,5 @@ service ChainStorage {
   rpc GetBlockByTransaction(GetBlockByTransactionRequest) returns (GetBlockByTransactionResponse);
   rpc GetNativeTransaction (GetNativeTransactionRequest) returns (GetNativeTransactionResponse);
   rpc GetVerifiedAccountState (GetVerifiedAccountStateRequest) returns (GetVerifiedAccountStateResponse);
+  rpc GetBlockByTimestamp (GetBlockByTimestampRequest) returns(GetBlockByTimestampResponse);
 }

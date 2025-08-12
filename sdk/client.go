@@ -80,6 +80,11 @@ type (
 		// Note that this API is still experimental and may change at any time.
 		GetBlockByTransaction(ctx context.Context, tag uint32, transactionHash string) ([]*api.Block, error)
 
+		// GetBlockByTimestamp returns the latest block before or at the given timestamp.
+		// The timestamp should be a Unix timestamp (seconds since January 1, 1970 UTC).
+		// If no block is found at or before the timestamp, it returns an error.
+		GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.Block, error)
+
 		// StreamChainEvents streams raw blocks from ChainStorage.
 		// The caller is responsible for keeping track of the sequence or sequence_num in BlockchainEvent.
 		StreamChainEvents(ctx context.Context, cfg StreamingConfiguration) (<-chan *ChainEventResult, error)
@@ -481,6 +486,24 @@ func (c *clientImpl) GetBlockByTransaction(ctx context.Context, tag uint32, tran
 	}
 
 	return blocks, nil
+}
+
+func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.Block, error) {
+	resp, err := c.client.GetBlockByTimestamp(ctx, &api.GetBlockByTimestampRequest{
+		Tag:       tag,
+		Timestamp: timestamp,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get block by timestamp (tag=%v, timestamp=%v): %w", tag, timestamp, err)
+	}
+
+	// Download the block data using the metadata from the response
+	block, err := c.downloadBlock(ctx, resp.Tag, resp.Height, resp.Hash)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to download block data: %w", err)
+	}
+
+	return block, nil
 }
 
 func (c *clientImpl) validateBlock(ctx context.Context, rawBlock *api.Block) error {

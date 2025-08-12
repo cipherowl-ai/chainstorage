@@ -113,6 +113,21 @@ func (mr *MockMetaStorageMockRecorder) GetBlockByHeight(arg0, arg1, arg2 any) *g
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByHeight", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockByHeight), arg0, arg1, arg2)
 }
 
+// GetBlockByTimestamp mocks base method.
+func (m *MockMetaStorage) GetBlockByTimestamp(arg0 context.Context, arg1 uint32, arg2 uint64) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockByTimestamp", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockByTimestamp indicates an expected call of GetBlockByTimestamp.
+func (mr *MockMetaStorageMockRecorder) GetBlockByTimestamp(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByTimestamp", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockByTimestamp), arg0, arg1, arg2)
+}
+
 // GetBlocksByHeightRange mocks base method.
 func (m *MockMetaStorage) GetBlocksByHeightRange(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) ([]*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -497,6 +512,21 @@ func (m *MockBlockStorage) GetBlockByHeight(arg0 context.Context, arg1 uint32, a
 func (mr *MockBlockStorageMockRecorder) GetBlockByHeight(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByHeight", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockByHeight), arg0, arg1, arg2)
+}
+
+// GetBlockByTimestamp mocks base method.
+func (m *MockBlockStorage) GetBlockByTimestamp(arg0 context.Context, arg1 uint32, arg2 uint64) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockByTimestamp", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockByTimestamp indicates an expected call of GetBlockByTimestamp.
+func (mr *MockBlockStorageMockRecorder) GetBlockByTimestamp(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByTimestamp", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockByTimestamp), arg0, arg1, arg2)
 }
 
 // GetBlocksByHeightRange mocks base method.
