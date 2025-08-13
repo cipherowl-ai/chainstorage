@@ -74,7 +74,6 @@ type (
 		EndHeight   uint64 // Optional. If not specified, will query latest block from DynamoDB
 		EventTag    uint32
 		Tag         uint32
-		BatchSize   int
 		Parallelism int
 		SkipEvents  bool
 		SkipBlocks  bool
@@ -178,10 +177,7 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}
 	}()
 
-	// Validate batch size
-	if request.BatchSize <= 0 {
-		request.BatchSize = 100
-	}
+	// No per-activity batch size; batching governed by workflow and parallelism
 
 	// Both skip flags cannot be true
 	if request.SkipEvents && request.SkipBlocks {
@@ -462,8 +458,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 
 func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
 	logger.Info("Starting batched event migration with parallelism",
-		zap.Int("parallelism", request.Parallelism),
-		zap.Int("batchSize", request.BatchSize))
+		zap.Int("parallelism", request.Parallelism))
 
 	// If we're skipping blocks, validate that required block metadata exists in PostgreSQL
 	if request.SkipBlocks {

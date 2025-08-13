@@ -309,7 +309,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				EndHeight:   batchEnd,
 				EventTag:    request.EventTag,
 				Tag:         tag,
-				BatchSize:   int(miniBatchSize),
 				Parallelism: parallelism,
 				SkipEvents:  request.SkipEvents,
 				SkipBlocks:  request.SkipBlocks,

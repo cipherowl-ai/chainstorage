@@ -73,7 +73,6 @@ func (s *migratorTestSuite) TestMigrator_Success() {
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			require.Equal(tag, request.Tag)
 			require.Equal(eventTag, request.EventTag)
-			require.Equal(int(migratorBatchSize/10), request.BatchSize)
 			require.False(request.SkipEvents)
 			require.False(request.SkipBlocks)
 
@@ -193,8 +192,6 @@ func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
 
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
-			// Internal activity batch size should be 1/10 of workflow batch size
-			require.Equal(int(customBatchSize/10), request.BatchSize)
 			return &activity.MigratorResponse{
 				BlocksMigrated: 50,
 				EventsMigrated: 250,
