@@ -515,13 +515,7 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	}
 	totalHeights := endHeight - startHeight + 1
 	// ceil(totalHeights / parallelism)
-	miniBatchSize := totalHeights / uint64(parallelism)
-	if totalHeights%uint64(parallelism) != 0 {
-		miniBatchSize++
-	}
-	if miniBatchSize == 0 {
-		miniBatchSize = 1
-	}
+	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
 
 	// Create channels for parallel processing
 	type heightRange struct {
