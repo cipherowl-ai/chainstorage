@@ -303,53 +303,110 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				zap.Uint64("batchStart", batchStart),
 				zap.Uint64("batchEnd", batchEnd))
 
-			migratorRequest := &activity.MigratorRequest{
-				StartHeight: batchStart,
-				EndHeight:   batchEnd,
-				EventTag:    request.EventTag,
-				Tag:         tag,
-				BatchSize:   int(miniBatchSize), // Use miniBatchSize for activity batch size
-				Parallelism: parallelism,
-				SkipEvents:  request.SkipEvents,
-				SkipBlocks:  request.SkipBlocks,
+			// Fan out this batch into multiple parallel activities to utilize multiple workers.
+			// We shard the height range evenly among `parallelism` shards.
+			numShards := parallelism
+			if numShards < 1 {
+				numShards = 1
 			}
 
-			response, err := w.migrator.Execute(ctx, migratorRequest)
-			if err != nil {
-				logger.Error(
-					"failed to migrate batch",
-					zap.Uint64("batchStart", batchStart),
-					zap.Uint64("batchEnd", batchEnd),
-					zap.Error(err),
-				)
-				return xerrors.Errorf("failed to migrate batch [%v, %v): %w", batchStart, batchEnd, err)
+			// Avoid launching more shards than heights.
+			totalHeightsInBatch := batchEnd - batchStart
+			if totalHeightsInBatch < uint64(numShards) {
+				numShards = int(totalHeightsInBatch)
+				if numShards == 0 {
+					numShards = 1
+				}
 			}
 
-			if !response.Success {
-				logger.Error(
-					"migration batch failed",
-					zap.Uint64("batchStart", batchStart),
-					zap.Uint64("batchEnd", batchEnd),
-					zap.String("message", response.Message),
-				)
-				return xerrors.Errorf("migration batch failed [%v, %v): %s", batchStart, batchEnd, response.Message)
+			shardSize := (totalHeightsInBatch + uint64(numShards) - 1) / uint64(numShards) // ceil-divide
+
+			type shardResult struct {
+				resp   *activity.MigratorResponse
+				err    error
+				sStart uint64
+				sEnd   uint64
 			}
 
-			// Update metrics
+			resultsCh := workflow.NewChannel(ctx)
+			launched := 0
+
+			for i := 0; i < numShards; i++ {
+				sStart := batchStart + uint64(i)*shardSize
+				sEnd := sStart + shardSize
+				if sEnd > batchEnd {
+					sEnd = batchEnd
+				}
+				if sStart >= sEnd {
+					continue
+				}
+
+				// Build request for this shard. Keep event sorting in activity; set internal activity parallelism to 1
+				// to avoid over-saturation since we are already fanning out at the workflow level.
+				shardReq := &activity.MigratorRequest{
+					StartHeight: sStart,
+					EndHeight:   sEnd,
+					EventTag:    request.EventTag,
+					Tag:         tag,
+					BatchSize:   int(miniBatchSize),
+					Parallelism: 1,
+					SkipEvents:  request.SkipEvents,
+					SkipBlocks:  request.SkipBlocks,
+				}
+
+				launched++
+				workflow.Go(ctx, func(ctx workflow.Context) {
+					resp, err := w.migrator.Execute(ctx, shardReq)
+					resultsCh.Send(ctx, shardResult{resp: resp, err: err, sStart: sStart, sEnd: sEnd})
+				})
+			}
+
+			// Collect results from all shards
+			var totalBlocksMigrated, totalEventsMigrated int
+			for received := 0; received < launched; received++ {
+				var r shardResult
+				resultsCh.Receive(ctx, &r)
+				if r.err != nil {
+					logger.Error(
+						"failed to migrate shard",
+						zap.Uint64("shardStart", r.sStart),
+						zap.Uint64("shardEnd", r.sEnd),
+						zap.Error(r.err),
+					)
+					return xerrors.Errorf("failed to migrate shard [%v, %v): %w", r.sStart, r.sEnd, r.err)
+				}
+				if r.resp == nil || !r.resp.Success {
+					msg := ""
+					if r.resp != nil {
+						msg = r.resp.Message
+					}
+					logger.Error(
+						"migration batch failed",
+						zap.Uint64("shardStart", r.sStart),
+						zap.Uint64("shardEnd", r.sEnd),
+						zap.String("message", msg),
+					)
+					return xerrors.Errorf("migration batch failed [%v, %v): %s", r.sStart, r.sEnd, msg)
+				}
+				totalBlocksMigrated += r.resp.BlocksMigrated
+				totalEventsMigrated += r.resp.EventsMigrated
+			}
+
+			// Update metrics for the whole batch after all shards complete
 			processedHeights += batchEnd - batchStart
 			progress := float64(processedHeights) / float64(totalHeightRange) * 100
 
 			metrics.Gauge(migratorHeightGauge).Update(float64(batchEnd - 1))
-			metrics.Counter(migratorBlocksCounter).Inc(int64(response.BlocksMigrated))
-			metrics.Counter(migratorEventsCounter).Inc(int64(response.EventsMigrated))
+			metrics.Counter(migratorBlocksCounter).Inc(int64(totalBlocksMigrated))
+			metrics.Counter(migratorEventsCounter).Inc(int64(totalEventsMigrated))
 			metrics.Gauge(migratorProgressGauge).Update(progress)
 
 			logger.Info(
 				"migrated batch successfully",
 				zap.Uint64("batchStart", batchStart),
 				zap.Uint64("batchEnd", batchEnd),
-				zap.Int("blocksMigrated", response.BlocksMigrated),
-				zap.Int("eventsMigrated", response.EventsMigrated),
+				zap.Int("blocksMigrated", totalBlocksMigrated),
+				zap.Int("eventsMigrated", totalEventsMigrated),
 				zap.Float64("progress", progress),
 			)
 
