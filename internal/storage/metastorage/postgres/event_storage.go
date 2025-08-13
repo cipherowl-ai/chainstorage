@@ -98,7 +98,7 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		}
 
 		// Create transaction with timeout context for event operations
-		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		txCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 		defer cancel()
 
 		tx, err := e.db.BeginTx(txCtx, nil)
@@ -114,81 +114,111 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			}
 		}()
 
-		// Resolve block_metadata_id for all events first (no COPY active), then bulk insert via COPY
-		// Buffer rows to insert
-		type stagedEventRow struct {
-			eventTag        int
-			eventSeq        int64
-			eventTypeText   string
-			blockMetadataId int64
-			height          int64
-			hash            string
-		}
-		staged := make([]stagedEventRow, 0, len(eventEntries))
-		for _, eventEntry := range eventEntries {
-			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
-			if err != nil {
-				return xerrors.Errorf("failed to get or create block metadata: %w", err)
-			}
-			staged = append(staged, stagedEventRow{
-				eventTag:        int(eventTag),
-				eventSeq:        eventEntry.EventId,
-				eventTypeText:   pgmodel.EventTypeToString(eventEntry.EventType),
-				blockMetadataId: blockMetadataId,
-				height:          int64(eventEntry.BlockHeight),
-				hash:            eventEntry.BlockHash,
-			})
-		}
-
-		// Stage events with resolved block_metadata_id into a temp table, then bulk insert
+		// Stage incoming events (no per-row lookups) for set-based processing
 		if _, err := tx.ExecContext(ctx, `
-			CREATE TEMP TABLE temp_block_events (
+			CREATE TEMP TABLE temp_events (
 				event_tag INT NOT NULL,
 				event_sequence BIGINT NOT NULL,
 				event_type TEXT NOT NULL,
-				block_metadata_id BIGINT NOT NULL,
 				height BIGINT NOT NULL,
-				hash VARCHAR(66)
+				hash VARCHAR(66),
+				bm_tag INT NOT NULL,
+				skipped BOOLEAN NOT NULL
 			) ON COMMIT DROP
 		`); err != nil {
-			return xerrors.Errorf("failed to create temp_block_events: %w", err)
+			return xerrors.Errorf("failed to create temp_events: %w", err)
 		}
 
-		stmt, err := tx.Prepare(pq.CopyIn("temp_block_events",
-			"event_tag", "event_sequence", "event_type", "block_metadata_id", "height", "hash"))
+		stmt, err := tx.Prepare(pq.CopyIn("temp_events",
+			"event_tag", "event_sequence", "event_type", "height", "hash", "bm_tag", "skipped"))
 		if err != nil {
-			return xerrors.Errorf("failed to prepare COPY for temp_block_events: %w", err)
+			return xerrors.Errorf("failed to prepare COPY for temp_events: %w", err)
 		}
 
-		for _, row := range staged {
+		for _, e := range eventEntries {
 			if _, err := stmt.Exec(
-				row.eventTag,
-				row.eventSeq,
-				row.eventTypeText,
-				row.blockMetadataId,
-				row.height,
-				row.hash,
+				eventTag,
+				e.EventId,
+				pgmodel.EventTypeToString(e.EventType),
+				e.BlockHeight,
+				e.BlockHash,
+				int(e.Tag),
+				e.BlockSkipped,
 			); err != nil {
 				_ = stmt.Close()
-				return xerrors.Errorf("failed to buffer event row for COPY: %w", err)
+				return xerrors.Errorf("failed to buffer temp_events row: %w", err)
 			}
 		}
 
 		if _, err := stmt.Exec(); err != nil {
 			_ = stmt.Close()
-			return xerrors.Errorf("failed to finalize COPY temp_block_events: %w", err)
+			return xerrors.Errorf("failed to finalize COPY temp_events: %w", err)
 		}
 		if err := stmt.Close(); err != nil {
 			return xerrors.Errorf("failed to close COPY statement: %w", err)
 		}
 
+		// Ensure skipped block_metadata rows exist in bulk
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped)
+			SELECT DISTINCT e.height, e.bm_tag, NULL, NULL, 0, NULL, 0, true
+			FROM temp_events e
+			WHERE e.skipped = true
+			ON CONFLICT (tag, height) WHERE skipped = true DO NOTHING
+		`); err != nil {
+			return xerrors.Errorf("failed to upsert skipped block_metadata: %w", err)
+		}
+
+		// Insert non-skipped events by joining on (tag, hash)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
-			SELECT event_tag, event_sequence, event_type::event_type_enum, block_metadata_id, height, hash
-			FROM temp_block_events
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = e.bm_tag AND bm.hash = e.hash AND bm.skipped = false
+			WHERE e.skipped = false
 			ON CONFLICT (event_tag, event_sequence) DO NOTHING
 		`); err != nil {
-			return xerrors.Errorf("failed to insert events from temp_block_events: %w", err)
+			return xerrors.Errorf("failed to insert non-skipped events: %w", err)
+		}
+
+		// Insert non-skipped events fallback: when bm_tag is DefaultBlockTag, allow join to bm.tag = 0
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = 0 AND e.bm_tag = $1 AND bm.hash = e.hash AND bm.skipped = false
+			WHERE e.skipped = false
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`, model.DefaultBlockTag); err != nil {
+			return xerrors.Errorf("failed to insert non-skipped events (fallback tag=0): %w", err)
+		}
+
+		// Insert skipped events by joining on (tag, height, skipped=true)
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = e.bm_tag AND bm.height = e.height AND bm.skipped = true
+			WHERE e.skipped = true
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`); err != nil {
+			return xerrors.Errorf("failed to insert skipped events: %w", err)
+		}
+
+		// Insert skipped events fallback: when bm_tag is DefaultBlockTag, allow join to bm.tag = 0
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = 0 AND e.bm_tag = $1 AND bm.height = e.height AND bm.skipped = true
+			WHERE e.skipped = true
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`, model.DefaultBlockTag); err != nil {
+			return xerrors.Errorf("failed to insert skipped events (fallback tag=0): %w", err)
 		}
 
 		if err := tx.Commit(); err != nil {

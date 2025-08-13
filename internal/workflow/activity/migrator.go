@@ -607,8 +607,8 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	// Sort all collected events once and write in contiguous chunks to avoid long-running transactions
 	if len(allEvents) > 0 {
 		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
-		// conservative chunk size to keep each transaction under timeout
-		const eventChunkSize = 200
+		// larger chunk size now that writes are bulked via COPY+JOIN
+		const eventChunkSize = 1000
 		for i := 0; i < len(allEvents); i += eventChunkSize {
 			end := i + eventChunkSize
 			if end > len(allEvents) {
