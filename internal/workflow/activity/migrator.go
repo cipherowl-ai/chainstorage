@@ -587,11 +587,20 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		}
 	}
 
-	// Sort all collected events once and write in a single transaction
+	// Sort all collected events once and write in contiguous chunks to avoid long-running transactions
 	if len(allEvents) > 0 {
 		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
-		if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, allEvents); err != nil {
-			return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(allEvents), startHeight, endHeight, err)
+		// conservative chunk size to keep each transaction under timeout
+		const eventChunkSize = 200
+		for i := 0; i < len(allEvents); i += eventChunkSize {
+			end := i + eventChunkSize
+			if end > len(allEvents) {
+				end = len(allEvents)
+			}
+			chunk := allEvents[i:end]
+			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
+				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
+			}
 		}
 	}
 	return len(allEvents), nil
