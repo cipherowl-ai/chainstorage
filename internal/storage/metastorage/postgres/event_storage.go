@@ -12,6 +12,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	pgmodel "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
+	"github.com/lib/pq"
 )
 
 const (
@@ -78,7 +79,6 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 	return e.instrumentAddEvents.Instrument(ctx, func(ctx context.Context) error {
 		startEventId := eventEntries[0].EventId
 		var eventsToValidate []*model.EventEntry
-		// fetch some events before startEventId
 		startFetchId := startEventId - addEventsSafePadding
 		if startFetchId < model.EventIdStartValue {
 			startFetchId = model.EventIdStartValue
@@ -93,8 +93,7 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			eventsToValidate = eventEntries
 		}
 
-		err := internal.ValidateEvents(eventsToValidate)
-		if err != nil {
+		if err := internal.ValidateEvents(eventsToValidate); err != nil {
 			return xerrors.Errorf("events failed validation: %w", err)
 		}
 
@@ -110,31 +109,89 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		defer func() {
 			if !committed {
 				if rollbackErr := tx.Rollback(); rollbackErr != nil {
-					// Log the rollback error but don't override the original error
 					_ = rollbackErr
 				}
 			}
 		}()
-		//get or create block_metadata entries for each event
+
+		// Resolve block_metadata_id for all events first (no COPY active), then bulk insert via COPY
+		// Buffer rows to insert
+		type stagedEventRow struct {
+			eventTag        int
+			eventSeq        int64
+			eventTypeText   string
+			blockMetadataId int64
+			height          int64
+			hash            string
+		}
+		staged := make([]stagedEventRow, 0, len(eventEntries))
 		for _, eventEntry := range eventEntries {
 			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
 			if err != nil {
 				return xerrors.Errorf("failed to get or create block metadata: %w", err)
 			}
+			staged = append(staged, stagedEventRow{
+				eventTag:        int(eventTag),
+				eventSeq:        eventEntry.EventId,
+				eventTypeText:   pgmodel.EventTypeToString(eventEntry.EventType),
+				blockMetadataId: blockMetadataId,
+				height:          int64(eventEntry.BlockHeight),
+				hash:            eventEntry.BlockHash,
+			})
+		}
 
-			// Insert the event with valid block_metadata_id (no more NULL handling)
-			_, err = tx.ExecContext(ctx, `
-				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
-				VALUES ($1, $2, $3, $4, $5, $6)
-				ON CONFLICT (event_tag, event_sequence) DO NOTHING
-			`, eventTag, eventEntry.EventId, pgmodel.EventTypeToString(eventEntry.EventType), blockMetadataId, eventEntry.BlockHeight, eventEntry.BlockHash)
-			if err != nil {
-				return xerrors.Errorf("failed to insert event entry: %w", err)
+		// Stage events with resolved block_metadata_id into a temp table, then bulk insert
+		if _, err := tx.ExecContext(ctx, `
+			CREATE TEMP TABLE temp_block_events (
+				event_tag INT NOT NULL,
+				event_sequence BIGINT NOT NULL,
+				event_type TEXT NOT NULL,
+				block_metadata_id BIGINT NOT NULL,
+				height BIGINT NOT NULL,
+				hash VARCHAR(66)
+			) ON COMMIT DROP
+		`); err != nil {
+			return xerrors.Errorf("failed to create temp_block_events: %w", err)
+		}
+
+		stmt, err := tx.Prepare(pq.CopyIn("temp_block_events",
+			"event_tag", "event_sequence", "event_type", "block_metadata_id", "height", "hash"))
+		if err != nil {
+			return xerrors.Errorf("failed to prepare COPY for temp_block_events: %w", err)
+		}
+
+		for _, row := range staged {
+			if _, err := stmt.Exec(
+				row.eventTag,
+				row.eventSeq,
+				row.eventTypeText,
+				row.blockMetadataId,
+				row.height,
+				row.hash,
+			); err != nil {
+				_ = stmt.Close()
+				return xerrors.Errorf("failed to buffer event row for COPY: %w", err)
 			}
 		}
 
-		err = tx.Commit()
-		if err != nil {
+		if _, err := stmt.Exec(); err != nil {
+			_ = stmt.Close()
+			return xerrors.Errorf("failed to finalize COPY temp_block_events: %w", err)
+		}
+		if err := stmt.Close(); err != nil {
+			return xerrors.Errorf("failed to close COPY statement: %w", err)
+		}
+
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT event_tag, event_sequence, event_type::event_type_enum, block_metadata_id, height, hash
+			FROM temp_block_events
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`); err != nil {
+			return xerrors.Errorf("failed to insert events from temp_block_events: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
 			return xerrors.Errorf("failed to commit transaction: %w", err)
 		}
 		committed = true
