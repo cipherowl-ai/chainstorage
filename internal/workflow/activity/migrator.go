@@ -487,6 +487,7 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 		parallelism = 1
 	}
 
+	batchStartTime := time.Now()
 	logger.Info("Processing event batch (single write)",
 		zap.Uint64("batchStart", startHeight),
 		zap.Uint64("batchEnd", endHeightInclusive),
@@ -500,7 +501,8 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 	logger.Info("Event migration completed (single write)",
 		zap.Uint64("rangeStart", startHeight),
 		zap.Uint64("rangeEnd", endHeightInclusive),
-		zap.Int("eventsMigrated", totalEvents))
+		zap.Int("eventsMigrated", totalEvents),
+		zap.Duration("duration", time.Since(batchStartTime)))
 	return totalEvents, nil
 }
 
@@ -527,9 +529,10 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	}
 
 	type batchResult struct {
-		events []*model.EventEntry
-		err    error
-		range_ heightRange
+		events   []*model.EventEntry
+		err      error
+		range_   heightRange
+		duration time.Duration
 	}
 
 	inputChannel := make(chan heightRange, int(totalHeights/miniBatchSize)+1)
@@ -549,11 +552,13 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	for i := 0; i < parallelism; i++ {
 		go func(workerID int) {
 			for heightRange := range inputChannel {
+				fetchStart := time.Now()
 				evts, err := a.fetchEventsRange(ctx, data, request, heightRange.start, heightRange.end)
 				resultChannel <- batchResult{
-					events: evts,
-					err:    err,
-					range_: heightRange,
+					events:   evts,
+					err:      err,
+					range_:   heightRange,
+					duration: time.Since(fetchStart),
 				}
 			}
 		}(i)
@@ -578,6 +583,18 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 			totalEvents += len(result.events)
 		}
 
+		logger.Info("Fetched events from Dynamo",
+			zap.Uint64("rangeStart", result.range_.start),
+			zap.Uint64("rangeEnd", result.range_.end),
+			zap.Int("events", len(result.events)),
+			zap.Duration("duration", result.duration))
+
+		// Heartbeat progress so it shows up in Temporal UI
+		activity.RecordHeartbeat(ctx, fmt.Sprintf(
+			"fetched events: heights [%d-%d], events=%d, took=%s",
+			result.range_.start, result.range_.end, len(result.events), result.duration,
+		))
+
 		if i%10 == 0 || len(result.events) > 0 {
 			logger.Debug("Mini-batch completed",
 				zap.Uint64("rangeStart", result.range_.start),
@@ -598,9 +615,22 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 				end = len(allEvents)
 			}
 			chunk := allEvents[i:end]
+			firstId := chunk[0].EventId
+			lastId := chunk[len(chunk)-1].EventId
+			persistStart := time.Now()
 			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
 				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
 			}
+			logger.Info("Persisted events chunk to Postgres",
+				zap.Int("chunkSize", len(chunk)),
+				zap.Int64("firstEventId", firstId),
+				zap.Int64("lastEventId", lastId),
+				zap.Duration("duration", time.Since(persistStart)))
+
+			activity.RecordHeartbeat(ctx, fmt.Sprintf(
+				"persisted chunk: events=%d, event_id=[%d-%d], took=%s",
+				len(chunk), firstId, lastId, time.Since(persistStart),
+			))
 		}
 	}
 	return len(allEvents), nil
