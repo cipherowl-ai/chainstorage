@@ -133,17 +133,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			batchSize = request.BatchSize
 		}
 
-		miniBatchSize := cfg.MiniBatchSize
-		if miniBatchSize <= 0 {
-			miniBatchSize = batchSize / 10 // Calculate from batch size
-			if miniBatchSize == 0 {
-				miniBatchSize = 10 // Minimum fallback
-			}
-		}
-		if request.MiniBatchSize > 0 {
-			miniBatchSize = request.MiniBatchSize
-		}
-
 		checkpointSize := cfg.CheckpointSize
 		if request.CheckpointSize > 0 {
 			checkpointSize = request.CheckpointSize

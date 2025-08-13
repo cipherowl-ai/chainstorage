@@ -7,12 +7,13 @@ import (
 
 	"golang.org/x/xerrors"
 
+	"github.com/lib/pq"
+
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	pgmodel "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
-	"github.com/lib/pq"
 )
 
 const (
