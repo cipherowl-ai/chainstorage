@@ -133,17 +133,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			batchSize = request.BatchSize
 		}
 
-		miniBatchSize := cfg.MiniBatchSize
-		if miniBatchSize <= 0 {
-			miniBatchSize = batchSize / 10 // Calculate from batch size
-			if miniBatchSize == 0 {
-				miniBatchSize = 10 // Minimum fallback
-			}
-		}
-		if request.MiniBatchSize > 0 {
-			miniBatchSize = request.MiniBatchSize
-		}
-
 		checkpointSize := cfg.CheckpointSize
 		if request.CheckpointSize > 0 {
 			checkpointSize = request.CheckpointSize
@@ -303,12 +292,12 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				zap.Uint64("batchStart", batchStart),
 				zap.Uint64("batchEnd", batchEnd))
 
+			// Execute a single migrator activity for the entire batch.
 			migratorRequest := &activity.MigratorRequest{
 				StartHeight: batchStart,
 				EndHeight:   batchEnd,
 				EventTag:    request.EventTag,
 				Tag:         tag,
-				BatchSize:   int(miniBatchSize), // Use miniBatchSize for activity batch size
 				Parallelism: parallelism,
 				SkipEvents:  request.SkipEvents,
 				SkipBlocks:  request.SkipBlocks,
@@ -324,7 +313,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				)
 				return xerrors.Errorf("failed to migrate batch [%v, %v): %w", batchStart, batchEnd, err)
 			}
-
 			if !response.Success {
 				logger.Error(
 					"migration batch failed",
@@ -335,7 +323,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				return xerrors.Errorf("migration batch failed [%v, %v): %s", batchStart, batchEnd, response.Message)
 			}
 
-			// Update metrics
+			// Update metrics for the whole batch after all shards complete
 			processedHeights += batchEnd - batchStart
 			progress := float64(processedHeights) / float64(totalHeightRange) * 100
 

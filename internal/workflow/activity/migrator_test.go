@@ -82,7 +82,6 @@ func (s *migratorActivityTestSuite) TestMigrator_RequestValidation() {
 		EndHeight:   uint64(1050),
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   10,
 		SkipEvents:  false,
 		SkipBlocks:  false,
 	}
@@ -91,7 +90,6 @@ func (s *migratorActivityTestSuite) TestMigrator_RequestValidation() {
 	require.Equal(uint64(1050), validRequest.EndHeight)
 	require.Equal(uint32(1), validRequest.Tag)
 	require.Equal(uint32(0), validRequest.EventTag)
-	require.Equal(10, validRequest.BatchSize)
 	require.False(validRequest.SkipEvents)
 	require.False(validRequest.SkipBlocks)
 }
@@ -122,7 +120,6 @@ func (s *migratorActivityTestSuite) TestMigrator_RequestOptions() {
 		EndHeight:   uint64(1050),
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   10,
 		SkipEvents:  false,
 		SkipBlocks:  true,
 	}
@@ -135,7 +132,6 @@ func (s *migratorActivityTestSuite) TestMigrator_RequestOptions() {
 		EndHeight:   uint64(1050),
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   10,
 		SkipEvents:  true,
 		SkipBlocks:  false,
 	}
@@ -148,7 +144,6 @@ func (s *migratorActivityTestSuite) TestMigrator_RequestOptions() {
 		EndHeight:   uint64(1050),
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   10,
 		SkipEvents:  true,
 		SkipBlocks:  true,
 	}
@@ -165,7 +160,6 @@ func (s *migratorActivityTestSuite) TestMigrator_InvalidRequest() {
 		EndHeight:   uint64(1000), // EndHeight < StartHeight
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   10,
 		SkipEvents:  false,
 		SkipBlocks:  false,
 	}
@@ -185,7 +179,6 @@ func (s *migratorActivityTestSuite) TestMigrator_DefaultBatchSize() {
 		EndHeight:   uint64(1050),
 		Tag:         uint32(1),
 		EventTag:    uint32(0),
-		BatchSize:   0, // Should use default
 		SkipEvents:  true,
 		SkipBlocks:  true, // Skip both to avoid actual migration logic
 	}

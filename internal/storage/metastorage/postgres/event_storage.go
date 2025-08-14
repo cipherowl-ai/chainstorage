@@ -7,6 +7,8 @@ import (
 
 	"golang.org/x/xerrors"
 
+	"github.com/lib/pq"
+
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
@@ -78,7 +80,6 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 	return e.instrumentAddEvents.Instrument(ctx, func(ctx context.Context) error {
 		startEventId := eventEntries[0].EventId
 		var eventsToValidate []*model.EventEntry
-		// fetch some events before startEventId
 		startFetchId := startEventId - addEventsSafePadding
 		if startFetchId < model.EventIdStartValue {
 			startFetchId = model.EventIdStartValue
@@ -93,13 +94,12 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			eventsToValidate = eventEntries
 		}
 
-		err := internal.ValidateEvents(eventsToValidate)
-		if err != nil {
+		if err := internal.ValidateEvents(eventsToValidate); err != nil {
 			return xerrors.Errorf("events failed validation: %w", err)
 		}
 
 		// Create transaction with timeout context for event operations
-		txCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		txCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 		defer cancel()
 
 		tx, err := e.db.BeginTx(txCtx, nil)
@@ -110,31 +110,105 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 		defer func() {
 			if !committed {
 				if rollbackErr := tx.Rollback(); rollbackErr != nil {
-					// Log the rollback error but don't override the original error
 					_ = rollbackErr
 				}
 			}
 		}()
-		//get or create block_metadata entries for each event
-		for _, eventEntry := range eventEntries {
-			blockMetadataId, err := e.getOrCreateBlockMetadataId(ctx, tx, eventEntry)
-			if err != nil {
-				return xerrors.Errorf("failed to get or create block metadata: %w", err)
-			}
 
-			// Insert the event with valid block_metadata_id (no more NULL handling)
-			_, err = tx.ExecContext(ctx, `
-				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
-				VALUES ($1, $2, $3, $4, $5, $6)
-				ON CONFLICT (event_tag, event_sequence) DO NOTHING
-			`, eventTag, eventEntry.EventId, pgmodel.EventTypeToString(eventEntry.EventType), blockMetadataId, eventEntry.BlockHeight, eventEntry.BlockHash)
-			if err != nil {
-				return xerrors.Errorf("failed to insert event entry: %w", err)
+		// Stage incoming events (no per-row lookups) for set-based processing
+		if _, err := tx.ExecContext(ctx, `
+			CREATE TEMP TABLE temp_events (
+				event_tag INT NOT NULL,
+				event_sequence BIGINT NOT NULL,
+				event_type TEXT NOT NULL,
+				height BIGINT NOT NULL,
+				hash VARCHAR(66),
+				bm_tag INT NOT NULL,
+				skipped BOOLEAN NOT NULL
+			) ON COMMIT DROP
+		`); err != nil {
+			return xerrors.Errorf("failed to create temp_events: %w", err)
+		}
+
+		stmt, err := tx.Prepare(pq.CopyIn("temp_events",
+			"event_tag", "event_sequence", "event_type", "height", "hash", "bm_tag", "skipped"))
+		if err != nil {
+			return xerrors.Errorf("failed to prepare COPY for temp_events: %w", err)
+		}
+
+		for _, e := range eventEntries {
+			if _, err := stmt.Exec(
+				eventTag,
+				e.EventId,
+				pgmodel.EventTypeToString(e.EventType),
+				e.BlockHeight,
+				e.BlockHash,
+				int(e.Tag),
+				e.BlockSkipped,
+			); err != nil {
+				_ = stmt.Close()
+				return xerrors.Errorf("failed to buffer temp_events row: %w", err)
 			}
 		}
 
-		err = tx.Commit()
-		if err != nil {
+		if _, err := stmt.Exec(); err != nil {
+			_ = stmt.Close()
+			return xerrors.Errorf("failed to finalize COPY temp_events: %w", err)
+		}
+		if err := stmt.Close(); err != nil {
+			return xerrors.Errorf("failed to close COPY statement: %w", err)
+		}
+
+		// Ensure skipped block_metadata rows exist in bulk
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped)
+			SELECT DISTINCT e.height, e.bm_tag, NULL, NULL, 0, NULL, 0, true
+			FROM temp_events e
+			WHERE e.skipped = true
+			ON CONFLICT (tag, height) WHERE skipped = true DO NOTHING
+		`); err != nil {
+			return xerrors.Errorf("failed to upsert skipped block_metadata: %w", err)
+		}
+
+		// Insert non-skipped events by joining on (tag, hash) with fallback for DefaultBlockTag via UNION ALL
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = e.bm_tag AND bm.hash = e.hash AND bm.skipped = false
+			WHERE e.skipped = false
+			UNION ALL
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON e.bm_tag = $1 AND bm.tag = 0 AND bm.hash = e.hash AND bm.skipped = false
+			WHERE e.skipped = false
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`, model.DefaultBlockTag); err != nil {
+			return xerrors.Errorf("failed to insert non-skipped events: %w", err)
+		}
+
+		// Insert skipped events by joining on (tag, height, skipped=true) with fallback for DefaultBlockTag via UNION ALL
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON bm.tag = e.bm_tag AND bm.height = e.height AND bm.skipped = true
+			WHERE e.skipped = true
+			UNION ALL
+			SELECT e.event_tag, e.event_sequence, e.event_type::event_type_enum, bm.id, e.height, e.hash
+			FROM temp_events e
+			JOIN block_metadata bm
+			  ON e.bm_tag = $1 AND bm.tag = 0 AND bm.height = e.height AND bm.skipped = true
+			WHERE e.skipped = true
+			ON CONFLICT (event_tag, event_sequence) DO NOTHING
+		`, model.DefaultBlockTag); err != nil {
+			return xerrors.Errorf("failed to insert skipped events: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
 			return xerrors.Errorf("failed to commit transaction: %w", err)
 		}
 		committed = true

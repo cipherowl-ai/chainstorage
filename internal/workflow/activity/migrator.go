@@ -74,7 +74,6 @@ type (
 		EndHeight   uint64 // Optional. If not specified, will query latest block from DynamoDB
 		EventTag    uint32
 		Tag         uint32
-		BatchSize   int
 		Parallelism int
 		SkipEvents  bool
 		SkipBlocks  bool
@@ -178,10 +177,7 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}
 	}()
 
-	// Validate batch size
-	if request.BatchSize <= 0 {
-		request.BatchSize = 100
-	}
+	// No per-activity batch size; batching governed by workflow and parallelism
 
 	// Both skip flags cannot be true
 	if request.SkipEvents && request.SkipBlocks {
@@ -462,8 +458,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 
 func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
 	logger.Info("Starting batched event migration with parallelism",
-		zap.Int("parallelism", request.Parallelism),
-		zap.Int("batchSize", request.BatchSize))
+		zap.Int("parallelism", request.Parallelism))
 
 	// If we're skipping blocks, validate that required block metadata exists in PostgreSQL
 	if request.SkipBlocks {
@@ -474,79 +469,48 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 		logger.Info("Block metadata validation passed")
 	}
 
-	totalEventsMigrated := 0
-
-	// Simplified migration logic - migrate events for the requested height range
+	// Migrate events for the entire requested height range in a single write to Postgres.
 	startHeight := request.StartHeight
-	// Determine inclusive end height: EndHeight is exclusive in requests
-	if request.EndHeight == 0 {
+	if request.EndHeight == 0 || startHeight >= request.EndHeight {
 		return 0, nil
 	}
 	endHeightInclusive := request.EndHeight - 1
-	if startHeight > endHeightInclusive {
-		return 0, nil
-	}
-
-	// Calculate batch size - use request.BatchSize or default to reasonable size
-	batchSize := uint64(request.BatchSize)
-	if batchSize == 0 {
-		batchSize = 100 // Default batch size for height ranges
-	}
 
 	// Determine parallelism
 	parallelism := request.Parallelism
 	if parallelism <= 0 {
-		parallelism = 1 // Default to sequential processing
+		parallelism = 1
 	}
 
-	totalEvents := 0
-	totalHeights := endHeightInclusive - startHeight + 1
+	batchStartTime := time.Now()
+	logger.Info("Processing event batch (single write)",
+		zap.Uint64("batchStart", startHeight),
+		zap.Uint64("batchEnd", endHeightInclusive),
+		zap.Int("parallelism", parallelism))
 
-	// Process in batches with parallelism
-	for batchStart := startHeight; batchStart <= endHeightInclusive; batchStart += batchSize {
-		batchEnd := batchStart + batchSize - 1
-		if batchEnd > endHeightInclusive {
-			batchEnd = endHeightInclusive
-		}
-
-		logger.Info("Processing event batch",
-			zap.Uint64("batchStart", batchStart),
-			zap.Uint64("batchEnd", batchEnd),
-			zap.Uint64("batchSize", batchEnd-batchStart+1))
-
-		batchEvents, err := a.migrateEventsBatch(ctx, logger, data, request, batchStart, batchEnd, parallelism)
-		if err != nil {
-			return totalEvents, xerrors.Errorf("failed to migrate events batch [%d-%d]: %w", batchStart, batchEnd, err)
-		}
-
-		totalEvents += batchEvents
-		progress := float64(batchEnd-startHeight+1) / float64(totalHeights) * 100
-
-		logger.Info("Event batch completed",
-			zap.Uint64("batchStart", batchStart),
-			zap.Uint64("batchEnd", batchEnd),
-			zap.Int("batchEvents", batchEvents),
-			zap.Int("totalEvents", totalEvents),
-			zap.Float64("progress", progress))
+	totalEvents, err := a.migrateEventsBatch(ctx, logger, data, request, startHeight, endHeightInclusive, parallelism)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to migrate events for range [%d-%d]: %w", startHeight, endHeightInclusive, err)
 	}
 
-	totalEventsMigrated += totalEvents
-	logger.Info("Batched event migration completed",
-		zap.Int("totalEventsMigrated", totalEventsMigrated),
-		zap.Uint64("totalHeights", totalHeights))
-	return totalEventsMigrated, nil
+	logger.Info("Event migration completed (single write)",
+		zap.Uint64("rangeStart", startHeight),
+		zap.Uint64("rangeEnd", endHeightInclusive),
+		zap.Int("eventsMigrated", totalEvents),
+		zap.Duration("duration", time.Since(batchStartTime)))
+	return totalEvents, nil
 }
 
 // migrateEventsBatch processes a batch of events with parallelism, similar to block migration approach
 func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
-	// Create mini-batches for parallel processing
-	miniBatchSize := uint64(10) // Process 10 heights per mini-batch
-	totalHeights := endHeight - startHeight + 1
-
-	// Adjust mini-batch size if total heights is small
-	if totalHeights < 10 {
-		miniBatchSize = totalHeights
+	// Create mini-batches sized to parallelism to minimize number of DB writes.
+	// Each worker handles one contiguous height range when possible.
+	if parallelism <= 0 {
+		parallelism = 1
 	}
+	totalHeights := endHeight - startHeight + 1
+	// ceil(totalHeights / parallelism)
+	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
 
 	// Create channels for parallel processing
 	type heightRange struct {
@@ -554,9 +518,10 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	}
 
 	type batchResult struct {
-		events int
-		err    error
-		range_ heightRange
+		events   []*model.EventEntry
+		err      error
+		range_   heightRange
+		duration time.Duration
 	}
 
 	inputChannel := make(chan heightRange, int(totalHeights/miniBatchSize)+1)
@@ -576,11 +541,13 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	for i := 0; i < parallelism; i++ {
 		go func(workerID int) {
 			for heightRange := range inputChannel {
-				events, err := a.migrateEventsRange(ctx, data, request, heightRange.start, heightRange.end)
+				fetchStart := time.Now()
+				evts, err := a.fetchEventsRange(ctx, data, request, heightRange.start, heightRange.end)
 				resultChannel <- batchResult{
-					events: events,
-					err:    err,
-					range_: heightRange,
+					events:   evts,
+					err:      err,
+					range_:   heightRange,
+					duration: time.Since(fetchStart),
 				}
 			}
 		}(i)
@@ -588,6 +555,7 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 
 	// Collect results
 	totalEvents := 0
+	var allEvents []*model.EventEntry
 	expectedBatches := int(totalHeights / miniBatchSize)
 	if totalHeights%miniBatchSize != 0 {
 		expectedBatches++
@@ -599,22 +567,66 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 			return totalEvents, xerrors.Errorf("failed to migrate events range [%d-%d]: %w",
 				result.range_.start, result.range_.end, result.err)
 		}
-		totalEvents += result.events
+		if len(result.events) > 0 {
+			allEvents = append(allEvents, result.events...)
+			totalEvents += len(result.events)
+		}
 
-		if i%10 == 0 || result.events > 0 {
+		logger.Info("Fetched events from Dynamo",
+			zap.Uint64("rangeStart", result.range_.start),
+			zap.Uint64("rangeEnd", result.range_.end),
+			zap.Int("events", len(result.events)),
+			zap.Duration("duration", result.duration))
+
+		// Heartbeat progress so it shows up in Temporal UI
+		activity.RecordHeartbeat(ctx, fmt.Sprintf(
+			"fetched events: heights [%d-%d], events=%d, took=%s",
+			result.range_.start, result.range_.end, len(result.events), result.duration,
+		))
+
+		if i%10 == 0 || len(result.events) > 0 {
 			logger.Debug("Mini-batch completed",
 				zap.Uint64("rangeStart", result.range_.start),
 				zap.Uint64("rangeEnd", result.range_.end),
-				zap.Int("events", result.events),
+				zap.Int("events", len(result.events)),
 				zap.Int("totalSoFar", totalEvents))
 		}
 	}
 
-	return totalEvents, nil
+	// Sort all collected events once and write in contiguous chunks to avoid long-running transactions
+	if len(allEvents) > 0 {
+		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
+		// larger chunk size now that writes are bulked via COPY+JOIN
+		const eventChunkSize = 1000
+		for i := 0; i < len(allEvents); i += eventChunkSize {
+			end := i + eventChunkSize
+			if end > len(allEvents) {
+				end = len(allEvents)
+			}
+			chunk := allEvents[i:end]
+			firstId := chunk[0].EventId
+			lastId := chunk[len(chunk)-1].EventId
+			persistStart := time.Now()
+			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
+				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
+			}
+			logger.Info("Persisted events chunk to Postgres",
+				zap.Int("chunkSize", len(chunk)),
+				zap.Int64("firstEventId", firstId),
+				zap.Int64("lastEventId", lastId),
+				zap.Duration("duration", time.Since(persistStart)))
+
+			activity.RecordHeartbeat(ctx, fmt.Sprintf(
+				"persisted chunk: events=%d, event_id=[%d-%d], took=%s",
+				len(chunk), firstId, lastId, time.Since(persistStart),
+			))
+		}
+	}
+	return len(allEvents), nil
 }
 
 // migrateEventsRange processes events for a specific height range efficiently
-func (a *Migrator) migrateEventsRange(ctx context.Context, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64) (int, error) {
+func (a *Migrator) fetchEventsRange(ctx context.Context, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64) ([]*model.EventEntry, error) {
 	allEvents := make([]*model.EventEntry, 0, (endHeight-startHeight+1)*2) // Estimate 2 events per block
 
 	// Collect all events in this range
@@ -624,7 +636,7 @@ func (a *Migrator) migrateEventsRange(ctx context.Context, data *MigrationData, 
 			if errors.Is(err, storage.ErrItemNotFound) {
 				continue // No events at this height; skip
 			}
-			return 0, xerrors.Errorf("failed to get events at height %d: %w", h, err)
+			return nil, xerrors.Errorf("failed to get events at height %d: %w", h, err)
 		}
 		if len(sourceEvents) > 0 {
 			allEvents = append(allEvents, sourceEvents...)
@@ -637,16 +649,7 @@ func (a *Migrator) migrateEventsRange(ctx context.Context, data *MigrationData, 
 			return allEvents[i].EventId < allEvents[j].EventId
 		})
 	}
-
-	// Bulk insert all events at once if we have any
-	if len(allEvents) > 0 {
-		if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, allEvents); err != nil {
-			return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w",
-				len(allEvents), startHeight, endHeight, err)
-		}
-	}
-
-	return len(allEvents), nil
+	return allEvents, nil
 }
 
 // validateBlockMetadataExists checks if block metadata exists in PostgreSQL for the height range
