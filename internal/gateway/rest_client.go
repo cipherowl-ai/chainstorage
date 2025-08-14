@@ -219,6 +219,15 @@ func (c *restClient) GetVerifiedAccountState(ctx context.Context, in *api.GetVer
 	return &response, nil
 }
 
+func (c *restClient) GetBlockByTimestamp(ctx context.Context, in *api.GetBlockByTimestampRequest, opts ...grpc.CallOption) (*api.GetBlockByTimestampResponse, error) {
+	var response api.GetBlockByTimestampResponse
+	if err := c.makeRequest(ctx, "GetBlockByTimestamp", in, &response); err != nil {
+		return nil, xerrors.Errorf("failed to make request: %w", err)
+	}
+
+	return &response, nil
+}
+
 func (c *restClient) makeRequest(ctx context.Context, method string, request proto.Message, response proto.Message) error {
 	return c.retry.Retry(ctx, func(ctx context.Context) error {
 		marshaler := protojson.MarshalOptions{}

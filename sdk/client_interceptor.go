@@ -134,6 +134,15 @@ func (c *timeoutableClient) GetBlockByTransaction(ctx context.Context, tag uint3
 	})
 }
 
+func (c *timeoutableClient) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.Block, error) {
+	return intercept(ctx, c.logger, func(ctx context.Context) (*api.Block, error) {
+		ctx, cancel := context.WithTimeout(ctx, c.mediumTimeout)
+		defer cancel()
+
+		return c.client.GetBlockByTimestamp(ctx, tag, timestamp)
+	})
+}
+
 func (c *timeoutableClient) StreamChainEvents(ctx context.Context, cfg StreamingConfiguration) (<-chan *ChainEventResult, error) {
 	// No timeout is implemented.
 	return c.client.StreamChainEvents(ctx, cfg)

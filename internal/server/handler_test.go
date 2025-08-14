@@ -22,6 +22,7 @@ import (
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client"
 	clientmocks "github.com/coinbase/chainstorage/internal/blockchain/client/mocks"
@@ -3087,4 +3088,114 @@ func (s *handlerTestSuite) TestGetVerifiedAccountState_Erc20() {
 	require.NotNil(resp)
 
 	require.Equal(result, resp.GetResponse())
+}
+
+func (s *handlerTestSuite) TestGetBlockByTimestamp_Success() {
+	require := testutil.Require(s.T())
+
+	// Create a test block with a specific timestamp
+	testTimestamp := uint64(1640995200) // 2022-01-01 00:00:00 UTC
+	testTime := time.Unix(int64(testTimestamp), 0)
+	stableTag := s.app.Config().GetStableBlockTag()
+
+	expectedBlock := &api.BlockMetadata{
+		Tag:           stableTag,
+		Hash:          "test_hash_123",
+		ParentHash:    "test_parent_hash_122",
+		Height:        123,
+		ParentHeight:  122,
+		ObjectKeyMain: "test_object_key",
+		Timestamp:     timestamppb.New(testTime),
+		Skipped:       false,
+	}
+
+	// Set up mock expectation
+	s.metaStorage.EXPECT().GetBlockByTimestamp(gomock.Any(), stableTag, testTimestamp).Times(1).DoAndReturn(
+		func(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
+			require.Equal(stableTag, tag)
+			return expectedBlock, nil
+		},
+	)
+
+	// Make the request
+	req := &api.GetBlockByTimestampRequest{
+		Tag:       0, // This will be converted to stable tag
+		Timestamp: testTimestamp,
+	}
+
+	resp, err := s.server.GetBlockByTimestamp(context.Background(), req)
+
+	// Verify the response
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(expectedBlock.Tag, resp.Tag)
+	require.Equal(expectedBlock.Hash, resp.Hash)
+	require.Equal(expectedBlock.ParentHash, resp.ParentHash)
+	require.Equal(expectedBlock.Height, resp.Height)
+	require.Equal(uint64(expectedBlock.Timestamp.GetSeconds()), resp.Timestamp)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTimestamp_MissingTimestamp() {
+	require := testutil.Require(s.T())
+
+	// Test with missing timestamp
+	req := &api.GetBlockByTimestampRequest{
+		Tag: 0,
+		// Timestamp: 0 (missing)
+	}
+
+	resp, err := s.server.GetBlockByTimestamp(context.Background(), req)
+
+	require.Nil(resp)
+	s.verifyStatusCode(codes.InvalidArgument, err)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTimestamp_NotFound() {
+	require := testutil.Require(s.T())
+
+	testTimestamp := uint64(1640995200) // 2022-01-01 00:00:00 UTC
+	stableTag := s.app.Config().GetStableBlockTag()
+
+	// Set up mock expectation to return not found
+	s.metaStorage.EXPECT().GetBlockByTimestamp(gomock.Any(), stableTag, testTimestamp).Times(1).DoAndReturn(
+		func(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
+			require.Equal(stableTag, tag)
+			return nil, storage.ErrItemNotFound
+		},
+	)
+
+	req := &api.GetBlockByTimestampRequest{
+		Tag:       0, // This will be converted to stable tag
+		Timestamp: testTimestamp,
+	}
+
+	resp, err := s.server.GetBlockByTimestamp(context.Background(), req)
+
+	require.Nil(resp)
+	s.verifyStatusCode(codes.NotFound, err)
+}
+
+func (s *handlerTestSuite) TestGetBlockByTimestamp_StorageError() {
+	require := testutil.Require(s.T())
+
+	testTimestamp := uint64(1640995200) // 2022-01-01 00:00:00 UTC
+	stableTag := s.app.Config().GetStableBlockTag()
+
+	// Set up mock expectation to return an error
+	s.metaStorage.EXPECT().GetBlockByTimestamp(gomock.Any(), stableTag, testTimestamp).Times(1).DoAndReturn(
+		func(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
+			require.Equal(stableTag, tag)
+			return nil, fmt.Errorf("database connection failed")
+		},
+	)
+
+	req := &api.GetBlockByTimestampRequest{
+		Tag:       0, // This will be converted to stable tag
+		Timestamp: testTimestamp,
+	}
+
+	resp, err := s.server.GetBlockByTimestamp(context.Background(), req)
+
+	require.Nil(resp)
+	s.verifyStatusCode(codes.Internal, err)
 }
