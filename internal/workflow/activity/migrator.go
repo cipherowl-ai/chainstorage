@@ -510,11 +510,12 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 
 	totalDuration := time.Since(batchStart)
 	logger.Info("Parallel block metadata migration completed",
+		zap.Int("totalBlocksMigrated", len(allBlocksWithInfo)),
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks),
 		zap.Duration("totalDuration", totalDuration),
 		zap.Float64("avgSecondsPerHeight", totalDuration.Seconds()/float64(totalHeights)))
 
-	return totalNonCanonicalBlocks, nil
+	return len(allBlocksWithInfo), nil
 }
 
 func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationData, request *MigratorRequest, height uint64) (int, error) {
