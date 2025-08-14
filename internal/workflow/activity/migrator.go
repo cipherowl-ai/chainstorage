@@ -639,7 +639,10 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 		return nil, storage.ErrItemNotFound
 	}
 
-	var allBlocks []BlockWithCanonicalInfo
+	// Use a map to deduplicate blocks with the same hash
+	// Keep the canonical entry if there are duplicates
+	blockMap := make(map[string]BlockWithCanonicalInfo)
+	
 	for _, item := range result.Items {
 		var blockEntry dynamodb_model.BlockMetaDataDDBEntry
 		err := dynamodbattribute.UnmarshalMap(item, &blockEntry)
@@ -654,7 +657,29 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 			BlockMetadata: dynamodb_model.BlockMetadataToProto(&blockEntry),
 			IsCanonical:   isCanonical,
 		}
-		allBlocks = append(allBlocks, blockWithInfo)
+		
+		// Deduplicate: if we already have this block hash, keep the canonical one
+		existing, exists := blockMap[blockEntry.Hash]
+		if !exists {
+			blockMap[blockEntry.Hash] = blockWithInfo
+		} else if isCanonical && !existing.IsCanonical {
+			// Replace with canonical version if current is canonical and existing is not
+			blockMap[blockEntry.Hash] = blockWithInfo
+		}
+	}
+	
+	// Convert map to slice
+	var allBlocks []BlockWithCanonicalInfo
+	for _, block := range blockMap {
+		allBlocks = append(allBlocks, block)
+	}
+
+	// Log if we found duplicates
+	if len(result.Items) != len(allBlocks) {
+		logger.Debug("Deduplicated blocks from DynamoDB",
+			zap.String("blockPid", blockPid),
+			zap.Int("originalCount", len(result.Items)),
+			zap.Int("dedupedCount", len(allBlocks)))
 	}
 
 	return allBlocks, nil
