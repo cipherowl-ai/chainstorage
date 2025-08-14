@@ -267,50 +267,254 @@ func (a *Migrator) createStorageInstances(ctx context.Context) (*MigrationData, 
 	}, nil
 }
 
+type heightRange struct {
+	start uint64
+	end   uint64
+}
+
 func (a *Migrator) migrateBlocks(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
-	migrateBlocksStart := time.Now()
-	logger.Info("Starting height-by-height block metadata migration with complete reorg support",
+	// Determine parallelism
+	parallelism := request.Parallelism
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+
+	logger.Info("Starting parallel block metadata migration with complete reorg support",
 		zap.Uint64("startHeight", request.StartHeight),
 		zap.Uint64("endHeight", request.EndHeight),
-		zap.Uint64("totalHeights", request.EndHeight-request.StartHeight))
+		zap.Uint64("totalHeights", request.EndHeight-request.StartHeight),
+		zap.Int("parallelism", parallelism))
 
+	// Use parallel batch processing similar to event migration
+	return a.migrateBlocksBatch(ctx, logger, data, request, request.StartHeight, request.EndHeight-1, parallelism)
+}
+
+// migrateBlocksBatch processes a batch of blocks with parallelism, similar to event migration approach
+func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
+	batchStart := time.Now()
+	totalHeights := endHeight - startHeight + 1
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+
+	// Create mini-batches sized to parallelism to minimize number of DB writes.
+	// ceil(totalHeights / parallelism)
+	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
+
+	type batchResult struct {
+		startHeight       uint64
+		endHeight         uint64
+		blocks            []BlockWithCanonicalInfo
+		nonCanonicalCount int
+		err               error
+		fetchDuration     time.Duration
+	}
+
+	logger.Info("Starting parallel block migration",
+		zap.Uint64("startHeight", startHeight),
+		zap.Uint64("endHeight", endHeight),
+		zap.Uint64("totalHeights", totalHeights),
+		zap.Uint64("miniBatchSize", miniBatchSize),
+		zap.Int("parallelism", parallelism))
+
+	inputChannel := make(chan heightRange, parallelism*2)
+	resultChannel := make(chan batchResult, parallelism*2)
+
+	// Start parallel workers
+	for i := 0; i < parallelism; i++ {
+		go func(workerID int) {
+			for heightRange := range inputChannel {
+				workerStart := time.Now()
+				allBlocks := []BlockWithCanonicalInfo{}
+				totalNonCanonical := 0
+
+				// Fetch all blocks in this height range (parallel DynamoDB queries)
+				for height := heightRange.start; height <= heightRange.end; height++ {
+					blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
+
+					// Get ALL blocks at this height (canonical + non-canonical) in one DynamoDB query
+					blocksAtHeight, err := a.getAllBlocksAtHeight(ctx, data, blockPid)
+					if err != nil {
+						if !errors.Is(err, storage.ErrItemNotFound) {
+							resultChannel <- batchResult{
+								startHeight: heightRange.start,
+								endHeight:   heightRange.end,
+								err:         xerrors.Errorf("failed to get blocks at height %d: %w", height, err),
+							}
+							return
+						}
+						// No blocks at this height, continue
+						continue
+					}
+
+					// Collect all blocks with canonical info for later sorting
+					for _, blockWithInfo := range blocksAtHeight {
+						allBlocks = append(allBlocks, blockWithInfo)
+						if !blockWithInfo.IsCanonical {
+							totalNonCanonical++
+						}
+					}
+				}
+
+				resultChannel <- batchResult{
+					startHeight:       heightRange.start,
+					endHeight:         heightRange.end,
+					blocks:            allBlocks,
+					nonCanonicalCount: totalNonCanonical,
+					fetchDuration:     time.Since(workerStart),
+				}
+			}
+		}(i)
+	}
+
+	// Generate work items
+	for currentHeight := startHeight; currentHeight <= endHeight; {
+		batchEnd := currentHeight + miniBatchSize - 1
+		if batchEnd > endHeight {
+			batchEnd = endHeight
+		}
+		inputChannel <- heightRange{start: currentHeight, end: batchEnd}
+		currentHeight = batchEnd + 1
+	}
+	close(inputChannel)
+
+	// Collect all results first (parallel fetch phase)
+	totalBatches := int((totalHeights + miniBatchSize - 1) / miniBatchSize)
 	totalNonCanonicalBlocks := 0
-	totalHeights := request.EndHeight - request.StartHeight
+	processedBatches := 0
+	allBlocksWithInfo := []BlockWithCanonicalInfo{}
 
-	for height := request.StartHeight; height < request.EndHeight; height++ {
-		heightStartTime := time.Now()
+	logger.Info("Collecting parallel fetch results", zap.Int("totalBatches", totalBatches))
 
-		nonCanonicalCount, err := a.migrateBlocksAtHeight(ctx, data, request, height)
-		if err != nil {
-			logger.Error("Failed to migrate blocks at height",
-				zap.Uint64("height", height),
-				zap.Duration("heightDuration", time.Since(heightStartTime)),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to migrate blocks at height %d: %w", height, err)
+	for i := 0; i < totalBatches; i++ {
+		result := <-resultChannel
+		processedBatches++
+
+		if result.err != nil {
+			logger.Error("Block migration batch failed",
+				zap.Uint64("startHeight", result.startHeight),
+				zap.Uint64("endHeight", result.endHeight),
+				zap.Error(result.err))
+			return 0, result.err
 		}
 
-		totalNonCanonicalBlocks += nonCanonicalCount
+		// Collect all blocks for sorting
+		allBlocksWithInfo = append(allBlocksWithInfo, result.blocks...)
+		totalNonCanonicalBlocks += result.nonCanonicalCount
 
-		// Progress logging every 10 heights for detailed monitoring
-		if (height-request.StartHeight+1)%10 == 0 {
-			percentage := float64(height-request.StartHeight+1) / float64(totalHeights) * 100
-			logger.Info("Block migration progress",
-				zap.Uint64("currentHeight", height),
-				zap.Uint64("processed", height-request.StartHeight+1),
-				zap.Uint64("total", totalHeights),
+		// Progress logging
+		if processedBatches%5 == 0 || processedBatches == totalBatches {
+			percentage := float64(processedBatches) / float64(totalBatches) * 100
+			logger.Info("Fetch progress",
+				zap.Int("processedBatches", processedBatches),
+				zap.Int("totalBatches", totalBatches),
 				zap.Float64("percentage", percentage),
-				zap.Duration("avgPerHeight", time.Since(migrateBlocksStart)/time.Duration(height-request.StartHeight+1)),
-				zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
+				zap.Int("blocksCollected", len(allBlocksWithInfo)),
+				zap.Duration("batchDuration", result.fetchDuration))
+		}
+
+		// Heartbeat for Temporal UI
+		if processedBatches%10 == 0 {
+			percentage := float64(processedBatches) / float64(totalBatches) * 100
+			activity.RecordHeartbeat(ctx, fmt.Sprintf(
+				"fetched blocks: batch=%d/%d (%.1f%%), collected=%d blocks",
+				processedBatches, totalBatches, percentage, len(allBlocksWithInfo),
+			))
 		}
 	}
 
-	totalDuration := time.Since(migrateBlocksStart)
-	logger.Info("Height-by-height block metadata migration completed",
+	// Handle empty result case
+	if len(allBlocksWithInfo) == 0 {
+		logger.Info("No blocks found in range, migration complete",
+			zap.Uint64("startHeight", startHeight),
+			zap.Uint64("endHeight", endHeight))
+		return 0, nil
+	}
+
+	logger.Info("Parallel fetch completed, starting sort and persist phase",
+		zap.Int("totalBlocks", len(allBlocksWithInfo)),
+		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
+
+	// Sort all blocks: first by height, then non-canonical BEFORE canonical (for "last block wins")
+	if len(allBlocksWithInfo) > 0 {
+		sortStart := time.Now()
+		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
+			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
+				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
+			}
+			// CRITICAL: For same height, non-canonical blocks must be processed FIRST
+			// so canonical blocks win with "last block wins" behavior
+			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
+		})
+		sortDuration := time.Since(sortStart)
+
+		// Log reorg detection
+		reorgHeights := make(map[uint64]int)
+		for _, block := range allBlocksWithInfo {
+			reorgHeights[block.Height]++
+		}
+
+		reorgCount := 0
+		for height, count := range reorgHeights {
+			if count > 1 {
+				reorgCount++
+				logger.Info("Reorg detected at height",
+					zap.Uint64("height", height),
+					zap.Int("blockCount", count))
+			}
+		}
+
+		logger.Info("Blocks sorted by height (non-canonical first)",
+			zap.Int("totalBlocks", len(allBlocksWithInfo)),
+			zap.Int("reorgHeights", reorgCount),
+			zap.Duration("sortDuration", sortDuration))
+
+		// Convert to BlockMetadata array for persistence
+		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+		for i, blockWithInfo := range allBlocksWithInfo {
+			allBlocks[i] = blockWithInfo.BlockMetadata
+		}
+
+		// Get the last block before our range for chain validation
+		var lastBlock *api.BlockMetadata
+		if startHeight > 0 {
+			// Try to get the previous block for chain validation
+			prevHeight := startHeight - 1
+			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
+			if err == nil {
+				lastBlock = prevBlock
+				logger.Debug("Found previous block for chain validation",
+					zap.Uint64("prevHeight", prevHeight),
+					zap.String("prevHash", prevBlock.Hash))
+			} else {
+				logger.Debug("No previous block found, proceeding without chain validation",
+					zap.Uint64("startHeight", startHeight))
+			}
+		}
+
+		// Bulk persist all blocks (PostgreSQL handles validation internally)
+		persistStart := time.Now()
+		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+		if err != nil {
+			logger.Error("Failed to bulk persist blocks",
+				zap.Error(err),
+				zap.Int("blockCount", len(allBlocks)))
+			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+		}
+		persistDuration := time.Since(persistStart)
+
+		logger.Info("Bulk persistence completed",
+			zap.Int("totalBlocks", len(allBlocks)),
+			zap.Duration("persistDuration", persistDuration))
+	}
+
+	totalDuration := time.Since(batchStart)
+	logger.Info("Parallel block metadata migration completed",
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks),
 		zap.Duration("totalDuration", totalDuration),
 		zap.Float64("avgSecondsPerHeight", totalDuration.Seconds()/float64(totalHeights)))
 
-	return int(totalHeights), nil
+	return totalNonCanonicalBlocks, nil
 }
 
 func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationData, request *MigratorRequest, height uint64) (int, error) {
