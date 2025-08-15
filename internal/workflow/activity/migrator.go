@@ -514,70 +514,187 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 				zap.Int("blockCount", len(allBlocks)))
 		} else {
 			// SLOW PATH: Reorgs detected, need careful handling
-			currentBatch := []*api.BlockMetadata{}
-			processedHeights := make(map[uint64]bool)
+			// Find continuous reorg ranges
+			heights := make([]uint64, 0, len(uniqueBlocksPerHeight))
+			for h := range uniqueBlocksPerHeight {
+				heights = append(heights, h)
+			}
+			sort.Slice(heights, func(i, j int) bool {
+				return heights[i] < heights[j]
+			})
 			
-			for _, blockWithInfo := range allBlocksWithInfo {
-				height := blockWithInfo.Height
-				
-				if processedHeights[height] {
-					continue
-				}
-				
-				blocksAtHeight := uniqueBlocksPerHeight[height]
-				
-				if reorgHeights[height] {
-					// Flush any accumulated batch before handling reorg
-					if len(currentBatch) > 0 {
-						err := data.DestStorage.PersistBlockMetas(ctx, false, currentBatch, lastBlock)
-						if err != nil {
-							logger.Error("Failed to persist batch before reorg",
-								zap.Error(err),
-								zap.Int("batchSize", len(currentBatch)))
-							return 0, xerrors.Errorf("failed to persist batch: %w", err)
-						}
-						lastBlock = currentBatch[len(currentBatch)-1]
-						currentBatch = []*api.BlockMetadata{}
+			// Find reorg start and end points
+			var reorgStart, reorgEnd uint64
+			inReorg := false
+			for _, h := range heights {
+				if reorgHeights[h] {
+					if !inReorg {
+						reorgStart = h
+						inReorg = true
 					}
-					
-					// Process reorg blocks individually
-					// Sort to ensure non-canonical first
-					sort.Slice(blocksAtHeight, func(i, j int) bool {
-						return !blocksAtHeight[i].IsCanonical && blocksAtHeight[j].IsCanonical
-					})
-					
-					for _, reorgBlock := range blocksAtHeight {
-						err := data.DestStorage.PersistBlockMetas(ctx, false, 
-							[]*api.BlockMetadata{reorgBlock.BlockMetadata}, lastBlock)
-						if err != nil {
-							logger.Error("Failed to persist reorg block",
-								zap.Uint64("height", height),
-								zap.String("hash", reorgBlock.Hash),
-								zap.Bool("canonical", reorgBlock.IsCanonical),
-								zap.Error(err))
-							return 0, xerrors.Errorf("failed to persist reorg block: %w", err)
-						}
-						
-						if reorgBlock.IsCanonical {
-							lastBlock = reorgBlock.BlockMetadata
-						}
-					}
-					processedHeights[height] = true
-				} else {
-					// Normal height: add to batch
-					currentBatch = append(currentBatch, blocksAtHeight[0].BlockMetadata)
-					processedHeights[height] = true
+					reorgEnd = h
+				} else if inReorg {
+					// Reorg ended
+					break
 				}
 			}
 			
-			// Persist any remaining batch
-			if len(currentBatch) > 0 {
-				err := data.DestStorage.PersistBlockMetas(ctx, false, currentBatch, lastBlock)
-				if err != nil {
-					logger.Error("Failed to persist final batch",
-						zap.Error(err),
-						zap.Int("batchSize", len(currentBatch)))
-					return 0, xerrors.Errorf("failed to persist final batch: %w", err)
+			if inReorg {
+				logger.Info("Found reorg range",
+					zap.Uint64("reorgStart", reorgStart),
+					zap.Uint64("reorgEnd", reorgEnd))
+				
+				// Process blocks before reorg as normal batch
+				var beforeReorgBatch []*api.BlockMetadata
+				for _, h := range heights {
+					if h >= reorgStart {
+						break
+					}
+					blocks := uniqueBlocksPerHeight[h]
+					if len(blocks) == 1 {
+						beforeReorgBatch = append(beforeReorgBatch, blocks[0].BlockMetadata)
+					}
+				}
+				
+				if len(beforeReorgBatch) > 0 {
+					err := data.DestStorage.PersistBlockMetas(ctx, false, beforeReorgBatch, lastBlock)
+					if err != nil {
+						logger.Error("Failed to persist batch before reorg",
+							zap.Error(err),
+							zap.Int("batchSize", len(beforeReorgBatch)))
+						return 0, xerrors.Errorf("failed to persist batch before reorg: %w", err)
+					}
+					lastBlock = beforeReorgBatch[len(beforeReorgBatch)-1]
+					logger.Info("Persisted blocks before reorg",
+						zap.Int("blockCount", len(beforeReorgBatch)))
+				}
+				
+				// Build the two parallel chains
+				var nonCanonicalChain []*api.BlockMetadata
+				var canonicalChain []*api.BlockMetadata
+				
+				for h := reorgStart; h <= reorgEnd; h++ {
+					blocks := uniqueBlocksPerHeight[h]
+					for _, block := range blocks {
+						if block.IsCanonical {
+							canonicalChain = append(canonicalChain, block.BlockMetadata)
+						} else {
+							nonCanonicalChain = append(nonCanonicalChain, block.BlockMetadata)
+						}
+					}
+				}
+				
+				// Sort both chains by height
+				sort.Slice(nonCanonicalChain, func(i, j int) bool {
+					return nonCanonicalChain[i].Height < nonCanonicalChain[j].Height
+				})
+				sort.Slice(canonicalChain, func(i, j int) bool {
+					return canonicalChain[i].Height < canonicalChain[j].Height
+				})
+				
+				logger.Info("Processing parallel chains",
+					zap.Int("nonCanonicalCount", len(nonCanonicalChain)),
+					zap.Int("canonicalCount", len(canonicalChain)))
+				
+				// Process non-canonical chain first (one by one for validation)
+				if len(nonCanonicalChain) > 0 {
+					// First block in non-canonical chain validates against lastBlock
+					err := data.DestStorage.PersistBlockMetas(ctx, false, 
+						[]*api.BlockMetadata{nonCanonicalChain[0]}, lastBlock)
+					if err != nil {
+						logger.Error("Failed to persist first non-canonical block",
+							zap.String("hash", nonCanonicalChain[0].Hash),
+							zap.Error(err))
+						return 0, xerrors.Errorf("failed to persist non-canonical chain start: %w", err)
+					}
+					
+					// Rest of non-canonical chain validates against each other
+					for i := 1; i < len(nonCanonicalChain); i++ {
+						err := data.DestStorage.PersistBlockMetas(ctx, false,
+							[]*api.BlockMetadata{nonCanonicalChain[i]}, nonCanonicalChain[i-1])
+						if err != nil {
+							logger.Error("Failed to persist non-canonical block",
+								zap.Uint64("height", nonCanonicalChain[i].Height),
+								zap.String("hash", nonCanonicalChain[i].Hash),
+								zap.Error(err))
+							return 0, xerrors.Errorf("failed to persist non-canonical chain: %w", err)
+						}
+					}
+					logger.Info("Persisted non-canonical chain")
+				}
+				
+				// Process canonical chain (this will win due to "last block wins")
+				if len(canonicalChain) > 0 {
+					// First canonical block validates against lastBlock
+					err := data.DestStorage.PersistBlockMetas(ctx, false,
+						[]*api.BlockMetadata{canonicalChain[0]}, lastBlock)
+					if err != nil {
+						logger.Error("Failed to persist first canonical block",
+							zap.String("hash", canonicalChain[0].Hash),
+							zap.Error(err))
+						return 0, xerrors.Errorf("failed to persist canonical chain start: %w", err)
+					}
+					
+					// Rest of canonical chain validates against each other
+					for i := 1; i < len(canonicalChain); i++ {
+						err := data.DestStorage.PersistBlockMetas(ctx, false,
+							[]*api.BlockMetadata{canonicalChain[i]}, canonicalChain[i-1])
+						if err != nil {
+							logger.Error("Failed to persist canonical block",
+								zap.Uint64("height", canonicalChain[i].Height),
+								zap.String("hash", canonicalChain[i].Hash),
+								zap.Error(err))
+							return 0, xerrors.Errorf("failed to persist canonical chain: %w", err)
+						}
+					}
+					
+					// Update lastBlock to the last canonical block
+					lastBlock = canonicalChain[len(canonicalChain)-1]
+					logger.Info("Persisted canonical chain")
+				}
+				
+				// Process blocks after reorg as normal batch
+				var afterReorgBatch []*api.BlockMetadata
+				for _, h := range heights {
+					if h <= reorgEnd {
+						continue
+					}
+					blocks := uniqueBlocksPerHeight[h]
+					if len(blocks) == 1 {
+						afterReorgBatch = append(afterReorgBatch, blocks[0].BlockMetadata)
+					}
+				}
+				
+				if len(afterReorgBatch) > 0 {
+					err := data.DestStorage.PersistBlockMetas(ctx, false, afterReorgBatch, lastBlock)
+					if err != nil {
+						logger.Error("Failed to persist batch after reorg",
+							zap.Error(err),
+							zap.Int("batchSize", len(afterReorgBatch)))
+						return 0, xerrors.Errorf("failed to persist batch after reorg: %w", err)
+					}
+					logger.Info("Persisted blocks after reorg",
+						zap.Int("blockCount", len(afterReorgBatch)))
+				}
+			} else {
+				// No continuous reorg found, shouldn't happen but handle gracefully
+				logger.Warn("Reorg detected but not continuous, falling back to individual processing")
+				for _, h := range heights {
+					blocks := uniqueBlocksPerHeight[h]
+					for _, block := range blocks {
+						err := data.DestStorage.PersistBlockMetas(ctx, false,
+							[]*api.BlockMetadata{block.BlockMetadata}, lastBlock)
+						if err != nil {
+							logger.Error("Failed to persist block",
+								zap.Uint64("height", block.Height),
+								zap.String("hash", block.Hash),
+								zap.Error(err))
+							return 0, xerrors.Errorf("failed to persist block: %w", err)
+						}
+						if block.IsCanonical {
+							lastBlock = block.BlockMetadata
+						}
+					}
 				}
 			}
 			
