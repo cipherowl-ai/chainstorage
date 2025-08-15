@@ -670,7 +670,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 	}
 	
 	// Convert map to slice
-	var allBlocks []BlockWithCanonicalInfo
+	allBlocks := make([]BlockWithCanonicalInfo, 0, len(blockMap))
 	for _, block := range blockMap {
 		allBlocks = append(allBlocks, block)
 	}
