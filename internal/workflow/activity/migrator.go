@@ -448,19 +448,28 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		})
 		sortDuration := time.Since(sortStart)
 
-		// Log reorg detection
-		reorgHeights := make(map[uint64]int)
+		// Detect reorgs: After deduplication in getAllBlocksAtHeight, 
+		// if we have >1 unique block at a height, it's a reorg
+		uniqueBlocksPerHeight := make(map[uint64][]BlockWithCanonicalInfo)
 		for _, block := range allBlocksWithInfo {
-			reorgHeights[block.Height]++
+			uniqueBlocksPerHeight[block.Height] = append(uniqueBlocksPerHeight[block.Height], block)
 		}
 
+		reorgHeights := make(map[uint64]bool)
 		reorgCount := 0
-		for height, count := range reorgHeights {
-			if count > 1 {
+		for height, blocks := range uniqueBlocksPerHeight {
+			// More than 1 unique block (after dedup) = reorg
+			if len(blocks) > 1 {
 				reorgCount++
+				reorgHeights[height] = true
 				logger.Info("Reorg detected at height",
 					zap.Uint64("height", height),
-					zap.Int("blockCount", count))
+					zap.Int("uniqueBlockCount", len(blocks)))
+				for _, b := range blocks {
+					logger.Debug("Block at reorg height",
+						zap.String("hash", b.Hash),
+						zap.Bool("canonical", b.IsCanonical))
+				}
 			}
 		}
 
@@ -469,16 +478,9 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			zap.Int("reorgHeights", reorgCount),
 			zap.Duration("sortDuration", sortDuration))
 
-		// Convert to BlockMetadata array for persistence
-		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-		for i, blockWithInfo := range allBlocksWithInfo {
-			allBlocks[i] = blockWithInfo.BlockMetadata
-		}
-
 		// Get the last block before our range for chain validation
 		var lastBlock *api.BlockMetadata
 		if startHeight > 0 {
-			// Try to get the previous block for chain validation
 			prevHeight := startHeight - 1
 			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
 			if err == nil {
@@ -492,20 +494,103 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			}
 		}
 
-		// Bulk persist all blocks (PostgreSQL handles validation internally)
 		persistStart := time.Now()
-		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-		if err != nil {
-			logger.Error("Failed to bulk persist blocks",
-				zap.Error(err),
+		
+		if reorgCount == 0 {
+			// FAST PATH: No reorgs detected, batch persist everything
+			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+			for i, blockWithInfo := range allBlocksWithInfo {
+				allBlocks[i] = blockWithInfo.BlockMetadata
+			}
+			
+			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+			if err != nil {
+				logger.Error("Failed to bulk persist blocks",
+					zap.Error(err),
+					zap.Int("blockCount", len(allBlocks)))
+				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+			}
+			logger.Info("Fast path: bulk persisted all blocks",
 				zap.Int("blockCount", len(allBlocks)))
-			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+		} else {
+			// SLOW PATH: Reorgs detected, need careful handling
+			currentBatch := []*api.BlockMetadata{}
+			processedHeights := make(map[uint64]bool)
+			
+			for _, blockWithInfo := range allBlocksWithInfo {
+				height := blockWithInfo.Height
+				
+				if processedHeights[height] {
+					continue
+				}
+				
+				blocksAtHeight := uniqueBlocksPerHeight[height]
+				
+				if reorgHeights[height] {
+					// Flush any accumulated batch before handling reorg
+					if len(currentBatch) > 0 {
+						err := data.DestStorage.PersistBlockMetas(ctx, false, currentBatch, lastBlock)
+						if err != nil {
+							logger.Error("Failed to persist batch before reorg",
+								zap.Error(err),
+								zap.Int("batchSize", len(currentBatch)))
+							return 0, xerrors.Errorf("failed to persist batch: %w", err)
+						}
+						lastBlock = currentBatch[len(currentBatch)-1]
+						currentBatch = []*api.BlockMetadata{}
+					}
+					
+					// Process reorg blocks individually
+					// Sort to ensure non-canonical first
+					sort.Slice(blocksAtHeight, func(i, j int) bool {
+						return !blocksAtHeight[i].IsCanonical && blocksAtHeight[j].IsCanonical
+					})
+					
+					for _, reorgBlock := range blocksAtHeight {
+						err := data.DestStorage.PersistBlockMetas(ctx, false, 
+							[]*api.BlockMetadata{reorgBlock.BlockMetadata}, lastBlock)
+						if err != nil {
+							logger.Error("Failed to persist reorg block",
+								zap.Uint64("height", height),
+								zap.String("hash", reorgBlock.Hash),
+								zap.Bool("canonical", reorgBlock.IsCanonical),
+								zap.Error(err))
+							return 0, xerrors.Errorf("failed to persist reorg block: %w", err)
+						}
+						
+						if reorgBlock.IsCanonical {
+							lastBlock = reorgBlock.BlockMetadata
+						}
+					}
+					processedHeights[height] = true
+				} else {
+					// Normal height: add to batch
+					currentBatch = append(currentBatch, blocksAtHeight[0].BlockMetadata)
+					processedHeights[height] = true
+				}
+			}
+			
+			// Persist any remaining batch
+			if len(currentBatch) > 0 {
+				err := data.DestStorage.PersistBlockMetas(ctx, false, currentBatch, lastBlock)
+				if err != nil {
+					logger.Error("Failed to persist final batch",
+						zap.Error(err),
+						zap.Int("batchSize", len(currentBatch)))
+					return 0, xerrors.Errorf("failed to persist final batch: %w", err)
+				}
+			}
+			
+			logger.Info("Slow path: handled reorgs",
+				zap.Int("reorgHeights", reorgCount))
 		}
+		
 		persistDuration := time.Since(persistStart)
 
-		logger.Info("Bulk persistence completed",
-			zap.Int("totalBlocks", len(allBlocks)),
-			zap.Duration("persistDuration", persistDuration))
+		logger.Info("Block persistence completed",
+			zap.Int("totalBlocks", len(allBlocksWithInfo)),
+			zap.Duration("persistDuration", persistDuration),
+			zap.Int("reorgHeights", reorgCount))
 	}
 
 	totalDuration := time.Since(batchStart)
