@@ -435,47 +435,26 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		zap.Int("totalBlocks", len(allBlocksWithInfo)),
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
 
-	// Sort all blocks: first by height, then non-canonical BEFORE canonical (for "last block wins")
+	// Sort all blocks: first by height, then by timestamp for same height
+	// Since canonical blocks have later timestamps, they'll naturally be persisted last
 	if len(allBlocksWithInfo) > 0 {
 		sortStart := time.Now()
 		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
+			// First sort by height
 			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
 				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
 			}
-			// CRITICAL: For same height, non-canonical blocks must be processed FIRST
-			// so canonical blocks win with "last block wins" behavior
+			// For same height, sort by timestamp (canonical blocks have later timestamps)
+			if allBlocksWithInfo[i].Timestamp != nil && allBlocksWithInfo[j].Timestamp != nil {
+				return allBlocksWithInfo[i].Timestamp.AsTime().Before(allBlocksWithInfo[j].Timestamp.AsTime())
+			}
+			// Fallback: if timestamps missing, non-canonical before canonical
 			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
 		})
 		sortDuration := time.Since(sortStart)
 
-		// Detect reorgs: After deduplication in getAllBlocksAtHeight,
-		// if we have >1 unique block at a height, it's a reorg
-		uniqueBlocksPerHeight := make(map[uint64][]BlockWithCanonicalInfo)
-		for _, block := range allBlocksWithInfo {
-			uniqueBlocksPerHeight[block.Height] = append(uniqueBlocksPerHeight[block.Height], block)
-		}
-
-		reorgHeights := make(map[uint64]bool)
-		reorgCount := 0
-		for height, blocks := range uniqueBlocksPerHeight {
-			// More than 1 unique block (after dedup) = reorg
-			if len(blocks) > 1 {
-				reorgCount++
-				reorgHeights[height] = true
-				logger.Info("Reorg detected at height",
-					zap.Uint64("height", height),
-					zap.Int("uniqueBlockCount", len(blocks)))
-				for _, b := range blocks {
-					logger.Debug("Block at reorg height",
-						zap.String("hash", b.Hash),
-						zap.Bool("canonical", b.IsCanonical))
-				}
-			}
-		}
-
-		logger.Info("Blocks sorted by height (non-canonical first)",
+		logger.Info("Blocks sorted by height and timestamp",
 			zap.Int("totalBlocks", len(allBlocksWithInfo)),
-			zap.Int("reorgHeights", reorgCount),
 			zap.Duration("sortDuration", sortDuration))
 
 		// Get the last block before our range for chain validation
@@ -496,218 +475,26 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 
 		persistStart := time.Now()
 
-		if reorgCount == 0 {
-			// FAST PATH: No reorgs detected, batch persist everything
-			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-			for i, blockWithInfo := range allBlocksWithInfo {
-				allBlocks[i] = blockWithInfo.BlockMetadata
-			}
+		// Since we sorted by height then timestamp, we can batch persist everything
+		// The sorting ensures canonical blocks (with later timestamps) are persisted last
+		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+		for i, blockWithInfo := range allBlocksWithInfo {
+			allBlocks[i] = blockWithInfo.BlockMetadata
+		}
 
-			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-			if err != nil {
-				logger.Error("Failed to bulk persist blocks",
-					zap.Error(err),
-					zap.Int("blockCount", len(allBlocks)))
-				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
-			}
-			logger.Info("Fast path: bulk persisted all blocks",
+		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+		if err != nil {
+			logger.Error("Failed to bulk persist blocks",
+				zap.Error(err),
 				zap.Int("blockCount", len(allBlocks)))
-		} else {
-			// SLOW PATH: Reorgs detected, need careful handling
-			// Find continuous reorg ranges
-			heights := make([]uint64, 0, len(uniqueBlocksPerHeight))
-			for h := range uniqueBlocksPerHeight {
-				heights = append(heights, h)
-			}
-			sort.Slice(heights, func(i, j int) bool {
-				return heights[i] < heights[j]
-			})
-
-			// Find reorg start and end points
-			var reorgStart, reorgEnd uint64
-			inReorg := false
-			for _, h := range heights {
-				if reorgHeights[h] {
-					if !inReorg {
-						reorgStart = h
-						inReorg = true
-					}
-					reorgEnd = h
-				} else if inReorg {
-					// Reorg ended
-					break
-				}
-			}
-
-			if inReorg {
-				logger.Info("Found reorg range",
-					zap.Uint64("reorgStart", reorgStart),
-					zap.Uint64("reorgEnd", reorgEnd))
-
-				// Process blocks before reorg as normal batch
-				var beforeReorgBatch []*api.BlockMetadata
-				for _, h := range heights {
-					if h >= reorgStart {
-						break
-					}
-					blocks := uniqueBlocksPerHeight[h]
-					if len(blocks) == 1 {
-						beforeReorgBatch = append(beforeReorgBatch, blocks[0].BlockMetadata)
-					}
-				}
-
-				if len(beforeReorgBatch) > 0 {
-					err := data.DestStorage.PersistBlockMetas(ctx, false, beforeReorgBatch, lastBlock)
-					if err != nil {
-						logger.Error("Failed to persist batch before reorg",
-							zap.Error(err),
-							zap.Int("batchSize", len(beforeReorgBatch)))
-						return 0, xerrors.Errorf("failed to persist batch before reorg: %w", err)
-					}
-					lastBlock = beforeReorgBatch[len(beforeReorgBatch)-1]
-					logger.Info("Persisted blocks before reorg",
-						zap.Int("blockCount", len(beforeReorgBatch)))
-				}
-
-				// Build the two parallel chains for the entire reorg range
-				var nonCanonicalChain []*api.BlockMetadata
-				var canonicalChain []*api.BlockMetadata
-
-				for h := reorgStart; h <= reorgEnd; h++ {
-					blocks := uniqueBlocksPerHeight[h]
-					for _, block := range blocks {
-						if block.IsCanonical {
-							canonicalChain = append(canonicalChain, block.BlockMetadata)
-						} else {
-							nonCanonicalChain = append(nonCanonicalChain, block.BlockMetadata)
-						}
-					}
-				}
-
-				// Sort both chains by height
-				sort.Slice(nonCanonicalChain, func(i, j int) bool {
-					return nonCanonicalChain[i].Height < nonCanonicalChain[j].Height
-				})
-				sort.Slice(canonicalChain, func(i, j int) bool {
-					return canonicalChain[i].Height < canonicalChain[j].Height
-				})
-
-				logger.Info("Processing parallel chains",
-					zap.Int("nonCanonicalCount", len(nonCanonicalChain)),
-					zap.Int("canonicalCount", len(canonicalChain)))
-
-				// Process non-canonical chain first (one by one for validation)
-				if len(nonCanonicalChain) > 0 {
-					// First block in non-canonical chain validates against lastBlock
-					err := data.DestStorage.PersistBlockMetas(ctx, false,
-						[]*api.BlockMetadata{nonCanonicalChain[0]}, lastBlock)
-					if err != nil {
-						logger.Error("Failed to persist first non-canonical block",
-							zap.String("hash", nonCanonicalChain[0].Hash),
-							zap.Error(err))
-						return 0, xerrors.Errorf("failed to persist non-canonical chain start: %w", err)
-					}
-
-					// Rest of non-canonical chain validates against each other
-					for i := 1; i < len(nonCanonicalChain); i++ {
-						err := data.DestStorage.PersistBlockMetas(ctx, false,
-							[]*api.BlockMetadata{nonCanonicalChain[i]}, nonCanonicalChain[i-1])
-						if err != nil {
-							logger.Error("Failed to persist non-canonical block",
-								zap.Uint64("height", nonCanonicalChain[i].Height),
-								zap.String("hash", nonCanonicalChain[i].Hash),
-								zap.Error(err))
-							return 0, xerrors.Errorf("failed to persist non-canonical chain: %w", err)
-						}
-					}
-					logger.Info("Persisted non-canonical chain")
-				}
-
-				// Process canonical chain (this will win due to "last block wins")
-				if len(canonicalChain) > 0 {
-					// First canonical block validates against lastBlock
-					err := data.DestStorage.PersistBlockMetas(ctx, false,
-						[]*api.BlockMetadata{canonicalChain[0]}, lastBlock)
-					if err != nil {
-						logger.Error("Failed to persist first canonical block",
-							zap.String("hash", canonicalChain[0].Hash),
-							zap.Error(err))
-						return 0, xerrors.Errorf("failed to persist canonical chain start: %w", err)
-					}
-
-					// Rest of canonical chain validates against each other
-					for i := 1; i < len(canonicalChain); i++ {
-						err := data.DestStorage.PersistBlockMetas(ctx, false,
-							[]*api.BlockMetadata{canonicalChain[i]}, canonicalChain[i-1])
-						if err != nil {
-							logger.Error("Failed to persist canonical block",
-								zap.Uint64("height", canonicalChain[i].Height),
-								zap.String("hash", canonicalChain[i].Hash),
-								zap.Error(err))
-							return 0, xerrors.Errorf("failed to persist canonical chain: %w", err)
-						}
-					}
-
-					// Update lastBlock to the last canonical block
-					lastBlock = canonicalChain[len(canonicalChain)-1]
-					logger.Info("Persisted canonical chain")
-				}
-
-				// Process blocks after reorg as normal batch
-				var afterReorgBatch []*api.BlockMetadata
-				for _, h := range heights {
-					if h <= reorgEnd {
-						continue
-					}
-					blocks := uniqueBlocksPerHeight[h]
-					if len(blocks) == 1 {
-						afterReorgBatch = append(afterReorgBatch, blocks[0].BlockMetadata)
-					}
-				}
-
-				if len(afterReorgBatch) > 0 {
-					err := data.DestStorage.PersistBlockMetas(ctx, false, afterReorgBatch, lastBlock)
-					if err != nil {
-						logger.Error("Failed to persist batch after reorg",
-							zap.Error(err),
-							zap.Int("batchSize", len(afterReorgBatch)))
-						return 0, xerrors.Errorf("failed to persist batch after reorg: %w", err)
-					}
-					logger.Info("Persisted blocks after reorg",
-						zap.Int("blockCount", len(afterReorgBatch)))
-				}
-			} else {
-				// No continuous reorg found, shouldn't happen but handle gracefully
-				logger.Warn("Reorg detected but not continuous, falling back to individual processing")
-				for _, h := range heights {
-					blocks := uniqueBlocksPerHeight[h]
-					for _, block := range blocks {
-						err := data.DestStorage.PersistBlockMetas(ctx, false,
-							[]*api.BlockMetadata{block.BlockMetadata}, lastBlock)
-						if err != nil {
-							logger.Error("Failed to persist block",
-								zap.Uint64("height", block.Height),
-								zap.String("hash", block.Hash),
-								zap.Error(err))
-							return 0, xerrors.Errorf("failed to persist block: %w", err)
-						}
-						if block.IsCanonical {
-							lastBlock = block.BlockMetadata
-						}
-					}
-				}
-			}
-
-			logger.Info("Slow path: handled reorgs",
-				zap.Int("reorgHeights", reorgCount))
+			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
 		}
 
 		persistDuration := time.Since(persistStart)
 
 		logger.Info("Block persistence completed",
 			zap.Int("totalBlocks", len(allBlocksWithInfo)),
-			zap.Duration("persistDuration", persistDuration),
-			zap.Int("reorgHeights", reorgCount))
+			zap.Duration("persistDuration", persistDuration))
 	}
 
 	totalDuration := time.Since(batchStart)
@@ -718,87 +505,6 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		zap.Float64("avgSecondsPerHeight", totalDuration.Seconds()/float64(totalHeights)))
 
 	return len(allBlocksWithInfo), nil
-}
-
-func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationData, request *MigratorRequest, height uint64) (int, error) {
-	blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
-	logger := a.getLogger(ctx)
-
-	// Get ALL blocks at this height (canonical + non-canonical) in one DynamoDB query
-	queryStart := time.Now()
-	allBlocks, err := a.getAllBlocksAtHeight(ctx, data, blockPid)
-	queryDuration := time.Since(queryStart)
-
-	if err != nil {
-		if errors.Is(err, storage.ErrItemNotFound) {
-			logger.Debug("No blocks found at height",
-				zap.Uint64("height", height),
-				zap.Duration("queryDuration", queryDuration))
-			return 0, nil
-		}
-		logger.Error("Failed to get blocks at height",
-			zap.Uint64("height", height),
-			zap.Duration("queryDuration", queryDuration),
-			zap.Error(err))
-		return 0, xerrors.Errorf("failed to get blocks at height %d: %w", height, err)
-	}
-
-	if len(allBlocks) == 0 {
-		logger.Debug("No blocks found at height", zap.Uint64("height", height))
-		return 0, nil
-	}
-
-	// Separate canonical and non-canonical blocks
-	var canonicalBlocks []*api.BlockMetadata
-	var nonCanonicalBlocks []*api.BlockMetadata
-
-	for _, blockWithInfo := range allBlocks {
-		if blockWithInfo.IsCanonical {
-			canonicalBlocks = append(canonicalBlocks, blockWithInfo.BlockMetadata)
-		} else {
-			nonCanonicalBlocks = append(nonCanonicalBlocks, blockWithInfo.BlockMetadata)
-		}
-	}
-
-	// Persist each block individually to avoid chain validation issues between different blocks at same height
-	persistStart := time.Now()
-
-	// First persist non-canonical blocks (won't become canonical in PostgreSQL)
-	for _, block := range nonCanonicalBlocks {
-		err = data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
-		if err != nil {
-			logger.Error("Failed to persist non-canonical block",
-				zap.Uint64("height", height),
-				zap.String("blockHash", block.Hash),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to persist non-canonical block at height %d: %w", height, err)
-		}
-	}
-
-	// Then persist canonical blocks (will become canonical in PostgreSQL due to "last block wins")
-	for _, block := range canonicalBlocks {
-		err = data.DestStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil)
-		if err != nil {
-			logger.Error("Failed to persist canonical block",
-				zap.Uint64("height", height),
-				zap.String("blockHash", block.Hash),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to persist canonical block at height %d: %w", height, err)
-		}
-	}
-
-	persistDuration := time.Since(persistStart)
-	totalBlocks := len(allBlocks)
-	nonCanonicalCount := len(nonCanonicalBlocks)
-
-	logger.Debug("Persisted all blocks at height",
-		zap.Uint64("height", height),
-		zap.Int("totalBlocks", totalBlocks),
-		zap.Int("canonicalBlocks", len(canonicalBlocks)),
-		zap.Int("nonCanonicalBlocks", nonCanonicalCount),
-		zap.Duration("persistDuration", persistDuration))
-
-	return nonCanonicalCount, nil
 }
 
 // BlockWithCanonicalInfo wraps BlockMetadata with canonical information
