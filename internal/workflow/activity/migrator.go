@@ -435,57 +435,32 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		zap.Int("totalBlocks", len(allBlocksWithInfo)),
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
 
-	// Sort blocks: by timestamp if all have valid timestamps, otherwise by height
+	// Check if there are any reorgs in this batch (multiple blocks at same height)
+	hasReorgs := false
+	heightCounts := make(map[uint64]int)
+	for _, block := range allBlocksWithInfo {
+		heightCounts[block.Height]++
+		if heightCounts[block.Height] > 1 {
+			hasReorgs = true
+		}
+	}
+	
 	if len(allBlocksWithInfo) > 0 {
 		sortStart := time.Now()
-
-		// Check if ANY non-genesis blocks have invalid timestamps (nil or zero)
-		// Genesis blocks (height=0) are allowed to have nil/zero timestamps
-		hasInvalidTimestamps := false
-		for _, block := range allBlocksWithInfo {
-			if block.Height > 0 && (block.Timestamp == nil || block.Timestamp.AsTime().IsZero()) {
-				hasInvalidTimestamps = true
-				logger.Debug("Found non-genesis block with invalid timestamp, will sort by height",
-					zap.Uint64("height", block.Height),
-					zap.String("hash", block.Hash))
-				break
+		
+		// Always sort by height first, then non-canonical before canonical
+		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
+			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
+				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
 			}
-		}
-
-		if hasInvalidTimestamps {
-			// Sort by height, then non-canonical before canonical for same height
-			sort.Slice(allBlocksWithInfo, func(i, j int) bool {
-				if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
-					return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
-				}
-				// For same height, non-canonical before canonical
-				return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
-			})
-			logger.Info("Sorted blocks by height due to missing timestamps in non-genesis blocks")
-		} else {
-			// All non-genesis blocks have valid timestamps, sort by timestamp only
-			sort.Slice(allBlocksWithInfo, func(i, j int) bool {
-				// Handle genesis blocks specially - they go first
-				iTime := allBlocksWithInfo[i].Timestamp
-				jTime := allBlocksWithInfo[j].Timestamp
-
-				// Genesis blocks go first if timestamps are nil/zero
-				if allBlocksWithInfo[i].Height == 0 && (iTime == nil || iTime.AsTime().IsZero()) {
-					return true
-				}
-				if allBlocksWithInfo[j].Height == 0 && (jTime == nil || jTime.AsTime().IsZero()) {
-					return false
-				}
-
-				// Both have timestamps, sort by timestamp
-				return iTime.AsTime().Before(jTime.AsTime())
-			})
-			logger.Info("Sorted blocks by timestamp")
-		}
+			// For same height, non-canonical before canonical
+			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
+		})
+		
 		sortDuration := time.Since(sortStart)
-
-		logger.Info("Blocks sorted by height and timestamp",
+		logger.Info("Blocks sorted",
 			zap.Int("totalBlocks", len(allBlocksWithInfo)),
+			zap.Bool("hasReorgs", hasReorgs),
 			zap.Duration("sortDuration", sortDuration))
 
 		// Get the last block before our range for chain validation
@@ -505,62 +480,49 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		}
 
 		persistStart := time.Now()
-
-		// Group blocks by height to detect reorgs
-		blocksByHeight := make(map[uint64][]*api.BlockMetadata)
-		for _, blockWithInfo := range allBlocksWithInfo {
-			blocksByHeight[blockWithInfo.Height] = append(blocksByHeight[blockWithInfo.Height], blockWithInfo.BlockMetadata)
-		}
-		
-		// Get sorted heights
-		heights := make([]uint64, 0, len(blocksByHeight))
-		for h := range blocksByHeight {
-			heights = append(heights, h)
-		}
-		sort.Slice(heights, func(i, j int) bool {
-			return heights[i] < heights[j]
-		})
-		
-		// Persist blocks height by height
 		blocksPersistedCount := 0
-		for _, height := range heights {
-			blocks := blocksByHeight[height]
+
+		if !hasReorgs {
+			// FAST PATH: No reorgs, can bulk persist with chain validation
+			logger.Info("No reorgs detected, using fast bulk persist")
 			
-			if len(blocks) > 1 {
-				// Reorg at this height - persist each block individually without validation
-				logger.Debug("Reorg detected at height, persisting individually",
-					zap.Uint64("height", height),
-					zap.Int("blockCount", len(blocks)))
-				
-				var lastPersistedBlock *api.BlockMetadata
-				for _, block := range blocks {
-					err := data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
-					if err != nil {
-						logger.Error("Failed to persist reorg block",
-							zap.Uint64("height", height),
-							zap.String("hash", block.Hash),
-							zap.Error(err))
-						return blocksPersistedCount, xerrors.Errorf("failed to persist reorg block: %w", err)
-					}
-					blocksPersistedCount++
-					lastPersistedBlock = block
-				}
-				// Update lastBlock to the last persisted block (canonical due to timestamp sorting)
-				lastBlock = lastPersistedBlock
-				logger.Debug("Updated lastBlock to canonical after reorg",
-					zap.Uint64("height", height),
-					zap.String("hash", lastBlock.Hash))
-			} else {
-				// Single block at this height - can validate against lastBlock
-				err := data.DestStorage.PersistBlockMetas(ctx, false, blocks, lastBlock)
+			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+			for i, blockWithInfo := range allBlocksWithInfo {
+				allBlocks[i] = blockWithInfo.BlockMetadata
+			}
+			
+			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+			if err != nil {
+				logger.Error("Failed to bulk persist blocks",
+					zap.Error(err),
+					zap.Int("blockCount", len(allBlocks)))
+				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+			}
+			blocksPersistedCount = len(allBlocks)
+			
+		} else {
+			// SLOW PATH: Has reorgs, persist one by one without chain validation
+			logger.Info("Reorgs detected, persisting blocks one by one")
+			
+			for _, blockWithInfo := range allBlocksWithInfo {
+				err := data.DestStorage.PersistBlockMetas(ctx, false, 
+					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
 				if err != nil {
 					logger.Error("Failed to persist block",
-						zap.Uint64("height", height),
+						zap.Uint64("height", blockWithInfo.Height),
+						zap.String("hash", blockWithInfo.Hash),
+						zap.Bool("canonical", blockWithInfo.IsCanonical),
 						zap.Error(err))
 					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
 				}
-				blocksPersistedCount += len(blocks)
-				lastBlock = blocks[0] // Update lastBlock for next iteration
+				blocksPersistedCount++
+				
+				// Log progress periodically
+				if blocksPersistedCount%100 == 0 {
+					logger.Debug("Progress update",
+						zap.Int("persisted", blocksPersistedCount),
+						zap.Int("total", len(allBlocksWithInfo)))
+				}
 			}
 		}
 
