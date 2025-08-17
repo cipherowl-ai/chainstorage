@@ -435,22 +435,53 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		zap.Int("totalBlocks", len(allBlocksWithInfo)),
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
 
-	// Sort all blocks: first by height, then by timestamp for same height
-	// Since canonical blocks have later timestamps, they'll naturally be persisted last
+	// Sort blocks: by timestamp if all have valid timestamps, otherwise by height
 	if len(allBlocksWithInfo) > 0 {
 		sortStart := time.Now()
-		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
-			// First sort by height
-			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
-				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
+
+		// Check if ANY non-genesis blocks have invalid timestamps (nil or zero)
+		// Genesis blocks (height=0) are allowed to have nil/zero timestamps
+		hasInvalidTimestamps := false
+		for _, block := range allBlocksWithInfo {
+			if block.Height > 0 && (block.Timestamp == nil || block.Timestamp.AsTime().IsZero()) {
+				hasInvalidTimestamps = true
+				logger.Debug("Found non-genesis block with invalid timestamp, will sort by height",
+					zap.Uint64("height", block.Height),
+					zap.String("hash", block.Hash))
+				break
 			}
-			// For same height, sort by timestamp (canonical blocks have later timestamps)
-			if allBlocksWithInfo[i].Timestamp != nil && allBlocksWithInfo[j].Timestamp != nil {
-				return allBlocksWithInfo[i].Timestamp.AsTime().Before(allBlocksWithInfo[j].Timestamp.AsTime())
-			}
-			// Fallback: if timestamps missing, non-canonical before canonical
-			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
-		})
+		}
+
+		if hasInvalidTimestamps {
+			// Sort by height, then non-canonical before canonical for same height
+			sort.Slice(allBlocksWithInfo, func(i, j int) bool {
+				if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
+					return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
+				}
+				// For same height, non-canonical before canonical
+				return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
+			})
+			logger.Info("Sorted blocks by height due to missing timestamps in non-genesis blocks")
+		} else {
+			// All non-genesis blocks have valid timestamps, sort by timestamp only
+			sort.Slice(allBlocksWithInfo, func(i, j int) bool {
+				// Handle genesis blocks specially - they go first
+				iTime := allBlocksWithInfo[i].Timestamp
+				jTime := allBlocksWithInfo[j].Timestamp
+
+				// Genesis blocks go first if timestamps are nil/zero
+				if allBlocksWithInfo[i].Height == 0 && (iTime == nil || iTime.AsTime().IsZero()) {
+					return true
+				}
+				if allBlocksWithInfo[j].Height == 0 && (jTime == nil || jTime.AsTime().IsZero()) {
+					return false
+				}
+
+				// Both have timestamps, sort by timestamp
+				return iTime.AsTime().Before(jTime.AsTime())
+			})
+			logger.Info("Sorted blocks by timestamp")
+		}
 		sortDuration := time.Since(sortStart)
 
 		logger.Info("Blocks sorted by height and timestamp",
