@@ -506,25 +506,61 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 
 		persistStart := time.Now()
 
-		// Since we sorted by height then timestamp, we can batch persist everything
-		// The sorting ensures canonical blocks (with later timestamps) are persisted last
-		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-		for i, blockWithInfo := range allBlocksWithInfo {
-			allBlocks[i] = blockWithInfo.BlockMetadata
+		// Group blocks by height to detect reorgs
+		blocksByHeight := make(map[uint64][]*api.BlockMetadata)
+		for _, blockWithInfo := range allBlocksWithInfo {
+			blocksByHeight[blockWithInfo.Height] = append(blocksByHeight[blockWithInfo.Height], blockWithInfo.BlockMetadata)
 		}
-
-		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-		if err != nil {
-			logger.Error("Failed to bulk persist blocks",
-				zap.Error(err),
-				zap.Int("blockCount", len(allBlocks)))
-			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+		
+		// Get sorted heights
+		heights := make([]uint64, 0, len(blocksByHeight))
+		for h := range blocksByHeight {
+			heights = append(heights, h)
+		}
+		sort.Slice(heights, func(i, j int) bool {
+			return heights[i] < heights[j]
+		})
+		
+		// Persist blocks height by height
+		blocksPersistedCount := 0
+		for _, height := range heights {
+			blocks := blocksByHeight[height]
+			
+			if len(blocks) > 1 {
+				// Reorg at this height - persist each block individually without validation
+				logger.Debug("Reorg detected at height, persisting individually",
+					zap.Uint64("height", height),
+					zap.Int("blockCount", len(blocks)))
+				
+				for _, block := range blocks {
+					err := data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
+					if err != nil {
+						logger.Error("Failed to persist reorg block",
+							zap.Uint64("height", height),
+							zap.String("hash", block.Hash),
+							zap.Error(err))
+						return blocksPersistedCount, xerrors.Errorf("failed to persist reorg block: %w", err)
+					}
+					blocksPersistedCount++
+				}
+			} else {
+				// Single block at this height - can validate against lastBlock
+				err := data.DestStorage.PersistBlockMetas(ctx, false, blocks, lastBlock)
+				if err != nil {
+					logger.Error("Failed to persist block",
+						zap.Uint64("height", height),
+						zap.Error(err))
+					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
+				}
+				blocksPersistedCount += len(blocks)
+				lastBlock = blocks[0] // Update lastBlock for next iteration
+			}
 		}
 
 		persistDuration := time.Since(persistStart)
 
 		logger.Info("Block persistence completed",
-			zap.Int("totalBlocks", len(allBlocksWithInfo)),
+			zap.Int("totalBlocks", blocksPersistedCount),
 			zap.Duration("persistDuration", persistDuration))
 	}
 
