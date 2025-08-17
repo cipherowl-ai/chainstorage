@@ -170,12 +170,14 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		}
 
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
+		eventTag := cfg.GetEffectiveEventTag(request.EventTag)
 		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
 			tagBlockTag: strconv.Itoa(int(tag)),
 		})
 		logger := w.getLogger(ctx).With(
 			zap.Reflect("request", request),
 			zap.Reflect("config", cfg),
+			zap.Uint32("effectiveEventTag", eventTag),
 		)
 
 		// Set up activity options early so we can use activities
@@ -184,7 +186,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Handle auto-resume functionality - use latest event height instead of block height
 		if request.AutoResume && request.StartHeight == 0 {
 			logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated event")
-			postgresEventResp, err := w.getLatestEventFromPostgres.Execute(ctx, &activity.GetLatestEventFromPostgresRequest{EventTag: request.EventTag})
+			postgresEventResp, err := w.getLatestEventFromPostgres.Execute(ctx, &activity.GetLatestEventFromPostgresRequest{EventTag: eventTag})
 			if err != nil {
 				return xerrors.Errorf("failed to get latest event height from PostgreSQL: %w", err)
 			}
@@ -296,7 +298,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			migratorRequest := &activity.MigratorRequest{
 				StartHeight: batchStart,
 				EndHeight:   batchEnd,
-				EventTag:    request.EventTag,
+				EventTag:    eventTag,
 				Tag:         tag,
 				Parallelism: parallelism,
 				SkipEvents:  request.SkipEvents,
