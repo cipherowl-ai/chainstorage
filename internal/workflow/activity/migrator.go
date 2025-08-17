@@ -532,6 +532,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 					zap.Uint64("height", height),
 					zap.Int("blockCount", len(blocks)))
 				
+				var lastPersistedBlock *api.BlockMetadata
 				for _, block := range blocks {
 					err := data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
 					if err != nil {
@@ -542,7 +543,13 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 						return blocksPersistedCount, xerrors.Errorf("failed to persist reorg block: %w", err)
 					}
 					blocksPersistedCount++
+					lastPersistedBlock = block
 				}
+				// Update lastBlock to the last persisted block (canonical due to timestamp sorting)
+				lastBlock = lastPersistedBlock
+				logger.Debug("Updated lastBlock to canonical after reorg",
+					zap.Uint64("height", height),
+					zap.String("hash", lastBlock.Hash))
 			} else {
 				// Single block at this height - can validate against lastBlock
 				err := data.DestStorage.PersistBlockMetas(ctx, false, blocks, lastBlock)
