@@ -1081,4 +1081,3 @@ const (
 	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
 	ActivityGetLatestEventFromPostgres = "activity.migrator.GetLatestEventFromPostgres"
 )
-```
