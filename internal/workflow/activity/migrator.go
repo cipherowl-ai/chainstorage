@@ -435,37 +435,50 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		zap.Int("totalBlocks", len(allBlocksWithInfo)),
 		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
 
-	// Check if there are any reorgs in this batch (multiple blocks at same height)
-	hasReorgs := false
-	heightCounts := make(map[uint64]int)
-	for _, block := range allBlocksWithInfo {
-		heightCounts[block.Height]++
-		if heightCounts[block.Height] > 1 {
-			hasReorgs = true
-		}
-	}
-
+	// Sort all blocks: first by height, then non-canonical BEFORE canonical (for "last block wins")
 	if len(allBlocksWithInfo) > 0 {
 		sortStart := time.Now()
-
-		// Always sort by height first, then non-canonical before canonical
 		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
 			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
 				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
 			}
-			// For same height, non-canonical before canonical
+			// CRITICAL: For same height, non-canonical blocks must be processed FIRST
+			// so canonical blocks win with "last block wins" behavior
 			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
 		})
-
 		sortDuration := time.Since(sortStart)
-		logger.Info("Blocks sorted",
+
+		// Log reorg detection
+		reorgHeights := make(map[uint64]int)
+		for _, block := range allBlocksWithInfo {
+			reorgHeights[block.Height]++
+		}
+
+		reorgCount := 0
+		for height, count := range reorgHeights {
+			if count > 1 {
+				reorgCount++
+				logger.Info("Reorg detected at height",
+					zap.Uint64("height", height),
+					zap.Int("blockCount", count))
+			}
+		}
+
+		logger.Info("Blocks sorted by height (non-canonical first)",
 			zap.Int("totalBlocks", len(allBlocksWithInfo)),
-			zap.Bool("hasReorgs", hasReorgs),
+			zap.Int("reorgHeights", reorgCount),
 			zap.Duration("sortDuration", sortDuration))
+
+		// Convert to BlockMetadata array for persistence
+		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+		for i, blockWithInfo := range allBlocksWithInfo {
+			allBlocks[i] = blockWithInfo.BlockMetadata
+		}
 
 		// Get the last block before our range for chain validation
 		var lastBlock *api.BlockMetadata
 		if startHeight > 0 {
+			// Try to get the previous block for chain validation
 			prevHeight := startHeight - 1
 			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
 			if err == nil {
@@ -479,64 +492,19 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			}
 		}
 
+		// Bulk persist all blocks (PostgreSQL handles validation internally)
 		persistStart := time.Now()
-		blocksPersistedCount := 0
-
-		if !hasReorgs {
-			// FAST PATH: No reorgs, can bulk persist with chain validation
-			logger.Info("No reorgs detected, using fast bulk persist")
-
-			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-			for i, blockWithInfo := range allBlocksWithInfo {
-				allBlocks[i] = blockWithInfo.BlockMetadata
-			}
-
-			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-			if err != nil {
-				logger.Error("Failed to bulk persist blocks",
-					zap.Error(err),
-					zap.Int("blockCount", len(allBlocks)))
-				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
-			}
-			blocksPersistedCount = len(allBlocks)
-
-		} else {
-			// SLOW PATH: Has reorgs, persist one by one without chain validation
-			logger.Info("Reorgs detected, persisting blocks one by one")
-
-			for i, blockWithInfo := range allBlocksWithInfo {
-				err := data.DestStorage.PersistBlockMetas(ctx, false,
-					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
-				if err != nil {
-					logger.Error("Failed to persist block",
-						zap.Uint64("height", blockWithInfo.Height),
-						zap.String("hash", blockWithInfo.Hash),
-						zap.Bool("canonical", blockWithInfo.IsCanonical),
-						zap.Error(err))
-					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
-				}
-				blocksPersistedCount++
-
-				// Heartbeat more frequently during slow path
-				if i%50 == 0 {
-					activity.RecordHeartbeat(ctx, fmt.Sprintf(
-						"Persisting blocks with reorgs: %d/%d completed",
-						blocksPersistedCount, len(allBlocksWithInfo)))
-				}
-
-				// Log progress periodically
-				if blocksPersistedCount%100 == 0 {
-					logger.Debug("Progress update",
-						zap.Int("persisted", blocksPersistedCount),
-						zap.Int("total", len(allBlocksWithInfo)))
-				}
-			}
+		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+		if err != nil {
+			logger.Error("Failed to bulk persist blocks",
+				zap.Error(err),
+				zap.Int("blockCount", len(allBlocks)))
+			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
 		}
-
 		persistDuration := time.Since(persistStart)
 
-		logger.Info("Block persistence completed",
-			zap.Int("totalBlocks", blocksPersistedCount),
+		logger.Info("Bulk persistence completed",
+			zap.Int("totalBlocks", len(allBlocks)),
 			zap.Duration("persistDuration", persistDuration))
 	}
 
@@ -1113,3 +1081,4 @@ const (
 	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
 	ActivityGetLatestEventFromPostgres = "activity.migrator.GetLatestEventFromPostgres"
 )
+```
