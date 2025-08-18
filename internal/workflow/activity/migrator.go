@@ -442,9 +442,12 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
 				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
 			}
-			// CRITICAL: For same height, non-canonical blocks must be processed FIRST
-			// so canonical blocks win with "last block wins" behavior
-			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
+			// CRITICAL: For same height, non-canonical blocks should come blocks must be processed FIRST
+			// so canonical ones blocks win with "last block wins" behavior
+			if allBlocksWithInfo[i].IsCanonical != allBlocksWithInfo[j].IsCanonical {
+				return !allBlocksWithInfo[i].IsCanonical
+			}
+			return false // Preserve order for blocks with same height and canonical status
 		})
 		sortDuration := time.Since(sortStart)
 

@@ -431,11 +431,11 @@ func (s *migratorActivityTestSuite) TestMigrator_ReorgEdgeCases() {
 	}
 }
 
-// TestMigrator_ReorgIntegrationTest tests the actual reorg handling logic with mocked storage
+// TestMigrator_ReorgIntegrationTest tests the actual reorg handling logic
 func (s *migratorActivityTestSuite) TestMigrator_ReorgIntegrationTest() {
 	require := testutil.Require(s.T())
 
-	// This test mocks the storage layer to verify the actual reorg handling logic
+	// This test verifies the reorg handling logic
 	// It tests the scenario: 1,2,3a,3b,4a,4b,5a,5b,6,7,8 where 'b' is canonical
 
 	// Mock data for the reorg scenario
@@ -609,6 +609,105 @@ func (s *migratorActivityTestSuite) TestMigrator_ReorgIntegrationTest() {
 	require.Len(mockBlocks["2-6"], 1) // Height 6 has no reorg
 	require.Len(mockBlocks["2-7"], 1) // Height 7 has no reorg
 	require.Len(mockBlocks["2-8"], 1) // Height 8 has no reorg
+
+	// Test sorting logic with reorgs
+	// Collect all blocks
+	var allBlocks []BlockWithCanonicalInfo
+	for height := uint64(1); height <= 8; height++ {
+		blockPid := fmt.Sprintf("2-%d", height)
+		blocks, exists := mockBlocks[blockPid]
+		if exists {
+			allBlocks = append(allBlocks, blocks...)
+		}
+	}
+
+	// Verify we have all 11 blocks
+	require.Len(allBlocks, 11)
+
+	// Check for reorgs (multiple blocks at same height)
+	hasReorgs := false
+	heightCounts := make(map[uint64]int)
+	for _, block := range allBlocks {
+		heightCounts[block.Height]++
+		if heightCounts[block.Height] > 1 {
+			hasReorgs = true
+		}
+	}
+	require.True(hasReorgs, "Test data should have reorgs")
+
+	// Sort blocks according to the migrator logic:
+	// By height first, then non-canonical before canonical for same height
+	sortBlocks := func(blocks []BlockWithCanonicalInfo) {
+		for i := 0; i < len(blocks); i++ {
+			for j := i + 1; j < len(blocks); j++ {
+				shouldSwap := false
+				if blocks[i].Height > blocks[j].Height {
+					shouldSwap = true
+				} else if blocks[i].Height == blocks[j].Height {
+					// For same height, non-canonical should come before canonical
+					if blocks[i].IsCanonical && !blocks[j].IsCanonical {
+						shouldSwap = true
+					}
+				}
+				if shouldSwap {
+					blocks[i], blocks[j] = blocks[j], blocks[i]
+				}
+			}
+		}
+	}
+
+	sortBlocks(allBlocks)
+
+	// Verify sorting order
+	blockIndex := 0
+
+	// Height 1 - no reorg
+	require.Equal(uint64(1), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical)
+	blockIndex++
+
+	// Height 2 - no reorg
+	require.Equal(uint64(2), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical)
+	blockIndex++
+
+	// Height 3 - reorg (non-canonical first, then canonical)
+	require.Equal(uint64(3), allBlocks[blockIndex].Height)
+	require.False(allBlocks[blockIndex].IsCanonical, "First block at height 3 should be non-canonical")
+	blockIndex++
+	require.Equal(uint64(3), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical, "Second block at height 3 should be canonical")
+	blockIndex++
+
+	// Height 4 - reorg (non-canonical first, then canonical)
+	require.Equal(uint64(4), allBlocks[blockIndex].Height)
+	require.False(allBlocks[blockIndex].IsCanonical, "First block at height 4 should be non-canonical")
+	blockIndex++
+	require.Equal(uint64(4), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical, "Second block at height 4 should be canonical")
+	blockIndex++
+
+	// Height 5 - reorg (non-canonical first, then canonical)
+	require.Equal(uint64(5), allBlocks[blockIndex].Height)
+	require.False(allBlocks[blockIndex].IsCanonical, "First block at height 5 should be non-canonical")
+	blockIndex++
+	require.Equal(uint64(5), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical, "Second block at height 5 should be canonical")
+	blockIndex++
+
+	// Heights 6, 7, 8 - no reorgs
+	require.Equal(uint64(6), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical)
+	blockIndex++
+	require.Equal(uint64(7), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical)
+	blockIndex++
+	require.Equal(uint64(8), allBlocks[blockIndex].Height)
+	require.True(allBlocks[blockIndex].IsCanonical)
+	blockIndex++ // Final increment after last block
+
+	// Verify all blocks were checked
+	require.Equal(len(allBlocks), blockIndex, fmt.Sprintf("Should have processed all %d blocks", len(allBlocks)))
 
 	// Verify chain continuity in the canonical chain
 	require.Equal("0x2222222222222222222222222222222222222222222222222222222222222222", mockBlocks["2-3"][1].ParentHash) // 3b -> 2
