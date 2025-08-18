@@ -444,10 +444,10 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			hasReorgs = true
 		}
 	}
-	
+
 	if len(allBlocksWithInfo) > 0 {
 		sortStart := time.Now()
-		
+
 		// Always sort by height first, then non-canonical before canonical
 		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
 			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
@@ -456,7 +456,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			// For same height, non-canonical before canonical
 			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
 		})
-		
+
 		sortDuration := time.Since(sortStart)
 		logger.Info("Blocks sorted",
 			zap.Int("totalBlocks", len(allBlocksWithInfo)),
@@ -485,12 +485,12 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		if !hasReorgs {
 			// FAST PATH: No reorgs, can bulk persist with chain validation
 			logger.Info("No reorgs detected, using fast bulk persist")
-			
+
 			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
 			for i, blockWithInfo := range allBlocksWithInfo {
 				allBlocks[i] = blockWithInfo.BlockMetadata
 			}
-			
+
 			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
 			if err != nil {
 				logger.Error("Failed to bulk persist blocks",
@@ -499,13 +499,13 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
 			}
 			blocksPersistedCount = len(allBlocks)
-			
+
 		} else {
 			// SLOW PATH: Has reorgs, persist one by one without chain validation
 			logger.Info("Reorgs detected, persisting blocks one by one")
-			
+
 			for i, blockWithInfo := range allBlocksWithInfo {
-				err := data.DestStorage.PersistBlockMetas(ctx, false, 
+				err := data.DestStorage.PersistBlockMetas(ctx, false,
 					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
 				if err != nil {
 					logger.Error("Failed to persist block",
@@ -516,14 +516,14 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
 				}
 				blocksPersistedCount++
-				
+
 				// Heartbeat more frequently during slow path
 				if i%50 == 0 {
 					activity.RecordHeartbeat(ctx, fmt.Sprintf(
 						"Persisting blocks with reorgs: %d/%d completed",
 						blocksPersistedCount, len(allBlocksWithInfo)))
 				}
-				
+
 				// Log progress periodically
 				if blocksPersistedCount%100 == 0 {
 					logger.Debug("Progress update",
