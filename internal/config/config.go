@@ -129,12 +129,12 @@ type (
 	}
 
 	PostgresConfig struct {
-		Host             string        `mapstructure:"host" validate:"required"`
-		Port             int           `mapstructure:"port" validate:"required"`
-		Database         string        `mapstructure:"database" validate:"required"`
+		Host             string        `mapstructure:"host"`
+		Port             int           `mapstructure:"port"`
+		Database         string        `mapstructure:"database"`
 		User             string        `mapstructure:"user"`
 		Password         string        `mapstructure:"password"`
-		SSLMode          string        `mapstructure:"ssl_mode" validate:"required"`
+		SSLMode          string        `mapstructure:"ssl_mode"`
 		MaxConnections   int           `mapstructure:"max_connections"`
 		MinConnections   int           `mapstructure:"min_connections"`
 		MaxIdleTime      time.Duration `mapstructure:"max_idle_time"`
