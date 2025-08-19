@@ -499,7 +499,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 
 		blocksPersistedCount := 0
 		persistStart := time.Now()
-		
+
 		if !hasReorgs {
 			// FAST PATH: No reorgs, can bulk persist with chain validation
 			logger.Info("No reorgs detected, using fast bulk persist")
@@ -507,7 +507,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			for i, blockWithInfo := range allBlocksWithInfo {
 				allBlocks[i] = blockWithInfo.BlockMetadata
 			}
-			
+
 			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
 			if err != nil {
 				logger.Error("Failed to bulk persist blocks",
@@ -516,13 +516,13 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
 			}
 			blocksPersistedCount = len(allBlocks)
-			
+
 		} else {
 			// SLOW PATH: Has reorgs, persist one by one without chain validation
 			logger.Info("Reorgs detected, persisting blocks one by one")
-			
+
 			for _, blockWithInfo := range allBlocksWithInfo {
-				err := data.DestStorage.PersistBlockMetas(ctx, false, 
+				err := data.DestStorage.PersistBlockMetas(ctx, false,
 					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
 				if err != nil {
 					logger.Error("Failed to persist block",
@@ -533,7 +533,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
 				}
 				blocksPersistedCount++
-				
+
 				// Log progress periodically
 				if blocksPersistedCount%100 == 0 {
 					logger.Debug("Progress update",
@@ -542,7 +542,7 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 				}
 			}
 		}
-		
+
 		persistDuration := time.Since(persistStart)
 		logger.Info("Bulk persistence completed",
 			zap.Int("totalBlocksPersisted", blocksPersistedCount),
@@ -714,18 +714,34 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		duration time.Duration
 	}
 
-	inputChannel := make(chan heightRange, int(totalHeights/miniBatchSize)+1)
-	resultChannel := make(chan batchResult, parallelism*2)
-
-	// Generate mini-batches
+	// First, count actual batches to ensure we collect all results
+	actualBatches := 0
+	var heightRanges []heightRange
 	for batchStart := startHeight; batchStart <= endHeight; batchStart += miniBatchSize {
 		batchEnd := batchStart + miniBatchSize - 1
 		if batchEnd > endHeight {
 			batchEnd = endHeight
 		}
-		inputChannel <- heightRange{start: batchStart, end: batchEnd}
+		heightRanges = append(heightRanges, heightRange{start: batchStart, end: batchEnd})
+		actualBatches++
+	}
+
+	inputChannel := make(chan heightRange, actualBatches)
+	resultChannel := make(chan batchResult, actualBatches)
+
+	// Add all batches to input channel
+	for _, hr := range heightRanges {
+		inputChannel <- hr
 	}
 	close(inputChannel)
+
+	logger.Info("Event migration batch generation",
+		zap.Int("actualBatches", actualBatches),
+		zap.Int("parallelism", parallelism),
+		zap.Uint64("miniBatchSize", miniBatchSize),
+		zap.Uint64("startHeight", startHeight),
+		zap.Uint64("endHeight", endHeight),
+		zap.Uint64("totalHeights", totalHeights))
 
 	// Start parallel workers
 	for i := 0; i < parallelism; i++ {
@@ -743,15 +759,11 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		}(i)
 	}
 
-	// Collect results
+	// Collect results - use actualBatches to ensure we get ALL results
 	totalEvents := 0
 	var allEvents []*model.EventEntry
-	expectedBatches := int(totalHeights / miniBatchSize)
-	if totalHeights%miniBatchSize != 0 {
-		expectedBatches++
-	}
 
-	for i := 0; i < expectedBatches; i++ {
+	for i := 0; i < actualBatches; i++ {
 		result := <-resultChannel
 		if result.err != nil {
 			return totalEvents, xerrors.Errorf("failed to migrate events range [%d-%d]: %w",
