@@ -34,6 +34,12 @@ func (s *eventStorageTestSuite) SetupTest() {
 	cfg, err := config.New()
 	require.NoError(err)
 
+	// Skip tests if Postgres is not configured
+	if cfg.AWS.Postgres == nil {
+		s.T().Skip("Postgres not configured, skipping test suite")
+		return
+	}
+
 	app := testapp.New(
 		s.T(),
 		fx.Provide(NewMetaStorage),

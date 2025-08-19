@@ -46,6 +46,13 @@ func (s *blockStorageTestSuite) SetupTest() {
 	var accessor internal.MetaStorage
 	cfg, err := config.New()
 	require.NoError(err)
+
+	// Skip tests if Postgres is not configured
+	if cfg.AWS.Postgres == nil {
+		s.T().Skip("Postgres not configured, skipping test suite")
+		return
+	}
+
 	// Set the starting block height
 	cfg.Chain.BlockStartHeight = 10
 	s.config = cfg
