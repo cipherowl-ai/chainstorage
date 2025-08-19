@@ -61,7 +61,7 @@ func (s *blockStorageTestSuite) SetupTest() {
 	s.accessor = accessor
 
 	// Get database connection for cleanup
-	db, err := newDBConnection(context.Background(), &cfg.AWS.Postgres)
+	db, err := newDBConnection(context.Background(), cfg.AWS.Postgres)
 	require.NoError(err)
 	s.db = db
 }
