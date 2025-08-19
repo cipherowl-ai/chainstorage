@@ -147,41 +147,49 @@ func TestDerivedConfigValues(t *testing.T) {
 		normalizedConfigName := strings.ReplaceAll(configName, "_", "-")
 
 		// Verify template derived configs.
-		dynamoDB := config.DynamoDBConfig{
-			BlockTable:                    fmt.Sprintf("example_chainstorage_blocks_%v", configName),
-			EventTable:                    cfg.AWS.DynamoDB.EventTable,
-			EventTableHeightIndex:         cfg.AWS.DynamoDB.EventTableHeightIndex,
-			VersionedEventTable:           fmt.Sprintf("example_chainstorage_versioned_block_events_%v", configName),
-			VersionedEventTableBlockIndex: fmt.Sprintf("example_chainstorage_versioned_block_events_by_block_id_%v", configName),
-			TransactionTable:              cfg.AWS.DynamoDB.TransactionTable,
-			// Skip DynamoDB.Arn verification
-			Arn: "",
+		var dynamoDBPtr *config.DynamoDBConfig
+		if cfg.AWS.DynamoDB != nil {
+			dynamoDB := config.DynamoDBConfig{
+				BlockTable:                    fmt.Sprintf("example_chainstorage_blocks_%v", configName),
+				EventTable:                    cfg.AWS.DynamoDB.EventTable,
+				EventTableHeightIndex:         cfg.AWS.DynamoDB.EventTableHeightIndex,
+				VersionedEventTable:           fmt.Sprintf("example_chainstorage_versioned_block_events_%v", configName),
+				VersionedEventTableBlockIndex: fmt.Sprintf("example_chainstorage_versioned_block_events_by_block_id_%v", configName),
+				TransactionTable:              cfg.AWS.DynamoDB.TransactionTable,
+				// Skip DynamoDB.Arn verification
+				Arn: "",
+			}
+			dynamoDBPtr = &dynamoDB
 		}
 
-		postgres := config.PostgresConfig{
-			Host:             cfg.AWS.Postgres.Host,
-			Port:             cfg.AWS.Postgres.Port,
-			Database:         cfg.AWS.Postgres.Database,
-			User:             cfg.AWS.Postgres.User,
-			Password:         cfg.AWS.Postgres.Password,
-			SSLMode:          cfg.AWS.Postgres.SSLMode,
-			MaxConnections:   cfg.AWS.Postgres.MaxConnections,
-			MinConnections:   cfg.AWS.Postgres.MinConnections,
-			MaxIdleTime:      cfg.AWS.Postgres.MaxIdleTime,
-			MaxLifetime:      cfg.AWS.Postgres.MaxLifetime,
-			ConnectTimeout:   cfg.AWS.Postgres.ConnectTimeout,
-			StatementTimeout: cfg.AWS.Postgres.StatementTimeout,
-			Schema:           cfg.AWS.Postgres.Schema,
-			TablePrefix:      cfg.AWS.Postgres.TablePrefix,
+		var postgresPtr *config.PostgresConfig
+		if cfg.AWS.Postgres != nil {
+			postgres := config.PostgresConfig{
+				Host:             cfg.AWS.Postgres.Host,
+				Port:             cfg.AWS.Postgres.Port,
+				Database:         cfg.AWS.Postgres.Database,
+				User:             cfg.AWS.Postgres.User,
+				Password:         cfg.AWS.Postgres.Password,
+				SSLMode:          cfg.AWS.Postgres.SSLMode,
+				MaxConnections:   cfg.AWS.Postgres.MaxConnections,
+				MinConnections:   cfg.AWS.Postgres.MinConnections,
+				MaxIdleTime:      cfg.AWS.Postgres.MaxIdleTime,
+				MaxLifetime:      cfg.AWS.Postgres.MaxLifetime,
+				ConnectTimeout:   cfg.AWS.Postgres.ConnectTimeout,
+				StatementTimeout: cfg.AWS.Postgres.StatementTimeout,
+				Schema:           cfg.AWS.Postgres.Schema,
+				TablePrefix:      cfg.AWS.Postgres.TablePrefix,
+			}
+			postgresPtr = &postgres
 		}
 
 		expectedAWS := config.AwsConfig{
 			Region:                 "us-east-1",
 			Bucket:                 fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
-			DynamoDB:               &dynamoDB,
-			Postgres:               &postgres,
-			IsLocalStack:           true,
-			IsResetLocal:           true,
+			DynamoDB:               dynamoDBPtr,
+			Postgres:               postgresPtr,
+			IsLocalStack:           cfg.AWS.IsLocalStack,
+			IsResetLocal:           cfg.AWS.IsResetLocal,
 			PresignedUrlExpiration: 30 * time.Minute,
 			DLQ: config.SQSConfig{
 				Name:                  fmt.Sprintf("example_chainstorage_blocks_%v_dlq", configName),
