@@ -451,32 +451,34 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 		})
 		sortDuration := time.Since(sortStart)
 
-		// Log reorg detection
-		reorgHeights := make(map[uint64]int)
+		// Check if there are any reorgs in this batch (multiple blocks at same height)
+		hasReorgs := false
+		heightCounts := make(map[uint64]int)
 		for _, block := range allBlocksWithInfo {
-			reorgHeights[block.Height]++
-		}
-
-		reorgCount := 0
-		for height, count := range reorgHeights {
-			if count > 1 {
-				reorgCount++
-				logger.Info("Reorg detected at height",
-					zap.Uint64("height", height),
-					zap.Int("blockCount", count))
+			heightCounts[block.Height]++
+			if heightCounts[block.Height] > 1 {
+				hasReorgs = true
 			}
 		}
 
-		logger.Info("Blocks sorted by height (non-canonical first)",
-			zap.Int("totalBlocks", len(allBlocksWithInfo)),
-			zap.Int("reorgHeights", reorgCount),
-			zap.Duration("sortDuration", sortDuration))
-
-		// Convert to BlockMetadata array for persistence
-		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-		for i, blockWithInfo := range allBlocksWithInfo {
-			allBlocks[i] = blockWithInfo.BlockMetadata
+		// Log reorg details if found
+		if hasReorgs {
+			reorgCount := 0
+			for height, count := range heightCounts {
+				if count > 1 {
+					reorgCount++
+					logger.Info("Reorg detected at height",
+						zap.Uint64("height", height),
+						zap.Int("blockCount", count))
+				}
+			}
+			logger.Info("Total reorg heights detected", zap.Int("reorgCount", reorgCount))
 		}
+
+		logger.Info("Blocks sorted",
+			zap.Int("totalBlocks", len(allBlocksWithInfo)),
+			zap.Bool("hasReorgs", hasReorgs),
+			zap.Duration("sortDuration", sortDuration))
 
 		// Get the last block before our range for chain validation
 		var lastBlock *api.BlockMetadata
@@ -495,19 +497,55 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			}
 		}
 
-		// Bulk persist all blocks (PostgreSQL handles validation internally)
+		blocksPersistedCount := 0
 		persistStart := time.Now()
-		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-		if err != nil {
-			logger.Error("Failed to bulk persist blocks",
-				zap.Error(err),
-				zap.Int("blockCount", len(allBlocks)))
-			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+		
+		if !hasReorgs {
+			// FAST PATH: No reorgs, can bulk persist with chain validation
+			logger.Info("No reorgs detected, using fast bulk persist")
+			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
+			for i, blockWithInfo := range allBlocksWithInfo {
+				allBlocks[i] = blockWithInfo.BlockMetadata
+			}
+			
+			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+			if err != nil {
+				logger.Error("Failed to bulk persist blocks",
+					zap.Error(err),
+					zap.Int("blockCount", len(allBlocks)))
+				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+			}
+			blocksPersistedCount = len(allBlocks)
+			
+		} else {
+			// SLOW PATH: Has reorgs, persist one by one without chain validation
+			logger.Info("Reorgs detected, persisting blocks one by one")
+			
+			for _, blockWithInfo := range allBlocksWithInfo {
+				err := data.DestStorage.PersistBlockMetas(ctx, false, 
+					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
+				if err != nil {
+					logger.Error("Failed to persist block",
+						zap.Uint64("height", blockWithInfo.Height),
+						zap.String("hash", blockWithInfo.Hash),
+						zap.Bool("canonical", blockWithInfo.IsCanonical),
+						zap.Error(err))
+					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
+				}
+				blocksPersistedCount++
+				
+				// Log progress periodically
+				if blocksPersistedCount%100 == 0 {
+					logger.Debug("Progress update",
+						zap.Int("persisted", blocksPersistedCount),
+						zap.Int("total", len(allBlocksWithInfo)))
+				}
+			}
 		}
+		
 		persistDuration := time.Since(persistStart)
-
 		logger.Info("Bulk persistence completed",
-			zap.Int("totalBlocks", len(allBlocks)),
+			zap.Int("totalBlocksPersisted", blocksPersistedCount),
 			zap.Duration("persistDuration", persistDuration))
 	}
 
