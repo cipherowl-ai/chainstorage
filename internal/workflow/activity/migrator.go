@@ -707,6 +707,7 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	type batchResult struct {
 		events []*model.EventEntry
 		err    error
+		rangeInfo heightRange
 	}
 
 	// Generate batches
@@ -720,6 +721,12 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		heightRanges = append(heightRanges, heightRange{start: batchStart, end: batchEnd})
 		actualBatches++
 	}
+
+	logger.Info("Starting parallel event fetch",
+		zap.Int("batches", actualBatches),
+		zap.Int("workers", parallelism),
+		zap.Uint64("startHeight", startHeight),
+		zap.Uint64("endHeight", endHeight))
 
 	inputChannel := make(chan heightRange, actualBatches)
 	resultChannel := make(chan batchResult, actualBatches)
@@ -742,6 +749,7 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 				resultChannel <- batchResult{
 					events: evts,
 					err:    err,
+					rangeInfo: heightRange,
 				}
 			}
 		}(i)
@@ -755,6 +763,7 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	
 	// Collect all results
 	var allEvents []*model.EventEntry
+	collectedBatches := 0
 	for result := range resultChannel {
 		if result.err != nil {
 			return 0, result.err
@@ -762,7 +771,17 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		if len(result.events) > 0 {
 			allEvents = append(allEvents, result.events...)
 		}
+		collectedBatches++
+		
+		// Log and heartbeat fetch progress
+		activity.RecordHeartbeat(ctx, fmt.Sprintf(
+			"fetched batch %d/%d: heights [%d-%d], events=%d",
+			collectedBatches, actualBatches, result.rangeInfo.start, result.rangeInfo.end, len(result.events),
+		))
 	}
+
+	logger.Info("All events fetched, starting sort and persist",
+		zap.Int("totalEvents", len(allEvents)))
 
 	// Sort all collected events by EventId
 	if len(allEvents) > 0 {
@@ -776,9 +795,25 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 				end = len(allEvents)
 			}
 			chunk := allEvents[i:end]
+			firstId := chunk[0].EventId
+			lastId := chunk[len(chunk)-1].EventId
+			persistStart := time.Now()
+			
 			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
 				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
 			}
+			
+			duration := time.Since(persistStart)
+			logger.Info("Persisted events chunk to Postgres",
+				zap.Int("chunkSize", len(chunk)),
+				zap.Int64("firstEventId", firstId),
+				zap.Int64("lastEventId", lastId),
+				zap.Duration("duration", duration))
+
+			activity.RecordHeartbeat(ctx, fmt.Sprintf(
+				"persisted chunk: events=%d, event_id=[%d-%d], took=%s",
+				len(chunk), firstId, lastId, duration,
+			))
 		}
 	}
 	return len(allEvents), nil
