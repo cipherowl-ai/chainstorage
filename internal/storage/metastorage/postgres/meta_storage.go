@@ -29,7 +29,7 @@ type (
 
 func NewMetaStorage(params Params) (internal.Result, error) {
 	// Use shared connection pool instead of creating new connections
-	pool, err := GetConnectionPool(context.Background(), &params.Config.AWS.Postgres)
+	pool, err := GetConnectionPool(context.Background(), params.Config.AWS.Postgres)
 	if err != nil {
 		return internal.Result{}, err
 	}
