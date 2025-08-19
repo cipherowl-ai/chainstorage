@@ -118,7 +118,7 @@ type (
 	AwsConfig struct {
 		Region                 string         `mapstructure:"region" validate:"required"`
 		Bucket                 string         `mapstructure:"bucket" validate:"required"`
-		Postgres               PostgresConfig `mapstructure:"postgres" validate:"required"`
+		Postgres               PostgresConfig `mapstructure:"postgres"`
 		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb" validate:"required"`
 		IsLocalStack           bool           `mapstructure:"local_stack"`
 		IsResetLocal           bool           `mapstructure:"reset_local"`
