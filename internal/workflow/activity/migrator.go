@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	awssdk "github.com/aws/aws-sdk-go/aws"
@@ -691,30 +692,24 @@ func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *
 	return totalEvents, nil
 }
 
-// migrateEventsBatch processes a batch of events with parallelism, similar to block migration approach
+// migrateEventsBatch processes a batch of events with parallelism
 func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
-	// Create mini-batches sized to parallelism to minimize number of DB writes.
-	// Each worker handles one contiguous height range when possible.
 	if parallelism <= 0 {
 		parallelism = 1
 	}
 	totalHeights := endHeight - startHeight + 1
-	// ceil(totalHeights / parallelism)
 	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
 
-	// Create channels for parallel processing
 	type heightRange struct {
 		start, end uint64
 	}
 
 	type batchResult struct {
-		events   []*model.EventEntry
-		err      error
-		range_   heightRange
-		duration time.Duration
+		events []*model.EventEntry
+		err    error
 	}
 
-	// First, count actual batches to ensure we collect all results
+	// Generate batches
 	actualBatches := 0
 	var heightRanges []heightRange
 	for batchStart := startHeight; batchStart <= endHeight; batchStart += miniBatchSize {
@@ -735,70 +730,45 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	}
 	close(inputChannel)
 
-	logger.Info("Event migration batch generation",
-		zap.Int("actualBatches", actualBatches),
-		zap.Int("parallelism", parallelism),
-		zap.Uint64("miniBatchSize", miniBatchSize),
-		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("totalHeights", totalHeights))
-
-	// Start parallel workers
+	// Start parallel workers with WaitGroup to track completion
+	var wg sync.WaitGroup
+	wg.Add(parallelism)
+	
 	for i := 0; i < parallelism; i++ {
 		go func(workerID int) {
+			defer wg.Done()
 			for heightRange := range inputChannel {
-				fetchStart := time.Now()
 				evts, err := a.fetchEventsRange(ctx, data, request, heightRange.start, heightRange.end)
 				resultChannel <- batchResult{
-					events:   evts,
-					err:      err,
-					range_:   heightRange,
-					duration: time.Since(fetchStart),
+					events: evts,
+					err:    err,
 				}
 			}
 		}(i)
 	}
-
-	// Collect results - use actualBatches to ensure we get ALL results
-	totalEvents := 0
+	
+	// Wait for all workers to complete in a separate goroutine
+	go func() {
+		wg.Wait()
+		close(resultChannel)
+	}()
+	
+	// Collect all results
 	var allEvents []*model.EventEntry
-
-	for i := 0; i < actualBatches; i++ {
-		result := <-resultChannel
+	for result := range resultChannel {
 		if result.err != nil {
-			return totalEvents, xerrors.Errorf("failed to migrate events range [%d-%d]: %w",
-				result.range_.start, result.range_.end, result.err)
+			return 0, result.err
 		}
 		if len(result.events) > 0 {
 			allEvents = append(allEvents, result.events...)
-			totalEvents += len(result.events)
-		}
-
-		logger.Info("Fetched events from Dynamo",
-			zap.Uint64("rangeStart", result.range_.start),
-			zap.Uint64("rangeEnd", result.range_.end),
-			zap.Int("events", len(result.events)),
-			zap.Duration("duration", result.duration))
-
-		// Heartbeat progress so it shows up in Temporal UI
-		activity.RecordHeartbeat(ctx, fmt.Sprintf(
-			"fetched events: heights [%d-%d], events=%d, took=%s",
-			result.range_.start, result.range_.end, len(result.events), result.duration,
-		))
-
-		if i%10 == 0 || len(result.events) > 0 {
-			logger.Debug("Mini-batch completed",
-				zap.Uint64("rangeStart", result.range_.start),
-				zap.Uint64("rangeEnd", result.range_.end),
-				zap.Int("events", len(result.events)),
-				zap.Int("totalSoFar", totalEvents))
 		}
 	}
 
-	// Sort all collected events once and write in contiguous chunks to avoid long-running transactions
+	// Sort all collected events by EventId
 	if len(allEvents) > 0 {
 		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
-		// larger chunk size now that writes are bulked via COPY+JOIN
+		
+		// Bulk persist in chunks
 		const eventChunkSize = 1000
 		for i := 0; i < len(allEvents); i += eventChunkSize {
 			end := i + eventChunkSize
@@ -806,22 +776,9 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 				end = len(allEvents)
 			}
 			chunk := allEvents[i:end]
-			firstId := chunk[0].EventId
-			lastId := chunk[len(chunk)-1].EventId
-			persistStart := time.Now()
 			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
 				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
 			}
-			logger.Info("Persisted events chunk to Postgres",
-				zap.Int("chunkSize", len(chunk)),
-				zap.Int64("firstEventId", firstId),
-				zap.Int64("lastEventId", lastId),
-				zap.Duration("duration", time.Since(persistStart)))
-
-			activity.RecordHeartbeat(ctx, fmt.Sprintf(
-				"persisted chunk: events=%d, event_id=[%d-%d], took=%s",
-				len(chunk), firstId, lastId, time.Since(persistStart),
-			))
 		}
 	}
 	return len(allEvents), nil
