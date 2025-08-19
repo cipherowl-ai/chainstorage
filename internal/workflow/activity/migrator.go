@@ -761,17 +761,19 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 		close(resultChannel)
 	}()
 	
-	// Collect all results
+	// Collect all results - MUST collect exactly actualBatches results
 	var allEvents []*model.EventEntry
 	collectedBatches := 0
-	for result := range resultChannel {
+	for i := 0; i < actualBatches; i++ {
+		result := <-resultChannel
+		collectedBatches++
+		
 		if result.err != nil {
 			return 0, result.err
 		}
 		if len(result.events) > 0 {
 			allEvents = append(allEvents, result.events...)
 		}
-		collectedBatches++
 		
 		// Log and heartbeat fetch progress
 		activity.RecordHeartbeat(ctx, fmt.Sprintf(
