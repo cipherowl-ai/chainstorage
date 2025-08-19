@@ -783,38 +783,94 @@ func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, d
 	logger.Info("All events fetched, starting sort and persist",
 		zap.Int("totalEvents", len(allEvents)))
 
-	// Sort all collected events by EventId
+	// Sort all collected events by EventId (ascending)
 	if len(allEvents) > 0 {
 		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
 		
-		// Bulk persist in chunks
-		const eventChunkSize = 1000
-		for i := 0; i < len(allEvents); i += eventChunkSize {
-			end := i + eventChunkSize
-			if end > len(allEvents) {
-				end = len(allEvents)
+		firstId := allEvents[0].EventId
+		lastId := allEvents[len(allEvents)-1].EventId
+		
+		logger.Info("Attempting to persist all events in single batch",
+			zap.Int("totalEvents", len(allEvents)),
+			zap.Int64("firstEventId", firstId),
+			zap.Int64("lastEventId", lastId))
+		
+		// Log first 10 and last 10 event IDs for debugging
+		var eventIdSample []int64
+		if len(allEvents) <= 20 {
+			for _, evt := range allEvents {
+				eventIdSample = append(eventIdSample, evt.EventId)
 			}
-			chunk := allEvents[i:end]
-			firstId := chunk[0].EventId
-			lastId := chunk[len(chunk)-1].EventId
-			persistStart := time.Now()
-			
-			if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, chunk); err != nil {
-				return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(chunk), startHeight, endHeight, err)
+		} else {
+			// First 10
+			for j := 0; j < 10; j++ {
+				eventIdSample = append(eventIdSample, allEvents[j].EventId)
 			}
-			
-			duration := time.Since(persistStart)
-			logger.Info("Persisted events chunk to Postgres",
-				zap.Int("chunkSize", len(chunk)),
-				zap.Int64("firstEventId", firstId),
-				zap.Int64("lastEventId", lastId),
-				zap.Duration("duration", duration))
-
-			activity.RecordHeartbeat(ctx, fmt.Sprintf(
-				"persisted chunk: events=%d, event_id=[%d-%d], took=%s",
-				len(chunk), firstId, lastId, duration,
-			))
+			// Last 10
+			for j := len(allEvents) - 10; j < len(allEvents); j++ {
+				eventIdSample = append(eventIdSample, allEvents[j].EventId)
+			}
 		}
+		logger.Debug("Event ID sample (first 10 and last 10)",
+			zap.Int64s("eventIds", eventIdSample))
+		
+		// Persist all events in a single call
+		persistStart := time.Now()
+		if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, allEvents); err != nil {
+			// On failure, check for gaps in our collected events
+			var gaps []string
+			for j := 1; j < len(allEvents); j++ {
+				if allEvents[j].EventId != allEvents[j-1].EventId+1 {
+					gap := fmt.Sprintf("position=%d: %d->%d (gap=%d)", 
+						j, allEvents[j-1].EventId, allEvents[j].EventId, 
+						allEvents[j].EventId - allEvents[j-1].EventId - 1)
+					gaps = append(gaps, gap)
+				}
+			}
+			
+			if len(gaps) > 0 {
+				logger.Error("Gaps found in collected events",
+					zap.Strings("gaps", gaps),
+					zap.Int("totalGaps", len(gaps)))
+			}
+			
+			// Log sample of event IDs around the error point mentioned in the error message
+			// The error says: "prev event id: 19793231, current event id: 19793530"
+			var contextEventIds []int64
+			for idx, evt := range allEvents {
+				if evt.EventId >= 19793220 && evt.EventId <= 19793540 {
+					contextEventIds = append(contextEventIds, evt.EventId)
+					if evt.EventId == 19793231 {
+						logger.Error("Found event 19793231 at position",
+							zap.Int("position", idx),
+							zap.Int64("eventId", evt.EventId))
+						if idx+1 < len(allEvents) {
+							logger.Error("Next event after 19793231",
+								zap.Int("position", idx+1),
+								zap.Int64("eventId", allEvents[idx+1].EventId))
+						}
+					}
+				}
+			}
+			if len(contextEventIds) > 0 {
+				logger.Error("Events around error range",
+					zap.Int64s("contextEventIds", contextEventIds))
+			}
+			
+			return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(allEvents), startHeight, endHeight, err)
+		}
+		
+		duration := time.Since(persistStart)
+		logger.Info("Successfully persisted all events to Postgres",
+			zap.Int("totalEvents", len(allEvents)),
+			zap.Int64("firstEventId", firstId),
+			zap.Int64("lastEventId", lastId),
+			zap.Duration("duration", duration))
+
+		activity.RecordHeartbeat(ctx, fmt.Sprintf(
+			"persisted all events: count=%d, event_id=[%d-%d], took=%s",
+			len(allEvents), firstId, lastId, duration,
+		))
 	}
 	return len(allEvents), nil
 }
