@@ -2,6 +2,7 @@ package activity
 
 import (
 	"fmt"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -637,26 +638,17 @@ func (s *migratorActivityTestSuite) TestMigrator_ReorgIntegrationTest() {
 
 	// Sort blocks according to the migrator logic:
 	// By height first, then non-canonical before canonical for same height
-	sortBlocks := func(blocks []BlockWithCanonicalInfo) {
-		for i := 0; i < len(blocks); i++ {
-			for j := i + 1; j < len(blocks); j++ {
-				shouldSwap := false
-				if blocks[i].Height > blocks[j].Height {
-					shouldSwap = true
-				} else if blocks[i].Height == blocks[j].Height {
-					// For same height, non-canonical should come before canonical
-					if blocks[i].IsCanonical && !blocks[j].IsCanonical {
-						shouldSwap = true
-					}
-				}
-				if shouldSwap {
-					blocks[i], blocks[j] = blocks[j], blocks[i]
-				}
-			}
-		}
-	}
 
-	sortBlocks(allBlocks)
+	sort.Slice(allBlocks, func(i, j int) bool {
+		if allBlocks[i].Height != allBlocks[j].Height {
+			return allBlocks[i].Height < allBlocks[j].Height
+		}
+		// For same height, non-canonical should come before canonical
+		if allBlocks[i].IsCanonical != allBlocks[j].IsCanonical {
+			return !allBlocks[i].IsCanonical
+		}
+		return false // Preserve order for same height and canonical status
+	})
 
 	// Verify sorting order
 	blockIndex := 0
