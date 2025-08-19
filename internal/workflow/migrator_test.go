@@ -72,7 +72,9 @@ func (s *migratorTestSuite) TestMigrator_Success() {
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			require.Equal(tag, request.Tag)
-			require.Equal(eventTag, request.EventTag)
+			// When eventTag is 0, it should be converted to the stable event tag from config
+			expectedEventTag := s.cfg.Workflows.Migrator.GetEffectiveEventTag(eventTag)
+			require.Equal(expectedEventTag, request.EventTag)
 			require.False(request.SkipEvents)
 			require.False(request.SkipBlocks)
 

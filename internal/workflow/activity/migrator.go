@@ -442,9 +442,12 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
 				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
 			}
-			// CRITICAL: For same height, non-canonical blocks must be processed FIRST
-			// so canonical blocks win with "last block wins" behavior
-			return !allBlocksWithInfo[i].IsCanonical && allBlocksWithInfo[j].IsCanonical
+			// CRITICAL: For same height, non-canonical blocks should come blocks must be processed FIRST
+			// so canonical ones blocks win with "last block wins" behavior
+			if allBlocksWithInfo[i].IsCanonical != allBlocksWithInfo[j].IsCanonical {
+				return !allBlocksWithInfo[i].IsCanonical
+			}
+			return false // Preserve order for blocks with same height and canonical status
 		})
 		sortDuration := time.Since(sortStart)
 
@@ -518,87 +521,6 @@ func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, d
 	return len(allBlocksWithInfo), nil
 }
 
-func (a *Migrator) migrateBlocksAtHeight(ctx context.Context, data *MigrationData, request *MigratorRequest, height uint64) (int, error) {
-	blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
-	logger := a.getLogger(ctx)
-
-	// Get ALL blocks at this height (canonical + non-canonical) in one DynamoDB query
-	queryStart := time.Now()
-	allBlocks, err := a.getAllBlocksAtHeight(ctx, data, blockPid)
-	queryDuration := time.Since(queryStart)
-
-	if err != nil {
-		if errors.Is(err, storage.ErrItemNotFound) {
-			logger.Debug("No blocks found at height",
-				zap.Uint64("height", height),
-				zap.Duration("queryDuration", queryDuration))
-			return 0, nil
-		}
-		logger.Error("Failed to get blocks at height",
-			zap.Uint64("height", height),
-			zap.Duration("queryDuration", queryDuration),
-			zap.Error(err))
-		return 0, xerrors.Errorf("failed to get blocks at height %d: %w", height, err)
-	}
-
-	if len(allBlocks) == 0 {
-		logger.Debug("No blocks found at height", zap.Uint64("height", height))
-		return 0, nil
-	}
-
-	// Separate canonical and non-canonical blocks
-	var canonicalBlocks []*api.BlockMetadata
-	var nonCanonicalBlocks []*api.BlockMetadata
-
-	for _, blockWithInfo := range allBlocks {
-		if blockWithInfo.IsCanonical {
-			canonicalBlocks = append(canonicalBlocks, blockWithInfo.BlockMetadata)
-		} else {
-			nonCanonicalBlocks = append(nonCanonicalBlocks, blockWithInfo.BlockMetadata)
-		}
-	}
-
-	// Persist each block individually to avoid chain validation issues between different blocks at same height
-	persistStart := time.Now()
-
-	// First persist non-canonical blocks (won't become canonical in PostgreSQL)
-	for _, block := range nonCanonicalBlocks {
-		err = data.DestStorage.PersistBlockMetas(ctx, false, []*api.BlockMetadata{block}, nil)
-		if err != nil {
-			logger.Error("Failed to persist non-canonical block",
-				zap.Uint64("height", height),
-				zap.String("blockHash", block.Hash),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to persist non-canonical block at height %d: %w", height, err)
-		}
-	}
-
-	// Then persist canonical blocks (will become canonical in PostgreSQL due to "last block wins")
-	for _, block := range canonicalBlocks {
-		err = data.DestStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil)
-		if err != nil {
-			logger.Error("Failed to persist canonical block",
-				zap.Uint64("height", height),
-				zap.String("blockHash", block.Hash),
-				zap.Error(err))
-			return 0, xerrors.Errorf("failed to persist canonical block at height %d: %w", height, err)
-		}
-	}
-
-	persistDuration := time.Since(persistStart)
-	totalBlocks := len(allBlocks)
-	nonCanonicalCount := len(nonCanonicalBlocks)
-
-	logger.Debug("Persisted all blocks at height",
-		zap.Uint64("height", height),
-		zap.Int("totalBlocks", totalBlocks),
-		zap.Int("canonicalBlocks", len(canonicalBlocks)),
-		zap.Int("nonCanonicalBlocks", nonCanonicalCount),
-		zap.Duration("persistDuration", persistDuration))
-
-	return nonCanonicalCount, nil
-}
-
 // BlockWithCanonicalInfo wraps BlockMetadata with canonical information
 type BlockWithCanonicalInfo struct {
 	*api.BlockMetadata
@@ -643,7 +565,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 	// Use a map to deduplicate blocks with the same hash
 	// Keep the canonical entry if there are duplicates
 	blockMap := make(map[string]BlockWithCanonicalInfo)
-	
+
 	for _, item := range result.Items {
 		var blockEntry dynamodb_model.BlockMetaDataDDBEntry
 		err := dynamodbattribute.UnmarshalMap(item, &blockEntry)
@@ -658,7 +580,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 			BlockMetadata: dynamodb_model.BlockMetadataToProto(&blockEntry),
 			IsCanonical:   isCanonical,
 		}
-		
+
 		// Deduplicate: if we already have this block hash, keep the canonical one
 		existing, exists := blockMap[blockEntry.Hash]
 		if !exists {
@@ -668,7 +590,7 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 			blockMap[blockEntry.Hash] = blockWithInfo
 		}
 	}
-	
+
 	// Convert map to slice
 	allBlocks := make([]BlockWithCanonicalInfo, 0, len(blockMap))
 	for _, block := range blockMap {
