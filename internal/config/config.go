@@ -118,8 +118,8 @@ type (
 	AwsConfig struct {
 		Region                 string         `mapstructure:"region" validate:"required"`
 		Bucket                 string         `mapstructure:"bucket" validate:"required"`
-		Postgres               PostgresConfig `mapstructure:"postgres" validate:"required"`
-		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb" validate:"required"`
+		Postgres               PostgresConfig `mapstructure:"postgres"`
+		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb"`
 		IsLocalStack           bool           `mapstructure:"local_stack"`
 		IsResetLocal           bool           `mapstructure:"reset_local"`
 		PresignedUrlExpiration time.Duration  `mapstructure:"presigned_url_expiration" validate:"required"`
