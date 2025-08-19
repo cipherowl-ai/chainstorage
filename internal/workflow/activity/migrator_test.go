@@ -638,6 +638,7 @@ func (s *migratorActivityTestSuite) TestMigrator_ReorgIntegrationTest() {
 
 	// Sort blocks according to the migrator logic:
 	// By height first, then non-canonical before canonical for same height
+
 	sort.Slice(allBlocks, func(i, j int) bool {
 		if allBlocks[i].Height != allBlocks[j].Height {
 			return allBlocks[i].Height < allBlocks[j].Height
