@@ -39,8 +39,8 @@ type (
 	}
 
 	MigratorRequest struct {
-		StartEventSequence int64  // Start event sequence
-		EndEventSequence   int64  // End event sequence (0 = auto-detect)
+		StartEventSequence int64 // Start event sequence
+		EndEventSequence   int64 // End event sequence (0 = auto-detect)
 		EventTag           uint32
 		Tag                uint32
 		BatchSize          uint64 // Optional. If not specified, it is read from the workflow config.
@@ -340,8 +340,8 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			logger.Info("continuous sync enabled, preparing for next sync cycle")
 			newRequest := *request
 			newRequest.StartEventSequence = request.EndEventSequence
-			newRequest.EndEventSequence = 0       // Will be auto-detected on next cycle
-			newRequest.AutoResume = false         // AutoResume should only happen on first workflow run
+			newRequest.EndEventSequence = 0 // Will be auto-detected on next cycle
+			newRequest.AutoResume = false   // AutoResume should only happen on first workflow run
 
 			// Wait for syncInterval before starting a new continuous sync workflow
 			logger.Info("waiting for sync interval before next cycle",

@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -95,14 +96,14 @@ func (s *MigratorIntegrationTestSuite) createTestEvents(
 	require := testutil.Require(s.T())
 
 	events := make([]*model.EventEntry, 0, endSequence-startSequence)
-	
+
 	// Create events with some BLOCK_ADDED and BLOCK_REMOVED events
 	for seq := startSequence; seq < endSequence; seq++ {
 		var eventType api.BlockchainEvent_Type
 		var blockHeight uint64
 		var blockHash string
 		var parentHash string
-		
+
 		// Every 10th event is a BLOCK_ADDED
 		if seq%10 == 0 {
 			eventType = api.BlockchainEvent_BLOCK_ADDED
@@ -124,39 +125,39 @@ func (s *MigratorIntegrationTestSuite) createTestEvents(
 			blockHash = ""
 			parentHash = ""
 		}
-		
+
 		event := &model.EventEntry{
-			EventId:      seq,
-			EventType:    eventType,
-			BlockHeight:  blockHeight,
-			BlockHash:    blockHash,
-			ParentHash:   parentHash,
-			Tag:          tag,
-			EventTag:     eventTag,
+			EventId:     seq,
+			EventType:   eventType,
+			BlockHeight: blockHeight,
+			BlockHash:   blockHash,
+			ParentHash:  parentHash,
+			Tag:         tag,
+			EventTag:    eventTag,
 		}
 		events = append(events, event)
-		
+
 		// Add reorg at specific height
 		if includeReorg && seq == startSequence+50 {
 			// Add another BLOCK_ADDED at same height (reorg)
 			reorgEvent := &model.EventEntry{
-				EventId:      seq + 1,
-				EventType:    api.BlockchainEvent_BLOCK_ADDED,
-				BlockHeight:  blockHeight,
-				BlockHash:    generateHash(blockHeight, 2), // Different hash for reorg
-				ParentHash:   parentHash,
-				Tag:          tag,
-				EventTag:     eventTag,
+				EventId:     seq + 1,
+				EventType:   api.BlockchainEvent_BLOCK_ADDED,
+				BlockHeight: blockHeight,
+				BlockHash:   generateHash(blockHeight, 2), // Different hash for reorg
+				ParentHash:  parentHash,
+				Tag:         tag,
+				EventTag:    eventTag,
 			}
 			events = append(events, reorgEvent)
 			seq++ // Skip next sequence since we used it
 		}
 	}
-	
+
 	// Store events in DynamoDB
 	err := deps.MetaStorage.AddEventEntries(ctx, eventTag, events)
 	require.NoError(err, "Failed to store events in DynamoDB")
-	
+
 	// For each BLOCK_ADDED event, fetch and store the actual block
 	for _, event := range events {
 		if event.EventType == api.BlockchainEvent_BLOCK_ADDED {
@@ -174,36 +175,36 @@ func (s *MigratorIntegrationTestSuite) createTestEvents(
 					},
 				}
 			}
-			
+
 			// Upload to blob storage
 			objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
 			require.NoError(err, "Failed to upload block at height %d", event.BlockHeight)
-			
+
 			// Update metadata with object key
 			block.Metadata.ObjectKeyMain = objectKey
-			
+
 			// Store in DynamoDB metadata storage
 			err = deps.MetaStorage.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil)
 			require.NoError(err, "Failed to store block in DynamoDB at height %d", event.BlockHeight)
 		}
 	}
-	
+
 	return nil
 }
 
 // Helper to generate deterministic hash for testing
 func generateHash(height uint64, variant int) string {
-	return string(height*1000 + uint64(variant))
+	return fmt.Sprintf("0x%x", height*1000+uint64(variant))
 }
 
 // Test event-driven migration
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_EventDriven() {
 	const (
-		tag            = uint32(1)
-		eventTag       = uint32(3)
-		startSequence  = int64(1000)
-		endSequence    = int64(1500)
-		batchSize      = 100
+		tag           = uint32(1)
+		eventTag      = uint32(3)
+		startSequence = int64(1000)
+		endSequence   = int64(1500)
+		batchSize     = 100
 	)
 
 	require := testutil.Require(s.T())
@@ -250,11 +251,11 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_EventDriven() {
 // Test event-driven migration with reorgs
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_WithReorgs() {
 	const (
-		tag            = uint32(1)
-		eventTag       = uint32(3)
-		startSequence  = int64(2000)
-		endSequence    = int64(2200)
-		batchSize      = 50
+		tag           = uint32(1)
+		eventTag      = uint32(3)
+		startSequence = int64(2000)
+		endSequence   = int64(2200)
+		batchSize     = 50
 	)
 
 	require := testutil.Require(s.T())
@@ -294,12 +295,12 @@ func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_WithReorgs() {
 // Test auto-resume functionality
 func (s *MigratorIntegrationTestSuite) TestMigratorIntegration_AutoResume() {
 	const (
-		tag            = uint32(1)
-		eventTag       = uint32(3)
-		initialStart   = int64(3000)
-		midPoint       = int64(3100)
-		endSequence    = int64(3200)
-		batchSize      = 50
+		tag          = uint32(1)
+		eventTag     = uint32(3)
+		initialStart = int64(3000)
+		midPoint     = int64(3100)
+		endSequence  = int64(3200)
+		batchSize    = 50
 	)
 
 	require := testutil.Require(s.T())

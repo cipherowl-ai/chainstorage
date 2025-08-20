@@ -71,7 +71,7 @@ func (s *migratorActivityTestSuite) TestMigrator_EventDrivenRequest() {
 		EventTag:           uint32(0),
 		Parallelism:        4,
 	}
-	
+
 	require.NotNil(request)
 	require.Equal(int64(1000), request.StartEventSequence)
 	require.Equal(int64(1050), request.EndEventSequence)
@@ -104,53 +104,53 @@ func (s *migratorActivityTestSuite) TestExtractBlocksFromEvents() {
 	// Create test events with BLOCK_ADDED and BLOCK_REMOVED
 	events := []*model.EventEntry{
 		{
-			EventId:      1001,
-			EventType:    api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight:  100,
-			BlockHash:    "0xaaa",
-			ParentHash:   "0x999",
+			EventId:     1001,
+			EventType:   api.BlockchainEvent_BLOCK_ADDED,
+			BlockHeight: 100,
+			BlockHash:   "0xaaa",
+			ParentHash:  "0x999",
 		},
 		{
-			EventId:      1002,
-			EventType:    api.BlockchainEvent_BLOCK_REMOVED,
-			BlockHeight:  100,
-			BlockHash:    "0xbbb",
-			ParentHash:   "0x999",
+			EventId:     1002,
+			EventType:   api.BlockchainEvent_BLOCK_REMOVED,
+			BlockHeight: 100,
+			BlockHash:   "0xbbb",
+			ParentHash:  "0x999",
 		},
 		{
-			EventId:      1003,
-			EventType:    api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight:  100,
-			BlockHash:    "0xccc",
-			ParentHash:   "0x999",
+			EventId:     1003,
+			EventType:   api.BlockchainEvent_BLOCK_ADDED,
+			BlockHeight: 100,
+			BlockHash:   "0xccc",
+			ParentHash:  "0x999",
 		},
 		{
-			EventId:      1004,
-			EventType:    api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight:  101,
-			BlockHash:    "0xddd",
-			ParentHash:   "0xccc",
+			EventId:     1004,
+			EventType:   api.BlockchainEvent_BLOCK_ADDED,
+			BlockHeight: 101,
+			BlockHash:   "0xddd",
+			ParentHash:  "0xccc",
 		},
 	}
 
 	// Extract blocks from events
 	blocks := s.migrator.extractBlocksFromEvents(s.app.Logger(), events)
-	
+
 	// Should extract only BLOCK_ADDED events
 	require.Len(blocks, 3)
-	
+
 	// Check first block
 	require.Equal(uint64(100), blocks[0].Height)
 	require.Equal("0xaaa", blocks[0].Hash)
 	require.Equal("0x999", blocks[0].ParentHash)
 	require.Equal(int64(1001), blocks[0].EventSeq)
-	
+
 	// Check second block (reorg at height 100)
 	require.Equal(uint64(100), blocks[1].Height)
 	require.Equal("0xccc", blocks[1].Hash)
 	require.Equal("0x999", blocks[1].ParentHash)
 	require.Equal(int64(1003), blocks[1].EventSeq)
-	
+
 	// Check third block
 	require.Equal(uint64(101), blocks[2].Height)
 	require.Equal("0xddd", blocks[2].Hash)
@@ -247,15 +247,15 @@ func (s *migratorActivityTestSuite) TestBlockWithInfo_Sorting() {
 	// Verify sorting
 	require.Equal(uint64(99), blocks[0].Height)
 	require.Equal("0x999", blocks[0].Hash)
-	
+
 	require.Equal(uint64(100), blocks[1].Height)
 	require.Equal("0xaaa", blocks[1].Hash)
 	require.Equal(int64(1001), blocks[1].EventSeq)
-	
+
 	require.Equal(uint64(100), blocks[2].Height)
 	require.Equal("0xbbb", blocks[2].Hash)
 	require.Equal(int64(1003), blocks[2].EventSeq) // Later sequence comes second
-	
+
 	require.Equal(uint64(101), blocks[3].Height)
 	require.Equal("0xccc", blocks[3].Hash)
 }
@@ -281,9 +281,9 @@ func (s *migratorActivityTestSuite) TestParallelEventFetching() {
 	totalSequences := int64(1000)
 	parallelism := 8
 	expectedMiniBatchSize := (totalSequences + int64(parallelism) - 1) / int64(parallelism)
-	
+
 	require.Equal(int64(125), expectedMiniBatchSize)
-	
+
 	// Test work distribution
 	var batches []struct{ start, end int64 }
 	for start := int64(0); start < totalSequences; start += expectedMiniBatchSize {
@@ -293,7 +293,7 @@ func (s *migratorActivityTestSuite) TestParallelEventFetching() {
 		}
 		batches = append(batches, struct{ start, end int64 }{start, end})
 	}
-	
+
 	require.Len(batches, parallelism)
 	require.Equal(int64(0), batches[0].start)
 	require.Equal(int64(125), batches[0].end)

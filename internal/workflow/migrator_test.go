@@ -75,11 +75,11 @@ func (s *migratorTestSuite) TestMigrator_EventDriven_Success() {
 			require.Equal(tag, request.Tag)
 			expectedEventTag := s.cfg.Workflows.Migrator.GetEffectiveEventTag(eventTag)
 			require.Equal(expectedEventTag, request.EventTag)
-			
+
 			// Event-driven migration processes both blocks and events
 			eventCount := request.EndEventSequence - request.StartEventSequence
 			blockCount := eventCount / 10 // Assume roughly 10% are BLOCK_ADDED events
-			
+
 			return &activity.MigratorResponse{
 				BlocksMigrated: int(blockCount),
 				EventsMigrated: int(eventCount),
@@ -139,7 +139,7 @@ func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
 			// Each batch should be customBatchSize
 			batchSize := request.EndEventSequence - request.StartEventSequence
 			require.LessOrEqual(batchSize, int64(customBatchSize))
-			
+
 			return &activity.MigratorResponse{
 				BlocksMigrated: 50,
 				EventsMigrated: int(batchSize),
@@ -179,7 +179,7 @@ func (s *migratorTestSuite) TestMigrator_AutoResume() {
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			// Should start from next sequence after latest
 			require.Equal(int64(5001), request.StartEventSequence)
-			
+
 			return &activity.MigratorResponse{
 				BlocksMigrated: 100,
 				EventsMigrated: 1000,
@@ -213,7 +213,7 @@ func (s *migratorTestSuite) TestMigrator_ContinuousSync() {
 				// Stop after 2 iterations to prevent infinite loop in test
 				s.env.CancelWorkflow()
 			}
-			
+
 			return &activity.MigratorResponse{
 				BlocksMigrated: 100,
 				EventsMigrated: 1000,
@@ -230,7 +230,7 @@ func (s *migratorTestSuite) TestMigrator_ContinuousSync() {
 		ContinuousSync:     true,
 		SyncInterval:       "1s",
 	})
-	
+
 	// Should get a continue-as-new error for continuous sync
 	if err != nil {
 		require.True(IsContinueAsNewError(err) || s.env.IsWorkflowCompleted())
@@ -250,7 +250,7 @@ func (s *migratorTestSuite) TestMigrator_Parallelism() {
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			// Verify parallelism is passed through
 			require.Equal(parallelism, request.Parallelism)
-			
+
 			eventCount := request.EndEventSequence - request.StartEventSequence
 			return &activity.MigratorResponse{
 				BlocksMigrated: int(eventCount / 10),
@@ -282,14 +282,14 @@ func (s *migratorTestSuite) TestMigrator_LargeMigration() {
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			batchCount++
-			
+
 			// Each batch should be the configured batch size
 			batchSize := request.EndEventSequence - request.StartEventSequence
 			require.LessOrEqual(batchSize, int64(migratorBatchSize))
-			
+
 			// Simulate processing
 			blockCount := batchSize / 10
-			
+
 			return &activity.MigratorResponse{
 				BlocksMigrated: int(blockCount),
 				EventsMigrated: int(batchSize),
@@ -307,11 +307,11 @@ func (s *migratorTestSuite) TestMigrator_LargeMigration() {
 		BatchSize:          migratorBatchSize,
 		CheckpointSize:     migratorCheckpointSize,
 	})
-	
+
 	// Should hit checkpoint and continue-as-new
 	require.Error(err)
 	require.True(IsContinueAsNewError(err))
-	
+
 	// Should have processed checkpoint size worth of events
 	expectedBatches := int(migratorCheckpointSize / migratorBatchSize)
 	require.Equal(expectedBatches, batchCount)
