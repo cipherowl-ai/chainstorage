@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
@@ -26,6 +25,7 @@ type (
 		getLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		getLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		getLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
+		getMaxEventId              *activity.GetMaxEventIdActivity
 	}
 
 	MigratorParams struct {
@@ -36,23 +36,21 @@ type (
 		GetLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		GetLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		GetLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
+		GetMaxEventId              *activity.GetMaxEventIdActivity
 	}
 
 	MigratorRequest struct {
-		StartHeight     uint64
-		EndHeight       uint64 // Optional. If not specified, will query latest block from DynamoDB.
-		EventTag        uint32
-		Tag             uint32
-		BatchSize       uint64 // Optional. If not specified, it is read from the workflow config.
-		MiniBatchSize   uint64 // Optional. If not specified, it is read from the workflow config.
-		CheckpointSize  uint64 // Optional. If not specified, it is read from the workflow config.
-		Parallelism     int    // Optional. If not specified, it is read from the workflow config.
-		SkipEvents      bool   // Optional. Skip event migration (blocks only)
-		SkipBlocks      bool   // Optional. Skip block migration (events only)
-		BackoffInterval string // Optional. If not specified, it is read from the workflow config.
-		ContinuousSync  bool   // Optional. Whether to continuously sync data in infinite loop mode
-		SyncInterval    string // Optional. Interval for continuous sync (e.g., "1m", "30s"). Defaults to 1 minute if not specified or invalid.
-		AutoResume      bool   // Optional. Automatically determine StartHeight from latest block in PostgreSQL destination
+		StartEventSequence int64 // Start event sequence
+		EndEventSequence   int64 // End event sequence (0 = auto-detect)
+		EventTag           uint32
+		Tag                uint32
+		BatchSize          uint64 // Optional. If not specified, it is read from the workflow config.
+		CheckpointSize     uint64 // Optional. If not specified, it is read from the workflow config.
+		Parallelism        int    // Optional. If not specified, it is read from the workflow config.
+		BackoffInterval    string // Optional. If not specified, it is read from the workflow config.
+		ContinuousSync     bool   // Optional. Whether to continuously sync data in infinite loop mode
+		SyncInterval       string // Optional. Interval for continuous sync (e.g., "1m", "30s"). Defaults to 1 minute if not specified or invalid.
+		AutoResume         bool   // Optional. Automatically determine StartEventSequence from latest event in PostgreSQL destination
 	}
 )
 
@@ -75,17 +73,16 @@ func NewMigrator(params MigratorParams) *Migrator {
 		getLatestBlockHeight:       params.GetLatestBlockHeight,
 		getLatestBlockFromPostgres: params.GetLatestBlockFromPostgres,
 		getLatestEventFromPostgres: params.GetLatestEventFromPostgres,
+		getMaxEventId:              params.GetMaxEventId,
 	}
 	w.registerWorkflow(w.execute)
 	return w
 }
 
 func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (client.WorkflowRun, error) {
-	// Add timestamp to workflow ID to avoid ALLOW_DUPLICATE_FAILED_ONLY policy conflicts
-	timestamp := time.Now().Unix()
-	workflowID := fmt.Sprintf("%s-%d", w.name, timestamp)
+	workflowID := w.name
 	if request.Tag != 0 {
-		workflowID = fmt.Sprintf("%s-%d/block_tag=%d", w.name, timestamp, request.Tag)
+		workflowID = fmt.Sprintf("%s/block_tag=%d", w.name, request.Tag)
 	}
 	return w.startMigratorWorkflow(ctx, workflowID, request)
 }
@@ -101,7 +98,6 @@ func (w *Migrator) startMigratorWorkflow(ctx context.Context, workflowID string,
 		ID:                                       workflowID,
 		TaskQueue:                                cfg.TaskList,
 		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
-		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
 		RetryPolicy:                              w.getRetryPolicy(cfg.WorkflowRetry),
 	}
@@ -123,10 +119,7 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			return xerrors.Errorf("failed to read config: %w", err)
 		}
 
-		// Both skip flags cannot be true
-		if request.SkipEvents && request.SkipBlocks {
-			return xerrors.New("cannot skip both events and blocks - nothing to migrate")
-		}
+		// Event-driven migration always processes both blocks and events
 
 		batchSize := cfg.BatchSize
 		if request.BatchSize > 0 {
@@ -183,64 +176,81 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Set up activity options early so we can use activities
 		ctx = w.withActivityOptions(ctx)
 
-		// Handle auto-resume functionality - use latest event height instead of block height
-		if request.AutoResume && request.StartHeight == 0 {
+		// Handle auto-resume functionality - use latest event sequence
+		if request.AutoResume && request.StartEventSequence == 0 {
 			logger.Info("AutoResume enabled, querying PostgreSQL destination for latest migrated event")
 			postgresEventResp, err := w.getLatestEventFromPostgres.Execute(ctx, &activity.GetLatestEventFromPostgresRequest{EventTag: eventTag})
 			if err != nil {
-				return xerrors.Errorf("failed to get latest event height from PostgreSQL: %w", err)
+				return xerrors.Errorf("failed to get latest event from PostgreSQL: %w", err)
 			}
 
 			if postgresEventResp.Found {
-				// Resume from the latest event height (blocks will be remigrated if needed, PostgreSQL handles duplicates)
-				request.StartHeight = postgresEventResp.Height
+				// Resume from the next event sequence
+				request.StartEventSequence = postgresEventResp.Sequence + 1
 				logger.Info("Auto-resume: found latest event in PostgreSQL destination",
-					zap.Uint64("latestEventHeight", postgresEventResp.Height),
-					zap.Uint64("resumeFromHeight", request.StartHeight))
+					zap.Int64("latestEventSequence", postgresEventResp.Sequence),
+					zap.Int64("resumeFromSequence", request.StartEventSequence))
 			} else {
 				// No events found in destination, start from the beginning
-				request.StartHeight = 0
+				request.StartEventSequence = 1 // Events start at 1
 				logger.Info("Auto-resume: no events found in PostgreSQL destination, starting from beginning")
 			}
 		}
 
-		// Handle end height auto-detection if not provided
-		if request.EndHeight == 0 {
-			logger.Info("No end height provided, fetching latest block height from DynamoDB via activity...")
-			resp, err := w.getLatestBlockHeight.Execute(ctx, &activity.GetLatestBlockHeightRequest{Tag: tag})
+		// Handle end event sequence auto-detection if not provided
+		if request.EndEventSequence == 0 {
+			logger.Info("No end event sequence provided, fetching max event ID from DynamoDB...")
+
+			// Query DynamoDB for the actual max event ID
+			maxEventResp, err := w.getMaxEventId.Execute(ctx, &activity.GetMaxEventIdRequest{
+				EventTag: eventTag,
+			})
 			if err != nil {
-				return xerrors.Errorf("failed to get latest block height from DynamoDB: %w", err)
+				return xerrors.Errorf("failed to get max event ID from DynamoDB: %w", err)
 			}
 
-			if continuousSync {
-				// For continuous sync, set end height to current latest block
-				request.EndHeight = resp.Height + 1
-				logger.Info("Auto-detected end height for continuous sync", zap.Uint64("endHeight", request.EndHeight))
-			} else {
-				request.EndHeight = resp.Height + 1
-				logger.Info("Auto-detected end height from DynamoDB", zap.Uint64("endHeight", request.EndHeight))
+			if !maxEventResp.Found {
+				logger.Warn("No events found in DynamoDB")
+				if continuousSync {
+					// In continuous sync, if no events exist yet, wait and retry
+					logger.Info("No events in DynamoDB, waiting for sync interval before retry",
+						zap.Duration("syncInterval", syncInterval))
+					err := workflow.Sleep(ctx, syncInterval)
+					if err != nil {
+						return xerrors.Errorf("workflow sleep failed while waiting for events: %w", err)
+					}
+					// Continue as new to retry
+					newRequest := *request
+					return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
+				}
+				return xerrors.New("No events found in DynamoDB to migrate")
 			}
+
+			request.EndEventSequence = maxEventResp.MaxEventId
+			logger.Info("Found max event ID in DynamoDB",
+				zap.Int64("maxEventId", maxEventResp.MaxEventId),
+				zap.Int64("startEventSequence", request.StartEventSequence))
 		}
 
-		// Validate end height after auto-detection and auto-resume
-		if !continuousSync && request.StartHeight >= request.EndHeight {
-			return xerrors.Errorf("startHeight (%d) must be less than endHeight (%d)",
-				request.StartHeight, request.EndHeight)
+		// Validate end sequence after auto-detection and auto-resume
+		if !continuousSync && request.StartEventSequence >= request.EndEventSequence {
+			return xerrors.Errorf("startEventSequence (%d) must be less than endEventSequence (%d)",
+				request.StartEventSequence, request.EndEventSequence)
 		}
 
 		// Additional handling for continuous sync:
-		// If EndHeight <= StartHeight, we are caught up. Instead of erroring, schedule next cycle.
-		if continuousSync && request.EndHeight != 0 && request.EndHeight <= request.StartHeight {
-			logger.Info("Continuous sync: caught up (no new blocks). Running event catch-up before next cycle",
-				zap.Uint64("startHeight", request.StartHeight),
-				zap.Uint64("endHeight", request.EndHeight))
+		// If EndEventSequence <= StartEventSequence, we are caught up.
+		if continuousSync && request.EndEventSequence != 0 && request.EndEventSequence <= request.StartEventSequence {
+			logger.Info("Continuous sync: caught up (no new events).",
+				zap.Int64("startEventSequence", request.StartEventSequence),
+				zap.Int64("endEventSequence", request.EndEventSequence))
 
 			// No special event catch-up needed - normal migration handles this
 
 			// Prepare for next cycle
 			newRequest := *request
-			newRequest.StartHeight = request.EndHeight
-			newRequest.EndHeight = 0 // re-detect on next cycle
+			newRequest.StartEventSequence = request.EndEventSequence
+			newRequest.EndEventSequence = 0 // re-detect on next cycle
 
 			// Wait for syncInterval before starting a new continuous sync workflow
 			logger.Info("waiting for sync interval before next catch-up cycle",
@@ -251,66 +261,60 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			}
 
 			logger.Info("starting next continuous sync cycle after catch-up",
-				zap.Uint64("nextStartHeight", newRequest.StartHeight))
+				zap.Int64("nextStartEventSequence", newRequest.StartEventSequence))
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
 		// Special case: if auto-resume found we're already caught up
-		if request.AutoResume && request.StartHeight >= request.EndHeight {
+		if request.AutoResume && request.StartEventSequence >= request.EndEventSequence {
 			logger.Info("Auto-resume detected: already caught up, no migration needed",
-				zap.Uint64("startHeight", request.StartHeight),
-				zap.Uint64("endHeight", request.EndHeight))
+				zap.Int64("startEventSequence", request.StartEventSequence),
+				zap.Int64("endEventSequence", request.EndEventSequence))
 			return nil // Successfully completed with no work to do
 		}
 
-		// Validate skip-blocks requirements (moved here after logger is available)
-		if request.SkipBlocks && !request.SkipEvents {
-			logger.Warn("Events-only migration requested (skip-blocks=true)")
-			logger.Warn("Block metadata must already exist in PostgreSQL for this height range")
-			logger.Warn("If validation fails, migrate blocks first with skip-events=true")
-		}
+		// Log migration mode
+		logger.Info("Starting event-driven migration workflow")
 
 		logger.Info("migrator workflow started")
 
-		totalHeightRange := request.EndHeight - request.StartHeight
-		processedHeights := uint64(0)
+		totalEventRange := request.EndEventSequence - request.StartEventSequence
+		processedEvents := int64(0)
 
-		for batchStart := request.StartHeight; batchStart < request.EndHeight; batchStart += batchSize {
+		for batchStart := request.StartEventSequence; batchStart < request.EndEventSequence; batchStart += int64(batchSize) {
 			// Check for checkpoint - only check after processing at least one batch
-			processedSoFar := batchStart - request.StartHeight
-			if processedSoFar > 0 && processedSoFar >= checkpointSize {
+			processedSoFar := batchStart - request.StartEventSequence
+			if processedSoFar > 0 && processedSoFar >= int64(checkpointSize) {
 				newRequest := *request
-				newRequest.StartHeight = batchStart
+				newRequest.StartEventSequence = batchStart
 				logger.Info("checkpoint reached", zap.Reflect("newRequest", newRequest))
 				return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 			}
 
-			batchEnd := batchStart + batchSize
-			if batchEnd > request.EndHeight {
-				batchEnd = request.EndHeight
+			batchEnd := batchStart + int64(batchSize)
+			if batchEnd > request.EndEventSequence {
+				batchEnd = request.EndEventSequence
 			}
 
-			logger.Info("migrating batch",
-				zap.Uint64("batchStart", batchStart),
-				zap.Uint64("batchEnd", batchEnd))
+			logger.Info("migrating event batch",
+				zap.Int64("batchStart", batchStart),
+				zap.Int64("batchEnd", batchEnd))
 
 			// Execute a single migrator activity for the entire batch.
 			migratorRequest := &activity.MigratorRequest{
-				StartHeight: batchStart,
-				EndHeight:   batchEnd,
-				EventTag:    eventTag,
-				Tag:         tag,
-				Parallelism: parallelism,
-				SkipEvents:  request.SkipEvents,
-				SkipBlocks:  request.SkipBlocks,
+				StartEventSequence: batchStart,
+				EndEventSequence:   batchEnd,
+				EventTag:           eventTag,
+				Tag:                tag,
+				Parallelism:        parallelism,
 			}
 
 			response, err := w.migrator.Execute(ctx, migratorRequest)
 			if err != nil {
 				logger.Error(
 					"failed to migrate batch",
-					zap.Uint64("batchStart", batchStart),
-					zap.Uint64("batchEnd", batchEnd),
+					zap.Int64("batchStart", batchStart),
+					zap.Int64("batchEnd", batchEnd),
 					zap.Error(err),
 				)
 				return xerrors.Errorf("failed to migrate batch [%v, %v): %w", batchStart, batchEnd, err)
@@ -318,16 +322,16 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			if !response.Success {
 				logger.Error(
 					"migration batch failed",
-					zap.Uint64("batchStart", batchStart),
-					zap.Uint64("batchEnd", batchEnd),
+					zap.Int64("batchStart", batchStart),
+					zap.Int64("batchEnd", batchEnd),
 					zap.String("message", response.Message),
 				)
 				return xerrors.Errorf("migration batch failed [%v, %v): %s", batchStart, batchEnd, response.Message)
 			}
 
 			// Update metrics for the whole batch after all shards complete
-			processedHeights += batchEnd - batchStart
-			progress := float64(processedHeights) / float64(totalHeightRange) * 100
+			processedEvents += batchEnd - batchStart
+			progress := float64(processedEvents) / float64(totalEventRange) * 100
 
 			metrics.Gauge(migratorHeightGauge).Update(float64(batchEnd - 1))
 			metrics.Counter(migratorBlocksCounter).Inc(int64(response.BlocksMigrated))
@@ -336,8 +340,8 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 
 			logger.Info(
 				"migrated batch successfully",
-				zap.Uint64("batchStart", batchStart),
-				zap.Uint64("batchEnd", batchEnd),
+				zap.Int64("batchStart", batchStart),
+				zap.Int64("batchEnd", batchEnd),
 				zap.Int("blocksMigrated", response.BlocksMigrated),
 				zap.Int("eventsMigrated", response.EventsMigrated),
 				zap.Float64("progress", progress),
@@ -352,9 +356,9 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		if continuousSync {
 			logger.Info("continuous sync enabled, preparing for next sync cycle")
 			newRequest := *request
-			newRequest.StartHeight = request.EndHeight
-			newRequest.EndHeight = 0      // Will be auto-detected on next cycle
-			newRequest.AutoResume = false // AutoResume should only happen on first workflow run
+			newRequest.StartEventSequence = request.EndEventSequence
+			newRequest.EndEventSequence = 0 // Will be auto-detected on next cycle
+			newRequest.AutoResume = false   // AutoResume should only happen on first workflow run
 
 			// Wait for syncInterval before starting a new continuous sync workflow
 			logger.Info("waiting for sync interval before next cycle",
@@ -365,14 +369,14 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			}
 
 			logger.Info("starting new continuous sync workflow",
-				zap.Uint64("nextStartHeight", newRequest.StartHeight),
+				zap.Int64("nextStartEventSequence", newRequest.StartEventSequence),
 				zap.Reflect("newRequest", newRequest))
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
 		logger.Info("migrator workflow finished",
-			zap.Uint64("totalHeights", totalHeightRange),
-			zap.Uint64("processedHeights", processedHeights))
+			zap.Int64("totalEvents", totalEventRange),
+			zap.Int64("processedEvents", processedEvents))
 
 		return nil
 	})
