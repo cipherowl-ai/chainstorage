@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-playground/validator/v10"
+
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
@@ -145,41 +147,49 @@ func TestDerivedConfigValues(t *testing.T) {
 		normalizedConfigName := strings.ReplaceAll(configName, "_", "-")
 
 		// Verify template derived configs.
-		dynamoDB := config.DynamoDBConfig{
-			BlockTable:                    fmt.Sprintf("example_chainstorage_blocks_%v", configName),
-			EventTable:                    cfg.AWS.DynamoDB.EventTable,
-			EventTableHeightIndex:         cfg.AWS.DynamoDB.EventTableHeightIndex,
-			VersionedEventTable:           fmt.Sprintf("example_chainstorage_versioned_block_events_%v", configName),
-			VersionedEventTableBlockIndex: fmt.Sprintf("example_chainstorage_versioned_block_events_by_block_id_%v", configName),
-			TransactionTable:              cfg.AWS.DynamoDB.TransactionTable,
-			// Skip DynamoDB.Arn verification
-			Arn: "",
+		var dynamoDBPtr *config.DynamoDBConfig
+		if cfg.AWS.DynamoDB != nil {
+			dynamoDB := config.DynamoDBConfig{
+				BlockTable:                    fmt.Sprintf("example_chainstorage_blocks_%v", configName),
+				EventTable:                    cfg.AWS.DynamoDB.EventTable,
+				EventTableHeightIndex:         cfg.AWS.DynamoDB.EventTableHeightIndex,
+				VersionedEventTable:           fmt.Sprintf("example_chainstorage_versioned_block_events_%v", configName),
+				VersionedEventTableBlockIndex: fmt.Sprintf("example_chainstorage_versioned_block_events_by_block_id_%v", configName),
+				TransactionTable:              cfg.AWS.DynamoDB.TransactionTable,
+				// Skip DynamoDB.Arn verification
+				Arn: "",
+			}
+			dynamoDBPtr = &dynamoDB
 		}
 
-		postgres := config.PostgresConfig{
-			Host:             cfg.AWS.Postgres.Host,
-			Port:             cfg.AWS.Postgres.Port,
-			Database:         cfg.AWS.Postgres.Database,
-			User:             cfg.AWS.Postgres.User,
-			Password:         cfg.AWS.Postgres.Password,
-			SSLMode:          cfg.AWS.Postgres.SSLMode,
-			MaxConnections:   cfg.AWS.Postgres.MaxConnections,
-			MinConnections:   cfg.AWS.Postgres.MinConnections,
-			MaxIdleTime:      cfg.AWS.Postgres.MaxIdleTime,
-			MaxLifetime:      cfg.AWS.Postgres.MaxLifetime,
-			ConnectTimeout:   cfg.AWS.Postgres.ConnectTimeout,
-			StatementTimeout: cfg.AWS.Postgres.StatementTimeout,
-			Schema:           cfg.AWS.Postgres.Schema,
-			TablePrefix:      cfg.AWS.Postgres.TablePrefix,
+		var postgresPtr *config.PostgresConfig
+		if cfg.AWS.Postgres != nil {
+			postgres := config.PostgresConfig{
+				Host:             cfg.AWS.Postgres.Host,
+				Port:             cfg.AWS.Postgres.Port,
+				Database:         cfg.AWS.Postgres.Database,
+				User:             cfg.AWS.Postgres.User,
+				Password:         cfg.AWS.Postgres.Password,
+				SSLMode:          cfg.AWS.Postgres.SSLMode,
+				MaxConnections:   cfg.AWS.Postgres.MaxConnections,
+				MinConnections:   cfg.AWS.Postgres.MinConnections,
+				MaxIdleTime:      cfg.AWS.Postgres.MaxIdleTime,
+				MaxLifetime:      cfg.AWS.Postgres.MaxLifetime,
+				ConnectTimeout:   cfg.AWS.Postgres.ConnectTimeout,
+				StatementTimeout: cfg.AWS.Postgres.StatementTimeout,
+				Schema:           cfg.AWS.Postgres.Schema,
+				TablePrefix:      cfg.AWS.Postgres.TablePrefix,
+			}
+			postgresPtr = &postgres
 		}
 
 		expectedAWS := config.AwsConfig{
 			Region:                 "us-east-1",
 			Bucket:                 fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
-			DynamoDB:               dynamoDB,
-			Postgres:               postgres,
-			IsLocalStack:           true,
-			IsResetLocal:           true,
+			DynamoDB:               dynamoDBPtr,
+			Postgres:               postgresPtr,
+			IsLocalStack:           cfg.AWS.IsLocalStack,
+			IsResetLocal:           cfg.AWS.IsResetLocal,
 			PresignedUrlExpiration: 30 * time.Minute,
 			DLQ: config.SQSConfig{
 				Name:                  fmt.Sprintf("example_chainstorage_blocks_%v_dlq", configName),
@@ -1086,4 +1096,90 @@ func TestDefaultHttpTimeout(t *testing.T) {
 	cfg, err := config.New()
 	require.NoError(err)
 	require.Equal(0*time.Second, cfg.Chain.Client.HttpTimeout)
+}
+
+func TestValidateAWSstorageConfig(t *testing.T) {
+	// Test that Postgres validation is skipped when Postgres is nil
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+
+	// Test 1: DynamoDB config when Postgres is nil
+	cfg.AWS.Postgres = nil
+	cfg.AWS.DynamoDB = &config.DynamoDBConfig{
+		BlockTable:                    "block_table",
+		VersionedEventTable:           "versioned_event_table",
+		VersionedEventTableBlockIndex: "versioned_event_table_block_index",
+	}
+
+	// Validate the config - this should NOT fail even though Postgres is nil
+	// and its fields (Host, Port, Database, SSLMode) are marked as required
+	validate := validator.New()
+	err = validate.Struct(&cfg.AWS)
+	require.NoError(err, "Validation should not fail when Postgres is nil")
+
+	require.Equal("block_table", cfg.AWS.DynamoDB.BlockTable)
+	require.Equal("versioned_event_table", cfg.AWS.DynamoDB.VersionedEventTable)
+	require.Equal("versioned_event_table_block_index", cfg.AWS.DynamoDB.VersionedEventTableBlockIndex)
+	cfg.AWS.DynamoDB = &config.DynamoDBConfig{
+		BlockTable:                    "block_table",
+		VersionedEventTable:           "versioned_event_table",
+		VersionedEventTableBlockIndex: "versioned_event_table_block_index",
+	}
+	require.Equal("block_table", cfg.AWS.DynamoDB.BlockTable)
+	require.Equal("versioned_event_table", cfg.AWS.DynamoDB.VersionedEventTable)
+	require.Equal("versioned_event_table_block_index", cfg.AWS.DynamoDB.VersionedEventTableBlockIndex)
+	// Test 2: Postgres config when DynamoDB is nil - with valid config
+	cfg.AWS.DynamoDB = nil
+	cfg.AWS.Postgres = &config.PostgresConfig{
+		Host:     "localhost",
+		Port:     5432,
+		Database: "chainstorage",
+		SSLMode:  "disable",
+	}
+	err = validate.Struct(&cfg.AWS)
+	require.NoError(err, "Validation should pass with valid Postgres config")
+	require.Equal("localhost", cfg.AWS.Postgres.Host)
+	require.Equal(5432, cfg.AWS.Postgres.Port)
+	require.Equal("chainstorage", cfg.AWS.Postgres.Database)
+	require.Equal("disable", cfg.AWS.Postgres.SSLMode)
+
+	// Test 3: Postgres config with missing required fields should fail validation
+	cfg.AWS.DynamoDB = nil
+	cfg.AWS.Postgres = &config.PostgresConfig{
+		Host: "localhost",
+		Port: 5432,
+		// Missing Database and SSLMode which are required
+	}
+	err = validate.Struct(&cfg.AWS)
+	require.Error(err, "Validation should fail when Postgres is not nil but has missing required fields")
+	// Test 4: Both configs valid when both are not nil
+	cfg.AWS.DynamoDB = &config.DynamoDBConfig{
+		BlockTable:                    "block_table",
+		VersionedEventTable:           "versioned_event_table",
+		VersionedEventTableBlockIndex: "versioned_event_table_block_index",
+	}
+	cfg.AWS.Postgres = &config.PostgresConfig{
+		Host:     "localhost",
+		Port:     5432,
+		Database: "chainstorage",
+		SSLMode:  "disable",
+	}
+	err = validate.Struct(&cfg.AWS)
+	require.NoError(err, "Validation should pass when both configs are valid")
+	require.Equal("block_table", cfg.AWS.DynamoDB.BlockTable)
+	require.Equal("versioned_event_table", cfg.AWS.DynamoDB.VersionedEventTable)
+	require.Equal("versioned_event_table_block_index", cfg.AWS.DynamoDB.VersionedEventTableBlockIndex)
+	require.Equal("localhost", cfg.AWS.Postgres.Host)
+	require.Equal(5432, cfg.AWS.Postgres.Port)
+	require.Equal("chainstorage", cfg.AWS.Postgres.Database)
+	require.Equal("disable", cfg.AWS.Postgres.SSLMode)
+
+	// Test 5: Both configs nil - validation should FAIL
+	// because at least one storage backend is required (required_without validation)
+	cfg.AWS.DynamoDB = nil
+	cfg.AWS.Postgres = nil
+	err = validate.Struct(&cfg.AWS)
+	require.Error(err, "Validation should fail when both configs are nil - at least one storage backend is required")
 }

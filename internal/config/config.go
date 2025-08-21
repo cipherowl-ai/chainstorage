@@ -116,16 +116,16 @@ type (
 	}
 
 	AwsConfig struct {
-		Region                 string         `mapstructure:"region" validate:"required"`
-		Bucket                 string         `mapstructure:"bucket" validate:"required"`
-		Postgres               PostgresConfig `mapstructure:"postgres" validate:"required"`
-		DynamoDB               DynamoDBConfig `mapstructure:"dynamodb" validate:"required"`
-		IsLocalStack           bool           `mapstructure:"local_stack"`
-		IsResetLocal           bool           `mapstructure:"reset_local"`
-		PresignedUrlExpiration time.Duration  `mapstructure:"presigned_url_expiration" validate:"required"`
-		DLQ                    SQSConfig      `mapstructure:"dlq"`
-		Storage                StorageConfig  `mapstructure:"storage"`
-		AWSAccount             AWSAccount     `mapstructure:"aws_account" validate:"required"`
+		Region                 string          `mapstructure:"region" validate:"required"`
+		Bucket                 string          `mapstructure:"bucket" validate:"required"`
+		Postgres               *PostgresConfig `mapstructure:"postgres" validate:"required_without=DynamoDB"`
+		DynamoDB               *DynamoDBConfig `mapstructure:"dynamodb" validate:"required_without=Postgres"`
+		IsLocalStack           bool            `mapstructure:"local_stack"`
+		IsResetLocal           bool            `mapstructure:"reset_local"`
+		PresignedUrlExpiration time.Duration   `mapstructure:"presigned_url_expiration" validate:"required"`
+		DLQ                    SQSConfig       `mapstructure:"dlq"`
+		Storage                StorageConfig   `mapstructure:"storage"`
+		AWSAccount             AWSAccount      `mapstructure:"aws_account" validate:"required"`
 	}
 
 	PostgresConfig struct {
