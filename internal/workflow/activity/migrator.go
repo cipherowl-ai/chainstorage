@@ -35,12 +35,11 @@ import (
 type (
 	Migrator struct {
 		baseActivity
-		config            *config.Config
-		session           *session.Session
-		dynamoClient      *dynamodb.DynamoDB
-		blockTable        string
-		metrics           tally.Scope
-		lastMigratedBlock *api.BlockMetadata // Track last block for validation
+		config       *config.Config
+		session      *session.Session
+		dynamoClient *dynamodb.DynamoDB
+		blockTable   string
+		metrics      tally.Scope
 	}
 
 	BlockToMigrate struct {
@@ -202,24 +201,8 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		zap.Int("totalEvents", len(events)),
 		zap.Int("blocksToMigrate", len(blocksToMigrate)))
 
-	// Step 3: Query PostgreSQL for the actual last migrated block before validation
-	// This ensures we have the correct state for validation across activity executions
-	if len(blocksToMigrate) > 0 && blocksToMigrate[0].Height > 0 {
-		expectedPrevHeight := blocksToMigrate[0].Height - 1
-		lastBlockInPG, err := migrationData.DestStorage.GetBlockByHeight(ctx, request.Tag, expectedPrevHeight)
-		if err != nil {
-			logger.Warn("Could not fetch last block from PostgreSQL for validation",
-				zap.Uint64("expectedHeight", expectedPrevHeight),
-				zap.Error(err))
-		} else {
-			a.lastMigratedBlock = lastBlockInPG
-			logger.Info("Fetched last migrated block from PostgreSQL for validation",
-				zap.Uint64("lastBlockHeight", lastBlockInPG.Height),
-				zap.String("lastBlockHash", lastBlockInPG.Hash))
-		}
-	}
-
-	// Step 4: Migrate blocks using existing fast/slow path
+	// Step 3: Migrate blocks using existing fast/slow path
+	// Note: Block validation is handled within migrateExtractedBlocks by querying PostgreSQL
 	blocksMigrated := 0
 	if len(blocksToMigrate) > 0 {
 		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, migrationData, request, blocksToMigrate)
@@ -228,7 +211,7 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}
 	}
 
-	// Step 5: Migrate events
+	// Step 4: Migrate events
 	eventsMigrated := 0
 	if len(events) > 0 {
 		eventsMigrated, err = a.persistEvents(ctx, logger, migrationData, request, events)
@@ -467,22 +450,23 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 			allBlocks[i] = blockWithInfo.BlockMetadata
 		}
 
-		// Get last block for validation
+		// Query PostgreSQL for the latest canonical block for validation
+		// Since there are no reorgs, the first block in our batch should reference the latest canonical block
 		var lastBlock *api.BlockMetadata
-		if a.lastMigratedBlock != nil {
-			lastBlock = a.lastMigratedBlock
-			logger.Debug("Using last migrated block for validation",
-				zap.Uint64("lastHeight", lastBlock.Height),
-				zap.String("lastHash", lastBlock.Hash))
-		} else if len(allBlocks) > 0 && allBlocks[0].Height > 0 {
-			// Try to get previous block from PostgreSQL for first batch
+		if len(allBlocks) > 0 && allBlocks[0].Height > 0 {
+			// Get the previous block from PostgreSQL (should be the latest canonical)
 			prevHeight := allBlocks[0].Height - 1
 			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
 			if err == nil {
 				lastBlock = prevBlock
-				logger.Debug("Found previous block in PostgreSQL for validation",
+				logger.Debug("Found latest canonical block in PostgreSQL for validation",
 					zap.Uint64("prevHeight", prevHeight),
 					zap.String("prevHash", prevBlock.Hash))
+			} else if !errors.Is(err, storage.ErrItemNotFound) {
+				// Log error but continue without validation (genesis or error case)
+				logger.Warn("Could not fetch previous block for validation",
+					zap.Uint64("prevHeight", prevHeight),
+					zap.Error(err))
 			}
 		}
 
@@ -496,16 +480,10 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 		}
 		blocksPersistedCount = len(allBlocks)
 
-		// Update last migrated block (last block in sorted array)
-		if len(allBlocks) > 0 {
-			a.lastMigratedBlock = allBlocks[len(allBlocks)-1]
-		}
-
 	} else {
 		// SLOW PATH: Has reorgs, persist one by one without validation
 		logger.Info("Reorgs detected, persisting blocks one by one")
 
-		var lastPersistedBlock *api.BlockMetadata
 		for _, blockWithInfo := range allBlocksWithInfo {
 			err := data.DestStorage.PersistBlockMetas(ctx, false,
 				[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
@@ -517,7 +495,6 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 				return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
 			}
 			blocksPersistedCount++
-			lastPersistedBlock = blockWithInfo.BlockMetadata
 
 			// Log progress periodically
 			if blocksPersistedCount%100 == 0 {
@@ -526,24 +503,11 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 					zap.Int("total", len(allBlocksWithInfo)))
 			}
 		}
-
-		// Update last migrated block (last one persisted, which is canonical due to ordering)
-		if lastPersistedBlock != nil {
-			a.lastMigratedBlock = lastPersistedBlock
-		}
 	}
 
-	if a.lastMigratedBlock != nil {
-		logger.Info("Blocks migrated successfully",
-			zap.Int("blocksPersistedCount", blocksPersistedCount),
-			zap.Bool("hadReorgs", hasReorgs),
-			zap.Uint64("lastBlockHeight", a.lastMigratedBlock.Height),
-			zap.String("lastBlockHash", a.lastMigratedBlock.Hash))
-	} else {
-		logger.Info("Blocks migrated successfully",
-			zap.Int("blocksPersistedCount", blocksPersistedCount),
-			zap.Bool("hadReorgs", hasReorgs))
-	}
+	logger.Info("Blocks migrated successfully",
+		zap.Int("blocksPersistedCount", blocksPersistedCount),
+		zap.Bool("hadReorgs", hasReorgs))
 
 	return blocksPersistedCount, nil
 }
