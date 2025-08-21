@@ -202,7 +202,24 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		zap.Int("totalEvents", len(events)),
 		zap.Int("blocksToMigrate", len(blocksToMigrate)))
 
-	// Step 3: Migrate blocks using existing fast/slow path
+	// Step 3: Query PostgreSQL for the actual last migrated block before validation
+	// This ensures we have the correct state for validation across activity executions
+	if len(blocksToMigrate) > 0 && blocksToMigrate[0].Height > 0 {
+		expectedPrevHeight := blocksToMigrate[0].Height - 1
+		lastBlockInPG, err := migrationData.DestStorage.GetBlockByHeight(ctx, request.Tag, expectedPrevHeight)
+		if err != nil {
+			logger.Warn("Could not fetch last block from PostgreSQL for validation",
+				zap.Uint64("expectedHeight", expectedPrevHeight),
+				zap.Error(err))
+		} else {
+			a.lastMigratedBlock = lastBlockInPG
+			logger.Info("Fetched last migrated block from PostgreSQL for validation",
+				zap.Uint64("lastBlockHeight", lastBlockInPG.Height),
+				zap.String("lastBlockHash", lastBlockInPG.Hash))
+		}
+	}
+
+	// Step 4: Migrate blocks using existing fast/slow path
 	blocksMigrated := 0
 	if len(blocksToMigrate) > 0 {
 		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, migrationData, request, blocksToMigrate)
@@ -211,7 +228,7 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}
 	}
 
-	// Step 4: Migrate events
+	// Step 5: Migrate events
 	eventsMigrated := 0
 	if len(events) > 0 {
 		eventsMigrated, err = a.persistEvents(ctx, logger, migrationData, request, events)
