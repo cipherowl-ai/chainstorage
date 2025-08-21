@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"time"
 
-	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
@@ -81,11 +80,9 @@ func NewMigrator(params MigratorParams) *Migrator {
 }
 
 func (w *Migrator) Execute(ctx context.Context, request *MigratorRequest) (client.WorkflowRun, error) {
-	// Add timestamp to workflow ID to avoid ALLOW_DUPLICATE_FAILED_ONLY policy conflicts
-	timestamp := time.Now().Unix()
-	workflowID := fmt.Sprintf("%s-%d", w.name, timestamp)
+	workflowID := w.name
 	if request.Tag != 0 {
-		workflowID = fmt.Sprintf("%s-%d/block_tag=%d", w.name, timestamp, request.Tag)
+		workflowID = fmt.Sprintf("%s/block_tag=%d", w.name, request.Tag)
 	}
 	return w.startMigratorWorkflow(ctx, workflowID, request)
 }
@@ -101,7 +98,6 @@ func (w *Migrator) startMigratorWorkflow(ctx context.Context, workflowID string,
 		ID:                                       workflowID,
 		TaskQueue:                                cfg.TaskList,
 		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
-		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
 		RetryPolicy:                              w.getRetryPolicy(cfg.WorkflowRetry),
 	}
