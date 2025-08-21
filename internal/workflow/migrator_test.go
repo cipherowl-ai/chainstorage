@@ -205,6 +205,13 @@ func (s *migratorTestSuite) TestMigrator_ContinuousSync() {
 	tag := uint32(1)
 	eventTag := uint32(0)
 
+	// Mock GetMaxEventId activity since EndEventSequence is 0
+	s.env.OnActivity(activity.ActivityGetMaxEventId, mock.Anything, mock.Anything).
+		Return(&activity.GetMaxEventIdResponse{
+			MaxEventId: int64(6000),
+			Found:      true,
+		}, nil).Once()
+
 	callCount := 0
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {

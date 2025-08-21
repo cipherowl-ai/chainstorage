@@ -70,6 +70,13 @@ type (
 		metrics tally.Scope
 	}
 
+	GetMaxEventIdActivity struct {
+		baseActivity
+		config  *config.Config
+		session *session.Session
+		metrics tally.Scope
+	}
+
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
@@ -141,6 +148,17 @@ func NewGetLatestEventFromPostgresActivity(params MigratorParams) *GetLatestEven
 	a := &GetLatestEventFromPostgresActivity{
 		baseActivity: newBaseActivity(ActivityGetLatestEventFromPostgres, params.Runtime),
 		config:       params.Config,
+		metrics:      params.Metrics,
+	}
+	a.register(a.execute)
+	return a
+}
+
+func NewGetMaxEventIdActivity(params MigratorParams) *GetMaxEventIdActivity {
+	a := &GetMaxEventIdActivity{
+		baseActivity: newBaseActivity(ActivityGetMaxEventId, params.Runtime),
+		config:       params.Config,
+		session:      params.Session,
 		metrics:      params.Metrics,
 	}
 	a.register(a.execute)
@@ -1334,6 +1352,15 @@ type GetLatestEventFromPostgresResponse struct {
 	Found    bool   // true if events were found, false if no events exist yet
 }
 
+type GetMaxEventIdRequest struct {
+	EventTag uint32
+}
+
+type GetMaxEventIdResponse struct {
+	MaxEventId int64 // Maximum event ID in DynamoDB
+	Found      bool  // true if events were found
+}
+
 func (a *Migrator) GetLatestBlockHeight(ctx context.Context, req *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
 	migrationData, err := a.createStorageInstances(ctx)
 	if err != nil {
@@ -1493,6 +1520,54 @@ func (a *GetLatestEventFromPostgresActivity) getLatestEventHeight(ctx context.Co
 	return eventEntry.BlockHeight, nil
 }
 
+func (a *GetMaxEventIdActivity) Execute(ctx workflow.Context, request *GetMaxEventIdRequest) (*GetMaxEventIdResponse, error) {
+	var response GetMaxEventIdResponse
+	err := a.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *GetMaxEventIdActivity) execute(ctx context.Context, request *GetMaxEventIdRequest) (*GetMaxEventIdResponse, error) {
+	logger := a.getLogger(ctx).With(
+		zap.Uint32("eventTag", request.EventTag),
+	)
+	logger.Info("getting max event ID from DynamoDB")
+
+	// Create DynamoDB storage directly
+	dynamoDBParams := dynamodb_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+		Session: a.session,
+	}
+	sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create DynamoDB storage: %w", err)
+	}
+
+	// Get max event ID from DynamoDB
+	maxEventId, err := sourceResult.MetaStorage.GetMaxEventId(ctx, request.EventTag)
+	if err != nil {
+		if errors.Is(err, storage.ErrItemNotFound) {
+			logger.Warn("no events found in DynamoDB")
+			return &GetMaxEventIdResponse{
+				MaxEventId: 0,
+				Found:      false,
+			}, nil
+		}
+		return nil, xerrors.Errorf("failed to get max event ID: %w", err)
+	}
+
+	logger.Info("found max event ID in DynamoDB",
+		zap.Int64("maxEventId", maxEventId))
+
+	return &GetMaxEventIdResponse{
+		MaxEventId: maxEventId,
+		Found:      true,
+	}, nil
+}
+
 func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Context) (*MigrationData, error) {
 	logger := a.getLogger(ctx)
 
@@ -1537,4 +1612,5 @@ const (
 	ActivityGetLatestBlockHeight       = "activity.migrator.GetLatestBlockHeight"
 	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
 	ActivityGetLatestEventFromPostgres = "activity.migrator.GetLatestEventFromPostgres"
+	ActivityGetMaxEventId              = "activity.migrator.GetMaxEventId"
 )

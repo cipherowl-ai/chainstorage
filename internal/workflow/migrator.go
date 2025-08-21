@@ -26,6 +26,7 @@ type (
 		getLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		getLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		getLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
+		getMaxEventId              *activity.GetMaxEventIdActivity
 	}
 
 	MigratorParams struct {
@@ -36,6 +37,7 @@ type (
 		GetLatestBlockHeight       *activity.GetLatestBlockHeightActivity
 		GetLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		GetLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
+		GetMaxEventId              *activity.GetMaxEventIdActivity
 	}
 
 	MigratorRequest struct {
@@ -72,6 +74,7 @@ func NewMigrator(params MigratorParams) *Migrator {
 		getLatestBlockHeight:       params.GetLatestBlockHeight,
 		getLatestBlockFromPostgres: params.GetLatestBlockFromPostgres,
 		getLatestEventFromPostgres: params.GetLatestEventFromPostgres,
+		getMaxEventId:              params.GetMaxEventId,
 	}
 	w.registerWorkflow(w.execute)
 	return w
@@ -201,18 +204,36 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		// Handle end event sequence auto-detection if not provided
 		if request.EndEventSequence == 0 {
 			logger.Info("No end event sequence provided, fetching max event ID from DynamoDB...")
-			// We need to get the max event ID from DynamoDB
-			// This would require a new activity or using the storage directly
-			// For now, we'll use a large number for continuous sync
-			if continuousSync {
-				// For continuous sync, we'll fetch up to current max and then wait
-				request.EndEventSequence = request.StartEventSequence + int64(batchSize)
-				logger.Info("Using batch size for continuous sync", zap.Int64("endEventSequence", request.EndEventSequence))
-			} else {
-				// For non-continuous, we need to know the actual max
-				// This would typically come from a GetMaxEventId activity
-				return xerrors.New("EndEventSequence must be specified for non-continuous sync")
+
+			// Query DynamoDB for the actual max event ID
+			maxEventResp, err := w.getMaxEventId.Execute(ctx, &activity.GetMaxEventIdRequest{
+				EventTag: eventTag,
+			})
+			if err != nil {
+				return xerrors.Errorf("failed to get max event ID from DynamoDB: %w", err)
 			}
+
+			if !maxEventResp.Found {
+				logger.Warn("No events found in DynamoDB")
+				if continuousSync {
+					// In continuous sync, if no events exist yet, wait and retry
+					logger.Info("No events in DynamoDB, waiting for sync interval before retry",
+						zap.Duration("syncInterval", syncInterval))
+					err := workflow.Sleep(ctx, syncInterval)
+					if err != nil {
+						return xerrors.Errorf("workflow sleep failed while waiting for events: %w", err)
+					}
+					// Continue as new to retry
+					newRequest := *request
+					return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
+				}
+				return xerrors.New("No events found in DynamoDB to migrate")
+			}
+
+			request.EndEventSequence = maxEventResp.MaxEventId
+			logger.Info("Found max event ID in DynamoDB",
+				zap.Int64("maxEventId", maxEventResp.MaxEventId),
+				zap.Int64("startEventSequence", request.StartEventSequence))
 		}
 
 		// Validate end sequence after auto-detection and auto-resume
