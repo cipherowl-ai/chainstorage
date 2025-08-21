@@ -9,10 +9,8 @@ import (
 	"sync"
 	"time"
 
-	awssdk "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 	"github.com/uber-go/tally/v4"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -25,7 +23,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	dynamodb_storage "github.com/coinbase/chainstorage/internal/storage/metastorage/dynamodb"
-	dynamodb_model "github.com/coinbase/chainstorage/internal/storage/metastorage/dynamodb/model"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	postgres_storage "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
@@ -304,113 +301,55 @@ func (a *Migrator) fetchEventsBySequence(ctx context.Context, logger *zap.Logger
 	endSeq := request.EndEventSequence
 	totalSequences := endSeq - startSeq
 
-	// Calculate mini-batch size based on parallelism
-	parallelism := request.Parallelism
-	if parallelism <= 0 {
-		parallelism = 1
-	}
-
-	// Mini-batch size = total sequences / parallelism
-	miniBatchSize := (totalSequences + int64(parallelism) - 1) / int64(parallelism)
-
-	logger.Info("Fetching events with parallelism",
+	logger.Info("Fetching events by sequence range",
 		zap.Int64("startSeq", startSeq),
 		zap.Int64("endSeq", endSeq),
-		zap.Int64("totalSequences", totalSequences),
-		zap.Int("parallelism", parallelism),
-		zap.Int64("miniBatchSize", miniBatchSize))
+		zap.Int64("totalSequences", totalSequences))
 
-	// Parallel fetch using workers
-	type batchResult struct {
-		events []*model.EventEntry
-		err    error
-		start  int64
-		end    int64
+	// Record heartbeat before starting the fetch
+	activity.RecordHeartbeat(ctx, fmt.Sprintf("Starting to fetch events [%d, %d)", startSeq, endSeq))
+
+	// GetEventsByEventIdRange already handles the fetching efficiently internally
+	// No need for additional batching/parallelism as DynamoDB Query operation
+	// is already optimized for sequential range scans
+	events, err := data.SourceStorage.GetEventsByEventIdRange(
+		ctx, request.EventTag, startSeq, endSeq)
+
+	if err != nil {
+		// Events must be continuous - any missing events indicate data integrity issues
+		return nil, xerrors.Errorf("failed to fetch events [%d,%d): %w",
+			startSeq, endSeq, err)
 	}
 
-	inputChan := make(chan struct{ start, end int64 }, parallelism)
-	resultChan := make(chan batchResult, parallelism)
+	// Record heartbeat after fetch completes
+	activity.RecordHeartbeat(ctx, fmt.Sprintf("Fetched %d events from range [%d, %d)",
+		len(events), startSeq, endSeq))
 
-	// Create work items
-	for start := startSeq; start < endSeq; start += miniBatchSize {
-		end := start + miniBatchSize
-		if end > endSeq {
-			end = endSeq
-		}
-		inputChan <- struct{ start, end int64 }{start, end}
-	}
-	close(inputChan)
-
-	// Start workers
-	var wg sync.WaitGroup
-	wg.Add(parallelism)
-
-	for i := 0; i < parallelism; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for work := range inputChan {
-				// Fetch events using GetEventsByEventIdRange
-				events, err := data.SourceStorage.GetEventsByEventIdRange(
-					ctx, request.EventTag, work.start, work.end)
-
-				resultChan <- batchResult{
-					events: events,
-					err:    err,
-					start:  work.start,
-					end:    work.end,
-				}
-			}
-		}(i)
+	// Validate we got the expected number of events
+	expectedCount := int(totalSequences)
+	if len(events) != expectedCount {
+		return nil, xerrors.Errorf("missing events: expected %d events but got %d for range [%d,%d)",
+			expectedCount, len(events), startSeq, endSeq)
 	}
 
-	// Wait for workers and close result channel
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
-
-	// Collect results
-	var allEvents []*model.EventEntry
-	missingRanges := []string{}
-	processedBatches := 0
-	totalBatches := (endSeq-startSeq+miniBatchSize-1)/miniBatchSize
-
-	for result := range resultChan {
-		processedBatches++
-		
-		// Record heartbeat with progress
-		activity.RecordHeartbeat(ctx, fmt.Sprintf("Fetching events: processed %d/%d mini-batches, collected %d events so far",
-			processedBatches, totalBatches, len(allEvents)))
-		
-		if result.err != nil {
-			// Handle missing sequences gracefully
-			if errors.Is(result.err, storage.ErrItemNotFound) {
-				logger.Warn("Some event sequences not found in range",
-					zap.Int64("start", result.start),
-					zap.Int64("end", result.end))
-				missingRanges = append(missingRanges, fmt.Sprintf("[%d,%d)", result.start, result.end))
-				continue
-			}
-			return nil, xerrors.Errorf("failed to fetch events [%d,%d): %w",
-				result.start, result.end, result.err)
-		}
-		allEvents = append(allEvents, result.events...)
-	}
-
-	if len(missingRanges) > 0 {
-		logger.Warn("Some event ranges had missing sequences",
-			zap.Strings("missingRanges", missingRanges))
-	}
-
-	// Sort by EventId to ensure proper ordering
-	sort.Slice(allEvents, func(i, j int) bool {
-		return allEvents[i].EventId < allEvents[j].EventId
+	// Sort events to ensure proper ordering for validation
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].EventId < events[j].EventId
 	})
 
-	logger.Info("Fetched events successfully",
-		zap.Int("totalEvents", len(allEvents)))
+	// Validate event IDs are continuous (no gaps)
+	for i, event := range events {
+		expectedEventId := startSeq + int64(i)
+		if event.EventId != expectedEventId {
+			return nil, xerrors.Errorf("gap in event sequence: expected event ID %d but got %d at index %d",
+				expectedEventId, event.EventId, i)
+		}
+	}
 
-	return allEvents, nil
+	logger.Info("Fetched events successfully",
+		zap.Int("totalEvents", len(events)))
+
+	return events, nil
 }
 
 func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
@@ -567,26 +506,81 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 	data *MigrationData, request *MigratorRequest,
 	blocksToMigrate []BlockToMigrate) ([]*BlockWithInfo, error) {
 
-	var allBlocksWithInfo []*BlockWithInfo
-
-	for _, block := range blocksToMigrate {
-		// Always fetch by hash - this handles reorgs correctly
-		blockMeta, err := data.SourceStorage.GetBlockByHash(ctx, request.Tag, block.Height, block.Hash)
-		if err != nil {
-			logger.Warn("Failed to fetch block by hash",
-				zap.Uint64("height", block.Height),
-				zap.String("hash", block.Hash),
-				zap.Error(err))
-			continue
-		}
-
-		allBlocksWithInfo = append(allBlocksWithInfo, &BlockWithInfo{
-			BlockMetadata: blockMeta,
-			Height:        block.Height,
-			Hash:          block.Hash,
-			EventSeq:      block.EventSeq,
-		})
+	if len(blocksToMigrate) == 0 {
+		return nil, nil
 	}
+
+	// Determine parallelism - use request parallelism or default to 1
+	parallelism := request.Parallelism
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	// Don't use more workers than blocks
+	if parallelism > len(blocksToMigrate) {
+		parallelism = 1
+	}
+
+	logger.Debug("Fetching block data in parallel",
+		zap.Int("totalBlocks", len(blocksToMigrate)),
+		zap.Int("parallelism", parallelism))
+
+	// Channel for work distribution
+	workChan := make(chan BlockToMigrate, len(blocksToMigrate))
+	resultChan := make(chan *BlockWithInfo, len(blocksToMigrate))
+
+	// Send work items directly
+	for _, block := range blocksToMigrate {
+		workChan <- block
+	}
+	close(workChan)
+
+	// Worker function
+	worker := func() {
+		for block := range workChan {
+			// Always fetch by hash - this handles reorgs correctly
+			blockMeta, err := data.SourceStorage.GetBlockByHash(ctx, request.Tag, block.Height, block.Hash)
+			if err != nil {
+				logger.Warn("Failed to fetch block by hash",
+					zap.Uint64("height", block.Height),
+					zap.String("hash", block.Hash),
+					zap.Error(err))
+				continue
+			}
+
+			resultChan <- &BlockWithInfo{
+				BlockMetadata: blockMeta,
+				Height:        block.Height,
+				Hash:          block.Hash,
+				EventSeq:      block.EventSeq,
+			}
+		}
+	}
+
+	// Start workers
+	var wg sync.WaitGroup
+	for i := 0; i < parallelism; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker()
+		}()
+	}
+
+	// Close result channel when all workers complete
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results - order doesn't matter since they'll be sorted later
+	var allBlocksWithInfo []*BlockWithInfo
+	for blockInfo := range resultChan {
+		allBlocksWithInfo = append(allBlocksWithInfo, blockInfo)
+	}
+
+	logger.Debug("Completed parallel block data fetch",
+		zap.Int("requested", len(blocksToMigrate)),
+		zap.Int("fetched", len(allBlocksWithInfo)))
 
 	return allBlocksWithInfo, nil
 }
@@ -636,582 +630,6 @@ func (a *Migrator) persistEvents(ctx context.Context, logger *zap.Logger,
 		zap.Float64("eventsPerSecond", float64(len(events))/persistDuration.Seconds()))
 
 	return len(events), nil
-}
-
-type heightRange struct {
-	start uint64
-	end   uint64
-}
-
-
-// migrateBlocksBatch processes a batch of blocks with parallelism, similar to event migration approach
-func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
-	batchStart := time.Now()
-	totalHeights := endHeight - startHeight + 1
-	if parallelism <= 0 {
-		parallelism = 1
-	}
-
-	// Create mini-batches sized to parallelism to minimize number of DB writes.
-	// ceil(totalHeights / parallelism)
-	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
-
-	type batchResult struct {
-		startHeight       uint64
-		endHeight         uint64
-		blocks            []BlockWithCanonicalInfo
-		nonCanonicalCount int
-		err               error
-		fetchDuration     time.Duration
-	}
-
-	logger.Info("Starting parallel block migration",
-		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight),
-		zap.Uint64("totalHeights", totalHeights),
-		zap.Uint64("miniBatchSize", miniBatchSize),
-		zap.Int("parallelism", parallelism))
-
-	inputChannel := make(chan heightRange, parallelism*2)
-	resultChannel := make(chan batchResult, parallelism*2)
-
-	// Start parallel workers
-	for i := 0; i < parallelism; i++ {
-		go func(workerID int) {
-			for heightRange := range inputChannel {
-				workerStart := time.Now()
-				allBlocks := []BlockWithCanonicalInfo{}
-				totalNonCanonical := 0
-
-				// Fetch all blocks in this height range (parallel DynamoDB queries)
-				for height := heightRange.start; height <= heightRange.end; height++ {
-					blockPid := fmt.Sprintf("%d-%d", request.Tag, height)
-
-					// Get ALL blocks at this height (canonical + non-canonical) in one DynamoDB query
-					blocksAtHeight, err := a.getAllBlocksAtHeight(ctx, data, blockPid)
-					if err != nil {
-						if !errors.Is(err, storage.ErrItemNotFound) {
-							resultChannel <- batchResult{
-								startHeight: heightRange.start,
-								endHeight:   heightRange.end,
-								err:         xerrors.Errorf("failed to get blocks at height %d: %w", height, err),
-							}
-							return
-						}
-						// No blocks at this height, continue
-						continue
-					}
-
-					// Collect all blocks with canonical info for later sorting
-					for _, blockWithInfo := range blocksAtHeight {
-						allBlocks = append(allBlocks, blockWithInfo)
-						if !blockWithInfo.IsCanonical {
-							totalNonCanonical++
-						}
-					}
-				}
-
-				resultChannel <- batchResult{
-					startHeight:       heightRange.start,
-					endHeight:         heightRange.end,
-					blocks:            allBlocks,
-					nonCanonicalCount: totalNonCanonical,
-					fetchDuration:     time.Since(workerStart),
-				}
-			}
-		}(i)
-	}
-
-	// Generate work items
-	for currentHeight := startHeight; currentHeight <= endHeight; {
-		batchEnd := currentHeight + miniBatchSize - 1
-		if batchEnd > endHeight {
-			batchEnd = endHeight
-		}
-		inputChannel <- heightRange{start: currentHeight, end: batchEnd}
-		currentHeight = batchEnd + 1
-	}
-	close(inputChannel)
-
-	// Collect all results first (parallel fetch phase)
-	totalBatches := int((totalHeights + miniBatchSize - 1) / miniBatchSize)
-	totalNonCanonicalBlocks := 0
-	processedBatches := 0
-	allBlocksWithInfo := []BlockWithCanonicalInfo{}
-
-	logger.Info("Collecting parallel fetch results", zap.Int("totalBatches", totalBatches))
-
-	for i := 0; i < totalBatches; i++ {
-		result := <-resultChannel
-		processedBatches++
-
-		if result.err != nil {
-			logger.Error("Block migration batch failed",
-				zap.Uint64("startHeight", result.startHeight),
-				zap.Uint64("endHeight", result.endHeight),
-				zap.Error(result.err))
-			return 0, result.err
-		}
-
-		// Collect all blocks for sorting
-		allBlocksWithInfo = append(allBlocksWithInfo, result.blocks...)
-		totalNonCanonicalBlocks += result.nonCanonicalCount
-
-		// Progress logging
-		if processedBatches%5 == 0 || processedBatches == totalBatches {
-			percentage := float64(processedBatches) / float64(totalBatches) * 100
-			logger.Info("Fetch progress",
-				zap.Int("processedBatches", processedBatches),
-				zap.Int("totalBatches", totalBatches),
-				zap.Float64("percentage", percentage),
-				zap.Int("blocksCollected", len(allBlocksWithInfo)),
-				zap.Duration("batchDuration", result.fetchDuration))
-		}
-
-		// Heartbeat for Temporal UI
-		if processedBatches%10 == 0 {
-			percentage := float64(processedBatches) / float64(totalBatches) * 100
-			activity.RecordHeartbeat(ctx, fmt.Sprintf(
-				"fetched blocks: batch=%d/%d (%.1f%%), collected=%d blocks",
-				processedBatches, totalBatches, percentage, len(allBlocksWithInfo),
-			))
-		}
-	}
-
-	// Handle empty result case
-	if len(allBlocksWithInfo) == 0 {
-		logger.Info("No blocks found in range, migration complete",
-			zap.Uint64("startHeight", startHeight),
-			zap.Uint64("endHeight", endHeight))
-		return 0, nil
-	}
-
-	logger.Info("Parallel fetch completed, starting sort and persist phase",
-		zap.Int("totalBlocks", len(allBlocksWithInfo)),
-		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks))
-
-	// Sort all blocks: first by height, then non-canonical BEFORE canonical (for "last block wins")
-	if len(allBlocksWithInfo) > 0 {
-		sortStart := time.Now()
-		sort.Slice(allBlocksWithInfo, func(i, j int) bool {
-			if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
-				return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
-			}
-			// CRITICAL: For same height, non-canonical blocks should come blocks must be processed FIRST
-			// so canonical ones blocks win with "last block wins" behavior
-			if allBlocksWithInfo[i].IsCanonical != allBlocksWithInfo[j].IsCanonical {
-				return !allBlocksWithInfo[i].IsCanonical
-			}
-			return false // Preserve order for blocks with same height and canonical status
-		})
-		sortDuration := time.Since(sortStart)
-
-		// Check if there are any reorgs in this batch (multiple blocks at same height)
-		hasReorgs := false
-		heightCounts := make(map[uint64]int)
-		for _, block := range allBlocksWithInfo {
-			heightCounts[block.Height]++
-			if heightCounts[block.Height] > 1 {
-				hasReorgs = true
-			}
-		}
-
-		// Log reorg details if found
-		if hasReorgs {
-			reorgCount := 0
-			for height, count := range heightCounts {
-				if count > 1 {
-					reorgCount++
-					logger.Info("Reorg detected at height",
-						zap.Uint64("height", height),
-						zap.Int("blockCount", count))
-				}
-			}
-			logger.Info("Total reorg heights detected", zap.Int("reorgCount", reorgCount))
-		}
-
-		logger.Info("Blocks sorted",
-			zap.Int("totalBlocks", len(allBlocksWithInfo)),
-			zap.Bool("hasReorgs", hasReorgs),
-			zap.Duration("sortDuration", sortDuration))
-
-		// Get the last block before our range for chain validation
-		var lastBlock *api.BlockMetadata
-		if startHeight > 0 {
-			// Try to get the previous block for chain validation
-			prevHeight := startHeight - 1
-			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
-			if err == nil {
-				lastBlock = prevBlock
-				logger.Debug("Found previous block for chain validation",
-					zap.Uint64("prevHeight", prevHeight),
-					zap.String("prevHash", prevBlock.Hash))
-			} else {
-				logger.Debug("No previous block found, proceeding without chain validation",
-					zap.Uint64("startHeight", startHeight))
-			}
-		}
-
-		blocksPersistedCount := 0
-		persistStart := time.Now()
-
-		if !hasReorgs {
-			// FAST PATH: No reorgs, can bulk persist with chain validation
-			logger.Info("No reorgs detected, using fast bulk persist")
-			allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-			for i, blockWithInfo := range allBlocksWithInfo {
-				allBlocks[i] = blockWithInfo.BlockMetadata
-			}
-
-			err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
-			if err != nil {
-				logger.Error("Failed to bulk persist blocks",
-					zap.Error(err),
-					zap.Int("blockCount", len(allBlocks)))
-				return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
-			}
-			blocksPersistedCount = len(allBlocks)
-
-		} else {
-			// SLOW PATH: Has reorgs, persist one by one without chain validation
-			logger.Info("Reorgs detected, persisting blocks one by one")
-
-			for _, blockWithInfo := range allBlocksWithInfo {
-				err := data.DestStorage.PersistBlockMetas(ctx, false,
-					[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
-				if err != nil {
-					logger.Error("Failed to persist block",
-						zap.Uint64("height", blockWithInfo.Height),
-						zap.String("hash", blockWithInfo.Hash),
-						zap.Bool("canonical", blockWithInfo.IsCanonical),
-						zap.Error(err))
-					return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
-				}
-				blocksPersistedCount++
-
-				// Log progress periodically
-				if blocksPersistedCount%100 == 0 {
-					logger.Debug("Progress update",
-						zap.Int("persisted", blocksPersistedCount),
-						zap.Int("total", len(allBlocksWithInfo)))
-				}
-			}
-		}
-
-		persistDuration := time.Since(persistStart)
-		logger.Info("Bulk persistence completed",
-			zap.Int("totalBlocksPersisted", blocksPersistedCount),
-			zap.Duration("persistDuration", persistDuration))
-	}
-
-	totalDuration := time.Since(batchStart)
-	logger.Info("Parallel block metadata migration completed",
-		zap.Int("totalBlocksMigrated", len(allBlocksWithInfo)),
-		zap.Int("totalNonCanonicalBlocks", totalNonCanonicalBlocks),
-		zap.Duration("totalDuration", totalDuration),
-		zap.Float64("avgSecondsPerHeight", totalDuration.Seconds()/float64(totalHeights)))
-
-	return len(allBlocksWithInfo), nil
-}
-
-// BlockWithCanonicalInfo wraps BlockMetadata with canonical information
-type BlockWithCanonicalInfo struct {
-	*api.BlockMetadata
-	IsCanonical bool
-}
-
-func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData, blockPid string) ([]BlockWithCanonicalInfo, error) {
-	logger := a.getLogger(ctx)
-
-	input := &dynamodb.QueryInput{
-		TableName:              awssdk.String(data.BlockTable),
-		KeyConditionExpression: awssdk.String("block_pid = :blockPid"),
-		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":blockPid": {
-				S: awssdk.String(blockPid),
-			},
-		},
-		ConsistentRead: awssdk.Bool(true),
-	}
-
-	queryStart := time.Now()
-	result, err := data.DynamoClient.QueryWithContext(ctx, input)
-	queryDuration := time.Since(queryStart)
-
-	logger.Debug("DynamoDB query for all blocks at height",
-		zap.String("blockPid", blockPid),
-		zap.Duration("queryDuration", queryDuration),
-		zap.Bool("success", err == nil))
-
-	if err != nil {
-		logger.Error("DynamoDB query failed for all blocks at height",
-			zap.String("blockPid", blockPid),
-			zap.Duration("queryDuration", queryDuration),
-			zap.Error(err))
-		return nil, xerrors.Errorf("failed to query all blocks at height: %w", err)
-	}
-
-	if len(result.Items) == 0 {
-		return nil, storage.ErrItemNotFound
-	}
-
-	// Use a map to deduplicate blocks with the same hash
-	// Keep the canonical entry if there are duplicates
-	blockMap := make(map[string]BlockWithCanonicalInfo)
-
-	for _, item := range result.Items {
-		var blockEntry dynamodb_model.BlockMetaDataDDBEntry
-		err := dynamodbattribute.UnmarshalMap(item, &blockEntry)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to unmarshal DynamoDB item: %w", err)
-		}
-
-		// Determine if this block is canonical based on block_rid
-		isCanonical := blockEntry.BlockRid == "canonical"
-
-		blockWithInfo := BlockWithCanonicalInfo{
-			BlockMetadata: dynamodb_model.BlockMetadataToProto(&blockEntry),
-			IsCanonical:   isCanonical,
-		}
-
-		// Deduplicate: if we already have this block hash, keep the canonical one
-		existing, exists := blockMap[blockEntry.Hash]
-		if !exists {
-			blockMap[blockEntry.Hash] = blockWithInfo
-		} else if isCanonical && !existing.IsCanonical {
-			// Replace with canonical version if current is canonical and existing is not
-			blockMap[blockEntry.Hash] = blockWithInfo
-		}
-	}
-
-	// Convert map to slice
-	allBlocks := make([]BlockWithCanonicalInfo, 0, len(blockMap))
-	for _, block := range blockMap {
-		allBlocks = append(allBlocks, block)
-	}
-
-	// Log if we found duplicates
-	if len(result.Items) != len(allBlocks) {
-		logger.Debug("Deduplicated blocks from DynamoDB",
-			zap.String("blockPid", blockPid),
-			zap.Int("originalCount", len(result.Items)),
-			zap.Int("dedupedCount", len(allBlocks)))
-	}
-
-	return allBlocks, nil
-}
-
-
-// migrateEventsBatch processes a batch of events with parallelism
-func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
-	if parallelism <= 0 {
-		parallelism = 1
-	}
-	totalHeights := endHeight - startHeight + 1
-	miniBatchSize := (totalHeights + uint64(parallelism) - 1) / uint64(parallelism)
-
-	type heightRange struct {
-		start, end uint64
-	}
-
-	type batchResult struct {
-		events    []*model.EventEntry
-		err       error
-		rangeInfo heightRange
-	}
-
-	// Generate batches
-	actualBatches := 0
-	var heightRanges []heightRange
-	for batchStart := startHeight; batchStart <= endHeight; batchStart += miniBatchSize {
-		batchEnd := batchStart + miniBatchSize - 1
-		if batchEnd > endHeight {
-			batchEnd = endHeight
-		}
-		heightRanges = append(heightRanges, heightRange{start: batchStart, end: batchEnd})
-		actualBatches++
-	}
-
-	logger.Info("Starting parallel event fetch",
-		zap.Int("batches", actualBatches),
-		zap.Int("workers", parallelism),
-		zap.Uint64("startHeight", startHeight),
-		zap.Uint64("endHeight", endHeight))
-
-	inputChannel := make(chan heightRange, actualBatches)
-	resultChannel := make(chan batchResult, actualBatches)
-
-	// Add all batches to input channel
-	for _, hr := range heightRanges {
-		inputChannel <- hr
-	}
-	close(inputChannel)
-
-	// Start parallel workers with WaitGroup to track completion
-	var wg sync.WaitGroup
-	wg.Add(parallelism)
-
-	for i := 0; i < parallelism; i++ {
-		go func(workerID int) {
-			defer wg.Done()
-			for heightRange := range inputChannel {
-				evts, err := a.fetchEventsRange(ctx, data, request, heightRange.start, heightRange.end)
-				resultChannel <- batchResult{
-					events:    evts,
-					err:       err,
-					rangeInfo: heightRange,
-				}
-			}
-		}(i)
-	}
-
-	// Wait for all workers to complete in a separate goroutine
-	go func() {
-		wg.Wait()
-		close(resultChannel)
-	}()
-
-	// Collect all results - MUST collect exactly actualBatches results
-	var allEvents []*model.EventEntry
-	collectedBatches := 0
-	for i := 0; i < actualBatches; i++ {
-		result := <-resultChannel
-		collectedBatches++
-
-		if result.err != nil {
-			return 0, result.err
-		}
-		if len(result.events) > 0 {
-			allEvents = append(allEvents, result.events...)
-		}
-
-		// Log and heartbeat fetch progress
-		activity.RecordHeartbeat(ctx, fmt.Sprintf(
-			"fetched batch %d/%d: heights [%d-%d], events=%d",
-			collectedBatches, actualBatches, result.rangeInfo.start, result.rangeInfo.end, len(result.events),
-		))
-	}
-
-	logger.Info("All events fetched, starting sort and persist",
-		zap.Int("totalEvents", len(allEvents)))
-
-	// Sort all collected events by EventId (ascending)
-	if len(allEvents) > 0 {
-		sort.Slice(allEvents, func(i, j int) bool { return allEvents[i].EventId < allEvents[j].EventId })
-
-		firstId := allEvents[0].EventId
-		lastId := allEvents[len(allEvents)-1].EventId
-
-		logger.Info("Attempting to persist all events in single batch",
-			zap.Int("totalEvents", len(allEvents)),
-			zap.Int64("firstEventId", firstId),
-			zap.Int64("lastEventId", lastId))
-
-		// Log first 10 and last 10 event IDs for debugging
-		var eventIdSample []int64
-		if len(allEvents) <= 20 {
-			for _, evt := range allEvents {
-				eventIdSample = append(eventIdSample, evt.EventId)
-			}
-		} else {
-			// First 10
-			for j := 0; j < 10; j++ {
-				eventIdSample = append(eventIdSample, allEvents[j].EventId)
-			}
-			// Last 10
-			for j := len(allEvents) - 10; j < len(allEvents); j++ {
-				eventIdSample = append(eventIdSample, allEvents[j].EventId)
-			}
-		}
-		logger.Debug("Event ID sample (first 10 and last 10)",
-			zap.Int64s("eventIds", eventIdSample))
-
-		// Persist all events in a single call
-		persistStart := time.Now()
-		if err := data.DestStorage.AddEventEntries(ctx, request.EventTag, allEvents); err != nil {
-			// On failure, check for gaps in our collected events
-			var gaps []string
-			for j := 1; j < len(allEvents); j++ {
-				if allEvents[j].EventId != allEvents[j-1].EventId+1 {
-					gap := fmt.Sprintf("position=%d: %d->%d (gap=%d)",
-						j, allEvents[j-1].EventId, allEvents[j].EventId,
-						allEvents[j].EventId-allEvents[j-1].EventId-1)
-					gaps = append(gaps, gap)
-				}
-			}
-
-			if len(gaps) > 0 {
-				logger.Error("Gaps found in collected events",
-					zap.Strings("gaps", gaps),
-					zap.Int("totalGaps", len(gaps)))
-			}
-
-			// Log sample of event IDs around the error point mentioned in the error message
-			// The error says: "prev event id: 19793231, current event id: 19793530"
-			var contextEventIds []int64
-			for idx, evt := range allEvents {
-				if evt.EventId >= 19793220 && evt.EventId <= 19793540 {
-					contextEventIds = append(contextEventIds, evt.EventId)
-					if evt.EventId == 19793231 {
-						logger.Error("Found event 19793231 at position",
-							zap.Int("position", idx),
-							zap.Int64("eventId", evt.EventId))
-						if idx+1 < len(allEvents) {
-							logger.Error("Next event after 19793231",
-								zap.Int("position", idx+1),
-								zap.Int64("eventId", allEvents[idx+1].EventId))
-						}
-					}
-				}
-			}
-			if len(contextEventIds) > 0 {
-				logger.Error("Events around error range",
-					zap.Int64s("contextEventIds", contextEventIds))
-			}
-
-			return 0, xerrors.Errorf("failed to bulk add %d events for range [%d-%d]: %w", len(allEvents), startHeight, endHeight, err)
-		}
-
-		duration := time.Since(persistStart)
-		logger.Info("Successfully persisted all events to Postgres",
-			zap.Int("totalEvents", len(allEvents)),
-			zap.Int64("firstEventId", firstId),
-			zap.Int64("lastEventId", lastId),
-			zap.Duration("duration", duration))
-
-		activity.RecordHeartbeat(ctx, fmt.Sprintf(
-			"persisted all events: count=%d, event_id=[%d-%d], took=%s",
-			len(allEvents), firstId, lastId, duration,
-		))
-	}
-	return len(allEvents), nil
-}
-
-// migrateEventsRange processes events for a specific height range efficiently
-func (a *Migrator) fetchEventsRange(ctx context.Context, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64) ([]*model.EventEntry, error) {
-	allEvents := make([]*model.EventEntry, 0, (endHeight-startHeight+1)*2) // Estimate 2 events per block
-
-	// Collect all events in this range
-	for h := startHeight; h <= endHeight; h++ {
-		sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, h)
-		if err != nil {
-			if errors.Is(err, storage.ErrItemNotFound) {
-				continue // No events at this height; skip
-			}
-			return nil, xerrors.Errorf("failed to get events at height %d: %w", h, err)
-		}
-		if len(sourceEvents) > 0 {
-			allEvents = append(allEvents, sourceEvents...)
-		}
-	}
-
-	// Sort events by event_sequence to ensure proper ordering and prevent gaps
-	if len(allEvents) > 0 {
-		sort.Slice(allEvents, func(i, j int) bool {
-			return allEvents[i].EventId < allEvents[j].EventId
-		})
-	}
-	return allEvents, nil
 }
 
 type GetLatestBlockHeightRequest struct {
@@ -1391,22 +809,6 @@ func (a *GetLatestEventFromPostgresActivity) execute(ctx context.Context, reques
 		Height:   eventEntry.BlockHeight,
 		Found:    true,
 	}, nil
-}
-
-func (a *GetLatestEventFromPostgresActivity) getLatestEventHeight(ctx context.Context, storage metastorage.MetaStorage, eventTag uint32) (uint64, error) {
-	// Get the max event sequence (equivalent to max event ID)
-	maxEventId, err := storage.GetMaxEventId(ctx, eventTag)
-	if err != nil {
-		return 0, err
-	}
-
-	// Get the event entry for that max event sequence to get its height
-	eventEntry, err := storage.GetEventByEventId(ctx, eventTag, maxEventId)
-	if err != nil {
-		return 0, xerrors.Errorf("failed to get event entry for max event sequence %d: %w", maxEventId, err)
-	}
-
-	return eventEntry.BlockHeight, nil
 }
 
 func (a *GetMaxEventIdActivity) Execute(ctx workflow.Context, request *GetMaxEventIdRequest) (*GetMaxEventIdResponse, error) {
