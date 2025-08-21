@@ -44,6 +44,7 @@ type (
 		Hash       string
 		ParentHash string
 		EventSeq   int64 // Event sequence for ordering
+		Skipped    bool  // Whether this is a skipped block
 	}
 
 	GetLatestBlockHeightActivity struct {
@@ -215,7 +216,10 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	}
 
 	// Step 2: Extract blocks from BLOCK_ADDED events
-	blocksToMigrate := a.extractBlocksFromEvents(logger, events)
+	blocksToMigrate, err := a.extractBlocksFromEvents(logger, events)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to extract blocks from events: %w", err)
+	}
 
 	logger.Info("Extracted blocks from events",
 		zap.Int("totalEvents", len(events)),
@@ -353,11 +357,12 @@ func (a *Migrator) fetchEventsBySequence(ctx context.Context, logger *zap.Logger
 }
 
 func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
-	events []*model.EventEntry) []BlockToMigrate {
+	events []*model.EventEntry) ([]BlockToMigrate, error) {
 
 	var blocks []BlockToMigrate
 	blockAddedCount := 0
 	blockRemovedCount := 0
+	skippedBlockCount := 0
 
 	for _, event := range events {
 		switch event.EventType {
@@ -367,10 +372,20 @@ func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
 				Hash:       event.BlockHash,
 				ParentHash: event.ParentHash,
 				EventSeq:   event.EventId,
+				Skipped:    event.BlockSkipped,
 			})
 			blockAddedCount++
+			if event.BlockSkipped {
+				skippedBlockCount++
+			}
 		case api.BlockchainEvent_BLOCK_REMOVED:
 			blockRemovedCount++
+		case api.BlockchainEvent_UNKNOWN:
+			return nil, xerrors.Errorf("encountered UNKNOWN event type at eventId=%d, height=%d", 
+				event.EventId, event.BlockHeight)
+		default:
+			return nil, xerrors.Errorf("unexpected event type %v at eventId=%d, height=%d", 
+				event.EventType, event.EventId, event.BlockHeight)
 		}
 	}
 
@@ -378,9 +393,10 @@ func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
 		zap.Int("totalEvents", len(events)),
 		zap.Int("blockAddedEvents", blockAddedCount),
 		zap.Int("blockRemovedEvents", blockRemovedCount),
+		zap.Int("skippedBlocks", skippedBlockCount),
 		zap.Int("blocksToMigrate", len(blocks)))
 
-	return blocks
+	return blocks, nil
 }
 
 func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logger,
@@ -537,14 +553,32 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 	// Worker function
 	worker := func() {
 		for block := range workChan {
-			// Always fetch by hash - this handles reorgs correctly
-			blockMeta, err := data.SourceStorage.GetBlockByHash(ctx, request.Tag, block.Height, block.Hash)
-			if err != nil {
-				logger.Warn("Failed to fetch block by hash",
-					zap.Uint64("height", block.Height),
-					zap.String("hash", block.Hash),
-					zap.Error(err))
-				continue
+			var blockMeta *api.BlockMetadata
+			
+			// For skipped blocks, create metadata directly without fetching
+			if block.Skipped {
+				blockMeta = &api.BlockMetadata{
+					Tag:          request.Tag,
+					Height:       block.Height,
+					Skipped:      true,
+					// Hash and ParentHash remain empty for skipped blocks
+					// These will be stored as NULL in PostgreSQL
+					Hash:         "",
+					ParentHash:   "",
+					ParentHeight: 0,
+					Timestamp:    nil,
+				}
+			} else {
+				// For regular blocks, fetch from source storage
+				var err error
+				blockMeta, err = data.SourceStorage.GetBlockByHash(ctx, request.Tag, block.Height, block.Hash)
+				if err != nil {
+					logger.Warn("Failed to fetch block by hash",
+						zap.Uint64("height", block.Height),
+						zap.String("hash", block.Hash),
+						zap.Error(err))
+					continue
+				}
 			}
 
 			resultChan <- &BlockWithInfo{
@@ -574,13 +608,18 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 
 	// Collect results - order doesn't matter since they'll be sorted later
 	var allBlocksWithInfo []*BlockWithInfo
+	skippedCount := 0
 	for blockInfo := range resultChan {
 		allBlocksWithInfo = append(allBlocksWithInfo, blockInfo)
+		if blockInfo.BlockMetadata != nil && blockInfo.BlockMetadata.Skipped {
+			skippedCount++
+		}
 	}
 
 	logger.Debug("Completed parallel block data fetch",
 		zap.Int("requested", len(blocksToMigrate)),
-		zap.Int("fetched", len(allBlocksWithInfo)))
+		zap.Int("fetched", len(allBlocksWithInfo)),
+		zap.Int("skippedBlocks", skippedCount))
 
 	return allBlocksWithInfo, nil
 }
