@@ -134,7 +134,8 @@ func (s *migratorActivityTestSuite) TestExtractBlocksFromEvents() {
 	}
 
 	// Extract blocks from events
-	blocks := s.migrator.extractBlocksFromEvents(s.app.Logger(), events)
+	blocks, err := s.migrator.extractBlocksFromEvents(s.app.Logger(), events)
+	require.NoError(err)
 
 	// Should extract only BLOCK_ADDED events
 	require.Len(blocks, 3)
@@ -156,6 +157,20 @@ func (s *migratorActivityTestSuite) TestExtractBlocksFromEvents() {
 	require.Equal("0xddd", blocks[2].Hash)
 	require.Equal("0xccc", blocks[2].ParentHash)
 	require.Equal(int64(1004), blocks[2].EventSeq)
+	
+	// Test UNKNOWN event type - should return error
+	eventsWithUnknown := []*model.EventEntry{
+		{
+			EventId:     1001,
+			EventType:   api.BlockchainEvent_UNKNOWN,
+			BlockHeight: 100,
+			BlockHash:   "0xaaa",
+		},
+	}
+	
+	_, err = s.migrator.extractBlocksFromEvents(s.app.Logger(), eventsWithUnknown)
+	require.Error(err)
+	require.Contains(err.Error(), "encountered UNKNOWN event type")
 }
 
 func (s *migratorActivityTestSuite) TestDetectReorgs() {
