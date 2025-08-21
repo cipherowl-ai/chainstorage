@@ -181,14 +181,19 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 
 	logger.Info("Starting event-driven migration")
 
-	// Add heartbeat mechanism
-	heartbeatTicker := time.NewTicker(30 * time.Second)
+	// Add heartbeat mechanism - send heartbeat every 10 seconds to avoid timeout
+	heartbeatTicker := time.NewTicker(10 * time.Second)
 	defer heartbeatTicker.Stop()
 
 	go func() {
 		for range heartbeatTicker.C {
-			activity.RecordHeartbeat(ctx, fmt.Sprintf("Processing events [%d, %d), elapsed: %v",
-				request.StartEventSequence, request.EndEventSequence, time.Since(startTime)))
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				activity.RecordHeartbeat(ctx, fmt.Sprintf("Processing events [%d, %d), elapsed: %v",
+					request.StartEventSequence, request.EndEventSequence, time.Since(startTime)))
+			}
 		}
 	}()
 
@@ -367,8 +372,16 @@ func (a *Migrator) fetchEventsBySequence(ctx context.Context, logger *zap.Logger
 	// Collect results
 	var allEvents []*model.EventEntry
 	missingRanges := []string{}
+	processedBatches := 0
+	totalBatches := (endSeq-startSeq+miniBatchSize-1)/miniBatchSize
 
 	for result := range resultChan {
+		processedBatches++
+		
+		// Record heartbeat with progress
+		activity.RecordHeartbeat(ctx, fmt.Sprintf("Fetching events: processed %d/%d mini-batches, collected %d events so far",
+			processedBatches, totalBatches, len(allEvents)))
+		
 		if result.err != nil {
 			// Handle missing sequences gracefully
 			if errors.Is(result.err, storage.ErrItemNotFound) {
@@ -514,8 +527,10 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 			}
 			blocksPersistedCount++
 
-			// Log progress periodically
+			// Log progress and send heartbeat periodically
 			if blocksPersistedCount%100 == 0 {
+				activity.RecordHeartbeat(ctx, fmt.Sprintf("Migrating blocks (slow path): %d/%d blocks persisted",
+					blocksPersistedCount, len(allBlocksWithInfo)))
 				logger.Debug("Progress update",
 					zap.Int("persisted", blocksPersistedCount),
 					zap.Int("total", len(allBlocksWithInfo)))
@@ -628,11 +643,6 @@ type heightRange struct {
 	end   uint64
 }
 
-// migrateBlocks is deprecated - use event-driven migration instead
-// func (a *Migrator) migrateBlocks(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
-// 	// This function is no longer used - replaced by event-driven migration
-// 	return 0, xerrors.New("migrateBlocks is deprecated - use event-driven migration")
-// }
 
 // migrateBlocksBatch processes a batch of blocks with parallelism, similar to event migration approach
 func (a *Migrator) migrateBlocksBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
@@ -991,55 +1001,6 @@ func (a *Migrator) getAllBlocksAtHeight(ctx context.Context, data *MigrationData
 	return allBlocks, nil
 }
 
-// migrateEvents is deprecated - replaced by event-driven migration
-func (a *Migrator) migrateEvents(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest) (int, error) {
-	// This function is no longer used - replaced by event-driven migration
-	return 0, xerrors.New("migrateEvents is deprecated - use event-driven migration")
-	/*
-		logger.Info("Starting batched event migration with parallelism",
-			zap.Int("parallelism", request.Parallelism))
-
-		// If we're skipping blocks, validate that required block metadata exists in PostgreSQL
-		if request.SkipBlocks {
-			logger.Info("Skip-blocks enabled, validating that block metadata exists in PostgreSQL")
-			if err := a.validateBlockMetadataExists(ctx, data, request); err != nil {
-				return 0, xerrors.Errorf("block metadata validation failed: %w", err)
-			}
-			logger.Info("Block metadata validation passed")
-		}
-
-		// Migrate events for the entire requested height range in a single write to Postgres.
-		startHeight := request.StartHeight
-		if request.EndHeight == 0 || startHeight >= request.EndHeight {
-			return 0, nil
-		}
-		endHeightInclusive := request.EndHeight - 1
-
-		// Determine parallelism
-		parallelism := request.Parallelism
-		if parallelism <= 0 {
-			parallelism = 1
-		}
-
-		batchStartTime := time.Now()
-		logger.Info("Processing event batch (single write)",
-			zap.Uint64("batchStart", startHeight),
-			zap.Uint64("batchEnd", endHeightInclusive),
-			zap.Int("parallelism", parallelism))
-
-		totalEvents, err := a.migrateEventsBatch(ctx, logger, data, request, startHeight, endHeightInclusive, parallelism)
-		if err != nil {
-			return 0, xerrors.Errorf("failed to migrate events for range [%d-%d]: %w", startHeight, endHeightInclusive, err)
-		}
-
-		logger.Info("Event migration completed (single write)",
-			zap.Uint64("rangeStart", startHeight),
-			zap.Uint64("rangeEnd", endHeightInclusive),
-			zap.Int("eventsMigrated", totalEvents),
-			zap.Duration("duration", time.Since(batchStartTime)))
-		return totalEvents, nil
-	*/
-}
 
 // migrateEventsBatch processes a batch of events with parallelism
 func (a *Migrator) migrateEventsBatch(ctx context.Context, logger *zap.Logger, data *MigrationData, request *MigratorRequest, startHeight, endHeight uint64, parallelism int) (int, error) {
@@ -1251,78 +1212,6 @@ func (a *Migrator) fetchEventsRange(ctx context.Context, data *MigrationData, re
 		})
 	}
 	return allEvents, nil
-}
-
-// validateBlockMetadataExists checks if block metadata exists in PostgreSQL for the height range
-// This is critical when skip-blocks is enabled, as events depend on block metadata via foreign keys
-// validateBlockMetadataExists is deprecated - replaced by event-driven migration
-func (a *Migrator) validateBlockMetadataExists(ctx context.Context, data *MigrationData, request *MigratorRequest) error {
-	// This function is no longer used
-	return nil
-	/*
-		logger := a.getLogger(ctx)
-
-		// Sample a few heights to check if block metadata exists
-		sampleHeights := []uint64{
-			request.StartHeight,
-			request.StartHeight + (request.EndHeight-request.StartHeight)/2,
-			request.EndHeight - 1,
-		}
-
-		missingHeights := []uint64{}
-
-		for _, height := range sampleHeights {
-			if height >= request.EndHeight {
-				continue
-			}
-
-			// Check if block metadata exists at this height
-			_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, height)
-			if err != nil {
-				if errors.Is(err, storage.ErrItemNotFound) {
-					missingHeights = append(missingHeights, height)
-					logger.Warn("Block metadata missing at height", zap.Uint64("height", height))
-				} else {
-					return xerrors.Errorf("failed to check block metadata at height %d: %w", height, err)
-				}
-			}
-		}
-
-		if len(missingHeights) > 0 {
-			return xerrors.Errorf("cannot migrate events with skip-blocks=true: block metadata missing at heights %v. "+
-				"Block metadata must be migrated first (run migration with skip-blocks=false) before migrating events only",
-				missingHeights)
-		}
-
-		// Additionally, check a few specific heights that events will reference
-		// Get some events to check their referenced block heights
-		sourceEvents, err := data.SourceStorage.GetEventsByBlockHeight(ctx, request.EventTag, request.StartHeight)
-		if err != nil && !errors.Is(err, storage.ErrItemNotFound) {
-			return xerrors.Errorf("failed to get sample events for validation: %w", err)
-		}
-
-		if len(sourceEvents) > 0 {
-			// Check first few events to see if their block metadata exists
-			checkCount := 3
-			if len(sourceEvents) < checkCount {
-				checkCount = len(sourceEvents)
-			}
-
-			for i := 0; i < checkCount; i++ {
-				event := sourceEvents[i]
-				_, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, event.BlockHeight)
-				if err != nil {
-					if errors.Is(err, storage.ErrItemNotFound) {
-						return xerrors.Errorf("cannot migrate events with skip-blocks=true: block metadata missing for event at height %d. "+
-							"Block metadata must be migrated first before migrating events", event.BlockHeight)
-					}
-					return xerrors.Errorf("failed to validate block metadata for event at height %d: %w", event.BlockHeight, err)
-				}
-			}
-		}
-
-		return nil
-	*/
 }
 
 type GetLatestBlockHeightRequest struct {
