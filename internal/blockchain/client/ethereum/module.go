@@ -47,5 +47,9 @@ var Module = fx.Options(
 		Name:   "story",
 		Target: NewStoryClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "ethereumclassic",
+		Target: NewEthereumClassicClientFactory,
+	}),
 	beacon.Module,
 )
