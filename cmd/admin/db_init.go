@@ -34,26 +34,32 @@ func newDBInitCommand() *cobra.Command {
 		Short: "Initialize database and users for a specific network from AWS Secrets Manager",
 		Long: `Initialize PostgreSQL database and users for a specific blockchain network based on configuration stored in AWS Secrets Manager.
 
-This command:
-1. Uses master credentials from environment variables (injected by Kubernetes)
+This command MUST be run from the ChainStorage admin pod, which has the master PostgreSQL credentials 
+injected as environment variables through Kubernetes secrets.
+
+The command:
+1. Uses master credentials from environment variables (CHAINSTORAGE_AWS_POSTGRES_*)
 2. Fetches network-specific credentials from AWS Secrets Manager
 3. Creates a database for the specified network
 4. Creates network-specific server (read-only) and worker (read-write) users
 5. Sets up proper permissions for each role
 6. Is idempotent - can be run multiple times safely
 
-The command must be run from within the Kubernetes cluster (e.g., admin pod) 
-with proper IAM role attached to access the secret.
+Required environment variables (automatically available in admin pod):
+- CHAINSTORAGE_AWS_POSTGRES_HOST: PostgreSQL cluster endpoint
+- CHAINSTORAGE_AWS_POSTGRES_PORT: PostgreSQL port
+- CHAINSTORAGE_AWS_POSTGRES_USER: Master username
+- CHAINSTORAGE_AWS_POSTGRES_PASSWORD: Master password
 
-Example usage:
+Example usage (run from admin pod):
   # Initialize database for ethereum-mainnet
-  chainstorage admin db-init --blockchain ethereum --network mainnet --env dev
+  ./admin db-init --blockchain ethereum --network mainnet --env dev
 
   # Dry run to preview changes
-  chainstorage admin db-init --blockchain ethereum --network mainnet --env dev --dry-run
+  ./admin db-init --blockchain ethereum --network mainnet --env dev --dry-run
 
   # Use specific AWS region
-  chainstorage admin db-init --blockchain ethereum --network mainnet --env prod --aws-region us-west-2`,
+  ./admin db-init --blockchain ethereum --network mainnet --env prod --aws-region us-west-2`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// Use commonFlags from common.go for blockchain, network, and env
 			return runDBInit(commonFlags.blockchain, commonFlags.network, commonFlags.env, awsRegion, dryRun)
@@ -77,14 +83,14 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 		zap.String("region", awsRegion),
 		zap.Bool("dry_run", dryRun))
 
-	// Get master credentials from environment variables
-	masterHost := os.Getenv("CHAINSTORAGE_CLUSTER_ENDPOINT")
-	masterPortStr := os.Getenv("CHAINSTORAGE_CLUSTER_PORT")
-	masterUser := os.Getenv("CHAINSTORAGE_MASTER_USERNAME")
-	masterPassword := os.Getenv("CHAINSTORAGE_MASTER_PASSWORD")
+	// Get master credentials from environment variables (as set in admin pod deployment)
+	masterHost := os.Getenv("CHAINSTORAGE_AWS_POSTGRES_HOST")
+	masterPortStr := os.Getenv("CHAINSTORAGE_AWS_POSTGRES_PORT")
+	masterUser := os.Getenv("CHAINSTORAGE_AWS_POSTGRES_USER")
+	masterPassword := os.Getenv("CHAINSTORAGE_AWS_POSTGRES_PASSWORD")
 
 	if masterHost == "" || masterPortStr == "" || masterUser == "" || masterPassword == "" {
-		return xerrors.New("missing required environment variables: CHAINSTORAGE_CLUSTER_ENDPOINT, CHAINSTORAGE_CLUSTER_PORT, CHAINSTORAGE_MASTER_USERNAME, CHAINSTORAGE_MASTER_PASSWORD")
+		return xerrors.New("missing required environment variables: CHAINSTORAGE_AWS_POSTGRES_HOST, CHAINSTORAGE_AWS_POSTGRES_PORT, CHAINSTORAGE_AWS_POSTGRES_USER, CHAINSTORAGE_AWS_POSTGRES_PASSWORD - ensure this command is run from the admin pod")
 	}
 
 	var masterPort int
