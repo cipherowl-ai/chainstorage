@@ -25,23 +25,24 @@ const (
 type Blockchain int32
 
 const (
-	Blockchain_BLOCKCHAIN_UNKNOWN     Blockchain = 0
-	Blockchain_BLOCKCHAIN_SOLANA      Blockchain = 11
-	Blockchain_BLOCKCHAIN_BITCOIN     Blockchain = 16
-	Blockchain_BLOCKCHAIN_ETHEREUM    Blockchain = 17
-	Blockchain_BLOCKCHAIN_BITCOINCASH Blockchain = 18
-	Blockchain_BLOCKCHAIN_LITECOIN    Blockchain = 19
-	Blockchain_BLOCKCHAIN_DOGECOIN    Blockchain = 26
-	Blockchain_BLOCKCHAIN_TRON        Blockchain = 30
-	Blockchain_BLOCKCHAIN_BSC         Blockchain = 31
-	Blockchain_BLOCKCHAIN_AVACCHAIN   Blockchain = 32
-	Blockchain_BLOCKCHAIN_POLYGON     Blockchain = 35
-	Blockchain_BLOCKCHAIN_OPTIMISM    Blockchain = 39
-	Blockchain_BLOCKCHAIN_ARBITRUM    Blockchain = 41
-	Blockchain_BLOCKCHAIN_APTOS       Blockchain = 47 // L1 network using the Move language (originally created for Libra/Diem)
-	Blockchain_BLOCKCHAIN_FANTOM      Blockchain = 51
-	Blockchain_BLOCKCHAIN_BASE        Blockchain = 56 // Coinbase L2
-	Blockchain_BLOCKCHAIN_STORY       Blockchain = 60
+	Blockchain_BLOCKCHAIN_UNKNOWN         Blockchain = 0
+	Blockchain_BLOCKCHAIN_SOLANA          Blockchain = 11
+	Blockchain_BLOCKCHAIN_BITCOIN         Blockchain = 16
+	Blockchain_BLOCKCHAIN_ETHEREUM        Blockchain = 17
+	Blockchain_BLOCKCHAIN_BITCOINCASH     Blockchain = 18
+	Blockchain_BLOCKCHAIN_LITECOIN        Blockchain = 19
+	Blockchain_BLOCKCHAIN_DOGECOIN        Blockchain = 26
+	Blockchain_BLOCKCHAIN_TRON            Blockchain = 30
+	Blockchain_BLOCKCHAIN_BSC             Blockchain = 31
+	Blockchain_BLOCKCHAIN_AVACCHAIN       Blockchain = 32
+	Blockchain_BLOCKCHAIN_POLYGON         Blockchain = 35
+	Blockchain_BLOCKCHAIN_OPTIMISM        Blockchain = 39
+	Blockchain_BLOCKCHAIN_ARBITRUM        Blockchain = 41
+	Blockchain_BLOCKCHAIN_APTOS           Blockchain = 47 // L1 network using the Move language (originally created for Libra/Diem)
+	Blockchain_BLOCKCHAIN_FANTOM          Blockchain = 51
+	Blockchain_BLOCKCHAIN_BASE            Blockchain = 56 // Coinbase L2
+	Blockchain_BLOCKCHAIN_STORY           Blockchain = 60
+	Blockchain_BLOCKCHAIN_ETHEREUMCLASSIC Blockchain = 61 // Ethereum Classic
 )
 
 // Enum value maps for Blockchain.
@@ -64,25 +65,27 @@ var (
 		51: "BLOCKCHAIN_FANTOM",
 		56: "BLOCKCHAIN_BASE",
 		60: "BLOCKCHAIN_STORY",
+		61: "BLOCKCHAIN_ETHEREUMCLASSIC",
 	}
 	Blockchain_value = map[string]int32{
-		"BLOCKCHAIN_UNKNOWN":     0,
-		"BLOCKCHAIN_SOLANA":      11,
-		"BLOCKCHAIN_BITCOIN":     16,
-		"BLOCKCHAIN_ETHEREUM":    17,
-		"BLOCKCHAIN_BITCOINCASH": 18,
-		"BLOCKCHAIN_LITECOIN":    19,
-		"BLOCKCHAIN_DOGECOIN":    26,
-		"BLOCKCHAIN_TRON":        30,
-		"BLOCKCHAIN_BSC":         31,
-		"BLOCKCHAIN_AVACCHAIN":   32,
-		"BLOCKCHAIN_POLYGON":     35,
-		"BLOCKCHAIN_OPTIMISM":    39,
-		"BLOCKCHAIN_ARBITRUM":    41,
-		"BLOCKCHAIN_APTOS":       47,
-		"BLOCKCHAIN_FANTOM":      51,
-		"BLOCKCHAIN_BASE":        56,
-		"BLOCKCHAIN_STORY":       60,
+		"BLOCKCHAIN_UNKNOWN":         0,
+		"BLOCKCHAIN_SOLANA":          11,
+		"BLOCKCHAIN_BITCOIN":         16,
+		"BLOCKCHAIN_ETHEREUM":        17,
+		"BLOCKCHAIN_BITCOINCASH":     18,
+		"BLOCKCHAIN_LITECOIN":        19,
+		"BLOCKCHAIN_DOGECOIN":        26,
+		"BLOCKCHAIN_TRON":            30,
+		"BLOCKCHAIN_BSC":             31,
+		"BLOCKCHAIN_AVACCHAIN":       32,
+		"BLOCKCHAIN_POLYGON":         35,
+		"BLOCKCHAIN_OPTIMISM":        39,
+		"BLOCKCHAIN_ARBITRUM":        41,
+		"BLOCKCHAIN_APTOS":           47,
+		"BLOCKCHAIN_FANTOM":          51,
+		"BLOCKCHAIN_BASE":            56,
+		"BLOCKCHAIN_STORY":           60,
+		"BLOCKCHAIN_ETHEREUMCLASSIC": 61,
 	}
 )
 
@@ -118,40 +121,41 @@ func (Blockchain) EnumDescriptor() ([]byte, []int) {
 type Network int32
 
 const (
-	Network_NETWORK_UNKNOWN             Network = 0
-	Network_NETWORK_SOLANA_MAINNET      Network = 22
-	Network_NETWORK_SOLANA_TESTNET      Network = 23
-	Network_NETWORK_BITCOIN_MAINNET     Network = 33
-	Network_NETWORK_BITCOIN_TESTNET     Network = 34
-	Network_NETWORK_ETHEREUM_MAINNET    Network = 35
-	Network_NETWORK_ETHEREUM_TESTNET    Network = 36
-	Network_NETWORK_BITCOINCASH_MAINNET Network = 37
-	Network_NETWORK_BITCOINCASH_TESTNET Network = 38
-	Network_NETWORK_LITECOIN_MAINNET    Network = 39
-	Network_NETWORK_LITECOIN_TESTNET    Network = 40
-	Network_NETWORK_TRON_MAINNET        Network = 64
-	Network_NETWORK_TRON_TESTNET        Network = 65
-	Network_NETWORK_ETHEREUM_GOERLI     Network = 66
-	Network_NETWORK_DOGECOIN_MAINNET    Network = 56
-	Network_NETWORK_DOGECOIN_TESTNET    Network = 57
-	Network_NETWORK_BSC_MAINNET         Network = 70
-	Network_NETWORK_BSC_TESTNET         Network = 71
-	Network_NETWORK_AVACCHAIN_MAINNET   Network = 72
-	Network_NETWORK_AVACCHAIN_TESTNET   Network = 73
-	Network_NETWORK_POLYGON_MAINNET     Network = 78
-	Network_NETWORK_POLYGON_TESTNET     Network = 79
-	Network_NETWORK_OPTIMISM_MAINNET    Network = 86
-	Network_NETWORK_OPTIMISM_TESTNET    Network = 87
-	Network_NETWORK_ARBITRUM_MAINNET    Network = 91
-	Network_NETWORK_ARBITRUM_TESTNET    Network = 92
-	Network_NETWORK_APTOS_MAINNET       Network = 103
-	Network_NETWORK_APTOS_TESTNET       Network = 104
-	Network_NETWORK_FANTOM_MAINNET      Network = 111
-	Network_NETWORK_FANTOM_TESTNET      Network = 112
-	Network_NETWORK_BASE_MAINNET        Network = 123 // Coinbase L2 running on Ethereum mainnet
-	Network_NETWORK_BASE_GOERLI         Network = 125 // Coinbase L2 running on Ethereum Goerli
-	Network_NETWORK_ETHEREUM_HOLESKY    Network = 136
-	Network_NETWORK_STORY_MAINNET       Network = 140
+	Network_NETWORK_UNKNOWN                 Network = 0
+	Network_NETWORK_SOLANA_MAINNET          Network = 22
+	Network_NETWORK_SOLANA_TESTNET          Network = 23
+	Network_NETWORK_BITCOIN_MAINNET         Network = 33
+	Network_NETWORK_BITCOIN_TESTNET         Network = 34
+	Network_NETWORK_ETHEREUM_MAINNET        Network = 35
+	Network_NETWORK_ETHEREUM_TESTNET        Network = 36
+	Network_NETWORK_BITCOINCASH_MAINNET     Network = 37
+	Network_NETWORK_BITCOINCASH_TESTNET     Network = 38
+	Network_NETWORK_LITECOIN_MAINNET        Network = 39
+	Network_NETWORK_LITECOIN_TESTNET        Network = 40
+	Network_NETWORK_TRON_MAINNET            Network = 64
+	Network_NETWORK_TRON_TESTNET            Network = 65
+	Network_NETWORK_ETHEREUM_GOERLI         Network = 66
+	Network_NETWORK_DOGECOIN_MAINNET        Network = 56
+	Network_NETWORK_DOGECOIN_TESTNET        Network = 57
+	Network_NETWORK_BSC_MAINNET             Network = 70
+	Network_NETWORK_BSC_TESTNET             Network = 71
+	Network_NETWORK_AVACCHAIN_MAINNET       Network = 72
+	Network_NETWORK_AVACCHAIN_TESTNET       Network = 73
+	Network_NETWORK_POLYGON_MAINNET         Network = 78
+	Network_NETWORK_POLYGON_TESTNET         Network = 79
+	Network_NETWORK_OPTIMISM_MAINNET        Network = 86
+	Network_NETWORK_OPTIMISM_TESTNET        Network = 87
+	Network_NETWORK_ARBITRUM_MAINNET        Network = 91
+	Network_NETWORK_ARBITRUM_TESTNET        Network = 92
+	Network_NETWORK_APTOS_MAINNET           Network = 103
+	Network_NETWORK_APTOS_TESTNET           Network = 104
+	Network_NETWORK_FANTOM_MAINNET          Network = 111
+	Network_NETWORK_FANTOM_TESTNET          Network = 112
+	Network_NETWORK_BASE_MAINNET            Network = 123 // Coinbase L2 running on Ethereum mainnet
+	Network_NETWORK_BASE_GOERLI             Network = 125 // Coinbase L2 running on Ethereum Goerli
+	Network_NETWORK_ETHEREUM_HOLESKY        Network = 136
+	Network_NETWORK_STORY_MAINNET           Network = 140
+	Network_NETWORK_ETHEREUMCLASSIC_MAINNET Network = 141
 )
 
 // Enum value maps for Network.
@@ -191,42 +195,44 @@ var (
 		125: "NETWORK_BASE_GOERLI",
 		136: "NETWORK_ETHEREUM_HOLESKY",
 		140: "NETWORK_STORY_MAINNET",
+		141: "NETWORK_ETHEREUMCLASSIC_MAINNET",
 	}
 	Network_value = map[string]int32{
-		"NETWORK_UNKNOWN":             0,
-		"NETWORK_SOLANA_MAINNET":      22,
-		"NETWORK_SOLANA_TESTNET":      23,
-		"NETWORK_BITCOIN_MAINNET":     33,
-		"NETWORK_BITCOIN_TESTNET":     34,
-		"NETWORK_ETHEREUM_MAINNET":    35,
-		"NETWORK_ETHEREUM_TESTNET":    36,
-		"NETWORK_BITCOINCASH_MAINNET": 37,
-		"NETWORK_BITCOINCASH_TESTNET": 38,
-		"NETWORK_LITECOIN_MAINNET":    39,
-		"NETWORK_LITECOIN_TESTNET":    40,
-		"NETWORK_TRON_MAINNET":        64,
-		"NETWORK_TRON_TESTNET":        65,
-		"NETWORK_ETHEREUM_GOERLI":     66,
-		"NETWORK_DOGECOIN_MAINNET":    56,
-		"NETWORK_DOGECOIN_TESTNET":    57,
-		"NETWORK_BSC_MAINNET":         70,
-		"NETWORK_BSC_TESTNET":         71,
-		"NETWORK_AVACCHAIN_MAINNET":   72,
-		"NETWORK_AVACCHAIN_TESTNET":   73,
-		"NETWORK_POLYGON_MAINNET":     78,
-		"NETWORK_POLYGON_TESTNET":     79,
-		"NETWORK_OPTIMISM_MAINNET":    86,
-		"NETWORK_OPTIMISM_TESTNET":    87,
-		"NETWORK_ARBITRUM_MAINNET":    91,
-		"NETWORK_ARBITRUM_TESTNET":    92,
-		"NETWORK_APTOS_MAINNET":       103,
-		"NETWORK_APTOS_TESTNET":       104,
-		"NETWORK_FANTOM_MAINNET":      111,
-		"NETWORK_FANTOM_TESTNET":      112,
-		"NETWORK_BASE_MAINNET":        123,
-		"NETWORK_BASE_GOERLI":         125,
-		"NETWORK_ETHEREUM_HOLESKY":    136,
-		"NETWORK_STORY_MAINNET":       140,
+		"NETWORK_UNKNOWN":                 0,
+		"NETWORK_SOLANA_MAINNET":          22,
+		"NETWORK_SOLANA_TESTNET":          23,
+		"NETWORK_BITCOIN_MAINNET":         33,
+		"NETWORK_BITCOIN_TESTNET":         34,
+		"NETWORK_ETHEREUM_MAINNET":        35,
+		"NETWORK_ETHEREUM_TESTNET":        36,
+		"NETWORK_BITCOINCASH_MAINNET":     37,
+		"NETWORK_BITCOINCASH_TESTNET":     38,
+		"NETWORK_LITECOIN_MAINNET":        39,
+		"NETWORK_LITECOIN_TESTNET":        40,
+		"NETWORK_TRON_MAINNET":            64,
+		"NETWORK_TRON_TESTNET":            65,
+		"NETWORK_ETHEREUM_GOERLI":         66,
+		"NETWORK_DOGECOIN_MAINNET":        56,
+		"NETWORK_DOGECOIN_TESTNET":        57,
+		"NETWORK_BSC_MAINNET":             70,
+		"NETWORK_BSC_TESTNET":             71,
+		"NETWORK_AVACCHAIN_MAINNET":       72,
+		"NETWORK_AVACCHAIN_TESTNET":       73,
+		"NETWORK_POLYGON_MAINNET":         78,
+		"NETWORK_POLYGON_TESTNET":         79,
+		"NETWORK_OPTIMISM_MAINNET":        86,
+		"NETWORK_OPTIMISM_TESTNET":        87,
+		"NETWORK_ARBITRUM_MAINNET":        91,
+		"NETWORK_ARBITRUM_TESTNET":        92,
+		"NETWORK_APTOS_MAINNET":           103,
+		"NETWORK_APTOS_TESTNET":           104,
+		"NETWORK_FANTOM_MAINNET":          111,
+		"NETWORK_FANTOM_TESTNET":          112,
+		"NETWORK_BASE_MAINNET":            123,
+		"NETWORK_BASE_GOERLI":             125,
+		"NETWORK_ETHEREUM_HOLESKY":        136,
+		"NETWORK_STORY_MAINNET":           140,
+		"NETWORK_ETHEREUMCLASSIC_MAINNET": 141,
 	}
 )
 
@@ -263,7 +269,7 @@ var file_coinbase_c3_common_common_proto_rawDesc = []byte{
 	0x0a, 0x1f, 0x63, 0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x2f, 0x63, 0x33, 0x2f, 0x63, 0x6f,
 	0x6d, 0x6d, 0x6f, 0x6e, 0x2f, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2e, 0x70, 0x72, 0x6f, 0x74,
 	0x6f, 0x12, 0x12, 0x63, 0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x2e, 0x63, 0x33, 0x2e, 0x63,
-	0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2a, 0x9f, 0x03, 0x0a, 0x0a, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x63,
+	0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x2a, 0xbf, 0x03, 0x0a, 0x0a, 0x42, 0x6c, 0x6f, 0x63, 0x6b, 0x63,
 	0x68, 0x61, 0x69, 0x6e, 0x12, 0x16, 0x0a, 0x12, 0x42, 0x4c, 0x4f, 0x43, 0x4b, 0x43, 0x48, 0x41,
 	0x49, 0x4e, 0x5f, 0x55, 0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x10, 0x00, 0x12, 0x15, 0x0a, 0x11,
 	0x42, 0x4c, 0x4f, 0x43, 0x4b, 0x43, 0x48, 0x41, 0x49, 0x4e, 0x5f, 0x53, 0x4f, 0x4c, 0x41, 0x4e,
@@ -289,7 +295,9 @@ var file_coinbase_c3_common_common_proto_rawDesc = []byte{
 	0x41, 0x49, 0x4e, 0x5f, 0x46, 0x41, 0x4e, 0x54, 0x4f, 0x4d, 0x10, 0x33, 0x12, 0x13, 0x0a, 0x0f,
 	0x42, 0x4c, 0x4f, 0x43, 0x4b, 0x43, 0x48, 0x41, 0x49, 0x4e, 0x5f, 0x42, 0x41, 0x53, 0x45, 0x10,
 	0x38, 0x12, 0x14, 0x0a, 0x10, 0x42, 0x4c, 0x4f, 0x43, 0x4b, 0x43, 0x48, 0x41, 0x49, 0x4e, 0x5f,
-	0x53, 0x54, 0x4f, 0x52, 0x59, 0x10, 0x3c, 0x2a, 0xd5, 0x07, 0x0a, 0x07, 0x4e, 0x65, 0x74, 0x77,
+	0x53, 0x54, 0x4f, 0x52, 0x59, 0x10, 0x3c, 0x12, 0x1e, 0x0a, 0x1a, 0x42, 0x4c, 0x4f, 0x43, 0x4b,
+	0x43, 0x48, 0x41, 0x49, 0x4e, 0x5f, 0x45, 0x54, 0x48, 0x45, 0x52, 0x45, 0x55, 0x4d, 0x43, 0x4c,
+	0x41, 0x53, 0x53, 0x49, 0x43, 0x10, 0x3d, 0x2a, 0xfb, 0x07, 0x0a, 0x07, 0x4e, 0x65, 0x74, 0x77,
 	0x6f, 0x72, 0x6b, 0x12, 0x13, 0x0a, 0x0f, 0x4e, 0x45, 0x54, 0x57, 0x4f, 0x52, 0x4b, 0x5f, 0x55,
 	0x4e, 0x4b, 0x4e, 0x4f, 0x57, 0x4e, 0x10, 0x00, 0x12, 0x1a, 0x0a, 0x16, 0x4e, 0x45, 0x54, 0x57,
 	0x4f, 0x52, 0x4b, 0x5f, 0x53, 0x4f, 0x4c, 0x41, 0x4e, 0x41, 0x5f, 0x4d, 0x41, 0x49, 0x4e, 0x4e,
@@ -350,12 +358,14 @@ var file_coinbase_c3_common_common_proto_rawDesc = []byte{
 	0x4c, 0x49, 0x10, 0x7d, 0x12, 0x1d, 0x0a, 0x18, 0x4e, 0x45, 0x54, 0x57, 0x4f, 0x52, 0x4b, 0x5f,
 	0x45, 0x54, 0x48, 0x45, 0x52, 0x45, 0x55, 0x4d, 0x5f, 0x48, 0x4f, 0x4c, 0x45, 0x53, 0x4b, 0x59,
 	0x10, 0x88, 0x01, 0x12, 0x1a, 0x0a, 0x15, 0x4e, 0x45, 0x54, 0x57, 0x4f, 0x52, 0x4b, 0x5f, 0x53,
-	0x54, 0x4f, 0x52, 0x59, 0x5f, 0x4d, 0x41, 0x49, 0x4e, 0x4e, 0x45, 0x54, 0x10, 0x8c, 0x01, 0x42,
-	0x3c, 0x5a, 0x3a, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e, 0x63, 0x6f, 0x6d, 0x2f, 0x63, 0x6f,
-	0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x2f, 0x63, 0x68, 0x61, 0x69, 0x6e, 0x73, 0x74, 0x6f, 0x72,
-	0x61, 0x67, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x73, 0x2f, 0x63, 0x6f, 0x69, 0x6e, 0x62,
-	0x61, 0x73, 0x65, 0x2f, 0x63, 0x33, 0x2f, 0x63, 0x6f, 0x6d, 0x6d, 0x6f, 0x6e, 0x62, 0x06, 0x70,
-	0x72, 0x6f, 0x74, 0x6f, 0x33,
+	0x54, 0x4f, 0x52, 0x59, 0x5f, 0x4d, 0x41, 0x49, 0x4e, 0x4e, 0x45, 0x54, 0x10, 0x8c, 0x01, 0x12,
+	0x24, 0x0a, 0x1f, 0x4e, 0x45, 0x54, 0x57, 0x4f, 0x52, 0x4b, 0x5f, 0x45, 0x54, 0x48, 0x45, 0x52,
+	0x45, 0x55, 0x4d, 0x43, 0x4c, 0x41, 0x53, 0x53, 0x49, 0x43, 0x5f, 0x4d, 0x41, 0x49, 0x4e, 0x4e,
+	0x45, 0x54, 0x10, 0x8d, 0x01, 0x42, 0x3c, 0x5a, 0x3a, 0x67, 0x69, 0x74, 0x68, 0x75, 0x62, 0x2e,
+	0x63, 0x6f, 0x6d, 0x2f, 0x63, 0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x2f, 0x63, 0x68, 0x61,
+	0x69, 0x6e, 0x73, 0x74, 0x6f, 0x72, 0x61, 0x67, 0x65, 0x2f, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x73,
+	0x2f, 0x63, 0x6f, 0x69, 0x6e, 0x62, 0x61, 0x73, 0x65, 0x2f, 0x63, 0x33, 0x2f, 0x63, 0x6f, 0x6d,
+	0x6d, 0x6f, 0x6e, 0x62, 0x06, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x33,
 }
 
 var (

@@ -8,11 +8,6 @@ storage_type:
   blob: S3
   dlq: SQS
   meta: DYNAMODB
-
-aws:
-  storage:
-    data_compression: ZSTD
-    zstd_dict_version: zstd.dict
 chain:
   feature:
     block_validation_enabled: false
@@ -23,17 +18,7 @@ chain:
     http_timeout: 0s
     master:
       endpoint_group: 
-        endpoints:
-        - name: eth-jsonrpc-m
-          rps: 1
-          url: https://api.developer.coinbase.com/rpc/v1/ethereumclassic/lfefJ4kqhM7qD8K_6II8XTd2gnu-CQor
-          weight: 1
     slave:
       endpoint_group: 
-        endpoints:
-        - name: eth-jsonrpc-s
-          rps: 1
-          url: https://api.developer.coinbase.com/rpc/v1/ethereumclassic/lfefJ4kqhM7qD8K_6II8XTd2gnu-CQor
-          weight: 1
     validator:
       endpoint_group: ""

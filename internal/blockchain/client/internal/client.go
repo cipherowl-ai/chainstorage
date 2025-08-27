@@ -54,24 +54,25 @@ type (
 	Params struct {
 		fx.In
 		fxparams.Params
-		Parser         parser.Parser
-		Bitcoin        ClientFactory `name:"bitcoin" optional:"true"`
-		Bsc            ClientFactory `name:"bsc" optional:"true"`
-		Ethereum       ClientFactory `name:"ethereum" optional:"true"`
-		Rosetta        ClientFactory `name:"rosetta" optional:"true"`
-		Solana         ClientFactory `name:"solana" optional:"true"`
-		Polygon        ClientFactory `name:"polygon" optional:"true"`
-		Avacchain      ClientFactory `name:"avacchain" optional:"true"`
-		Arbitrum       ClientFactory `name:"arbitrum" optional:"true"`
-		Optimism       ClientFactory `name:"optimism" optional:"true"`
-		Base           ClientFactory `name:"base" optional:"true"`
-		Fantom         ClientFactory `name:"fantom" optional:"true"`
-		Aptos          ClientFactory `name:"aptos" optional:"true"`
-		EthereumBeacon ClientFactory `name:"ethereum/beacon" optional:"true"`
-		CosmosStaking  ClientFactory `name:"cosmos/staking" optional:"true"`
-		CardanoStaking ClientFactory `name:"cardano/staking" optional:"true"`
-		Tron           ClientFactory `name:"tron" optional:"true"`
-		Story          ClientFactory `name:"story" optional:"true"`
+		Parser          parser.Parser
+		Bitcoin         ClientFactory `name:"bitcoin" optional:"true"`
+		Bsc             ClientFactory `name:"bsc" optional:"true"`
+		Ethereum        ClientFactory `name:"ethereum" optional:"true"`
+		Rosetta         ClientFactory `name:"rosetta" optional:"true"`
+		Solana          ClientFactory `name:"solana" optional:"true"`
+		Polygon         ClientFactory `name:"polygon" optional:"true"`
+		Avacchain       ClientFactory `name:"avacchain" optional:"true"`
+		Arbitrum        ClientFactory `name:"arbitrum" optional:"true"`
+		Optimism        ClientFactory `name:"optimism" optional:"true"`
+		Base            ClientFactory `name:"base" optional:"true"`
+		Fantom          ClientFactory `name:"fantom" optional:"true"`
+		Aptos           ClientFactory `name:"aptos" optional:"true"`
+		EthereumBeacon  ClientFactory `name:"ethereum/beacon" optional:"true"`
+		CosmosStaking   ClientFactory `name:"cosmos/staking" optional:"true"`
+		CardanoStaking  ClientFactory `name:"cardano/staking" optional:"true"`
+		Tron            ClientFactory `name:"tron" optional:"true"`
+		Story           ClientFactory `name:"story" optional:"true"`
+		EthereumClassic ClientFactory `name:"ethereumclassic" optional:"true"`
 	}
 
 	ClientParams struct {
@@ -139,6 +140,8 @@ func NewClient(params Params) (Result, error) {
 			factory = params.Tron
 		case common.Blockchain_BLOCKCHAIN_STORY:
 			factory = params.Story
+		case common.Blockchain_BLOCKCHAIN_ETHEREUMCLASSIC:
+			factory = params.EthereumClassic
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
