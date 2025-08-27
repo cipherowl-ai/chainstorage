@@ -685,14 +685,21 @@ Start the streamer workflow:
 go run ./cmd/admin workflow start --workflow streamer --input '{}' --blockchain ethereum --network goerli --env local
 ```
 
-Start the migration workflow:
+Start the migrator workflow (event-driven migration from DynamoDB to PostgreSQL):
 ```shell
-# Migrate with auto-detected end height (latest block from DynamoDB)
-go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 400, "Tag": 2, "EventTag": 3}' --blockchain ethereum --network mainnet --env local
+# Migrate events by sequence range
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartEventSequence": 1, "EndEventSequence": 1000, "Tag": 2, "EventTag": 3, "BatchSize": 500, "Parallelism": 2, "CheckpointSize": 10000}' --blockchain ethereum --network mainnet --env local
 
-# Migrate with specific height range
-go run ./cmd/admin workflow start --workflow migrator --input '{"StartHeight": 400, "EndHeight": 800, "Tag": 2, "EventTag": 3}' --blockchain ethereum --network mainnet --env local
+# Auto-resume from last migrated position
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartEventSequence": 0, "EndEventSequence": 100000, "Tag": 2, "EventTag": 3, "AutoResume": true}' --blockchain ethereum --network mainnet --env local
+
+# Continuous sync mode with auto-resume
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartEventSequence": 0, "EndEventSequence": 0, "Tag": 2, "EventTag": 3, "AutoResume": true, "ContinuousSync": true, "BatchSize": 500,"Parallelism": 2, "CheckpointSize": 10000}' --blockchain ethereum --network mainnet --env local
+
+# Custom batch size and parallelism for large migrations
+go run ./cmd/admin workflow start --workflow migrator --input '{"StartEventSequence": 1000000, "EndEventSequence": 2000000, "Tag": 1, "EventTag": 0, "BatchSize": 10000, "Parallelism": 16, "CheckpointSize": 100000}' --blockchain ethereum --network mainnet --env local
 ```
+Note: The migrator uses an event-driven architecture where events are fetched by sequence number and blocks are extracted from BLOCK_ADDED events. This ensures data consistency and proper handling of blockchain reorganizations.
 
 Start the cross validator workflow:
 ```shell

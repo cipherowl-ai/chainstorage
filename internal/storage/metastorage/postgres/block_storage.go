@@ -171,15 +171,16 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			if err != nil {
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
 			}
-
-			// Insert ALL blocks (including skipped) into canonical_blocks
-			_, err = tx.ExecContext(txCtx, canonicalQuery,
-				block.Height,
-				blockId,
-				block.Tag,
-			)
-			if err != nil {
-				return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
+			if !block.Skipped {
+				// Insert ALL blocks that are not skipped into canonical_blocks
+				_, err = tx.ExecContext(txCtx, canonicalQuery,
+					block.Height,
+					blockId,
+					block.Tag,
+				)
+				if err != nil {
+					return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
+				}
 			}
 		}
 		// Commit transaction
