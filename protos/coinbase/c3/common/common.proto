@@ -24,6 +24,7 @@ enum Blockchain {
     BLOCKCHAIN_FANTOM = 51;
     BLOCKCHAIN_BASE = 56; // Coinbase L2
     BLOCKCHAIN_STORY = 60;
+    BLOCKCHAIN_ETHEREUMCLASSIC = 61; // Ethereum Classic
 }
 
 // Network defines an enumeration of supported networks.
@@ -81,4 +82,6 @@ enum Network {
     NETWORK_ETHEREUM_HOLESKY = 136;
 
     NETWORK_STORY_MAINNET = 140;
+    
+    NETWORK_ETHEREUMCLASSIC_MAINNET = 141;
 }

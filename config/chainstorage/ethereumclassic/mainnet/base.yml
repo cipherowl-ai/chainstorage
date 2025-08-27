@@ -12,21 +12,21 @@ api:
   streaming_max_no_event_time: 10m
 aws:
   aws_account: development
-  bucket: example-chainstorage-ethereum-mainnet-dev
+  bucket: example-chainstorage-ethereumclassic-mainnet-dev
   dlq:
     delay_secs: 900
-    name: example_chainstorage_blocks_ethereum_mainnet_dlq
+    name: example_chainstorage_blocks_ethereumclassic_mainnet_dlq
     visibility_timeout_secs: 600
   dynamodb:
-    block_table: example_chainstorage_blocks_ethereum_mainnet
-    event_table: example_chainstorage_block_events_ethereum_mainnet
-    event_table_height_index: example_chainstorage_block_events_by_height_eth_main
-    transaction_table: example_chainstorage_transactions_table_ethereum_mainnet
-    versioned_event_table: example_chainstorage_versioned_block_events_ethereum_mainnet
-    versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_ethereum_mainnet
+    block_table: example_chainstorage_blocks_ethereumclassic_mainnet
+    event_table: example_chainstorage_block_events_ethereumclassic_mainnet
+    event_table_height_index: example_chainstorage_block_events_by_height_ethclassic_main
+    transaction_table: example_chainstorage_transactions_table_ethereumclassic_mainnet
+    versioned_event_table: example_chainstorage_versioned_block_events_ethereumclassic_mainnet
+    versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_ethereumclassic_mainnet
   postgres:
     connect_timeout: 30s
-    database: chainstorage_ethereum_mainnet
+    database: chainstorage_ethereumclassic_mainnet
     host: localhost
     max_connections: 25
     min_connections: 5
@@ -34,14 +34,14 @@ aws:
     port: 5433
     ssl_mode: require
     statement_timeout: 60s
-    user: cs_ethereum_mainnet_worker
+    user: cs_ethereumclassic_mainnet_worker
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
     data_compression: GZIP
 cadence:
   address: ""
-  domain: chainstorage-ethereum-mainnet
+  domain: chainstorage-ethereumclassic-mainnet
   retention_period: 7
   tls:
     enabled: true
@@ -52,7 +52,7 @@ chain:
     latest: 2
     stable: 2
   block_time: 12s
-  blockchain: BLOCKCHAIN_ETHEREUM
+  blockchain: BLOCKCHAIN_ETHEREUMCLASSIC
   client:
     consensus:
       endpoint_group: ""
@@ -72,8 +72,8 @@ chain:
     default_stable_event: true
     rosetta_parser: true
   irreversible_distance: 12
-  network: NETWORK_ETHEREUM_MAINNET
-config_name: ethereum_mainnet
+  network: NETWORK_ETHEREUMCLASSIC_MAINNET
+config_name: ethereumclassic_mainnet
 cron:
   block_range_size: 4
 functional_test: ""
@@ -83,7 +83,7 @@ gcp:
 sdk:
   auth_header: ""
   auth_token: ""
-  chainstorage_address: https://example-chainstorage-ethereum-mainnet
+  chainstorage_address: https://example-chainstorage-ethereumclassic-mainnet
   num_workers: 10
   restful: true
 server:

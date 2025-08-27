@@ -45,24 +45,25 @@ type (
 	Params struct {
 		fx.In
 		fxparams.Params
-		Aleo           ParserFactory `name:"aleo" optional:"true"`
-		Bitcoin        ParserFactory `name:"bitcoin" optional:"true"`
-		Bsc            ParserFactory `name:"bsc" optional:"true"`
-		Ethereum       ParserFactory `name:"ethereum" optional:"true"`
-		Rosetta        ParserFactory `name:"rosetta" optional:"true"`
-		Solana         ParserFactory `name:"solana" optional:"true"`
-		Polygon        ParserFactory `name:"polygon" optional:"true"`
-		Avacchain      ParserFactory `name:"avacchain" optional:"true"`
-		Arbitrum       ParserFactory `name:"arbitrum" optional:"true"`
-		Optimism       ParserFactory `name:"optimism" optional:"true"`
-		Fantom         ParserFactory `name:"fantom" optional:"true"`
-		Base           ParserFactory `name:"base" optional:"true"`
-		Aptos          ParserFactory `name:"aptos" optional:"true"`
-		EthereumBeacon ParserFactory `name:"ethereum/beacon" optional:"true"`
-		CosmosStaking  ParserFactory `name:"cosmos/staking" optional:"true"`
-		CardanoStaking ParserFactory `name:"cardano/staking" optional:"true"`
-		Tron           ParserFactory `name:"tron" optional:"true"`
-		Story          ParserFactory `name:"story" optional:"true"`
+		Aleo            ParserFactory `name:"aleo" optional:"true"`
+		Bitcoin         ParserFactory `name:"bitcoin" optional:"true"`
+		Bsc             ParserFactory `name:"bsc" optional:"true"`
+		Ethereum        ParserFactory `name:"ethereum" optional:"true"`
+		Rosetta         ParserFactory `name:"rosetta" optional:"true"`
+		Solana          ParserFactory `name:"solana" optional:"true"`
+		Polygon         ParserFactory `name:"polygon" optional:"true"`
+		Avacchain       ParserFactory `name:"avacchain" optional:"true"`
+		Arbitrum        ParserFactory `name:"arbitrum" optional:"true"`
+		Optimism        ParserFactory `name:"optimism" optional:"true"`
+		Fantom          ParserFactory `name:"fantom" optional:"true"`
+		Base            ParserFactory `name:"base" optional:"true"`
+		Aptos           ParserFactory `name:"aptos" optional:"true"`
+		EthereumBeacon  ParserFactory `name:"ethereum/beacon" optional:"true"`
+		CosmosStaking   ParserFactory `name:"cosmos/staking" optional:"true"`
+		CardanoStaking  ParserFactory `name:"cardano/staking" optional:"true"`
+		Tron            ParserFactory `name:"tron" optional:"true"`
+		Story           ParserFactory `name:"story" optional:"true"`
+		EthereumClassic ParserFactory `name:"ethereumclassic" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -110,6 +111,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Tron
 		case common.Blockchain_BLOCKCHAIN_STORY:
 			factory = params.Story
+		case common.Blockchain_BLOCKCHAIN_ETHEREUMCLASSIC:
+			factory = params.EthereumClassic
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
