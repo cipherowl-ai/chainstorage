@@ -225,11 +225,11 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		zap.Int("totalEvents", len(events)),
 		zap.Int("blocksToMigrate", len(blocksToMigrate)))
 
-	// Step 3: Migrate blocks using existing fast/slow path
-	// Note: Block validation is handled within migrateExtractedBlocks by querying PostgreSQL
+	// Step 3: Migrate blocks using segmented approach for reorgs
+	// Pass events to detect reorg boundaries from BLOCK_REMOVED events
 	blocksMigrated := 0
 	if len(blocksToMigrate) > 0 {
-		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, migrationData, request, blocksToMigrate)
+		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, migrationData, request, blocksToMigrate, events)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to migrate blocks: %w", err)
 		}
@@ -381,10 +381,10 @@ func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
 		case api.BlockchainEvent_BLOCK_REMOVED:
 			blockRemovedCount++
 		case api.BlockchainEvent_UNKNOWN:
-			return nil, xerrors.Errorf("encountered UNKNOWN event type at eventId=%d, height=%d", 
+			return nil, xerrors.Errorf("encountered UNKNOWN event type at eventId=%d, height=%d",
 				event.EventId, event.BlockHeight)
 		default:
-			return nil, xerrors.Errorf("unexpected event type %v at eventId=%d, height=%d", 
+			return nil, xerrors.Errorf("unexpected event type %v at eventId=%d, height=%d",
 				event.EventType, event.EventId, event.BlockHeight)
 		}
 	}
@@ -401,114 +401,183 @@ func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
 
 func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logger,
 	data *MigrationData, request *MigratorRequest,
-	blocksToMigrate []BlockToMigrate) (int, error) {
+	blocksToMigrate []BlockToMigrate, events []*model.EventEntry) (int, error) {
 
 	if len(blocksToMigrate) == 0 {
 		return 0, nil
 	}
 
-	// Detect reorgs in current batch
-	hasReorgs := a.detectReorgs(blocksToMigrate)
+	// Split blocks into segments based on reorg boundaries detected from events
+	segments := a.splitBlocksByReorgs(logger, events, blocksToMigrate)
 
-	// Fetch actual block data from DynamoDB
-	allBlocksWithInfo, err := a.fetchBlockData(ctx, logger, data, request, blocksToMigrate)
-	if err != nil {
-		return 0, xerrors.Errorf("failed to fetch block data: %w", err)
+	// If no segments were created (edge case), return
+	if len(segments) == 0 {
+		logger.Warn("No segments created from blocks")
+		return 0, nil
 	}
 
-	// Sort blocks: by height first, then by event sequence
-	sort.Slice(allBlocksWithInfo, func(i, j int) bool {
-		if allBlocksWithInfo[i].Height != allBlocksWithInfo[j].Height {
-			return allBlocksWithInfo[i].Height < allBlocksWithInfo[j].Height
-		}
-		// For same height, order by event sequence (last one wins)
-		return allBlocksWithInfo[i].EventSeq < allBlocksWithInfo[j].EventSeq
-	})
+	totalBlocksPersistedCount := 0
 
-	// REUSE EXISTING FAST/SLOW PATH LOGIC
-	blocksPersistedCount := 0
-
-	if !hasReorgs {
-		// FAST PATH: No reorgs in current batch, can validate
-		logger.Info("No reorgs detected, using fast bulk persist with validation")
-		allBlocks := make([]*api.BlockMetadata, len(allBlocksWithInfo))
-		for i, blockWithInfo := range allBlocksWithInfo {
-			allBlocks[i] = blockWithInfo.BlockMetadata
+	// Process each segment
+	for segmentIdx, segment := range segments {
+		if len(segment.Blocks) == 0 {
+			continue
 		}
 
-		// Query PostgreSQL for the latest canonical block for validation
-		// Since there are no reorgs, the first block in our batch should reference the latest canonical block
-		var lastBlock *api.BlockMetadata
-		if len(allBlocks) > 0 && allBlocks[0].Height > 0 {
-			// Get the previous block from PostgreSQL (should be the latest canonical)
-			prevHeight := allBlocks[0].Height - 1
-			prevBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, prevHeight)
-			if err == nil {
-				lastBlock = prevBlock
-				logger.Debug("Found latest canonical block in PostgreSQL for validation",
-					zap.Uint64("prevHeight", prevHeight),
-					zap.String("prevHash", prevBlock.Hash))
-			} else if !errors.Is(err, storage.ErrItemNotFound) {
-				// Log error but continue without validation (genesis or error case)
-				logger.Warn("Could not fetch previous block for validation",
-					zap.Uint64("prevHeight", prevHeight),
-					zap.Error(err))
-			}
-		}
+		logger.Info("Processing block segment",
+			zap.Int("segmentIndex", segmentIdx),
+			zap.Int("blockCount", len(segment.Blocks)),
+			zap.Uint64("parentHeight", segment.ParentHeight))
 
-		// Bulk persist with validation (lastBlock can be nil for genesis)
-		err := data.DestStorage.PersistBlockMetas(ctx, false, allBlocks, lastBlock)
+		// Fetch actual block data from DynamoDB for this segment
+		segmentBlocksWithInfo, err := a.fetchBlockData(ctx, logger, data, request, segment.Blocks)
 		if err != nil {
-			logger.Error("Failed to bulk persist blocks",
-				zap.Error(err),
-				zap.Int("blockCount", len(allBlocks)))
-			return 0, xerrors.Errorf("failed to bulk persist blocks: %w", err)
+			return totalBlocksPersistedCount, xerrors.Errorf("failed to fetch block data for segment %d: %w", segmentIdx, err)
 		}
-		blocksPersistedCount = len(allBlocks)
 
-	} else {
-		// SLOW PATH: Has reorgs, persist one by one without validation
-		logger.Info("Reorgs detected, persisting blocks one by one")
+		// Sort blocks: by height first, then by event sequence (last one wins for same height)
+		sort.Slice(segmentBlocksWithInfo, func(i, j int) bool {
+			if segmentBlocksWithInfo[i].Height != segmentBlocksWithInfo[j].Height {
+				return segmentBlocksWithInfo[i].Height < segmentBlocksWithInfo[j].Height
+			}
+			return segmentBlocksWithInfo[i].EventSeq < segmentBlocksWithInfo[j].EventSeq
+		})
 
-		for _, blockWithInfo := range allBlocksWithInfo {
-			err := data.DestStorage.PersistBlockMetas(ctx, false,
-				[]*api.BlockMetadata{blockWithInfo.BlockMetadata}, nil)
-			if err != nil {
-				logger.Error("Failed to persist block",
-					zap.Uint64("height", blockWithInfo.Height),
-					zap.String("hash", blockWithInfo.Hash),
+		// Convert to BlockMetadata slice
+		segmentBlocks := make([]*api.BlockMetadata, len(segmentBlocksWithInfo))
+		for i, blockWithInfo := range segmentBlocksWithInfo {
+			segmentBlocks[i] = blockWithInfo.BlockMetadata
+		}
+
+		// Get the parent block for validation based on segment configuration
+		var lastBlock *api.BlockMetadata
+		// If segment specifies a parent height, or if first block isn't genesis
+		if segment.ParentHeight > 0 || (len(segmentBlocks) > 0 && segmentBlocks[0].Height > 0) {
+			// Determine which height to fetch parent from
+			var parentHeight uint64
+			if segment.ParentHeight > 0 {
+				parentHeight = segment.ParentHeight
+			} else {
+				// For first segment without explicit parent, use first block's parent
+				parentHeight = segmentBlocks[0].Height - 1
+			}
+			
+			parentBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, parentHeight)
+			if err == nil {
+				lastBlock = parentBlock
+				logger.Debug("Found parent block for segment validation",
+					zap.Int("segmentIndex", segmentIdx),
+					zap.Uint64("parentHeight", parentHeight),
+					zap.String("parentHash", parentBlock.Hash))
+			} else if !errors.Is(err, storage.ErrItemNotFound) {
+				logger.Warn("Could not fetch parent block for segment validation",
+					zap.Int("segmentIndex", segmentIdx),
+					zap.Uint64("parentHeight", parentHeight),
 					zap.Error(err))
-				return blocksPersistedCount, xerrors.Errorf("failed to persist block: %w", err)
 			}
-			blocksPersistedCount++
+		}
 
-			// Log progress and send heartbeat periodically
-			if blocksPersistedCount%100 == 0 {
-				activity.RecordHeartbeat(ctx, fmt.Sprintf("Migrating blocks (slow path): %d/%d blocks persisted",
-					blocksPersistedCount, len(allBlocksWithInfo)))
-				logger.Debug("Progress update",
-					zap.Int("persisted", blocksPersistedCount),
-					zap.Int("total", len(allBlocksWithInfo)))
-			}
+		// Bulk persist the segment with validation
+		err = data.DestStorage.PersistBlockMetas(ctx, false, segmentBlocks, lastBlock)
+		if err != nil {
+			logger.Error("Failed to persist segment",
+				zap.Int("segmentIndex", segmentIdx),
+				zap.Int("blockCount", len(segmentBlocks)),
+				zap.Error(err))
+			return totalBlocksPersistedCount, xerrors.Errorf("failed to persist segment %d: %w", segmentIdx, err)
+		}
+
+		totalBlocksPersistedCount += len(segmentBlocks)
+
+		// Record heartbeat if in activity context
+		if activity.IsActivity(ctx) {
+			activity.RecordHeartbeat(ctx, fmt.Sprintf("Migrated segment %d/%d: %d blocks (total: %d)",
+				segmentIdx+1, len(segments), len(segmentBlocks), totalBlocksPersistedCount))
 		}
 	}
 
-	logger.Info("Blocks migrated successfully",
-		zap.Int("blocksPersistedCount", blocksPersistedCount),
-		zap.Bool("hadReorgs", hasReorgs))
+	logger.Info("All segments migrated successfully",
+		zap.Int("totalSegments", len(segments)),
+		zap.Int("totalBlocksPersisted", totalBlocksPersistedCount))
 
-	return blocksPersistedCount, nil
+	return totalBlocksPersistedCount, nil
 }
 
-func (a *Migrator) detectReorgs(blocks []BlockToMigrate) bool {
-	heightMap := make(map[uint64]int)
+// BlockSegment represents a continuous segment of blocks to persist together
+type BlockSegment struct {
+	Blocks []BlockToMigrate
+	// ParentHeight is the height of the block that should validate as parent of first block
+	ParentHeight uint64
+}
+
+// splitBlocksByReorgs splits blocks into segments at reorg boundaries (BLOCK_REMOVED events)
+func (a *Migrator) splitBlocksByReorgs(logger *zap.Logger,
+	events []*model.EventEntry, blocks []BlockToMigrate) []BlockSegment {
+
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	// Map blocks by eventId for quick lookup
+	blockByEventId := make(map[int64]BlockToMigrate)
 	for _, block := range blocks {
-		heightMap[block.Height]++
-		if heightMap[block.Height] > 1 {
-			return true
+		blockByEventId[block.EventSeq] = block
+	}
+
+	var segments []BlockSegment
+	var currentSegment []BlockToMigrate
+	var segmentParentHeight uint64 = 0
+	var reorgStartHeight uint64 = 0
+
+	for _, event := range events {
+		switch event.EventType {
+		case api.BlockchainEvent_BLOCK_REMOVED:
+			// When we see first BLOCK_REMOVED, save current segment
+			if len(currentSegment) > 0 {
+				segments = append(segments, BlockSegment{
+					Blocks:       currentSegment,
+					ParentHeight: segmentParentHeight,
+				})
+				currentSegment = nil
+			}
+			// Track where the reorg started (will be parent for next segment)
+			if reorgStartHeight == 0 || event.BlockHeight < reorgStartHeight {
+				reorgStartHeight = event.BlockHeight
+			}
+
+		case api.BlockchainEvent_BLOCK_ADDED:
+			if block, exists := blockByEventId[event.EventId]; exists {
+				// If we just had a reorg, set the parent height
+				if reorgStartHeight > 0 {
+					segmentParentHeight = reorgStartHeight - 1
+					reorgStartHeight = 0 // Reset for next reorg
+				}
+				currentSegment = append(currentSegment, block)
+			}
 		}
 	}
-	return false
+
+	// Add any remaining blocks as final segment
+	if len(currentSegment) > 0 {
+		segments = append(segments, BlockSegment{
+			Blocks:       currentSegment,
+			ParentHeight: segmentParentHeight,
+		})
+	}
+
+	// Log segments for debugging
+	for i, segment := range segments {
+		if len(segment.Blocks) > 0 {
+			logger.Debug("Block segment",
+				zap.Int("index", i),
+				zap.Int("blocks", len(segment.Blocks)),
+				zap.Uint64("firstHeight", segment.Blocks[0].Height),
+				zap.Uint64("lastHeight", segment.Blocks[len(segment.Blocks)-1].Height),
+				zap.Uint64("parentHeight", segment.ParentHeight))
+		}
+	}
+
+	return segments
 }
 
 type BlockWithInfo struct {
@@ -554,13 +623,13 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 	worker := func() {
 		for block := range workChan {
 			var blockMeta *api.BlockMetadata
-			
+
 			// For skipped blocks, create metadata directly without fetching
 			if block.Skipped {
 				blockMeta = &api.BlockMetadata{
-					Tag:          request.Tag,
-					Height:       block.Height,
-					Skipped:      true,
+					Tag:     request.Tag,
+					Height:  block.Height,
+					Skipped: true,
 					// Hash and ParentHash remain empty for skipped blocks
 					// These will be stored as NULL in PostgreSQL
 					Hash:         "",
