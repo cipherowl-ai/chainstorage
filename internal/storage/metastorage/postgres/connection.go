@@ -60,41 +60,14 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 		}
 	}
 
-	// Check if tables exist, if not run migrations
-	tablesExist, err := checkTablesExist(ctx, db)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to check if tables exist: %w", err)
+	// Always run migrations - goose will check which migrations have been applied
+	// and only run new ones. This ensures incremental migrations work properly.
+	logger.Debug("Running database migrations")
+	if err := runMigrations(ctx, db); err != nil {
+		return nil, xerrors.Errorf("failed to run migrations: %w", err)
 	}
-
-	if !tablesExist {
-		logger.Debug("Tables don't exist, running migrations")
-		if err := runMigrations(ctx, db); err != nil {
-			return nil, xerrors.Errorf("failed to run migrations: %w", err)
-		}
-		logger.Debug("Migrations completed successfully")
-	} else {
-		logger.Debug("Tables already exist, skipping migrations")
-	}
+	logger.Debug("Migrations completed successfully")
 
 	return db, nil
 }
 
-// checkTablesExist checks if the core PostgreSQL tables exist
-// Returns true if the main tables exist, false otherwise
-func checkTablesExist(ctx context.Context, db *sql.DB) (bool, error) {
-	// Check for the existence of block_metadata table as it's the primary table
-	query := `
-		SELECT EXISTS (
-			SELECT FROM information_schema.tables 
-			WHERE table_schema = 'public' 
-			AND table_name = 'block_metadata'
-		)`
-
-	var exists bool
-	err := db.QueryRowContext(ctx, query).Scan(&exists)
-	if err != nil {
-		return false, xerrors.Errorf("failed to check table existence: %w", err)
-	}
-
-	return exists, nil
-}
