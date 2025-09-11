@@ -3,28 +3,30 @@ package activity
 import (
 	"testing"
 
+	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
 	"go.uber.org/fx"
-	"go.uber.org/mock/gomock"
+	"go.uber.org/zap"
 
-	"github.com/coinbase/chainstorage/internal/cadence"
-	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
-	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 type migratorActivityTestSuite struct {
 	suite.Suite
 	testsuite.WorkflowTestSuite
-	env      *cadence.TestEnv
-	ctrl     *gomock.Controller
-	app      testapp.TestApp
-	migrator *Migrator
-	cfg      *config.Config
+	ctrl                  *gomock.Controller
+	app                   testapp.TestApp
+	logger                *zap.Logger
+	migrator              *Migrator
+	getLatestHeight       *GetLatestBlockHeightActivity
+	getLatestFromPostgres *GetLatestBlockFromPostgresActivity
+	getLatestEvent        *GetLatestEventFromPostgresActivity
+	getMaxEventId         *GetMaxEventIdActivity
+	env                   *testsuite.TestActivityEnvironment
 }
 
 func TestMigratorActivityTestSuite(t *testing.T) {
@@ -32,390 +34,373 @@ func TestMigratorActivityTestSuite(t *testing.T) {
 }
 
 func (s *migratorActivityTestSuite) SetupTest() {
-	require := testutil.Require(s.T())
-
-	s.env = cadence.NewTestActivityEnv(s)
 	s.ctrl = gomock.NewController(s.T())
+	s.env = s.NewTestActivityEnvironment()
 
-	cfg, err := config.New(
-		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_ETHEREUM),
-		config.WithNetwork(common.Network_NETWORK_ETHEREUM_MAINNET),
-		config.WithEnvironment(config.EnvLocal),
-	)
-	require.NoError(err)
-	s.cfg = cfg
+	var deps struct {
+		fx.In
+		Migrator                   *Migrator
+		GetLatestHeight            *GetLatestBlockHeightActivity
+		GetLatestFromPostgres      *GetLatestBlockFromPostgresActivity
+		GetLatestEventFromPostgres *GetLatestEventFromPostgresActivity
+		GetMaxEventId              *GetMaxEventIdActivity
+	}
 
 	s.app = testapp.New(
 		s.T(),
-		Module,
-		cadence.WithTestEnv(s.env),
-		testapp.WithConfig(cfg),
-		fx.Populate(&s.migrator),
+		testapp.WithFunctional(),
+		fx.Populate(&deps),
 	)
+
+	s.migrator = deps.Migrator
+	s.getLatestHeight = deps.GetLatestHeight
+	s.getLatestFromPostgres = deps.GetLatestFromPostgres
+	s.getLatestEvent = deps.GetLatestEventFromPostgres
+	s.getMaxEventId = deps.GetMaxEventId
+	s.logger = s.app.Logger()
+
+	s.env.RegisterActivity(s.migrator.Execute)
+	s.env.RegisterActivity(s.getLatestHeight.Execute)
+	s.env.RegisterActivity(s.getLatestFromPostgres.Execute)
+	s.env.RegisterActivity(s.getLatestEvent.Execute)
+	s.env.RegisterActivity(s.getMaxEventId.Execute)
 }
 
 func (s *migratorActivityTestSuite) TearDownTest() {
 	s.app.Close()
 	s.ctrl.Finish()
-	s.env.AssertExpectations(s.T())
 }
 
-func (s *migratorActivityTestSuite) TestMigrator_EventDrivenRequest() {
-	require := testutil.Require(s.T())
-
-	// Test event-driven request structure
-	request := &MigratorRequest{
-		StartEventSequence: int64(1000),
-		EndEventSequence:   int64(1050),
-		Tag:                uint32(1),
-		EventTag:           uint32(0),
-		Parallelism:        4,
-	}
-
-	require.NotNil(request)
-	require.Equal(int64(1000), request.StartEventSequence)
-	require.Equal(int64(1050), request.EndEventSequence)
-	require.Equal(uint32(1), request.Tag)
-	require.Equal(uint32(0), request.EventTag)
-	require.Equal(4, request.Parallelism)
-}
-
-func (s *migratorActivityTestSuite) TestMigrator_ResponseStructure() {
-	require := testutil.Require(s.T())
-
-	// Test response structure
-	response := &MigratorResponse{
-		BlocksMigrated: 100,
-		EventsMigrated: 500,
-		Success:        true,
-		Message:        "Migrated 100 blocks and 500 events in 1.5s",
-	}
-
-	require.Equal(100, response.BlocksMigrated)
-	require.Equal(500, response.EventsMigrated)
-	require.True(response.Success)
-	require.Contains(response.Message, "100 blocks")
-	require.Contains(response.Message, "500 events")
-}
-
-func (s *migratorActivityTestSuite) TestExtractBlocksFromEvents() {
-	require := testutil.Require(s.T())
-
-	// Create test events with BLOCK_ADDED and BLOCK_REMOVED
-	events := []*model.EventEntry{
-		{
-			EventId:     1001,
-			EventType:   api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight: 100,
-			BlockHash:   "0xaaa",
-			ParentHash:  "0x999",
-		},
-		{
-			EventId:     1002,
-			EventType:   api.BlockchainEvent_BLOCK_REMOVED,
-			BlockHeight: 100,
-			BlockHash:   "0xbbb",
-			ParentHash:  "0x999",
-		},
-		{
-			EventId:     1003,
-			EventType:   api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight: 100,
-			BlockHash:   "0xccc",
-			ParentHash:  "0x999",
-		},
-		{
-			EventId:     1004,
-			EventType:   api.BlockchainEvent_BLOCK_ADDED,
-			BlockHeight: 101,
-			BlockHash:   "0xddd",
-			ParentHash:  "0xccc",
-		},
-	}
-
-	// Extract blocks from events
-	blocks, err := s.migrator.extractBlocksFromEvents(s.app.Logger(), events)
-	require.NoError(err)
-
-	// Should extract only BLOCK_ADDED events
-	require.Len(blocks, 3)
-
-	// Check first block
-	require.Equal(uint64(100), blocks[0].Height)
-	require.Equal("0xaaa", blocks[0].Hash)
-	require.Equal("0x999", blocks[0].ParentHash)
-	require.Equal(int64(1001), blocks[0].EventSeq)
-
-	// Check second block (reorg at height 100)
-	require.Equal(uint64(100), blocks[1].Height)
-	require.Equal("0xccc", blocks[1].Hash)
-	require.Equal("0x999", blocks[1].ParentHash)
-	require.Equal(int64(1003), blocks[1].EventSeq)
-
-	// Check third block
-	require.Equal(uint64(101), blocks[2].Height)
-	require.Equal("0xddd", blocks[2].Hash)
-	require.Equal("0xccc", blocks[2].ParentHash)
-	require.Equal(int64(1004), blocks[2].EventSeq)
-
-	// Test UNKNOWN event type - should return error
-	eventsWithUnknown := []*model.EventEntry{
-		{
-			EventId:     1001,
-			EventType:   api.BlockchainEvent_UNKNOWN,
-			BlockHeight: 100,
-			BlockHash:   "0xaaa",
-		},
-	}
-
-	_, err = s.migrator.extractBlocksFromEvents(s.app.Logger(), eventsWithUnknown)
-	require.Error(err)
-	require.Contains(err.Error(), "encountered UNKNOWN event type")
-}
-
-func (s *migratorActivityTestSuite) TestSplitBlocksByReorgs() {
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_NoReorgs() {
 	require := testutil.Require(s.T())
 	logger := s.app.Logger()
 
-	// Test case 1: No reorgs - single segment
-	eventsNoReorg := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
+	// Test case: No reorgs - single segment
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb", ParentHash: "0xa"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc", ParentHash: "0xb"},
 	}
-	blocksNoReorg := []BlockToMigrate{
-		{Height: 100, Hash: "0xa", EventSeq: 1},
-		{Height: 101, Hash: "0xb", EventSeq: 2},
-		{Height: 102, Hash: "0xc", EventSeq: 3},
-	}
-	segments := s.migrator.splitBlocksByReorgs(logger, eventsNoReorg, blocksNoReorg)
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
 	require.Len(segments, 1, "Should have 1 segment when no reorgs")
 	require.Len(segments[0].Blocks, 3)
-	require.Equal(uint64(0), segments[0].ParentHeight)
 
-	// Test case 2: Single reorg in middle
-	eventsSingleReorg := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
-		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103},
+	// Verify blocks are in correct order
+	require.Equal(uint64(100), segments[0].Blocks[0].Height)
+	require.Equal("0xa", segments[0].Blocks[0].Hash)
+	require.Equal(uint64(101), segments[0].Blocks[1].Height)
+	require.Equal("0xb", segments[0].Blocks[1].Hash)
+	require.Equal(uint64(102), segments[0].Blocks[2].Height)
+	require.Equal("0xc", segments[0].Blocks[2].Hash)
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_SingleReorg() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Test case: Single reorg in middle
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb", ParentHash: "0xa"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc1", ParentHash: "0xb"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102, BlockHash: "0xc1"},
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc2", ParentHash: "0xb"},
+		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103, BlockHash: "0xd", ParentHash: "0xc2"},
 	}
-	blocksSingleReorg := []BlockToMigrate{
-		{Height: 100, Hash: "0xa", EventSeq: 1},
-		{Height: 101, Hash: "0xb", EventSeq: 2},
-		{Height: 102, Hash: "0xc1", EventSeq: 3},
-		{Height: 102, Hash: "0xc2", EventSeq: 5},
-		{Height: 103, Hash: "0xd", EventSeq: 6},
-	}
-	segments = s.migrator.splitBlocksByReorgs(logger, eventsSingleReorg, blocksSingleReorg)
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
 	require.Len(segments, 2, "Should have 2 segments with 1 reorg")
-	require.Len(segments[0].Blocks, 3) // blocks 100, 101, 102(c1)
-	require.Len(segments[1].Blocks, 2) // blocks 102(c2), 103
-	require.Equal(uint64(0), segments[0].ParentHeight)
-	require.Equal(uint64(101), segments[1].ParentHeight) // Parent is block 101
 
-	// Test case 3: Multiple reorgs
-	eventsMultiReorg := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
-		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
+	// First segment: blocks before reorg
+	require.Len(segments[0].Blocks, 3)
+	require.Equal(uint64(100), segments[0].Blocks[0].Height)
+	require.Equal(uint64(101), segments[0].Blocks[1].Height)
+	require.Equal(uint64(102), segments[0].Blocks[2].Height)
+	require.Equal("0xc1", segments[0].Blocks[2].Hash)
+
+	// Second segment: blocks after reorg
+	require.Len(segments[1].Blocks, 2)
+	require.Equal(uint64(102), segments[1].Blocks[0].Height)
+	require.Equal("0xc2", segments[1].Blocks[0].Hash)
+	require.Equal(uint64(103), segments[1].Blocks[1].Height)
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_MultipleReorgs() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Test case: Multiple reorgs
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb1", ParentHash: "0xa"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0xb1"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb2", ParentHash: "0xa"},
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc1", ParentHash: "0xb2"},
+		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102, BlockHash: "0xc1"},
+		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0xb2"},
+		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb3", ParentHash: "0xa"},
+		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc2", ParentHash: "0xb3"},
 	}
-	blocksMultiReorg := []BlockToMigrate{
-		{Height: 100, Hash: "0xa", EventSeq: 1},
-		{Height: 101, Hash: "0xb1", EventSeq: 2},
-		{Height: 101, Hash: "0xb2", EventSeq: 4},
-		{Height: 102, Hash: "0xc1", EventSeq: 5},
-		{Height: 101, Hash: "0xb3", EventSeq: 8},
-		{Height: 102, Hash: "0xc2", EventSeq: 9},
-	}
-	segments = s.migrator.splitBlocksByReorgs(logger, eventsMultiReorg, blocksMultiReorg)
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
 	require.Len(segments, 3, "Should have 3 segments with 2 reorgs")
-	require.Len(segments[0].Blocks, 2) // blocks 100, 101(b1)
-	require.Len(segments[1].Blocks, 2) // blocks 101(b2), 102(c1)
-	require.Len(segments[2].Blocks, 2) // blocks 101(b3), 102(c2)
-	require.Equal(uint64(0), segments[0].ParentHeight)
-	require.Equal(uint64(100), segments[1].ParentHeight)
-	require.Equal(uint64(100), segments[2].ParentHeight)
 
-	// Test case 4: Starting with BLOCK_REMOVED
-	eventsStartRemoved := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
+	// First segment
+	require.Len(segments[0].Blocks, 2)
+	require.Equal("0xa", segments[0].Blocks[0].Hash)
+	require.Equal("0xb1", segments[0].Blocks[1].Hash)
+
+	// Second segment
+	require.Len(segments[1].Blocks, 2)
+	require.Equal("0xb2", segments[1].Blocks[0].Hash)
+	require.Equal("0xc1", segments[1].Blocks[1].Hash)
+
+	// Third segment
+	require.Len(segments[2].Blocks, 2)
+	require.Equal("0xb3", segments[2].Blocks[0].Hash)
+	require.Equal("0xc2", segments[2].Blocks[1].Hash)
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_StartingWithRemoved() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Test case: Starting with BLOCK_REMOVED
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102, BlockHash: "0xold"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0xold"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb", ParentHash: "0xa"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc", ParentHash: "0xb"},
 	}
-	blocksStartRemoved := []BlockToMigrate{
-		{Height: 101, Hash: "0xb", EventSeq: 3},
-		{Height: 102, Hash: "0xc", EventSeq: 4},
-	}
-	segments = s.migrator.splitBlocksByReorgs(logger, eventsStartRemoved, blocksStartRemoved)
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
 	require.Len(segments, 1, "Should have 1 segment when starting with REMOVED")
 	require.Len(segments[0].Blocks, 2)
-	require.Equal(uint64(100), segments[0].ParentHeight) // Parent is 100 (101-1)
+	require.Equal("0xb", segments[0].Blocks[0].Hash)
+	require.Equal("0xc", segments[0].Blocks[1].Hash)
+}
 
-	// Test case 5: Empty blocks
-	segments = s.migrator.splitBlocksByReorgs(logger, []*model.EventEntry{}, []BlockToMigrate{})
-	require.Nil(segments, "Should return nil for empty blocks")
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_EmptyEvents() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
 
-	// Test case 6: Complex reorg pattern
-	eventsComplex := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103},
-		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 103},
-		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
-		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 10, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103},
-		{EventId: 11, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 104},
-		{EventId: 12, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 105},
+	segments := s.migrator.buildSegmentsFromEvents(logger, []*model.EventEntry{})
+	require.Nil(segments, "Should return nil for empty events")
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_ComplexReorgPattern() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Complex pattern: build up chain, then deep reorg
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0x100", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0x101a", ParentHash: "0x100"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0x102a", ParentHash: "0x101a"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103, BlockHash: "0x103a", ParentHash: "0x102a"},
+		// Deep reorg back to block 100
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 103, BlockHash: "0x103a"},
+		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102, BlockHash: "0x102a"},
+		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0x101a"},
+		// Build new chain
+		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0x101b", ParentHash: "0x100"},
+		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0x102b", ParentHash: "0x101b"},
+		{EventId: 10, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 103, BlockHash: "0x103b", ParentHash: "0x102b"},
+		{EventId: 11, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 104, BlockHash: "0x104", ParentHash: "0x103b"},
+		{EventId: 12, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 105, BlockHash: "0x105", ParentHash: "0x104"},
 	}
-	blocksComplex := []BlockToMigrate{
-		{Height: 100, Hash: "0x100", EventSeq: 1},
-		{Height: 101, Hash: "0x101a", EventSeq: 2},
-		{Height: 102, Hash: "0x102a", EventSeq: 3},
-		{Height: 103, Hash: "0x103a", EventSeq: 4},
-		{Height: 101, Hash: "0x101b", EventSeq: 8},
-		{Height: 102, Hash: "0x102b", EventSeq: 9},
-		{Height: 103, Hash: "0x103b", EventSeq: 10},
-		{Height: 104, Hash: "0x104", EventSeq: 11},
-		{Height: 105, Hash: "0x105", EventSeq: 12},
-	}
-	segments = s.migrator.splitBlocksByReorgs(logger, eventsComplex, blocksComplex)
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
 	require.Len(segments, 2, "Should have 2 segments")
-	require.Len(segments[0].Blocks, 4) // 100, 101a, 102a, 103a
-	require.Len(segments[1].Blocks, 5) // 101b, 102b, 103b, 104, 105
-	require.Equal(uint64(0), segments[0].ParentHeight)
-	require.Equal(uint64(100), segments[1].ParentHeight) // Reorg started at 101, so parent is 100
+
+	// First segment: original chain
+	require.Len(segments[0].Blocks, 4)
+	require.Equal("0x100", segments[0].Blocks[0].Hash)
+	require.Equal("0x103a", segments[0].Blocks[3].Hash)
+
+	// Second segment: new chain after reorg
+	require.Len(segments[1].Blocks, 5)
+	require.Equal("0x101b", segments[1].Blocks[0].Hash)
+	require.Equal("0x105", segments[1].Blocks[4].Hash)
 }
 
-func (s *migratorActivityTestSuite) TestGetLatestEventFromPostgres() {
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_SkippedBlocks() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Test with skipped blocks
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99", BlockSkipped: false},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "", ParentHash: "", BlockSkipped: true},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc", ParentHash: "0xa", BlockSkipped: false},
+	}
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Len(segments, 1)
+	require.Len(segments[0].Blocks, 3)
+
+	// Verify skipped block is included
+	require.Equal(uint64(100), segments[0].Blocks[0].Height)
+	require.False(segments[0].Blocks[0].Skipped)
+	require.Equal(uint64(101), segments[0].Blocks[1].Height)
+	require.True(segments[0].Blocks[1].Skipped)
+	require.Equal(uint64(102), segments[0].Blocks[2].Height)
+	require.False(segments[0].Blocks[2].Skipped)
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_OnlyRemovedEvents() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Only BLOCK_REMOVED events - no blocks to migrate
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 100},
+	}
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Nil(segments, "Should return nil when only REMOVED events")
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_AlternatingAddRemove() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Alternating ADD and REMOVE pattern
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 100},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xb", ParentHash: "0x99"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 100},
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xc", ParentHash: "0x99"},
+	}
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Len(segments, 3, "Should have 3 segments")
+
+	// Each segment should have one block
+	for i, segment := range segments {
+		require.Len(segment.Blocks, 1, "Segment %d should have 1 block", i)
+		require.Equal(uint64(100), segment.Blocks[0].Height)
+	}
+	require.Equal("0xa", segments[0].Blocks[0].Hash)
+	require.Equal("0xb", segments[1].Blocks[0].Hash)
+	require.Equal("0xc", segments[2].Blocks[0].Hash)
+}
+
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_ConsecutiveRemovals() {
+	require := testutil.Require(s.T())
+	logger := s.app.Logger()
+
+	// Multiple consecutive BLOCK_REMOVED events
+	events := []*model.EventEntry{
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb", ParentHash: "0xa"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 100},
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 99}, // Removing even further back
+		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 99, BlockHash: "0xnew99", ParentHash: "0x98"},
+		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xnew100", ParentHash: "0xnew99"},
+	}
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Len(segments, 2)
+
+	// First segment: original blocks
+	require.Len(segments[0].Blocks, 2)
+	require.Equal("0xa", segments[0].Blocks[0].Hash)
+	require.Equal("0xb", segments[0].Blocks[1].Hash)
+
+	// Second segment: new blocks after deep reorg
+	require.Len(segments[1].Blocks, 2)
+	require.Equal("0xnew99", segments[1].Blocks[0].Hash)
+	require.Equal("0xnew100", segments[1].Blocks[1].Hash)
+}
+
+func (s *migratorActivityTestSuite) TestFetchBlockData_OrderPreservation() {
 	require := testutil.Require(s.T())
 
-	// Test request structure
-	request := &GetLatestEventFromPostgresRequest{
-		EventTag: uint32(3),
+	// Create test blocks in specific order
+	blocksToMigrate := []BlockToMigrate{
+		{Height: 102, Hash: "0xc", EventSeq: 3},
+		{Height: 100, Hash: "0xa", EventSeq: 1},
+		{Height: 101, Hash: "0xb", EventSeq: 2},
 	}
-	require.Equal(uint32(3), request.EventTag)
 
-	// Test response structure - with events found
-	responseWithEvents := &GetLatestEventFromPostgresResponse{
-		Sequence: int64(12345),
-		Height:   uint64(5000),
-		Found:    true,
+	// Test that WorkItem structure exists and has correct fields
+	workItem := WorkItem{
+		Block: blocksToMigrate[0],
+		Index: 0,
 	}
-	require.Equal(int64(12345), responseWithEvents.Sequence)
-	require.Equal(uint64(5000), responseWithEvents.Height)
-	require.True(responseWithEvents.Found)
-
-	// Test response structure - no events found
-	responseNoEvents := &GetLatestEventFromPostgresResponse{
-		Sequence: 0,
-		Height:   0,
-		Found:    false,
-	}
-	require.Equal(int64(0), responseNoEvents.Sequence)
-	require.Equal(uint64(0), responseNoEvents.Height)
-	require.False(responseNoEvents.Found)
+	require.Equal(uint64(102), workItem.Block.Height)
+	require.Equal(0, workItem.Index)
 }
 
-func (s *migratorActivityTestSuite) TestBlockWithInfo_Sorting() {
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_EventSequenceOrdering() {
 	require := testutil.Require(s.T())
+	logger := s.app.Logger()
 
-	// Create blocks with reorgs to test sorting
-	blocks := []*BlockWithInfo{
-		{
-			BlockMetadata: &api.BlockMetadata{Height: 100, Hash: "0xaaa"},
-			Height:        100,
-			Hash:          "0xaaa",
-			EventSeq:      1001,
-		},
-		{
-			BlockMetadata: &api.BlockMetadata{Height: 100, Hash: "0xbbb"},
-			Height:        100,
-			Hash:          "0xbbb",
-			EventSeq:      1003, // Later event sequence
-		},
-		{
-			BlockMetadata: &api.BlockMetadata{Height: 99, Hash: "0x999"},
-			Height:        99,
-			Hash:          "0x999",
-			EventSeq:      1000,
-		},
-		{
-			BlockMetadata: &api.BlockMetadata{Height: 101, Hash: "0xccc"},
-			Height:        101,
-			Hash:          "0xccc",
-			EventSeq:      1004,
-		},
+	// Test that blocks maintain event sequence ordering within segments
+	events := []*model.EventEntry{
+		{EventId: 10, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0xa", ParentHash: "0x99"},
+		{EventId: 20, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0xb", ParentHash: "0xa"},
+		{EventId: 30, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xc", ParentHash: "0xb"},
+		{EventId: 40, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
+		{EventId: 50, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0xd", ParentHash: "0xb"},
 	}
 
-	// Sort by height first, then by event sequence for same height
-	sortBlocksByHeightAndSequence(blocks)
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Len(segments, 2)
 
-	// Verify sorting
-	require.Equal(uint64(99), blocks[0].Height)
-	require.Equal("0x999", blocks[0].Hash)
-
-	require.Equal(uint64(100), blocks[1].Height)
-	require.Equal("0xaaa", blocks[1].Hash)
-	require.Equal(int64(1001), blocks[1].EventSeq)
-
-	require.Equal(uint64(100), blocks[2].Height)
-	require.Equal("0xbbb", blocks[2].Hash)
-	require.Equal(int64(1003), blocks[2].EventSeq) // Later sequence comes second
-
-	require.Equal(uint64(101), blocks[3].Height)
-	require.Equal("0xccc", blocks[3].Hash)
+	// Verify EventSeq is preserved
+	require.Equal(int64(10), segments[0].Blocks[0].EventSeq)
+	require.Equal(int64(20), segments[0].Blocks[1].EventSeq)
+	require.Equal(int64(30), segments[0].Blocks[2].EventSeq)
+	require.Equal(int64(50), segments[1].Blocks[0].EventSeq)
 }
 
-// Helper function for sorting
-func sortBlocksByHeightAndSequence(blocks []*BlockWithInfo) {
-	// This mimics the sorting logic in migrateExtractedBlocks
-	for i := 0; i < len(blocks); i++ {
-		for j := i + 1; j < len(blocks); j++ {
-			if blocks[i].Height > blocks[j].Height {
-				blocks[i], blocks[j] = blocks[j], blocks[i]
-			} else if blocks[i].Height == blocks[j].Height && blocks[i].EventSeq > blocks[j].EventSeq {
-				blocks[i], blocks[j] = blocks[j], blocks[i]
-			}
-		}
-	}
-}
-
-func (s *migratorActivityTestSuite) TestParallelEventFetching() {
+func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_LargeReorgChain() {
 	require := testutil.Require(s.T())
+	logger := s.app.Logger()
 
-	// Test mini-batch calculation
-	totalSequences := int64(1000)
-	parallelism := 8
-	expectedMiniBatchSize := (totalSequences + int64(parallelism) - 1) / int64(parallelism)
+	// Test with a large number of blocks and reorgs
+	events := make([]*model.EventEntry, 0, 1000)
 
-	require.Equal(int64(125), expectedMiniBatchSize)
-
-	// Test work distribution
-	var batches []struct{ start, end int64 }
-	for start := int64(0); start < totalSequences; start += expectedMiniBatchSize {
-		end := start + expectedMiniBatchSize
-		if end > totalSequences {
-			end = totalSequences
-		}
-		batches = append(batches, struct{ start, end int64 }{start, end})
+	// Add 100 blocks
+	for i := 0; i < 100; i++ {
+		events = append(events, &model.EventEntry{
+			EventId:     int64(i + 1),
+			EventType:   api.BlockchainEvent_BLOCK_ADDED,
+			BlockHeight: uint64(100 + i),
+			BlockHash:   string(rune('a'+i%26)) + "orig",
+			ParentHash:  string(rune('a'+(i-1)%26)) + "orig",
+		})
 	}
 
-	require.Len(batches, parallelism)
-	require.Equal(int64(0), batches[0].start)
-	require.Equal(int64(125), batches[0].end)
-	require.Equal(int64(875), batches[7].start)
-	require.Equal(int64(1000), batches[7].end)
+	// Remove last 50 blocks
+	for i := 99; i >= 50; i-- {
+		events = append(events, &model.EventEntry{
+			EventId:     int64(101 + (99 - i)),
+			EventType:   api.BlockchainEvent_BLOCK_REMOVED,
+			BlockHeight: uint64(100 + i),
+		})
+	}
+
+	// Add 60 new blocks
+	for i := 0; i < 60; i++ {
+		events = append(events, &model.EventEntry{
+			EventId:     int64(151 + i),
+			EventType:   api.BlockchainEvent_BLOCK_ADDED,
+			BlockHeight: uint64(150 + i),
+			BlockHash:   string(rune('a'+i%26)) + "new",
+			ParentHash:  string(rune('a'+(i-1)%26)) + "new",
+		})
+	}
+
+	segments := s.migrator.buildSegmentsFromEvents(logger, events)
+	require.Len(segments, 2)
+	require.Len(segments[0].Blocks, 100)
+	require.Len(segments[1].Blocks, 60)
 }

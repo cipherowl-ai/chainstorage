@@ -215,27 +215,13 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}, nil
 	}
 
-	// Step 2: Extract blocks from BLOCK_ADDED events
-	blocksToMigrate, err := a.extractBlocksFromEvents(logger, events)
+	// Step 2: Split events into segments and migrate blocks
+	blocksMigrated, err := a.migrateExtractedBlocks(ctx, logger, migrationData, request, events)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to extract blocks from events: %w", err)
+		return nil, xerrors.Errorf("failed to migrate blocks: %w", err)
 	}
 
-	logger.Info("Extracted blocks from events",
-		zap.Int("totalEvents", len(events)),
-		zap.Int("blocksToMigrate", len(blocksToMigrate)))
-
-	// Step 3: Migrate blocks using segmented approach for reorgs
-	// Pass events to detect reorg boundaries from BLOCK_REMOVED events
-	blocksMigrated := 0
-	if len(blocksToMigrate) > 0 {
-		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, migrationData, request, blocksToMigrate, events)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to migrate blocks: %w", err)
-		}
-	}
-
-	// Step 4: Migrate events
+	// Step 3: Migrate events
 	eventsMigrated := 0
 	if len(events) > 0 {
 		eventsMigrated, err = a.persistEvents(ctx, logger, migrationData, request, events)
@@ -336,7 +322,8 @@ func (a *Migrator) fetchEventsBySequence(ctx context.Context, logger *zap.Logger
 			expectedCount, len(events), startSeq, endSeq)
 	}
 
-	// Sort events to ensure proper ordering for validation
+	// Sort events by EventId to ensure proper ordering for gap validation
+	// DynamoDB Query should return sorted results, but we sort to be defensive
 	sort.Slice(events, func(i, j int) bool {
 		return events[i].EventId < events[j].EventId
 	})
@@ -356,59 +343,12 @@ func (a *Migrator) fetchEventsBySequence(ctx context.Context, logger *zap.Logger
 	return events, nil
 }
 
-func (a *Migrator) extractBlocksFromEvents(logger *zap.Logger,
-	events []*model.EventEntry) ([]BlockToMigrate, error) {
-
-	var blocks []BlockToMigrate
-	blockAddedCount := 0
-	blockRemovedCount := 0
-	skippedBlockCount := 0
-
-	for _, event := range events {
-		switch event.EventType {
-		case api.BlockchainEvent_BLOCK_ADDED:
-			blocks = append(blocks, BlockToMigrate{
-				Height:     event.BlockHeight,
-				Hash:       event.BlockHash,
-				ParentHash: event.ParentHash,
-				EventSeq:   event.EventId,
-				Skipped:    event.BlockSkipped,
-			})
-			blockAddedCount++
-			if event.BlockSkipped {
-				skippedBlockCount++
-			}
-		case api.BlockchainEvent_BLOCK_REMOVED:
-			blockRemovedCount++
-		case api.BlockchainEvent_UNKNOWN:
-			return nil, xerrors.Errorf("encountered UNKNOWN event type at eventId=%d, height=%d",
-				event.EventId, event.BlockHeight)
-		default:
-			return nil, xerrors.Errorf("unexpected event type %v at eventId=%d, height=%d",
-				event.EventType, event.EventId, event.BlockHeight)
-		}
-	}
-
-	logger.Info("Extracted blocks from events",
-		zap.Int("totalEvents", len(events)),
-		zap.Int("blockAddedEvents", blockAddedCount),
-		zap.Int("blockRemovedEvents", blockRemovedCount),
-		zap.Int("skippedBlocks", skippedBlockCount),
-		zap.Int("blocksToMigrate", len(blocks)))
-
-	return blocks, nil
-}
-
 func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logger,
 	data *MigrationData, request *MigratorRequest,
-	blocksToMigrate []BlockToMigrate, events []*model.EventEntry) (int, error) {
+	events []*model.EventEntry) (int, error) {
 
-	if len(blocksToMigrate) == 0 {
-		return 0, nil
-	}
-
-	// Split blocks into segments based on reorg boundaries detected from events
-	segments := a.splitBlocksByReorgs(logger, events, blocksToMigrate)
+	// Build segments directly from events
+	segments := a.buildSegmentsFromEvents(logger, events)
 
 	// If no segments were created (edge case), return
 	if len(segments) == 0 {
@@ -426,22 +366,13 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 
 		logger.Info("Processing block segment",
 			zap.Int("segmentIndex", segmentIdx),
-			zap.Int("blockCount", len(segment.Blocks)),
-			zap.Uint64("parentHeight", segment.ParentHeight))
+			zap.Int("blockCount", len(segment.Blocks)))
 
-		// Fetch actual block data from DynamoDB for this segment
+		// Fetch actual block data from DynamoDB for this segment (with order preservation)
 		segmentBlocksWithInfo, err := a.fetchBlockData(ctx, logger, data, request, segment.Blocks)
 		if err != nil {
 			return totalBlocksPersistedCount, xerrors.Errorf("failed to fetch block data for segment %d: %w", segmentIdx, err)
 		}
-
-		// Sort blocks: by height first, then by event sequence (last one wins for same height)
-		sort.Slice(segmentBlocksWithInfo, func(i, j int) bool {
-			if segmentBlocksWithInfo[i].Height != segmentBlocksWithInfo[j].Height {
-				return segmentBlocksWithInfo[i].Height < segmentBlocksWithInfo[j].Height
-			}
-			return segmentBlocksWithInfo[i].EventSeq < segmentBlocksWithInfo[j].EventSeq
-		})
 
 		// Convert to BlockMetadata slice
 		segmentBlocks := make([]*api.BlockMetadata, len(segmentBlocksWithInfo))
@@ -449,29 +380,15 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 			segmentBlocks[i] = blockWithInfo.BlockMetadata
 		}
 
-		// Get the parent block for validation based on segment configuration
+		// Get parent block for validation if not genesis
 		var lastBlock *api.BlockMetadata
-		// If segment specifies a parent height, or if first block isn't genesis
-		if segment.ParentHeight > 0 || (len(segmentBlocks) > 0 && segmentBlocks[0].Height > 0) {
-			// Determine which height to fetch parent from
-			var parentHeight uint64
-			if segment.ParentHeight > 0 {
-				parentHeight = segment.ParentHeight
-			} else {
-				// For first segment without explicit parent, use first block's parent
-				parentHeight = segmentBlocks[0].Height - 1
-			}
-			
+		if len(segmentBlocks) > 0 && segmentBlocks[0].Height > 0 {
+			parentHeight := segmentBlocks[0].Height - 1
 			parentBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, parentHeight)
 			if err == nil {
 				lastBlock = parentBlock
-				logger.Debug("Found parent block for segment validation",
-					zap.Int("segmentIndex", segmentIdx),
-					zap.Uint64("parentHeight", parentHeight),
-					zap.String("parentHash", parentBlock.Hash))
 			} else if !errors.Is(err, storage.ErrItemNotFound) {
-				logger.Warn("Could not fetch parent block for segment validation",
-					zap.Int("segmentIndex", segmentIdx),
+				logger.Warn("Could not fetch parent block",
 					zap.Uint64("parentHeight", parentHeight),
 					zap.Error(err))
 			}
@@ -506,63 +423,39 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 // BlockSegment represents a continuous segment of blocks to persist together
 type BlockSegment struct {
 	Blocks []BlockToMigrate
-	// ParentHeight is the height of the block that should validate as parent of first block
-	ParentHeight uint64
 }
 
-// splitBlocksByReorgs splits blocks into segments at reorg boundaries (BLOCK_REMOVED events)
-func (a *Migrator) splitBlocksByReorgs(logger *zap.Logger,
-	events []*model.EventEntry, blocks []BlockToMigrate) []BlockSegment {
+// buildSegmentsFromEvents creates block segments from events, starting new segments after BLOCK_REMOVED events
+func (a *Migrator) buildSegmentsFromEvents(logger *zap.Logger,
+	events []*model.EventEntry) []*BlockSegment {
 
-	if len(blocks) == 0 {
-		return nil
-	}
+	var segments []*BlockSegment
+	var currentSegment *BlockSegment = nil
 
-	// Map blocks by eventId for quick lookup
-	blockByEventId := make(map[int64]BlockToMigrate)
-	for _, block := range blocks {
-		blockByEventId[block.EventSeq] = block
-	}
-
-	var segments []BlockSegment
-	var currentSegment []BlockToMigrate
-	var segmentParentHeight uint64 = 0
-	var reorgStartHeight uint64 = 0
-
+	// Process events in order (already sorted by EventSeq)
 	for _, event := range events {
 		switch event.EventType {
 		case api.BlockchainEvent_BLOCK_REMOVED:
-			// When we see first BLOCK_REMOVED, save current segment
-			if len(currentSegment) > 0 {
-				segments = append(segments, BlockSegment{
-					Blocks:       currentSegment,
-					ParentHeight: segmentParentHeight,
-				})
-				currentSegment = nil
-			}
-			// Track where the reorg started (will be parent for next segment)
-			if reorgStartHeight == 0 || event.BlockHeight < reorgStartHeight {
-				reorgStartHeight = event.BlockHeight
-			}
+			// End current segment
+			currentSegment = nil
 
 		case api.BlockchainEvent_BLOCK_ADDED:
-			if block, exists := blockByEventId[event.EventId]; exists {
-				// If we just had a reorg, set the parent height
-				if reorgStartHeight > 0 {
-					segmentParentHeight = reorgStartHeight - 1
-					reorgStartHeight = 0 // Reset for next reorg
+			if currentSegment == nil {
+				// Create new segment
+				currentSegment = &BlockSegment{
+					Blocks: []BlockToMigrate{},
 				}
-				currentSegment = append(currentSegment, block)
+				segments = append(segments, currentSegment)
 			}
+			// Create block directly from event and append to current segment
+			currentSegment.Blocks = append(currentSegment.Blocks, BlockToMigrate{
+				Height:     event.BlockHeight,
+				Hash:       event.BlockHash,
+				ParentHash: event.ParentHash,
+				EventSeq:   event.EventId,
+				Skipped:    event.BlockSkipped,
+			})
 		}
-	}
-
-	// Add any remaining blocks as final segment
-	if len(currentSegment) > 0 {
-		segments = append(segments, BlockSegment{
-			Blocks:       currentSegment,
-			ParentHeight: segmentParentHeight,
-		})
 	}
 
 	// Log segments for debugging
@@ -572,8 +465,7 @@ func (a *Migrator) splitBlocksByReorgs(logger *zap.Logger,
 				zap.Int("index", i),
 				zap.Int("blocks", len(segment.Blocks)),
 				zap.Uint64("firstHeight", segment.Blocks[0].Height),
-				zap.Uint64("lastHeight", segment.Blocks[len(segment.Blocks)-1].Height),
-				zap.Uint64("parentHeight", segment.ParentHeight))
+				zap.Uint64("lastHeight", segment.Blocks[len(segment.Blocks)-1].Height))
 		}
 	}
 
@@ -587,6 +479,12 @@ type BlockWithInfo struct {
 	EventSeq int64
 }
 
+// WorkItem for parallel fetching with index preservation
+type WorkItem struct {
+	Block BlockToMigrate
+	Index int
+}
+
 func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 	data *MigrationData, request *MigratorRequest,
 	blocksToMigrate []BlockToMigrate) ([]*BlockWithInfo, error) {
@@ -595,12 +493,11 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 		return nil, nil
 	}
 
-	// Determine parallelism - use request parallelism or default to 1
+	// Determine parallelism
 	parallelism := request.Parallelism
 	if parallelism <= 0 {
 		parallelism = 1
 	}
-	// Don't use more workers than blocks
 	if parallelism > len(blocksToMigrate) {
 		parallelism = 1
 	}
@@ -609,88 +506,83 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 		zap.Int("totalBlocks", len(blocksToMigrate)),
 		zap.Int("parallelism", parallelism))
 
-	// Channel for work distribution
-	workChan := make(chan BlockToMigrate, len(blocksToMigrate))
-	resultChan := make(chan *BlockWithInfo, len(blocksToMigrate))
+	// Pre-allocate result array
+	results := make([]*BlockWithInfo, len(blocksToMigrate))
 
-	// Send work items directly
-	for _, block := range blocksToMigrate {
-		workChan <- block
+	// Channel for work items (index, block)
+	workChan := make(chan WorkItem, len(blocksToMigrate))
+
+	// Send work items with their index
+	for i, block := range blocksToMigrate {
+		workChan <- WorkItem{Block: block, Index: i}
 	}
 	close(workChan)
 
-	// Worker function
-	worker := func() {
-		for block := range workChan {
-			var blockMeta *api.BlockMetadata
-
-			// For skipped blocks, create metadata directly without fetching
-			if block.Skipped {
-				blockMeta = &api.BlockMetadata{
-					Tag:     request.Tag,
-					Height:  block.Height,
-					Skipped: true,
-					// Hash and ParentHash remain empty for skipped blocks
-					// These will be stored as NULL in PostgreSQL
-					Hash:         "",
-					ParentHash:   "",
-					ParentHeight: 0,
-					Timestamp:    nil,
-				}
-			} else {
-				// For regular blocks, fetch from source storage
-				var err error
-				blockMeta, err = data.SourceStorage.GetBlockByHash(ctx, request.Tag, block.Height, block.Hash)
-				if err != nil {
-					logger.Warn("Failed to fetch block by hash",
-						zap.Uint64("height", block.Height),
-						zap.String("hash", block.Hash),
-						zap.Error(err))
-					continue
-				}
-			}
-
-			resultChan <- &BlockWithInfo{
-				BlockMetadata: blockMeta,
-				Height:        block.Height,
-				Hash:          block.Hash,
-				EventSeq:      block.EventSeq,
-			}
-		}
-	}
-
-	// Start workers
+	// Worker function - fetches block and writes directly to results[index]
 	var wg sync.WaitGroup
 	for i := 0; i < parallelism; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker()
+			for item := range workChan {
+				var blockMeta *api.BlockMetadata
+
+				// For skipped blocks, create metadata directly
+				if item.Block.Skipped {
+					blockMeta = &api.BlockMetadata{
+						Tag:          request.Tag,
+						Height:       item.Block.Height,
+						Skipped:      true,
+						Hash:         "",
+						ParentHash:   "",
+						ParentHeight: 0,
+						Timestamp:    nil,
+					}
+				} else {
+					// For regular blocks, fetch from source storage
+					var err error
+					blockMeta, err = data.SourceStorage.GetBlockByHash(ctx, request.Tag, item.Block.Height, item.Block.Hash)
+					if err != nil {
+						logger.Warn("Failed to fetch block by hash",
+							zap.Uint64("height", item.Block.Height),
+							zap.String("hash", item.Block.Hash),
+							zap.Error(err))
+						continue // Skip this block
+					}
+				}
+
+				// Write directly to the correct index
+				results[item.Index] = &BlockWithInfo{
+					BlockMetadata: blockMeta,
+					Height:        item.Block.Height,
+					Hash:          item.Block.Hash,
+					EventSeq:      item.Block.EventSeq,
+				}
+			}
 		}()
 	}
 
-	// Close result channel when all workers complete
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	// Wait for all workers to complete
+	wg.Wait()
 
-	// Collect results - order doesn't matter since they'll be sorted later
-	var allBlocksWithInfo []*BlockWithInfo
+	// Filter out nils (from failed fetches) and count skipped
+	var validResults []*BlockWithInfo
 	skippedCount := 0
-	for blockInfo := range resultChan {
-		allBlocksWithInfo = append(allBlocksWithInfo, blockInfo)
-		if blockInfo.BlockMetadata != nil && blockInfo.BlockMetadata.Skipped {
-			skippedCount++
+	for _, blockInfo := range results {
+		if blockInfo != nil {
+			validResults = append(validResults, blockInfo)
+			if blockInfo.BlockMetadata != nil && blockInfo.BlockMetadata.Skipped {
+				skippedCount++
+			}
 		}
 	}
 
 	logger.Debug("Completed parallel block data fetch",
 		zap.Int("requested", len(blocksToMigrate)),
-		zap.Int("fetched", len(allBlocksWithInfo)),
+		zap.Int("fetched", len(validResults)),
 		zap.Int("skippedBlocks", skippedCount))
 
-	return allBlocksWithInfo, nil
+	return validResults, nil
 }
 
 func (a *Migrator) persistEvents(ctx context.Context, logger *zap.Logger,
