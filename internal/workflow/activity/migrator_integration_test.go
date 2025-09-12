@@ -270,15 +270,15 @@ func (s *migratorIntegrationTestSuite) TestMigrateExtractedBlocks_ComplexReorg_M
 
 	// Complex scenario: multiple reorgs
 	events := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
-		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102},
-		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101},
-		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101},
-		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102},
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0x100", ParentHash: "0x99"},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0x101a", ParentHash: "0x100"},
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0x101a"},
+		{EventId: 4, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0x101b", ParentHash: "0x100"},
+		{EventId: 5, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0x102a", ParentHash: "0x101b"},
+		{EventId: 6, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 102, BlockHash: "0x102a"},
+		{EventId: 7, EventType: api.BlockchainEvent_BLOCK_REMOVED, BlockHeight: 101, BlockHash: "0x101b"},
+		{EventId: 8, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "0x101c", ParentHash: "0x100"},
+		{EventId: 9, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0x102b", ParentHash: "0x101c"},
 	}
 
 	// Events contain all the block information needed
@@ -344,9 +344,9 @@ func (s *migratorIntegrationTestSuite) TestMigrateExtractedBlocks_SkippedBlocks(
 
 	// Test with skipped blocks
 	events := []*model.EventEntry{
-		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockSkipped: false},
-		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockSkipped: true}, // Skipped
-		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockSkipped: false},
+		{EventId: 1, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 100, BlockHash: "0x100", ParentHash: "0x99", BlockSkipped: false},
+		{EventId: 2, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 101, BlockHash: "", ParentHash: "", BlockSkipped: true}, // Skipped
+		{EventId: 3, EventType: api.BlockchainEvent_BLOCK_ADDED, BlockHeight: 102, BlockHash: "0x102", ParentHash: "0x100", BlockSkipped: false},
 	}
 
 	// Events contain all the block information needed

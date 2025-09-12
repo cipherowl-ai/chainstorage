@@ -9,9 +9,12 @@ import (
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 
+	"github.com/coinbase/chainstorage/internal/cadence"
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -26,7 +29,8 @@ type migratorActivityTestSuite struct {
 	getLatestFromPostgres *GetLatestBlockFromPostgresActivity
 	getLatestEvent        *GetLatestEventFromPostgresActivity
 	getMaxEventId         *GetMaxEventIdActivity
-	env                   *testsuite.TestActivityEnvironment
+	env                   *cadence.TestEnv
+	cfg                   *config.Config
 }
 
 func TestMigratorActivityTestSuite(t *testing.T) {
@@ -34,8 +38,18 @@ func TestMigratorActivityTestSuite(t *testing.T) {
 }
 
 func (s *migratorActivityTestSuite) SetupTest() {
+	require := testutil.Require(s.T())
+
+	s.env = cadence.NewTestActivityEnv(s)
 	s.ctrl = gomock.NewController(s.T())
-	s.env = s.NewTestActivityEnvironment()
+
+	cfg, err := config.New(
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_ETHEREUM),
+		config.WithNetwork(common.Network_NETWORK_ETHEREUM_MAINNET),
+		config.WithEnvironment(config.EnvLocal),
+	)
+	require.NoError(err)
+	s.cfg = cfg
 
 	var deps struct {
 		fx.In
@@ -48,7 +62,9 @@ func (s *migratorActivityTestSuite) SetupTest() {
 
 	s.app = testapp.New(
 		s.T(),
-		testapp.WithFunctional(),
+		Module,
+		cadence.WithTestEnv(s.env),
+		testapp.WithConfig(cfg),
 		fx.Populate(&deps),
 	)
 
@@ -59,16 +75,12 @@ func (s *migratorActivityTestSuite) SetupTest() {
 	s.getMaxEventId = deps.GetMaxEventId
 	s.logger = s.app.Logger()
 
-	s.env.RegisterActivity(s.migrator.Execute)
-	s.env.RegisterActivity(s.getLatestHeight.Execute)
-	s.env.RegisterActivity(s.getLatestFromPostgres.Execute)
-	s.env.RegisterActivity(s.getLatestEvent.Execute)
-	s.env.RegisterActivity(s.getMaxEventId.Execute)
 }
 
 func (s *migratorActivityTestSuite) TearDownTest() {
 	s.app.Close()
 	s.ctrl.Finish()
+	s.env.AssertExpectations(s.T())
 }
 
 func (s *migratorActivityTestSuite) TestBuildSegmentsFromEvents_NoReorgs() {
