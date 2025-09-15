@@ -6,6 +6,7 @@ import (
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 )
@@ -28,6 +29,11 @@ type (
 )
 
 func NewMetaStorage(params Params) (internal.Result, error) {
+	// Validate Postgres config when actually creating the storage
+	if err := validatePostgresConfig(params.Config.AWS.Postgres); err != nil {
+		return internal.Result{}, xerrors.Errorf("invalid postgres config: %w", err)
+	}
+
 	// Use shared connection pool instead of creating new connections
 	pool, err := GetConnectionPool(context.Background(), params.Config.AWS.Postgres)
 	if err != nil {
@@ -75,4 +81,24 @@ func (f *metaStorageFactory) Create() (internal.Result, error) {
 
 func NewFactory(params Params) internal.MetaStorageFactory {
 	return &metaStorageFactory{params}
+}
+
+// validatePostgresConfig validates required postgres fields when actually using postgres storage
+func validatePostgresConfig(cfg *config.PostgresConfig) error {
+	if cfg == nil {
+		return xerrors.New("postgres config is nil")
+	}
+	if cfg.Host == "" {
+		return xerrors.New("postgres host is required")
+	}
+	if cfg.Port == 0 {
+		return xerrors.New("postgres port is required")
+	}
+	if cfg.Database == "" {
+		return xerrors.New("postgres database is required")
+	}
+	if cfg.SSLMode == "" {
+		return xerrors.New("postgres ssl_mode is required")
+	}
+	return nil
 }
