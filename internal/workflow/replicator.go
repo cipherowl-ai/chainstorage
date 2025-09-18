@@ -269,9 +269,15 @@ func (w *Replicator) execute(ctx workflow.Context, request *ReplicatorRequest) e
 							zap.Error(err))
 
 						// Calculate the new start height by going back by irreversible_distance
-						newStartHeight := startHeight
-						if startHeight > cfg.IrreversibleDistance {
-							newStartHeight = startHeight - cfg.IrreversibleDistance
+						// Ensure we go back at least 1 block, even if IrreversibleDistance is 0
+						var newStartHeight uint64
+						reorgDistance := cfg.IrreversibleDistance
+						if reorgDistance == 0 {
+							reorgDistance = 1 // Go back at least 1 block
+						}
+
+						if startHeight > reorgDistance {
+							newStartHeight = startHeight - reorgDistance
 						} else {
 							newStartHeight = 0
 						}
