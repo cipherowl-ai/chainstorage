@@ -179,6 +179,12 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 
 	logger.Info("Starting event-driven migration")
 
+	// Validate event sequence range
+	if request.EndEventSequence <= request.StartEventSequence {
+		return nil, xerrors.Errorf("invalid request: EndEventSequence (%d) must be greater than StartEventSequence (%d)",
+			request.EndEventSequence, request.StartEventSequence)
+	}
+
 	// Add heartbeat mechanism - send heartbeat every 10 seconds to avoid timeout
 	heartbeatTicker := time.NewTicker(10 * time.Second)
 	defer heartbeatTicker.Stop()
