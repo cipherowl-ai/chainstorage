@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
@@ -259,6 +260,38 @@ func (w *Replicator) execute(ctx workflow.Context, request *ReplicatorRequest) e
 					BlockHeight:   endHeight - 1,
 				})
 				if err != nil {
+					// Check if the error is due to chain discontinuity (reorg)
+					if xerrors.Is(err, parser.ErrInvalidChain) {
+						// Reorg detected - restart from a safe point
+						logger.Warn("Chain discontinuity detected, likely due to reorg. Restarting from earlier height",
+							zap.Uint64("currentStartHeight", startHeight),
+							zap.Uint64("irreversibleDistance", cfg.IrreversibleDistance),
+							zap.Error(err))
+
+						// Calculate the new start height by going back by irreversible_distance
+						// Ensure we go back at least 1 block, even if IrreversibleDistance is 0
+						var newStartHeight uint64
+						reorgDistance := cfg.IrreversibleDistance
+						if reorgDistance == 0 {
+							reorgDistance = 1 // Go back at least 1 block
+						}
+
+						if startHeight > reorgDistance {
+							newStartHeight = startHeight - reorgDistance
+						} else {
+							newStartHeight = 0
+						}
+
+						// Create a new request starting from the safe point
+						newRequest := *request
+						newRequest.StartHeight = newStartHeight
+						logger.Info("Restarting replicator workflow after reorg",
+							zap.Uint64("newStartHeight", newStartHeight),
+							zap.Uint64("endHeight", request.EndHeight))
+
+						// Continue as new workflow to handle the reorg
+						return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
+					}
 					return xerrors.Errorf("failed to update watermark: %w", err)
 				}
 			}
