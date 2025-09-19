@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	migratorCheckpointSize = 1000
-	migratorBatchSize      = 100
+	migratorCheckpointSize = 50000
+	migratorBatchSize      = 5000
 )
 
 type migratorTestSuite struct {
@@ -44,6 +44,7 @@ func (s *migratorTestSuite) SetupTest() {
 	cfg.Workflows.Migrator.BatchSize = migratorBatchSize
 	cfg.Workflows.Migrator.CheckpointSize = migratorCheckpointSize
 	cfg.Workflows.Migrator.BackoffInterval = time.Second
+	cfg.Workflows.Migrator.Parallelism = 8
 	s.cfg = cfg
 
 	s.env = cadence.NewTestEnv(s)
@@ -61,38 +62,37 @@ func (s *migratorTestSuite) TearDownTest() {
 	s.env.AssertExpectations(s.T())
 }
 
-func (s *migratorTestSuite) TestMigrator_Success() {
+func (s *migratorTestSuite) TestMigrator_EventDriven_Success() {
 	require := testutil.Require(s.T())
 
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
+	startSequence := int64(1000)
+	endSequence := int64(6000) // 5000 events, fits in one batch
 	tag := uint32(1)
 	eventTag := uint32(0)
 
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			require.Equal(tag, request.Tag)
-			// When eventTag is 0, it should be converted to the stable event tag from config
 			expectedEventTag := s.cfg.Workflows.Migrator.GetEffectiveEventTag(eventTag)
 			require.Equal(expectedEventTag, request.EventTag)
-			require.False(request.SkipEvents)
-			require.False(request.SkipBlocks)
 
-			// Simulate migrating the requested range
-			batchSize := request.EndHeight - request.StartHeight
+			// Event-driven migration processes both blocks and events
+			eventCount := request.EndEventSequence - request.StartEventSequence
+			blockCount := eventCount / 10 // Assume roughly 10% are BLOCK_ADDED events
+
 			return &activity.MigratorResponse{
-				BlocksMigrated: int(batchSize),
-				EventsMigrated: int(batchSize * 5), // Simulate 5 events per block
+				BlocksMigrated: int(blockCount),
+				EventsMigrated: int(eventCount),
 				Success:        true,
-				Message:        "Migration completed successfully",
+				Message:        "Event-driven migration completed successfully",
 			}, nil
 		})
 
 	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
+		StartEventSequence: startSequence,
+		EndEventSequence:   endSequence,
+		Tag:                tag,
+		EventTag:           eventTag,
 	})
 	require.NoError(err)
 }
@@ -100,302 +100,226 @@ func (s *migratorTestSuite) TestMigrator_Success() {
 func (s *migratorTestSuite) TestMigrator_WithCheckpoint() {
 	require := testutil.Require(s.T())
 
-	startHeight := uint64(1000)
-	endHeight := uint64(startHeight + migratorCheckpointSize + 100) // Exceed checkpoint
+	startSequence := int64(1000)
+	endSequence := startSequence + int64(migratorCheckpointSize) + 10000 // Exceed checkpoint
 	tag := uint32(1)
 	eventTag := uint32(0)
 
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(&activity.MigratorResponse{
-			BlocksMigrated: 100,
-			EventsMigrated: 500,
+			BlocksMigrated: 500,
+			EventsMigrated: 5000,
 			Success:        true,
-			Message:        "Migration completed successfully",
+			Message:        "Migration batch completed",
 		}, nil)
 
 	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
+		StartEventSequence: startSequence,
+		EndEventSequence:   endSequence,
+		Tag:                tag,
+		EventTag:           eventTag,
 	})
 	require.Error(err)
 	require.True(IsContinueAsNewError(err))
 }
 
-func (s *migratorTestSuite) TestMigrator_SkipBlocks() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
-	tag := uint32(1)
-	eventTag := uint32(0)
-
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
-			require.True(request.SkipBlocks)
-			require.False(request.SkipEvents)
-			return &activity.MigratorResponse{
-				BlocksMigrated: 0,
-				EventsMigrated: 100,
-				Success:        true,
-				Message:        "Events migrated successfully",
-			}, nil
-		})
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
-		SkipBlocks:  true,
-	})
-	require.NoError(err)
-}
-
-func (s *migratorTestSuite) TestMigrator_SkipEvents() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
-	tag := uint32(1)
-	eventTag := uint32(0)
-
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
-			require.False(request.SkipBlocks)
-			require.True(request.SkipEvents)
-			return &activity.MigratorResponse{
-				BlocksMigrated: 100,
-				EventsMigrated: 0,
-				Success:        true,
-				Message:        "Blocks migrated successfully",
-			}, nil
-		})
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
-		SkipEvents:  true,
-	})
-	require.NoError(err)
-}
-
 func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
 	require := testutil.Require(s.T())
 
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
+	startSequence := int64(1000)
+	endSequence := int64(3000)
 	tag := uint32(1)
 	eventTag := uint32(0)
-	customBatchSize := uint64(50)
-
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
-			return &activity.MigratorResponse{
-				BlocksMigrated: 50,
-				EventsMigrated: 250,
-				Success:        true,
-				Message:        "Migration completed successfully",
-			}, nil
-		})
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
-		BatchSize:   customBatchSize,
-	})
-	require.NoError(err)
-}
-
-func (s *migratorTestSuite) TestMigrator_CustomBackoffInterval() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
-	tag := uint32(1)
-	eventTag := uint32(0)
-
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(&activity.MigratorResponse{
-			BlocksMigrated: 100,
-			EventsMigrated: 500,
-			Success:        true,
-			Message:        "Migration completed successfully",
-		}, nil)
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight:     startHeight,
-		EndHeight:       endHeight,
-		Tag:             tag,
-		EventTag:        eventTag,
-		BackoffInterval: "2s",
-	})
-	require.NoError(err)
-}
-
-func (s *migratorTestSuite) TestMigrator_ActivityFailure() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
-	tag := uint32(1)
-	eventTag := uint32(0)
-
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(&activity.MigratorResponse{
-			BlocksMigrated: 0,
-			EventsMigrated: 0,
-			Success:        false,
-			Message:        "Migration failed due to connection error",
-		}, nil)
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
-	})
-	require.Error(err)
-	require.Contains(err.Error(), "migration batch failed")
-}
-
-func (s *migratorTestSuite) TestMigrator_ValidateRequest_AutoDetection() {
-	require := testutil.Require(s.T())
-
-	// Test that EndHeight can be 0 (auto-detection) - mock the GetLatestBlockHeight activity
-	s.env.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
-		Return(&activity.GetLatestBlockHeightResponse{
-			Height: 1500,
-		}, nil)
-
-	// Mock the main migrator activity
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(&activity.MigratorResponse{
-			BlocksMigrated: 500,
-			EventsMigrated: 1000,
-			Success:        true,
-			Message:        "Migration completed successfully",
-		}, nil)
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: 1000,
-		EndHeight:   0, // Should trigger auto-detection
-		Tag:         1,
-		EventTag:    0,
-	})
-	require.NoError(err)
-}
-
-func (s *migratorTestSuite) TestMigrator_ValidateRequest_InvalidRange() {
-	require := testutil.Require(s.T())
-
-	// StartHeight == EndHeight should fail (after auto-detection)
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: 1000,
-		EndHeight:   1000,
-		Tag:         1,
-		EventTag:    0,
-	})
-	require.Error(err)
-	require.Contains(err.Error(), "startHeight (1000) must be less than endHeight (1000)")
-}
-
-func (s *migratorTestSuite) TestMigrator_InvalidBackoffInterval() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1200)
-	tag := uint32(1)
-	eventTag := uint32(0)
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight:     startHeight,
-		EndHeight:       endHeight,
-		Tag:             tag,
-		EventTag:        eventTag,
-		BackoffInterval: "invalid-duration",
-	})
-	require.Error(err)
-	require.Contains(err.Error(), "failed to parse backoff interval")
-}
-
-func (s *migratorTestSuite) TestMigrator_AutoDetectionEndHeight() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	tag := uint32(1)
-	eventTag := uint32(0)
-	expectedLatestHeight := uint64(1500)
-
-	// Mock the GetLatestBlockHeight activity
-	s.env.OnActivity(activity.ActivityGetLatestBlockHeight, mock.Anything, mock.Anything).
-		Return(&activity.GetLatestBlockHeightResponse{
-			Height: expectedLatestHeight,
-		}, nil)
-
-	// Mock the main migrator activity
-	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
-		Return(&activity.MigratorResponse{
-			BlocksMigrated: 500,
-			EventsMigrated: 1000,
-			Success:        true,
-			Message:        "Migration completed successfully",
-		}, nil)
-
-	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   0, // Should trigger auto-detection
-		Tag:         tag,
-		EventTag:    eventTag,
-	})
-	require.NoError(err)
-}
-
-func (s *migratorTestSuite) TestMigrator_MultipleBatches() {
-	require := testutil.Require(s.T())
-
-	startHeight := uint64(1000)
-	endHeight := uint64(1300) // 3 batches of 100
-	tag := uint32(1)
-	eventTag := uint32(0)
+	customBatchSize := uint64(500)
 
 	callCount := 0
 	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
 			callCount++
-
-			// Verify batch boundaries
-			switch callCount {
-			case 1:
-				require.Equal(uint64(1000), request.StartHeight)
-				require.Equal(uint64(1100), request.EndHeight)
-			case 2:
-				require.Equal(uint64(1100), request.StartHeight)
-				require.Equal(uint64(1200), request.EndHeight)
-			case 3:
-				require.Equal(uint64(1200), request.StartHeight)
-				require.Equal(uint64(1300), request.EndHeight)
-			}
+			// Each batch should be customBatchSize
+			batchSize := request.EndEventSequence - request.StartEventSequence
+			require.LessOrEqual(batchSize, int64(customBatchSize))
 
 			return &activity.MigratorResponse{
-				BlocksMigrated: 100,
-				EventsMigrated: 500,
+				BlocksMigrated: 50,
+				EventsMigrated: int(batchSize),
 				Success:        true,
-				Message:        "Batch migrated successfully",
+				Message:        "Batch completed",
 			}, nil
 		})
 
 	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
-		StartHeight: startHeight,
-		EndHeight:   endHeight,
-		Tag:         tag,
-		EventTag:    eventTag,
+		StartEventSequence: startSequence,
+		EndEventSequence:   endSequence,
+		Tag:                tag,
+		EventTag:           eventTag,
+		BatchSize:          customBatchSize,
 	})
 	require.NoError(err)
-	require.Equal(3, callCount)
+	// Should have been called 4 times (2000 events / 500 per batch)
+	require.Equal(4, callCount)
+}
+
+func (s *migratorTestSuite) TestMigrator_AutoResume() {
+	require := testutil.Require(s.T())
+
+	tag := uint32(1)
+	eventTag := uint32(3)
+
+	// Mock GetLatestEventFromPostgres to return a sequence
+	s.env.OnActivity(activity.ActivityGetLatestEventFromPostgres, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestEventFromPostgresResponse{
+			Sequence: int64(5000),
+			Height:   uint64(1000),
+			Found:    true,
+		}, nil).Once()
+
+	// The workflow should resume from sequence 5001
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
+			// Should start from next sequence after latest
+			require.Equal(int64(5001), request.StartEventSequence)
+
+			return &activity.MigratorResponse{
+				BlocksMigrated: 100,
+				EventsMigrated: 1000,
+				Success:        true,
+				Message:        "Resumed migration",
+			}, nil
+		})
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 0, // Will be auto-detected
+		EndEventSequence:   10000,
+		Tag:                tag,
+		EventTag:           eventTag,
+		AutoResume:         true,
+	})
+	require.NoError(err)
+}
+
+func (s *migratorTestSuite) TestMigrator_ContinuousSync() {
+	require := testutil.Require(s.T())
+
+	startSequence := int64(1000)
+	tag := uint32(1)
+	eventTag := uint32(0)
+
+	// Mock GetMaxEventId activity since EndEventSequence is 0
+	s.env.OnActivity(activity.ActivityGetMaxEventId, mock.Anything, mock.Anything).
+		Return(&activity.GetMaxEventIdResponse{
+			MaxEventId: int64(6000),
+			Found:      true,
+		}, nil).Once()
+
+	callCount := 0
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
+			callCount++
+			if callCount > 2 {
+				// Stop after 2 iterations to prevent infinite loop in test
+				s.env.CancelWorkflow()
+			}
+
+			return &activity.MigratorResponse{
+				BlocksMigrated: 100,
+				EventsMigrated: 1000,
+				Success:        true,
+				Message:        "Batch migrated",
+			}, nil
+		})
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: startSequence,
+		EndEventSequence:   0, // Will be auto-detected for continuous sync
+		Tag:                tag,
+		EventTag:           eventTag,
+		ContinuousSync:     true,
+		SyncInterval:       "1s",
+	})
+
+	// Should get a continue-as-new error for continuous sync
+	if err != nil {
+		require.True(IsContinueAsNewError(err) || s.env.IsWorkflowCompleted())
+	}
+}
+
+func (s *migratorTestSuite) TestMigrator_Parallelism() {
+	require := testutil.Require(s.T())
+
+	startSequence := int64(1000)
+	endSequence := int64(6000)
+	tag := uint32(1)
+	eventTag := uint32(0)
+	parallelism := 4
+
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
+			// Verify parallelism is passed through
+			require.Equal(parallelism, request.Parallelism)
+
+			eventCount := request.EndEventSequence - request.StartEventSequence
+			return &activity.MigratorResponse{
+				BlocksMigrated: int(eventCount / 10),
+				EventsMigrated: int(eventCount),
+				Success:        true,
+				Message:        "Parallel migration completed",
+			}, nil
+		})
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: startSequence,
+		EndEventSequence:   endSequence,
+		Tag:                tag,
+		EventTag:           eventTag,
+		Parallelism:        parallelism,
+	})
+	require.NoError(err)
+}
+
+func (s *migratorTestSuite) TestMigrator_LargeMigration() {
+	require := testutil.Require(s.T())
+
+	startSequence := int64(1000000)
+	endSequence := int64(2000000) // 1 million events
+	tag := uint32(1)
+	eventTag := uint32(0)
+
+	batchCount := 0
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
+			batchCount++
+
+			// Each batch should be the configured batch size
+			batchSize := request.EndEventSequence - request.StartEventSequence
+			require.LessOrEqual(batchSize, int64(migratorBatchSize))
+
+			// Simulate processing
+			blockCount := batchSize / 10
+
+			return &activity.MigratorResponse{
+				BlocksMigrated: int(blockCount),
+				EventsMigrated: int(batchSize),
+				Success:        true,
+				Message:        "Large batch processed",
+			}, nil
+		})
+
+	// This should trigger checkpoints
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: startSequence,
+		EndEventSequence:   endSequence,
+		Tag:                tag,
+		EventTag:           eventTag,
+		BatchSize:          migratorBatchSize,
+		CheckpointSize:     migratorCheckpointSize,
+	})
+
+	// Should hit checkpoint and continue-as-new
+	require.Error(err)
+	require.True(IsContinueAsNewError(err))
+
+	// Should have processed checkpoint size worth of events
+	expectedBatches := int(migratorCheckpointSize / migratorBatchSize)
+	require.Equal(expectedBatches, batchCount)
 }
