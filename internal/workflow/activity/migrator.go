@@ -180,8 +180,8 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	logger.Info("Starting event-driven migration")
 
 	// Validate event sequence range
-	if request.EndEventSequence <= request.StartEventSequence {
-		return nil, xerrors.Errorf("invalid request: EndEventSequence (%d) must be greater than StartEventSequence (%d)",
+	if request.EndEventSequence < request.StartEventSequence {
+		return nil, xerrors.Errorf("invalid request: EndEventSequence (%d) cannot be less than StartEventSequence (%d)",
 			request.EndEventSequence, request.StartEventSequence)
 	}
 
