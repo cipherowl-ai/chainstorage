@@ -73,6 +73,7 @@ type (
 		Tron            ClientFactory `name:"tron" optional:"true"`
 		Story           ClientFactory `name:"story" optional:"true"`
 		EthereumClassic ClientFactory `name:"ethereumclassic" optional:"true"`
+		Plasma          ClientFactory `name:"plasma" optional:"true"`
 	}
 
 	ClientParams struct {
@@ -142,6 +143,8 @@ func NewClient(params Params) (Result, error) {
 			factory = params.Story
 		case common.Blockchain_BLOCKCHAIN_ETHEREUMCLASSIC:
 			factory = params.EthereumClassic
+		case common.Blockchain_BLOCKCHAIN_PLASMA:
+			factory = params.Plasma
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta

@@ -64,6 +64,7 @@ type (
 		Tron            ParserFactory `name:"tron" optional:"true"`
 		Story           ParserFactory `name:"story" optional:"true"`
 		EthereumClassic ParserFactory `name:"ethereumclassic" optional:"true"`
+		Plasma          ParserFactory `name:"plasma" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -113,6 +114,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Story
 		case common.Blockchain_BLOCKCHAIN_ETHEREUMCLASSIC:
 			factory = params.EthereumClassic
+		case common.Blockchain_BLOCKCHAIN_PLASMA:
+			factory = params.Plasma
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
