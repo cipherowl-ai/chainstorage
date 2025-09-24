@@ -45,5 +45,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("ethereumclassic", NewEthereumClassicNativeParser).
 		SetValidatorFactory(NewEthereumClassicValidator).
 		Build(),
+	internal.NewParserBuilder("plasma", NewPlasmaNativeParser).
+		SetValidatorFactory(NewPlasmaValidator).
+		Build(),
 	beacon.Module,
 )
