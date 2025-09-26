@@ -218,10 +218,14 @@ func (a *Syncer) execute(ctx context.Context, request *SyncerRequest) (*SyncerRe
 			})
 		}
 	} else {
+		// Record heartbeat before potentially slow blockchain call
+		a.heartbeater.RecordHeartbeat(ctx)
 		inMetadatas, err = a.masterBlockchainClient.BatchGetBlockMetadata(ctx, request.Tag, start, end)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get metadata for blocks from %d to %d: %w", start, end-1, err)
 		}
+		// Record heartbeat after blockchain call
+		a.heartbeater.RecordHeartbeat(ctx)
 
 		// Check if the first block to be synced is a valid descendant of the local fork block.
 		// If the condition is not met, it is likely that master node experienced a block chain reorg right after
@@ -610,6 +614,9 @@ func (a *Syncer) getBlocksInParallel(
 	for i := 0; i < parallelism; i++ {
 		g.Go(func() error {
 			for metadata := range inputChannel {
+				// Record heartbeat before processing each block to prevent timeout
+				a.heartbeater.RecordHeartbeat(ctx)
+
 				block, err := a.safeGetBlock(ctx, logger, metadata, withBestEffort, dataCompression, fastSync, transactionIndexingParallelism)
 				if err != nil {
 					logger.Warn("failed to get block",
@@ -622,6 +629,9 @@ func (a *Syncer) getBlocksInParallel(
 					reprocessChannel <- nil
 					outChannel <- block
 				}
+
+				// Record heartbeat after processing each block
+				a.heartbeater.RecordHeartbeat(ctx)
 			}
 			return nil
 		})
