@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -786,6 +787,207 @@ func TestBatchCall_URLError(t *testing.T) {
 	errMsg := xerrors.Unwrap(err).Error()
 	require.Contains(errMsg, "a test error")
 	require.NotContains(errMsg, "foo.com")
+}
+
+func TestAutoBatchCall_BatchMode(t *testing.T) {
+	require := testutil.Require(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	httpClient := jsonrpcmocks.NewMockHTTPClient(ctrl)
+
+	// Verify that batch call is made (single HTTP request with array)
+	httpClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
+		// Read and verify the request body
+		bodyBytes, err := ioutil.ReadAll(req.Body)
+		require.NoError(err)
+
+		// Verify it's a batch request (starts with '[')
+		bodyStr := strings.TrimSpace(string(bodyBytes))
+		require.True(strings.HasPrefix(bodyStr, "["), "Request should be a JSON array")
+		require.True(strings.HasSuffix(bodyStr, "]"), "Request should be a JSON array")
+
+		// Verify method and number of requests in batch
+		require.Contains(bodyStr, `"method":"hello"`)
+		require.Equal(3, strings.Count(bodyStr, `"method":"hello"`), "Should have exactly 3 requests in batch")
+
+		// Verify each request has correct params
+		require.Contains(bodyStr, `"params":["0x1234"]`)
+		require.Contains(bodyStr, `"params":["0x1235"]`)
+		require.Contains(bodyStr, `"params":["0x1236"]`)
+
+		// Return batch response
+		responseBody := ioutil.NopCloser(strings.NewReader(`
+			[
+				{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcd"}},
+				{"jsonrpc":"2.0","id":2,"result":{"hash": "0xabcf"}},
+				{"jsonrpc":"2.0","id":1,"result":{"hash": "0xabce"}}
+			]`))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       responseBody,
+		}, nil
+	}).Times(1) // Exactly one HTTP call for batch request
+
+	var params clientParams
+	app := testapp.New(
+		t,
+		withDummyEndpoints(),
+		fx.Provide(jsonrpc.New),
+		fx.Provide(func() jsonrpc.HTTPClient {
+			return httpClient
+		}),
+		fx.Populate(&params),
+	)
+	defer app.Close()
+
+	client := params.Master
+	require.NotNil(client)
+	batchParams := []jsonrpc.Params{
+		{"0x1234"},
+		{"0x1235"},
+		{"0x1236"},
+	}
+	// AutoBatchCall should use batch mode when DisableTxBatch is false (default)
+	batchResponse, err := client.AutoBatchCall(context.Background(),
+		&jsonrpc.RequestMethod{Name: "hello", Timeout: time.Duration(5)},
+		batchParams)
+	require.NoError(err)
+
+	// Though the response is out of order, AutoBatchCall should return them in ID order.
+	expectedHashes := []string{"0xabcd", "0xabce", "0xabcf"}
+	for i, response := range batchResponse {
+		var block Block
+		err = response.Unmarshal(&block)
+		require.NoError(err)
+		require.Equal(expectedHashes[i], block.Hash)
+	}
+}
+
+func TestAutoBatchCall_SingleMode(t *testing.T) {
+	require := testutil.Require(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	httpClient := jsonrpcmocks.NewMockHTTPClient(ctrl)
+
+	// Map to track which params were requested
+	var mu sync.Mutex
+	requestedParams := make(map[string]bool)
+
+	// Expect 3 separate single calls (order may vary due to concurrency)
+	httpClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(req *http.Request) (*http.Response, error) {
+		// Read and verify the request body
+		bodyBytes, err := ioutil.ReadAll(req.Body)
+		require.NoError(err)
+
+		// Verify it's NOT a batch request (should NOT start with '[')
+		bodyStr := strings.TrimSpace(string(bodyBytes))
+		require.False(strings.HasPrefix(bodyStr, "["), "Should be a single request, not batch")
+
+		// Parse to check which param was sent
+		var request struct {
+			Method string        `json:"method"`
+			Params []interface{} `json:"params"`
+		}
+		err = json.Unmarshal(bodyBytes, &request)
+		require.NoError(err)
+		require.Equal("hello", request.Method)
+
+		// Track which param was requested
+		mu.Lock()
+		paramStr := request.Params[0].(string)
+		requestedParams[paramStr] = true
+
+		// Return appropriate response based on param
+		var responseStr string
+		switch paramStr {
+		case "0x1234":
+			responseStr = `{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcd"}}`
+		case "0x1235":
+			responseStr = `{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabce"}}`
+		case "0x1236":
+			responseStr = `{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcf"}}`
+		default:
+			t.Fatalf("Unexpected param: %s", paramStr)
+		}
+		mu.Unlock()
+
+		body := ioutil.NopCloser(strings.NewReader(responseStr))
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       body,
+		}, nil
+	}).Times(3) // Exactly 3 separate HTTP calls
+
+	// Create config with DisableTxBatch = true
+	cfg, err := config.New()
+	require.NoError(err)
+	dummyEndpoints := []config.Endpoint{
+		{
+			Name:           "node_name",
+			Url:            "node_url",
+			Weight:         1,
+			DisableTxBatch: true,
+			TxConcurrency:  3,
+		},
+	}
+	cfg.Chain.Client = config.ClientConfig{
+		Master: config.JSONRPCConfig{
+			EndpointGroup: config.EndpointGroup{
+				Endpoints: dummyEndpoints,
+			},
+		},
+		Slave: config.JSONRPCConfig{
+			EndpointGroup: config.EndpointGroup{
+				Endpoints: dummyEndpoints,
+			},
+		},
+	}
+
+	var params clientParams
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(jsonrpc.New),
+		fx.Provide(func() jsonrpc.HTTPClient {
+			return httpClient
+		}),
+		fx.Populate(&params),
+	)
+	defer app.Close()
+
+	client := params.Master
+	require.NotNil(client)
+	batchParams := []jsonrpc.Params{
+		{"0x1234"},
+		{"0x1235"},
+		{"0x1236"},
+	}
+	// AutoBatchCall should use concurrent single calls when DisableTxBatch is true
+	batchResponse, err := client.AutoBatchCall(context.Background(),
+		&jsonrpc.RequestMethod{Name: "hello", Timeout: time.Duration(5)},
+		batchParams)
+	require.NoError(err)
+
+	// Verify results are returned in the same order as input params
+	// even though requests were made concurrently
+	expectedHashes := []string{"0xabcd", "0xabce", "0xabcf"}
+	for i, response := range batchResponse {
+		var block Block
+		err = response.Unmarshal(&block)
+		require.NoError(err)
+		require.Equal(expectedHashes[i], block.Hash,
+			"Result at index %d should match input param at same index", i)
+	}
+
+	// Also verify all params were actually requested (concurrently)
+	require.Len(requestedParams, 3, "Should have made exactly 3 requests")
+	require.True(requestedParams["0x1234"], "Should have requested 0x1234")
+	require.True(requestedParams["0x1235"], "Should have requested 0x1235")
+	require.True(requestedParams["0x1236"], "Should have requested 0x1236")
 }
 
 func TestNullResponse(t *testing.T) {

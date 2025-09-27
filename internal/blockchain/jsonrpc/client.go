@@ -318,7 +318,6 @@ func (c *clientImpl) AutoBatchCall(ctx context.Context, method *RequestMethod, b
 		opt(&options)
 	}
 
-
 	endpoint, err := c.endpointProvider.GetEndpoint(ctx)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get endpoint for request: %w", err)

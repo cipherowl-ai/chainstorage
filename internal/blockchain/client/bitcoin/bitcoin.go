@@ -295,11 +295,8 @@ func (b *bitcoinClient) getInputTransactions(
 ) ([][][]byte, error) {
 	transactions := header.Transactions
 	blockHash := header.Hash.Value()
-<<<<<<< HEAD
 	txBatchSize := b.config.Chain.Client.TxBatchSize
-=======
 	blockHeight := header.Height.Value()
->>>>>>> 886d7a1 (add config to make concurrent single calls; config bitcoincash to single call)
 
 	// Use a set to deduplicate input transaction IDs while preserving order
 	inputTransactionIDSet := make(map[string]struct{})
@@ -319,19 +316,12 @@ func (b *bitcoinClient) getInputTransactions(
 
 	numTransactionSet := len(inputTransactionIDSet)
 	inputTransactionsMap := make(map[string][]byte, numTransactionSet)
-	// Get batch size from config
 
 	b.logger.Debug(
 		"getting input transactions>>>",
 		zap.Int("numTransactions", numTransactionSet),
 		zap.Int("txBatchSize", txBatchSize),
 	)
-
-	// Get batch size from config
-	txBatchSize := b.config.Chain.Client.TxBatchSize
-	if txBatchSize <= 0 {
-		txBatchSize = 100
-	}
 
 	// batch of batchCalls to getrawtransaction in order to fetch input transaction data
 	for batchStart := 0; batchStart < numTransactionSet; batchStart += txBatchSize {
