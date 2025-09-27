@@ -1098,6 +1098,15 @@ func TestDefaultHttpTimeout(t *testing.T) {
 	require.Equal(0*time.Second, cfg.Chain.Client.HttpTimeout)
 }
 
+func TestDefaultTxBatchSize(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(100, cfg.Chain.Client.TxBatchSize)
+}
+
+
 func TestValidateAWSstorageConfig(t *testing.T) {
 	// Test that Postgres validation is skipped when Postgres is nil
 	require := testutil.Require(t)

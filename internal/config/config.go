@@ -80,6 +80,7 @@ type (
 		Additional  JSONRPCConfig     `mapstructure:"additional"`
 		Retry       ClientRetryConfig `mapstructure:"retry"`
 		HttpTimeout time.Duration     `mapstructure:"http_timeout"`
+		TxBatchSize int               `mapstructure:"tx_batch_size"`
 	}
 
 	JSONRPCConfig struct {
@@ -622,6 +623,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 		v.SetDefault("aws.local_stack", true)
 		v.SetDefault("aws.reset_local", true)
 	}
+	v.SetDefault("chain.client.tx_batch_size", 100)
 
 	// Read the data in base.yml
 	if err := v.ReadConfig(configReader); err != nil {
