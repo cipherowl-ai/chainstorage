@@ -54,6 +54,7 @@ chain:
   block_time: 10m
   blockchain: BLOCKCHAIN_BITCOINCASH
   client:
+    tx_batch_size: 100
     consensus:
       endpoint_group: ""
     http_timeout: 0s
