@@ -327,7 +327,7 @@ type (
 		Endpoints              []Endpoint     `json:"endpoints"`
 		EndpointsFailover      []Endpoint     `json:"endpoints_failover"`
 		UseFailover            bool           `json:"use_failover"`
-		EndpointConfig         EndpointConfig `json:"endpoint_config"`
+		EndpointConfig         EndpointConfig `json:"endpoint_config" mapstructure:"endpoint_config"`
 		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover"`
 	}
 
@@ -336,24 +336,26 @@ type (
 		Endpoints              []Endpoint     `json:"endpoints"`
 		EndpointsFailover      []Endpoint     `json:"endpoints_failover"`
 		UseFailover            bool           `json:"use_failover"`
-		EndpointConfig         EndpointConfig `json:"endpoint_config"`
+		EndpointConfig         EndpointConfig `json:"endpoint_config" mapstructure:"endpoint_config"`
 		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover"`
 	}
 
 	Endpoint struct {
-		Name       string            `json:"name"`
-		ProviderID string            `json:"provider_id"`
-		Url        string            `json:"url"`
-		User       string            `json:"user"`
-		Password   string            `json:"password"`
-		Weight     uint8             `json:"weight"`
-		ExtraUrls  map[string]string `json:"extra_urls"`
-		RPS        int               `json:"rps"`
+		Name           string            `json:"name"`
+		ProviderID     string            `json:"provider_id" mapstructure:"provider_id"`
+		Url            string            `json:"url"`
+		User           string            `json:"user"`
+		Password       string            `json:"password"`
+		Weight         uint8             `json:"weight"`
+		ExtraUrls      map[string]string `json:"extra_urls" mapstructure:"extra_urls"`
+		RPS            int               `json:"rps"`
+		DisableTxBatch bool              `json:"disable_tx_batch" mapstructure:"disable_tx_batch"`
+		TxConcurrency  int               `json:"tx_concurrency" mapstructure:"tx_concurrency"`
 	}
 
 	EndpointConfig struct {
-		StickySession StickySessionConfig `json:"sticky_session"`
-		Headers       map[string]string   `json:"headers"`
+		StickySession StickySessionConfig `json:"sticky_session" mapstructure:"sticky_session"`
+		Headers       map[string]string   `json:"headers" mapstructure:"headers"`
 	}
 
 	StickySessionConfig struct {
@@ -625,6 +627,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	}
 	v.SetDefault("chain.client.tx_batch_size", 100)
 
+	// Set default value for TxBatchSize
+	v.SetDefault("chain.client.tx_batch_size", 100)
+
 	// Read the data in base.yml
 	if err := v.ReadConfig(configReader); err != nil {
 		return nil, xerrors.Errorf("failed to read config: %w", err)
@@ -656,6 +661,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	}
 
 	cfg.setDerivedConfigs(reflect.ValueOf(&cfg))
+
+	// Set default values for endpoint batch configuration
+	cfg.setEndpointDefaults()
 
 	if err := validate.Struct(&cfg); err != nil {
 		return nil, xerrors.Errorf("failed to validate config: %w", err)
@@ -810,6 +818,42 @@ func (c *Config) setDerivedConfigs(v reflect.Value) {
 
 func (c *Config) GetLatestEventTag() uint32 {
 	return c.Chain.EventTag.Latest
+}
+
+// setEndpointDefaults sets default values for endpoint batch configuration
+func (c *Config) setEndpointDefaults() {
+	// Process all JSONRPC configs in the client config
+	jsonrpcConfigs := []*JSONRPCConfig{
+		&c.Chain.Client.Master,
+		&c.Chain.Client.Slave,
+		&c.Chain.Client.Validator,
+		&c.Chain.Client.Consensus,
+		&c.Chain.Client.Additional,
+	}
+
+	for _, jsonrpcConfig := range jsonrpcConfigs {
+		if jsonrpcConfig == nil {
+			continue
+		}
+
+		// Process primary endpoints
+		for i := range jsonrpcConfig.EndpointGroup.Endpoints {
+			endpoint := &jsonrpcConfig.EndpointGroup.Endpoints[i]
+			// If batch is disabled and TxConcurrency is not set, default to 10
+			if endpoint.DisableTxBatch && endpoint.TxConcurrency == 0 {
+				endpoint.TxConcurrency = 10
+			}
+		}
+
+		// Process failover endpoints
+		for i := range jsonrpcConfig.EndpointGroup.EndpointsFailover {
+			endpoint := &jsonrpcConfig.EndpointGroup.EndpointsFailover[i]
+			// If batch is disabled and TxConcurrency is not set, default to 10
+			if endpoint.DisableTxBatch && endpoint.TxConcurrency == 0 {
+				endpoint.TxConcurrency = 10
+			}
+		}
+	}
 }
 
 func (c *Config) GetStableEventTag() uint32 {

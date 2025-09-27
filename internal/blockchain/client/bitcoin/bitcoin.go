@@ -295,7 +295,11 @@ func (b *bitcoinClient) getInputTransactions(
 ) ([][][]byte, error) {
 	transactions := header.Transactions
 	blockHash := header.Hash.Value()
+<<<<<<< HEAD
 	txBatchSize := b.config.Chain.Client.TxBatchSize
+=======
+	blockHeight := header.Height.Value()
+>>>>>>> 886d7a1 (add config to make concurrent single calls; config bitcoincash to single call)
 
 	// Use a set to deduplicate input transaction IDs while preserving order
 	inputTransactionIDSet := make(map[string]struct{})
@@ -323,10 +327,15 @@ func (b *bitcoinClient) getInputTransactions(
 		zap.Int("txBatchSize", txBatchSize),
 	)
 
+	// Get batch size from config
+	txBatchSize := b.config.Chain.Client.TxBatchSize
+	if txBatchSize <= 0 {
+		txBatchSize = 100
+	}
+
 	// batch of batchCalls to getrawtransaction in order to fetch input transaction data
 	for batchStart := 0; batchStart < numTransactionSet; batchStart += txBatchSize {
 		batchEnd := min(batchStart+txBatchSize, numTransactionSet)
-
 		batchParams := make([]jsonrpc.Params, batchEnd-batchStart)
 		for i, transactionID := range inputTransactionIDs[batchStart:batchEnd] {
 			batchParams[i] = jsonrpc.Params{
@@ -335,12 +344,14 @@ func (b *bitcoinClient) getInputTransactions(
 			}
 		}
 
-		batchResponses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
+		// Use AutoBatchCall which will handle batch vs concurrent single calls based on endpoint config
+		batchResponses, err := b.client.AutoBatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
 		if err != nil {
 			return nil, xerrors.Errorf(
-				"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
+				"failed to call %s for subset of (blockHash=%s, blockHeight=%v, startTransactionID=%v, batchSize=%v): %w",
 				bitcoinGetRawTransactionMethod.Name,
 				blockHash,
+				blockHeight,
 				inputTransactionIDs[batchStart],
 				batchEnd-batchStart,
 				err,
