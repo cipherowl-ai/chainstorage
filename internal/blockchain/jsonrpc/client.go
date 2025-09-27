@@ -5,14 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/endpoints"
@@ -27,6 +29,7 @@ type (
 	Client interface {
 		Call(ctx context.Context, method *RequestMethod, params Params, opts ...Option) (*Response, error)
 		BatchCall(ctx context.Context, method *RequestMethod, batchParams []Params, opts ...Option) ([]*Response, error)
+		AutoBatchCall(ctx context.Context, method *RequestMethod, batchParams []Params, opts ...Option) ([]*Response, error)
 	}
 
 	HTTPClient interface {
@@ -177,7 +180,11 @@ func (c *clientImpl) Call(ctx context.Context, method *RequestMethod, params Par
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get endpoint for request: %w", err)
 	}
+	return c.callWithEndpoint(ctx, method, params, endpoint, options)
+}
 
+// callWithEndpoint makes a call using a specific endpoint
+func (c *clientImpl) callWithEndpoint(ctx context.Context, method *RequestMethod, params Params, endpoint *endpoints.Endpoint, options options) (*Response, error) {
 	endpoint.IncRequestsCounter(1)
 
 	request := &Request{
@@ -217,6 +224,11 @@ func (c *clientImpl) BatchCall(ctx context.Context, method *RequestMethod, batch
 		return nil, xerrors.Errorf("failed to get endpoint for request: %w", err)
 	}
 
+	return c.batchCallWithEndpoint(ctx, method, batchParams, endpoint, options)
+}
+
+// batchCallWithEndpoint makes a batch call using a specific endpoint
+func (c *clientImpl) batchCallWithEndpoint(ctx context.Context, method *RequestMethod, batchParams []Params, endpoint *endpoints.Endpoint, options options) ([]*Response, error) {
 	endpoint.IncRequestsCounter(int64(len(batchParams)))
 
 	batchRequests := make([]*Request, len(batchParams))
@@ -299,6 +311,67 @@ func (c *clientImpl) BatchCall(ctx context.Context, method *RequestMethod, batch
 	return finalBatchResponses, nil
 }
 
+func (c *clientImpl) AutoBatchCall(ctx context.Context, method *RequestMethod, batchParams []Params, opts ...Option) ([]*Response, error) {
+	// Parse options
+	var options options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	endpoint, err := c.endpointProvider.GetEndpoint(ctx)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get endpoint for request: %w", err)
+	}
+	// Check if this endpoint has batch mode disabled
+	if endpoint.Config.DisableTxBatch {
+		// Use concurrent single calls for endpoints that don't support batch
+		return c.concurrentSingleCalls(ctx, method, batchParams, endpoint, options)
+	}
+
+	// Use regular batch call with the same endpoint
+	return c.batchCallWithEndpoint(ctx, method, batchParams, endpoint, options)
+}
+
+// concurrentSingleCalls handles batch requests by making concurrent single calls
+func (c *clientImpl) concurrentSingleCalls(ctx context.Context, method *RequestMethod, batchParams []Params, endpoint *endpoints.Endpoint, options options) ([]*Response, error) {
+	// Use configured concurrency or default
+	concurrency := endpoint.Config.TxConcurrency
+	if concurrency <= 0 {
+		concurrency = 10 // default
+	}
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
+	finalResponses := make([]*Response, len(batchParams))
+	var mu sync.Mutex
+
+	for i, params := range batchParams {
+		idx := i             // capture loop variable
+		paramsCopy := params // capture loop variable
+
+		g.Go(func() error {
+			// Make individual call using the same endpoint
+			// Note: callWithEndpoint will increment the counter for each request
+			response, err := c.callWithEndpoint(ctx, method, paramsCopy, endpoint, options)
+			if err != nil {
+				return err
+			}
+
+			mu.Lock()
+			finalResponses[idx] = response
+			mu.Unlock()
+
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	return finalResponses, nil
+}
+
 func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration, endpoint *endpoints.Endpoint, data any, out any) error {
 	url := endpoint.Config.Url
 	user := endpoint.Config.User
@@ -333,7 +406,7 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 	finalizer := finalizer.WithCloser(response.Body)
 	defer finalizer.Finalize()
 
-	responseBody, err := ioutil.ReadAll(response.Body)
+	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
 		return retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
 	}
