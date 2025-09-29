@@ -298,17 +298,15 @@ func (b *bitcoinClient) getInputTransactions(
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 
 	// Use a set to deduplicate input transaction IDs while preserving order
-	inputTransactionIDSet := make(map[string]struct{})
+	inputTransactionIDSet := make(map[string]bool)
 	var inputTransactionIDs []string
 	for _, tx := range transactions {
 		for _, input := range tx.Inputs {
 			inputTransactionID := input.Identifier.Value()
 			// coinbase transaction does not have txid
-			if inputTransactionID != "" {
-				if _, exists := inputTransactionIDSet[inputTransactionID]; !exists {
-					inputTransactionIDSet[inputTransactionID] = struct{}{}
-					inputTransactionIDs = append(inputTransactionIDs, inputTransactionID)
-				}
+			if inputTransactionID != "" && !inputTransactionIDSet[inputTransactionID] {
+				inputTransactionIDSet[inputTransactionID] = true
+				inputTransactionIDs = append(inputTransactionIDs, inputTransactionID)
 			}
 		}
 	}
