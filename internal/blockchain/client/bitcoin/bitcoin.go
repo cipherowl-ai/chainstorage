@@ -44,9 +44,6 @@ const (
 	bitcoinErrCodeInvalidParameter    = -8
 	bitcoinErrMessageBlockNotFound    = "Block not found"
 	bitcoinErrMessageBlockOutOfRange  = "Block height out of range"
-
-	// batch size
-	bitcoinGetInputTransactionsBatchSize = 100
 )
 
 var _ internal.Client = (*bitcoinClient)(nil)
@@ -298,28 +295,35 @@ func (b *bitcoinClient) getInputTransactions(
 ) ([][][]byte, error) {
 	transactions := header.Transactions
 	blockHash := header.Hash.Value()
+	txBatchSize := b.config.Chain.Client.TxBatchSize
 
+	// Use a set to deduplicate input transaction IDs while preserving order
+	inputTransactionIDSet := make(map[string]bool)
 	var inputTransactionIDs []string
-	// TODO: dedupe for inputTransactionIDs
 	for _, tx := range transactions {
 		for _, input := range tx.Inputs {
 			inputTransactionID := input.Identifier.Value()
 			// coinbase transaction does not have txid
-			if inputTransactionID != "" {
+			if inputTransactionID != "" && !inputTransactionIDSet[inputTransactionID] {
+				inputTransactionIDSet[inputTransactionID] = true
 				inputTransactionIDs = append(inputTransactionIDs, inputTransactionID)
 			}
 		}
 	}
 
-	numTransactions := len(inputTransactionIDs)
-	inputTransactionsMap := make(map[string][]byte, numTransactions)
+	numTransactionSet := len(inputTransactionIDSet)
+	inputTransactionsMap := make(map[string][]byte, numTransactionSet)
+	// Get batch size from config
+
+	b.logger.Debug(
+		"getting input transactions>>>",
+		zap.Int("numTransactions", numTransactionSet),
+		zap.Int("txBatchSize", txBatchSize),
+	)
 
 	// batch of batchCalls to getrawtransaction in order to fetch input transaction data
-	for batchStart := 0; batchStart < numTransactions; batchStart += bitcoinGetInputTransactionsBatchSize {
-		batchEnd := batchStart + bitcoinGetInputTransactionsBatchSize
-		if batchEnd > numTransactions {
-			batchEnd = numTransactions
-		}
+	for batchStart := 0; batchStart < numTransactionSet; batchStart += txBatchSize {
+		batchEnd := min(batchStart+txBatchSize, numTransactionSet)
 
 		batchParams := make([]jsonrpc.Params, batchEnd-batchStart)
 		for i, transactionID := range inputTransactionIDs[batchStart:batchEnd] {
