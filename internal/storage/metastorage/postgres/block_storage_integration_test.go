@@ -290,6 +290,138 @@ func (s *blockStorageTestSuite) equalProto(x, y any) {
 	}
 }
 
+func (s *blockStorageTestSuite) TestWatermarkVisibilityControl() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+
+	// Create blocks
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 10, tag)
+
+	// Persist blocks WITHOUT watermark (updateWatermark=false)
+	err := s.accessor.PersistBlockMetas(ctx, false, blocks, nil)
+	require.NoError(err)
+
+	// GetLatestBlock should return ErrItemNotFound because no blocks are watermarked
+	_, err = s.accessor.GetLatestBlock(ctx, tag)
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound), "Expected ErrItemNotFound when no watermark exists")
+
+	// Now persist the same blocks WITH watermark (updateWatermark=true)
+	err = s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	// GetLatestBlock should now return the highest block
+	latestBlock, err := s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	require.NotNil(latestBlock)
+	require.Equal(blocks[9].Height, latestBlock.Height)
+	require.Equal(blocks[9].Hash, latestBlock.Hash)
+
+	// Add more blocks with watermark
+	moreBlocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight+10, 5, tag)
+	err = s.accessor.PersistBlockMetas(ctx, true, moreBlocks, nil)
+	require.NoError(err)
+
+	// GetLatestBlock should return the new highest watermarked block
+	latestBlock, err = s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	require.Equal(moreBlocks[4].Height, latestBlock.Height)
+	require.Equal(moreBlocks[4].Hash, latestBlock.Hash)
+}
+
+func (s *blockStorageTestSuite) TestWatermarkWithReorg() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+
+	// Create initial chain
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 10, tag)
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	// Verify latest block
+	latestBlock, err := s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	require.Equal(blocks[9].Height, latestBlock.Height)
+
+	// Simulate reorg: create alternative chain from height startHeight+7
+	// This represents the reorg scenario where we need to replace blocks
+	reorgBlocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight+7, 3, tag)
+	// Change hashes to simulate different blocks
+	for i := range reorgBlocks {
+		reorgBlocks[i].Hash = fmt.Sprintf("0xreorg%d", i)
+		if i > 0 {
+			reorgBlocks[i].ParentHash = reorgBlocks[i-1].Hash
+		} else {
+			reorgBlocks[i].ParentHash = blocks[6].Hash // Link to pre-reorg chain
+		}
+	}
+
+	// Persist reorg blocks with watermark
+	err = s.accessor.PersistBlockMetas(ctx, true, reorgBlocks, blocks[6])
+	require.NoError(err)
+
+	// GetLatestBlock should return the new reorg tip
+	latestBlock, err = s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	require.Equal(reorgBlocks[2].Height, latestBlock.Height)
+	require.Equal(reorgBlocks[2].Hash, latestBlock.Hash)
+}
+
+func (s *blockStorageTestSuite) TestWatermarkMultipleTags() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+
+	tag1 := uint32(1)
+	tag2 := uint32(2)
+
+	// Create blocks for tag1
+	blocks1 := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag1)
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks1, nil)
+	require.NoError(err)
+
+	// Create blocks for tag2
+	blocks2 := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 10, tag2)
+	err = s.accessor.PersistBlockMetas(ctx, true, blocks2, nil)
+	require.NoError(err)
+
+	// Verify each tag has its own latest block
+	latestBlock1, err := s.accessor.GetLatestBlock(ctx, tag1)
+	require.NoError(err)
+	require.Equal(blocks1[4].Height, latestBlock1.Height)
+
+	latestBlock2, err := s.accessor.GetLatestBlock(ctx, tag2)
+	require.NoError(err)
+	require.Equal(blocks2[9].Height, latestBlock2.Height)
+}
+
+func (s *blockStorageTestSuite) TestGetBlocksByHeightRangeStillWorks() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+
+	// Create blocks without watermark
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 10, tag)
+	err := s.accessor.PersistBlockMetas(ctx, false, blocks, nil)
+	require.NoError(err)
+
+	// GetBlocksByHeightRange should still work even without watermark
+	// This is important for defense-in-depth validation
+	fetchedBlocks, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+10)
+	require.NoError(err)
+	require.Len(fetchedBlocks, 10)
+
+	// Verify the blocks are correct
+	sort.Slice(fetchedBlocks, func(i, j int) bool {
+		return fetchedBlocks[i].Height < fetchedBlocks[j].Height
+	})
+	for i := 0; i < 10; i++ {
+		s.equalProto(blocks[i], fetchedBlocks[i])
+	}
+}
+
 func TestIntegrationBlockStorageTestSuite(t *testing.T) {
 	require := testutil.Require(t)
 	cfg, err := config.New()
