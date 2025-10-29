@@ -10,13 +10,17 @@ CREATE INDEX idx_canonical_watermark ON canonical_blocks (tag, height DESC) WHER
 
 -- Set watermark on the current highest block for each tag to prevent GetLatestBlock failures
 -- This ensures continuity during migration by marking existing latest blocks as validated
-UPDATE canonical_blocks cb1
+-- Use CTE for better performance on large tables (avoids correlated subquery)
+WITH max_heights AS (
+    SELECT tag, MAX(height) as max_height
+    FROM canonical_blocks
+    GROUP BY tag
+)
+UPDATE canonical_blocks
 SET is_watermark = TRUE
-WHERE height = (
-    SELECT MAX(height)
-    FROM canonical_blocks cb2
-    WHERE cb2.tag = cb1.tag
-);
+FROM max_heights
+WHERE canonical_blocks.tag = max_heights.tag
+  AND canonical_blocks.height = max_heights.max_height;
 
 -- +goose Down
 -- Drop the partial index first
