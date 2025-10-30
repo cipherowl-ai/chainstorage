@@ -75,8 +75,8 @@ Example usage:
 	cmd.Flags().DurationVar(&connectTimeout, "connect-timeout", 30*time.Second, "Connection timeout")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show pending migrations without applying them")
 
-	cmd.MarkFlagRequired("master-user")
-	cmd.MarkFlagRequired("master-password")
+	_ = cmd.MarkFlagRequired("master-user")
+	_ = cmd.MarkFlagRequired("master-password")
 
 	return cmd
 }
@@ -125,7 +125,9 @@ func runDBMigrate(masterUser, masterPassword, host string, port int, dbName, ssl
 	if err != nil {
 		return xerrors.Errorf("failed to open database connection: %w", err)
 	}
-	defer db.Close()
+	defer func() {
+		_ = db.Close()
+	}()
 
 	if err := db.PingContext(ctx); err != nil {
 		return xerrors.Errorf("failed to ping database: %w", err)
