@@ -12,6 +12,12 @@ import (
 //go:embed db/migrations/*.sql
 var embedMigrations embed.FS
 
+// GetEmbeddedMigrations returns the embedded migrations filesystem
+// This is used by the admin db-migrate command
+func GetEmbeddedMigrations() embed.FS {
+	return embedMigrations
+}
+
 func runMigrations(ctx context.Context, db *sql.DB) error {
 	goose.SetBaseFS(embedMigrations)
 

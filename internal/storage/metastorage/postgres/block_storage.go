@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math/rand"
 	"sort"
 	"strings"
 	"time"
@@ -54,8 +55,6 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 func (b *blockStorageImpl) PersistBlockMetas(
 	ctx context.Context, updateWatermark bool, blocks []*api.BlockMetadata, lastBlock *api.BlockMetadata) error {
 	return b.instrumentPersistBlockMetas.Instrument(ctx, func(ctx context.Context) error {
-		// `updateWatermark` is ignored in Postgres implementation because we can always find the latest
-		// block by querying the maximum height in canonical_blocks for a tag.
 		if len(blocks) == 0 {
 			return nil
 		}
@@ -127,6 +126,9 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				skipped = EXCLUDED.skipped
 			RETURNING id`
 
+		// Simply insert or update canonical blocks like DynamoDB does
+		// The "last write wins" behavior matches DynamoDB's TransactWriteItems
+		// Chain validation happens in update_watermark activity, not here
 		canonicalQuery := `
 			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
 			VALUES ($1, $2, $3)
@@ -172,7 +174,8 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
 			}
 
-			// Insert ALL blocks (including skipped) into canonical_blocks
+			// Insert into canonical_blocks
+			// Always insert/update canonical blocks like DynamoDB does
 			_, err = tx.ExecContext(txCtx, canonicalQuery,
 				block.Height,
 				blockId,
@@ -182,6 +185,43 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
 			}
 		}
+
+		// Update watermark if requested
+		// Set is_watermark=TRUE for the highest block to mark it as validated
+		// This prevents canonical chain leakage to streamer before validation
+		if updateWatermark && len(blocks) > 0 {
+			highestBlock := blocks[len(blocks)-1]
+
+			// Probabilistically clear old watermarks (1 in 5000 chance)
+			// This prevents unbounded accumulation while keeping the operation rare enough
+			// to have negligible performance impact
+			if rand.Intn(5000) == 0 {
+				// Clear all old watermarks for this tag, keeping only the current one
+				// This is safe because only GetLatestBlock uses is_watermark filter,
+				// and it only needs the highest watermarked block
+				clearQuery := `
+					UPDATE canonical_blocks
+					SET is_watermark = FALSE
+					WHERE tag = $1 AND is_watermark = TRUE`
+				_, err = tx.ExecContext(txCtx, clearQuery, highestBlock.Tag)
+				if err != nil {
+					// Log but don't fail - cleanup is best-effort
+					// In production, you might want to use a proper logger here
+					_ = err
+				}
+			}
+
+			// Set the new watermark
+			watermarkQuery := `
+				UPDATE canonical_blocks
+				SET is_watermark = TRUE
+				WHERE tag = $1 AND height = $2`
+			_, err = tx.ExecContext(txCtx, watermarkQuery, highestBlock.Tag, highestBlock.Height)
+			if err != nil {
+				return xerrors.Errorf("failed to update watermark for height %d: %w", highestBlock.Height, err)
+			}
+		}
+
 		// Commit transaction
 		err = tx.Commit()
 		if err != nil {
@@ -195,12 +235,14 @@ func (b *blockStorageImpl) PersistBlockMetas(
 func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api.BlockMetadata, error) {
 	return b.instrumentGetLatestBlock.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
 		// Get the latest canonical block by highest height
+		// Only return blocks that have been validated (is_watermark=TRUE)
+		// This prevents canonical chain leakage to streamer before validation
 		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
+			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main,
 			       bm.timestamp, bm.skipped
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
-			WHERE cb.tag = $1
+			WHERE cb.tag = $1 AND cb.is_watermark = TRUE
 			ORDER BY cb.height DESC
 			LIMIT 1`
 		row := b.db.QueryRowContext(ctx, query, tag)
@@ -326,6 +368,12 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 			}
 		}
 
+		// Validate chain continuity (parent hash matching) like DynamoDB does
+		// This is critical for detecting reorgs and triggering recovery logic
+		if err = parser.ValidateChain(blocks, nil); err != nil {
+			return nil, xerrors.Errorf("failed to validate chain: %w", err)
+		}
+
 		return blocks, nil
 	})
 }
@@ -397,6 +445,18 @@ func (b *blockStorageImpl) validateHeight(height uint64) error {
 			height, b.blockStartHeight, errors.ErrInvalidHeight)
 	}
 	return nil
+}
+
+// GetWatermarkCount returns the number of watermarked blocks for monitoring purposes
+// This metric helps track watermark accumulation and determine if cleanup is needed
+func (b *blockStorageImpl) GetWatermarkCount(ctx context.Context, tag uint32) (int64, error) {
+	var count int64
+	query := `SELECT COUNT(*) FROM canonical_blocks WHERE tag = $1 AND is_watermark = TRUE`
+	err := b.db.QueryRowContext(ctx, query, tag).Scan(&count)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to get watermark count: %w", err)
+	}
+	return count, nil
 }
 
 func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {

@@ -70,4 +70,3 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 
 	return db, nil
 }
-

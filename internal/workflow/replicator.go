@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/client"
@@ -261,7 +262,8 @@ func (w *Replicator) execute(ctx workflow.Context, request *ReplicatorRequest) e
 				})
 				if err != nil {
 					// Check if the error is due to chain discontinuity (reorg)
-					if xerrors.Is(err, parser.ErrInvalidChain) {
+					// Use string matching because Temporal error serialization breaks xerrors.Is
+					if strings.Contains(err.Error(), parser.ErrInvalidChain.Error()) {
 						// Reorg detected - restart from a safe point
 						logger.Warn("Chain discontinuity detected, likely due to reorg. Restarting from earlier height",
 							zap.Uint64("currentStartHeight", startHeight),
