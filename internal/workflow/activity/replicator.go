@@ -143,26 +143,25 @@ func (a *Replicator) prepareRawBlockData(ctx context.Context, blockFile *api.Blo
 	}
 	var rawBytes []byte
 	var compressedBytes []byte
-	switch blockFile.Compression {
-	case api.Compression_NONE:
-		rawBytes = bodyBytes
-		if compression == api.Compression_GZIP {
-			compressedBytes, err = storage_utils.Compress(rawBytes, compression)
-			if err != nil {
-				return nil, xerrors.Errorf("failed to compress block data with type %v: %w", compression.String(), err)
-			}
-		}
-	case api.Compression_GZIP:
+
+	sourceCompressionType := blockFile.Compression
+	if sourceCompressionType == compression {
 		compressedBytes = bodyBytes
-		if compression == api.Compression_NONE {
-			rawBytes, err = storage_utils.Decompress(rawBytes, blockFile.Compression)
-			if err != nil {
-				return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", blockFile.Compression.String(), err)
-			}
+		if sourceCompressionType == api.Compression_NONE {
+			rawBytes = bodyBytes
 		}
-	default:
-		return nil, xerrors.Errorf("unknown block file compression type %v", blockFile.Compression.String())
+
+	} else {
+		rawBytes, err = storage_utils.Decompress(bodyBytes, sourceCompressionType)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", sourceCompressionType.String(), err)
+		}
+		compressedBytes, err = storage_utils.Compress(rawBytes, compression)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to compress block data with type %v: %w", compression.String(), err)
+		}
 	}
+
 	metadata := &api.BlockMetadata{
 		Tag:          blockFile.Tag,
 		Hash:         blockFile.Hash,
@@ -177,7 +176,6 @@ func (a *Replicator) prepareRawBlockData(ctx context.Context, blockFile *api.Blo
 	// TODO remove this after the api upgrade
 	if metadata.Timestamp == nil || (metadata.Timestamp.Nanos == 0 && metadata.Timestamp.Seconds == 0) {
 		block := new(api.Block)
-		rawBytes := rawBytes
 		if len(rawBytes) == 0 {
 			rawBytes, err = storage_utils.Decompress(bodyBytes, blockFile.Compression)
 			if err != nil {
@@ -201,7 +199,7 @@ func (a *Replicator) prepareRawBlockData(ctx context.Context, blockFile *api.Blo
 	case api.Compression_NONE:
 		rawBlockData.BlockData = rawBytes
 		return rawBlockData, nil
-	case api.Compression_GZIP:
+	case api.Compression_GZIP, api.Compression_ZSTD:
 		rawBlockData.BlockData = compressedBytes
 		return rawBlockData, nil
 	default:
