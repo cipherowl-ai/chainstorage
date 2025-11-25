@@ -113,7 +113,7 @@ func (a *Replicator) downloadBlockData(ctx context.Context, url string) ([]byte,
 
 		httpResp, err := a.httpClient.Do(req)
 		if err != nil {
-			return nil, retry.Retryable(xerrors.Errorf("failed to download block file: %w", err))
+			return nil, retry.Retryable(xerrors.Errorf("failed to download block file: %w, url: %s", err, url))
 		}
 
 		finalizer := finalizer.WithCloser(httpResp.Body)
@@ -231,6 +231,35 @@ func (a *Replicator) execute(ctx context.Context, request *ReplicatorRequest) (*
 		i := i
 		group.Go(func() error {
 			blockFile := blocks.Files[i]
+			if blockFile.GetSkipped() || blockFile.GetFileUrl() == "" {
+				if blockFile.GetSkipped() {
+					logger.Debug(
+						"block file skipped; skip download",
+						zap.Uint32("tag", blockFile.Tag),
+						zap.Uint64("height", blockFile.Height),
+						zap.Bool("skipped", blockFile.Skipped),
+					)
+				} else {
+					logger.Warn(
+						"block file url missing; skip download",
+						zap.Uint32("tag", blockFile.Tag),
+						zap.Uint64("height", blockFile.Height),
+						zap.Bool("skipped", blockFile.Skipped),
+					)
+				}
+
+				blockMetas[i] = &api.BlockMetadata{
+					Tag:          blockFile.Tag,
+					Hash:         blockFile.Hash,
+					ParentHash:   blockFile.ParentHash,
+					Height:       blockFile.Height,
+					ParentHeight: blockFile.ParentHeight,
+					Skipped:      blockFile.Skipped,
+					Timestamp:    blockFile.BlockTimestamp,
+				}
+				return nil
+			}
+
 			logger.Debug(
 				"downloading block",
 				zap.Uint32("tag", blockFile.Tag),
