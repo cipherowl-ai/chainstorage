@@ -204,6 +204,17 @@ func (w *Poller) execute(ctx workflow.Context, request *PollerRequest) error {
 			}
 			sessionCtx, err = workflow.CreateSession(ctx, so)
 			if err != nil {
+				if IsErrSessionFailed(ctx, err) || IsScheduleToStartTimeout(err) {
+					request.RetryableErrorCount++
+					errMetricName := w.getRetryableErrorMetricName(ctx, err)
+					metrics.Counter(errMetricName).Inc(1)
+
+					if request.RetryableErrorCount <= RetryableErrorLimit {
+						workflow.Sleep(ctx, backoffInterval)
+						return w.continueAsNew(ctx, request)
+					}
+					return xerrors.Errorf("retryable errors on session creation exceeded threshold: %w", err)
+				}
 				return xerrors.Errorf("failed to create workflow session: %w", err)
 			}
 			defer workflow.CompleteSession(sessionCtx)
