@@ -5,6 +5,6 @@ import (
 )
 
 func NewMonadClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
-	// Plasma shares the same data schema as Ethereum since it is an EVM chain.
+	// Reuse the Ethereum client factory since it is an EVM chain.
 	return NewEthereumClientFactory(params)
 }

@@ -5,6 +5,6 @@ import (
 )
 
 func NewMonadNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
-	// Plasma shares the same data schema as Ethereum since its an EVM chain.
+	// Reuse the Ethereum native parser since its an EVM chain.
 	return NewEthereumNativeParser(params, opts...)
 }
