@@ -48,5 +48,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("plasma", NewPlasmaNativeParser).
 		SetValidatorFactory(NewPlasmaValidator).
 		Build(),
+	internal.NewParserBuilder("monad", NewMonadNativeParser).
+		SetValidatorFactory(NewMonadValidator).
+		Build(),
 	beacon.Module,
 )

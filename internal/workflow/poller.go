@@ -210,7 +210,9 @@ func (w *Poller) execute(ctx workflow.Context, request *PollerRequest) error {
 					metrics.Counter(errMetricName).Inc(1)
 
 					if request.RetryableErrorCount <= RetryableErrorLimit {
-						workflow.Sleep(ctx, backoffInterval)
+						if err := workflow.Sleep(ctx, backoffInterval); err != nil {
+							return err
+						}
 						return w.continueAsNew(ctx, request)
 					}
 					return xerrors.Errorf("retryable errors on session creation exceeded threshold: %w", err)

@@ -26,6 +26,7 @@ enum Blockchain {
     BLOCKCHAIN_STORY = 60;
     BLOCKCHAIN_ETHEREUMCLASSIC = 61; // Ethereum Classic
     BLOCKCHAIN_PLASMA = 62; // Plasma
+    BLOCKCHAIN_MONAD = 63; // Monad
 }
 
 // Network defines an enumeration of supported networks.
@@ -87,4 +88,6 @@ enum Network {
     NETWORK_ETHEREUMCLASSIC_MAINNET = 141;
 
     NETWORK_PLASMA_MAINNET = 142;
+
+    NETWORK_MONAD_MAINNET = 143;
 }
