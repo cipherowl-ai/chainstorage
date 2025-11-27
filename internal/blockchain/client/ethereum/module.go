@@ -55,5 +55,9 @@ var Module = fx.Options(
 		Name:   "plasma",
 		Target: NewPlasmaClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "monad",
+		Target: NewMonadClientFactory,
+	}),
 	beacon.Module,
 )
