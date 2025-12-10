@@ -1343,9 +1343,6 @@ func init() {
 		
 		// Initialize AES from environment variable or default
 		aesKeyStr := os.Getenv("SRC20_AES_KEY")
-		if aesKeyStr == "" {
-			aesKeyStr = "0x0aa14dad19b11c95fd366db53bf02b8aceaf3c699b64751bf2ca401eeefd722c"
-		}
 		aesKey, _ := hex.DecodeString(strings.TrimPrefix(aesKeyStr, "0x"))
 		aesGCM, _ = aes.CreateAESGCM(aesKey)
 	})

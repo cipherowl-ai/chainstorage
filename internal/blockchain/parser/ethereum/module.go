@@ -51,5 +51,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("monad", NewMonadNativeParser).
 		SetValidatorFactory(NewMonadValidator).
 		Build(),
+	internal.NewParserBuilder("seismic", NewSeismicNativeParser).
+		SetValidatorFactory(NewSeismicValidator).
+		Build(),
 	beacon.Module,
 )

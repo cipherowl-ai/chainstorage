@@ -1,8 +1,8 @@
 module github.com/coinbase/chainstorage
 
-go 1.23.0
+go 1.24.0
 
-toolchain go1.23.9
+toolchain go1.24.11
 
 require (
 	cloud.google.com/go/firestore v1.14.0
@@ -16,7 +16,7 @@ require (
 	github.com/cenkalti/backoff/v4 v4.2.1
 	github.com/coinbase/rosetta-sdk-go v0.8.9
 	github.com/coinbase/rosetta-sdk-go/types v1.0.0
-	github.com/ethereum/go-ethereum v1.13.15
+	github.com/ethereum/go-ethereum v1.16.7
 	github.com/fatih/color v1.16.0
 	github.com/gagliardetto/solana-go v1.8.4
 	github.com/go-playground/validator/v10 v10.17.0
@@ -65,7 +65,10 @@ require github.com/nexus-rpc/sdk-go v0.3.0 // indirect
 
 require github.com/lib/pq v1.10.9
 
-require github.com/pressly/goose/v3 v3.14.0
+require (
+	github.com/SeismicSystems/aes v0.0.0-20251119232201-ff6734fc5e0e
+	github.com/pressly/goose/v3 v3.14.0
+)
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.25.1 // indirect
@@ -206,7 +209,7 @@ require (
 	go4.org/intern v0.0.0-20230525184215-6c62f75575cb // indirect
 	go4.org/unsafe/assume-no-moving-gc v0.0.0-20231121144256-b99613f794b6 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect
-	golang.org/x/sys v0.32.0 // indirect
+	golang.org/x/sys v0.36.0 // indirect
 	golang.org/x/term v0.31.0 // indirect
 	google.golang.org/genproto v0.0.0-20240125205218-1f4bbc51befe // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20240827150818-7e3bb234dfed // indirect
