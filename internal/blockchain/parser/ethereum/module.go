@@ -57,5 +57,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("megaeth", NewMegaethNativeParser).
 		SetValidatorFactory(NewMegaethValidator).
 		Build(),
+	internal.NewParserBuilder("seismic", NewSeismicNativeParser).
+		SetValidatorFactory(NewSeismicValidator).
+		Build(),
 	beacon.Module,
 )

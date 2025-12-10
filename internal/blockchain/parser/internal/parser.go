@@ -68,6 +68,7 @@ type (
 		Monad           ParserFactory `name:"monad" optional:"true"`
 		Abstract        ParserFactory `name:"abstract" optional:"true"`
 		Megaeth         ParserFactory `name:"megaeth" optional:"true"`
+		Seismic         ParserFactory `name:"seismic" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -121,10 +122,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Plasma
 		case common.Blockchain_BLOCKCHAIN_MONAD:
 			factory = params.Monad
-		case common.Blockchain_BLOCKCHAIN_ABSTRACT:
-			factory = params.Abstract
-		case common.Blockchain_BLOCKCHAIN_MEGAETH:
-			factory = params.Megaeth
+		case common.Blockchain_BLOCKCHAIN_SEISMIC:
+			factory = params.Seismic
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
