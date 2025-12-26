@@ -51,5 +51,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("monad", NewMonadNativeParser).
 		SetValidatorFactory(NewMonadValidator).
 		Build(),
+	internal.NewParserBuilder("megaeth", NewMegaethNativeParser).
+		SetValidatorFactory(NewMegaethValidator).
+		Build(),
 	beacon.Module,
 )
