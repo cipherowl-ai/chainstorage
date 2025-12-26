@@ -66,6 +66,7 @@ type (
 		EthereumClassic ParserFactory `name:"ethereumclassic" optional:"true"`
 		Plasma          ParserFactory `name:"plasma" optional:"true"`
 		Monad           ParserFactory `name:"monad" optional:"true"`
+		Megaeth         ParserFactory `name:"megaeth" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -119,6 +120,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Plasma
 		case common.Blockchain_BLOCKCHAIN_MONAD:
 			factory = params.Monad
+		case common.Blockchain_BLOCKCHAIN_MEGAETH:
+			factory = params.Megaeth
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta

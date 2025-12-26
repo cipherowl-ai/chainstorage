@@ -2,31 +2,29 @@
 api:
   auth: ""
   max_num_block_files: 1000
-  max_num_blocks: 5
+  max_num_blocks: 50
   num_workers: 10
   rate_limit:
     global_rps: 3000
     per_client_rps: 2000
   streaming_batch_size: 50
   streaming_interval: 1s
-  streaming_max_no_event_time: 30m
+  streaming_max_no_event_time: 10m
 aws:
   aws_account: development
   bucket: ""
   dlq:
     delay_secs: 900
-    name: example_chainstorage_blocks_bitcoincash_mainnet_dlq
+    name: example_chainstorage_blocks_megaeth_mainnet_dlq
     visibility_timeout_secs: 600
   dynamodb:
-    block_table: example_chainstorage_blocks_bitcoincash_mainnet
-    event_table: example_chainstorage_block_events_bitcoincash_mainnet
-    event_table_height_index: example_chainstorage_block_events_by_height_bitcoincash_mainnet
-    transaction_table: example_chainstorage_transactions_table_bitcoincash_mainnet
-    versioned_event_table: example_chainstorage_versioned_block_events_bitcoincash_mainnet
-    versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_bitcoincash_mainnet
+    block_table: example_chainstorage_blocks_megaeth_mainnet
+    transaction_table: example_chainstorage_transactions_table_megaeth_mainnet
+    versioned_event_table: example_chainstorage_versioned_block_events_megaeth_mainnet
+    versioned_event_table_block_index: example_chainstorage_versioned_block_events_by_block_id_megaeth_mainnet
   postgres:
     connect_timeout: 30s
-    database: chainstorage_bitcoincash_mainnet
+    database: chainstorage_megaeth_mainnet
     host: localhost
     max_connections: 25
     min_connections: 5
@@ -34,14 +32,14 @@ aws:
     port: 5433
     ssl_mode: require
     statement_timeout: 60s
-    user: cs_bitcoincash_mainnet_worker
+    user: cs_megaeth_mainnet_worker
   presigned_url_expiration: 30m
   region: us-east-1
   storage:
     data_compression: GZIP
 cadence:
   address: ""
-  domain: chainstorage-bitcoincash-mainnet
+  domain: chainstorage-megaeth-mainnet
   retention_period: 7
   tls:
     enabled: true
@@ -49,10 +47,10 @@ cadence:
 chain:
   block_start_height: 0
   block_tag:
-    latest: 2
-    stable: 2
-  block_time: 10m
-  blockchain: BLOCKCHAIN_BITCOINCASH
+    latest: 1
+    stable: 1
+  block_time: 2s
+  blockchain: BLOCKCHAIN_MEGAETH
   client:
     consensus:
       endpoint_group: ""
@@ -61,21 +59,21 @@ chain:
       endpoint_group: ""
     slave:
       endpoint_group: ""
-    tx_batch_size: 100
     validator:
       endpoint_group: ""
   event_tag:
-    latest: 0
-    stable: 0
+    latest: 1
+    stable: 1
   feature:
+    block_validation_enabled: true
+    block_validation_muted: true
     default_stable_event: true
     rosetta_parser: true
-  irreversible_distance: 2
-  network: NETWORK_BITCOINCASH_MAINNET
-config_name: bitcoincash_mainnet
+  irreversible_distance: 10
+  network: NETWORK_MEGAETH_MAINNET
+config_name: megaeth_mainnet
 cron:
-  block_range_size: 2
-  disable_dlq_processor: true
+  block_range_size: 4
 functional_test: ""
 gcp:
   presigned_url_expiration: 30m
@@ -83,24 +81,25 @@ gcp:
 sdk:
   auth_header: ""
   auth_token: ""
-  chainstorage_address: https://example-chainstorage-bitcoincash-mainnet
+  chainstorage_address: https://example-chainstorage-megaeth-mainnet
   num_workers: 10
   restful: true
 server:
   bind_address: localhost:9090
 sla:
-  block_height_delta: 5
-  block_time_delta: 1h
-  event_height_delta: 5
-  event_time_delta: 1h
+  block_height_delta: 60
+  block_time_delta: 2m
+  event_height_delta: 60
+  event_time_delta: 2m
   expected_workflows:
   - monitor
   - poller
   - streamer
-  out_of_sync_node_distance: 10
-  tier: 2
-  time_since_last_block: 1h15m
-  time_since_last_event: 1h15m
+  - cross_validator
+  out_of_sync_node_distance: 60
+  tier: 1
+  time_since_last_block: 2m30s
+  time_since_last_event: 2m30s
 workflows:
   backfiller:
     activity_retry:
@@ -109,12 +108,12 @@ workflows:
       maximum_attempts: 3
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
-    activity_start_to_close_timeout: 10m
+    activity_start_to_close_timeout: 20m
     batch_size: 2500
     checkpoint_size: 5000
     max_reprocessed_per_batch: 30
     mini_batch_size: 1
-    num_concurrent_extractors: 21
+    num_concurrent_extractors: 20
     task_list: default
     workflow_identity: workflow.backfiller
     workflow_run_timeout: 24h
@@ -138,12 +137,12 @@ workflows:
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
     activity_start_to_close_timeout: 10m
-    backoff_interval: 10s
+    backoff_interval: 1s
     batch_size: 100
     checkpoint_size: 1000
-    parallelism: 4
+    parallelism: 10
     task_list: default
-    validation_percentage: 10
+    validation_percentage: 100
     workflow_identity: workflow.cross_validator
     workflow_retry:
       backoff_coefficient: 1
@@ -189,8 +188,9 @@ workflows:
     backoff_interval: 10s
     batch_size: 50
     block_gap_limit: 3000
-    checkpoint_size: 250
+    checkpoint_size: 500
     event_gap_limit: 300
+    failover_enabled: true
     parallelism: 4
     task_list: default
     workflow_identity: workflow.monitor
@@ -201,24 +201,27 @@ workflows:
       maximum_interval: 30s
     workflow_run_timeout: 24h
   poller:
-    activity_heartbeat_timeout: 15m
+    activity_heartbeat_timeout: 2m
     activity_retry:
       backoff_coefficient: 2
       initial_interval: 10s
       maximum_attempts: 6
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
-    activity_start_to_close_timeout: 30m
-    backoff_interval: 10s
+    activity_start_to_close_timeout: 10m
+    backoff_interval: 0s
     checkpoint_size: 1000
+    consensus_validation: true
+    consensus_validation_muted: true
+    failover_enabled: true
     fast_sync: false
     liveness_check_enabled: true
     liveness_check_interval: 1m
     liveness_check_violation_limit: 10
-    max_blocks_to_sync_per_cycle: 5
+    max_blocks_to_sync_per_cycle: 100
     parallelism: 10
     session_creation_timeout: 2m
-    session_enabled: false
+    session_enabled: true
     task_list: default
     workflow_identity: workflow.poller
     workflow_retry:
@@ -250,7 +253,7 @@ workflows:
       maximum_interval: 3m
     activity_schedule_to_close_timeout: 1h
     activity_start_to_close_timeout: 2m
-    backoff_interval: 10s
+    backoff_interval: 0s
     batch_size: 500
     checkpoint_size: 500
     task_list: default
