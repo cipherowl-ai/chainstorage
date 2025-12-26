@@ -60,6 +60,10 @@ var Module = fx.Options(
 		Target: NewMonadClientFactory,
 	}),
 	fx.Provide(fx.Annotated{
+		Name:   "abstract",
+		Target: NewAbstractClientFactory,
+	}),
+	fx.Provide(fx.Annotated{
 		Name:   "megaeth",
 		Target: NewMegaethClientFactory,
 	}),

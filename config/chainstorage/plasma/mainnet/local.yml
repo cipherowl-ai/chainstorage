@@ -8,7 +8,3 @@ storage_type:
   blob: S3
   dlq: SQS
   meta: DYNAMODB
-chain:
-  feature:
-    block_validation_enabled: false
-  block_start_height: 1
