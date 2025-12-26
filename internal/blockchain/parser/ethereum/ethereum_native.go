@@ -2,17 +2,13 @@ package ethereum
 
 import (
 	"context"
-	"crypto/cipher"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/go-playground/validator/v10"
@@ -21,16 +17,12 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
-	"github.com/SeismicSystems/aes"
-	"github.com/ethereum/go-ethereum/accounts/abi"
-
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/ethereum/types"
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
-	ecommon "github.com/ethereum/go-ethereum/common"
 )
 
 type (
@@ -246,18 +238,20 @@ type (
 	}
 
 	ethereumNativeParserImpl struct {
-		Logger    *zap.Logger
-		validate  *validator.Validate
-		nodeType  types.EthereumNodeType
-		traceType types.TraceType
-		config    *config.Config
-		metrics   *ethereumNativeParserMetrics
+		Logger      *zap.Logger
+		validate    *validator.Validate
+		nodeType    types.EthereumNodeType
+		traceType   types.TraceType
+		config      *config.Config
+		metrics     *ethereumNativeParserMetrics
+		src20Parser SRC20TokenTransferParser // Optional, only Seismic sets this
 	}
 
 	ethereumParserOptions struct {
 		nodeType        types.EthereumNodeType
 		traceType       types.TraceType
 		checksumAddress bool
+		src20Parser     SRC20TokenTransferParser
 	}
 
 	nestedParityTrace struct {
@@ -457,12 +451,13 @@ func NewEthereumNativeParser(params internal.ParserParams, opts ...internal.Pars
 	}
 
 	return &ethereumNativeParserImpl{
-		Logger:    log.WithPackage(params.Logger),
-		validate:  validator.New(),
-		nodeType:  options.nodeType,
-		traceType: options.traceType,
-		config:    params.Config,
-		metrics:   newEthereumNativeParserMetrics(params.Metrics),
+		Logger:      log.WithPackage(params.Logger),
+		validate:    validator.New(),
+		nodeType:    options.nodeType,
+		traceType:   options.traceType,
+		config:      params.Config,
+		metrics:     newEthereumNativeParserMetrics(params.Metrics),
+		src20Parser: options.src20Parser,
 	}, nil
 }
 
@@ -497,6 +492,15 @@ func WithEthereumChecksumAddress() internal.ParserFactoryOption {
 	return func(options any) {
 		if v, ok := options.(*ethereumParserOptions); ok {
 			v.checksumAddress = true
+		}
+	}
+}
+
+// WithSRC20Parser sets the SRC20 token transfer parser for Seismic chain.
+func WithSRC20Parser(parser SRC20TokenTransferParser) internal.ParserFactoryOption {
+	return func(options any) {
+		if v, ok := options.(*ethereumParserOptions); ok {
+			v.src20Parser = parser
 		}
 	}
 }
@@ -1265,7 +1269,6 @@ func (p *ethereumNativeParserImpl) parseTokenTransfers(transactionReceipts []*ap
 			if len(eventLog.Topics) == 3 && eventLog.Topics[0] == TransferEventTopic {
 				// Parse ERC-20 token
 				// https://ethereum.org/en/developers/docs/standards/tokens/erc-20/
-
 				tokenTransfer, err := p.parseERC20TokenTransfer(eventLog)
 				if err != nil {
 					return nil, xerrors.Errorf("failed to parse erc20 token transfer: %w", err)
@@ -1283,10 +1286,13 @@ func (p *ethereumNativeParserImpl) parseTokenTransfers(transactionReceipts []*ap
 				if tokenTransfer != nil {
 					tokenTransfers = append(tokenTransfers, tokenTransfer)
 				}
-			} else if len(eventLog.Topics) == 4 && eventLog.Topics[0] == SRCTransferEventTopic {
-				tokenTransfer, err := p.parseSRC20TokenTransfer(eventLog)
+			} else if p.src20Parser != nil && len(eventLog.Topics) == 4 && eventLog.Topics[0] == SRCTransferEventTopic {
+				// Parse SRC-20 token (Seismic only)
+				// Outer topic check avoids unnecessary function calls
+				// SRCTransferEventTopic is exported from seismic_native.go
+				tokenTransfer, err := p.src20Parser.ParseSRC20TokenTransfer(eventLog)
 				if err != nil {
-					return nil, xerrors.Errorf("failed to parse erc20 token transfer: %w", err)
+					return nil, xerrors.Errorf("failed to parse src20 token transfer: %w", err)
 				}
 				if tokenTransfer != nil {
 					tokenTransfers = append(tokenTransfers, tokenTransfer)
@@ -1298,105 +1304,6 @@ func (p *ethereumNativeParserImpl) parseTokenTransfers(transactionReceipts []*ap
 	}
 
 	return results, nil
-}
-
-const (
-	SRCTransferEventTopic = "0x80ffa007a69623ef13594f5e8178eee6c4ef2d0cba74c08329e879f695b7d3f6"
-
-	SRC20Abi = `[
-		{
-			"type": "event",
-			"name": "Approval",
-			"inputs": [
-				{"name": "owner", "type": "address", "indexed": true, "internalType": "address"},
-				{"name": "spender", "type": "address", "indexed": true, "internalType": "address"},
-				{"name": "encryptKeyHash", "type": "bytes32", "indexed": true, "internalType": "bytes32"},
-				{"name": "encryptedAmount", "type": "bytes", "indexed": false, "internalType": "bytes"}
-			],
-			"anonymous": false
-		},
-		{
-			"type": "event",
-			"name": "Transfer",
-			"inputs": [
-				{"name": "from", "type": "address", "indexed": true, "internalType": "address"},
-				{"name": "to", "type": "address", "indexed": true, "internalType": "address"},
-				{"name": "encryptKeyHash", "type": "bytes32", "indexed": true, "internalType": "bytes32"},
-				{"name": "encryptedAmount", "type": "bytes", "indexed": false, "internalType": "bytes"}
-			],
-			"anonymous": false
-		}
-	]`
-)
-
-var (
-	src20ABI *abi.ABI
-	aesGCM   cipher.AEAD
-	initOnce sync.Once
-)
-
-func init() {
-	initOnce.Do(func() {
-		// Initialize ABI
-		contractAbi, _ := abi.JSON(strings.NewReader(SRC20Abi))
-		src20ABI = &contractAbi
-		
-		// Initialize AES from environment variable or default
-		aesKeyStr := os.Getenv("SRC20_AES_KEY")
-		aesKey, _ := hex.DecodeString(strings.TrimPrefix(aesKeyStr, "0x"))
-		aesGCM, _ = aes.CreateAESGCM(aesKey)
-	})
-}
-
-
-func (p *ethereumNativeParserImpl) parseSRC20TokenTransfer(eventLog *api.EthereumEventLog) (*api.EthereumTokenTransfer, error) {
-	// Parse event data
-	var transferEvent struct {
-		From            ecommon.Address
-		To              ecommon.Address
-		EncryptedAmount []byte
-	}
-	
-	logData, err := hex.DecodeString(strings.TrimPrefix(eventLog.Data, "0x"))
-	if err != nil {
-		return nil, xerrors.Errorf("failed to decode log data: %w", err)
-	}
-	
-	if err := src20ABI.UnpackIntoInterface(&transferEvent, "Transfer", logData); err != nil {
-		return nil, xerrors.Errorf("failed to unpack Transfer event: %w", err)
-	}
-	
-	// Decrypt amount
-	value, err := aes.DecryptAESGCM(transferEvent.EncryptedAmount, aesGCM)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to decrypt amount: %w", err)
-	}
-	
-	// Clean addresses
-	tokenAddress, _ := internal.CleanAddress(eventLog.Address)
-	fromAddress, _ := internal.CleanAddress(eventLog.Topics[1])
-	toAddress, _ := internal.CleanAddress(eventLog.Topics[2])
-	
-	valueStr := value.String()
-	
-	return &api.EthereumTokenTransfer{
-		TokenAddress:     tokenAddress,
-		FromAddress:      fromAddress,
-		ToAddress:        toAddress,
-		Value:            valueStr,
-		TransactionHash:  eventLog.TransactionHash,
-		TransactionIndex: eventLog.TransactionIndex,
-		LogIndex:         eventLog.LogIndex,
-		BlockHash:        eventLog.BlockHash,
-		BlockNumber:      eventLog.BlockNumber,
-		TokenTransfer: &api.EthereumTokenTransfer_Erc20{
-			Erc20: &api.ERC20TokenTransfer{
-				FromAddress: fromAddress,
-				ToAddress:   toAddress,
-				Value:       valueStr,
-			},
-		},
-	}, nil
 }
 
 func (p *ethereumNativeParserImpl) parseERC20TokenTransfer(eventLog *api.EthereumEventLog) (*api.EthereumTokenTransfer, error) {

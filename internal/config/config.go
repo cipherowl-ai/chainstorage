@@ -70,6 +70,9 @@ type (
 		IrreversibleDistance uint64        `mapstructure:"irreversible_distance" validate:"required"`
 		Rosetta              RosettaConfig `mapstructure:"rosetta"`
 		BlockTime            time.Duration `mapstructure:"block_time" validate:"required"`
+		// CustomParams stores chain-specific custom parameters as key-value pairs.
+		// For example, Seismic uses "src20_aes_key" for encrypted token transfer parsing.
+		CustomParams map[string]string `mapstructure:"custom_params"`
 	}
 
 	ClientConfig struct {
