@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
+	"regexp"
 
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
@@ -84,6 +86,7 @@ const (
 
 var (
 	ErrFailoverUnavailable = xerrors.New("no endpoint is available for failover")
+	placeholderVarRE       = regexp.MustCompile(`\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 )
 
 func NewEndpointProvider(params EndpointProviderParams) (EndpointProviderResult, error) {
@@ -213,6 +216,15 @@ func newEndpoint(
 	endpoint *config.Endpoint,
 	endpointConfig *config.EndpointConfig,
 ) (*Endpoint, error) {
+	// Expand URL placeholders before it is used anywhere else (e.g. sticky session cookie hash).
+	if endpoint.Url != "" {
+		expanded, err := expandEndpointURL(endpoint.Url)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to expand endpoint url for %q: %w", endpoint.Name, err)
+		}
+		endpoint.Url = expanded
+	}
+
 	var opts []ClientOption
 
 	//TODO: check if this is still needed
@@ -290,6 +302,38 @@ func newEndpoint(
 			}).
 			Counter("requests"),
 	}, nil
+}
+
+// expandEndpointURL expands placeholders in the URL using environment variables.
+//
+// Supported formats:
+// - {VAR}: custom syntax (e.g. {URL_TOKEN})
+//
+// It returns an error if any placeholder is left unresolved.
+func expandEndpointURL(raw string) (string, error) {
+	missing := make(map[string]struct{})
+	expanded := placeholderVarRE.ReplaceAllStringFunc(raw, func(m string) string {
+		sub := placeholderVarRE.FindStringSubmatch(m)
+		// sub is always [full, group1] when regex matches, but keep it defensive.
+		if len(sub) != 2 {
+			return m
+		}
+
+		key := sub[1]
+		val, ok := os.LookupEnv(key)
+		if !ok {
+			missing[key] = struct{}{}
+			return m
+		}
+		return val
+	})
+
+	if len(missing) > 0 {
+		// Keep the expanded URL in the error for debugging (it will still contain {VAR} markers).
+		return "", xerrors.Errorf("endpoint url contains unresolved placeholder(s): %v", expanded)
+	}
+
+	return expanded, nil
 }
 
 func getStickySessionValue(cfg *config.Config) string {
