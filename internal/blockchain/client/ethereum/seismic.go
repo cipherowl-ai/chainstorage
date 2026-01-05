@@ -5,6 +5,6 @@ import (
 )
 
 func NewSeismicClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
-	// Plasma shares the same data schema as Ethereum since it is an EVM chain.
+	// Shares the same data schema as Ethereum since it is an EVM chain.
 	return NewEthereumClientFactory(params)
 }

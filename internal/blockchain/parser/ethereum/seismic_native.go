@@ -115,9 +115,18 @@ func (p *seismicSRC20Parser) ParseSRC20TokenTransfer(eventLog *api.EthereumEvent
 	}
 
 	// Clean addresses from indexed topics
-	tokenAddress, _ := internal.CleanAddress(eventLog.Address)
-	fromAddress, _ := internal.CleanAddress(eventLog.Topics[1])
-	toAddress, _ := internal.CleanAddress(eventLog.Topics[2])
+	tokenAddress, err := internal.CleanAddress(eventLog.Address)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to clean token address for src20: %w", err)
+	}
+	fromAddress, err := internal.CleanAddress(eventLog.Topics[1])
+	if err != nil {
+		return nil, xerrors.Errorf("failed to clean from address for src20: %w", err)
+	}
+	toAddress, err := internal.CleanAddress(eventLog.Topics[2])
+	if err != nil {
+		return nil, xerrors.Errorf("failed to clean to address for src20: %w", err)
+	}
 
 	valueStr := value.String()
 
@@ -161,6 +170,8 @@ func NewSeismicNativeParser(params internal.ParserParams, opts ...internal.Parse
 			return nil, xerrors.Errorf("failed to create SRC20 parser: %w", err)
 		}
 		opts = append(opts, WithSRC20Parser(src20Parser))
+	} else {
+		params.Logger.Warn("SRC20_AES_KEY is not configured for Seismic parser; SRC20 token transfers will be skipped.")
 	}
 
 	return NewEthereumNativeParser(params, opts...)
