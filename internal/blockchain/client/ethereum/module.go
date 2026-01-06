@@ -68,7 +68,7 @@ var Module = fx.Options(
 		Target: NewMegaethClientFactory,
 	}),
 	fx.Provide(fx.Annotated{
-			Name:   "seismic",
+		Name:   "seismic",
 		Target: NewSeismicClientFactory,
 	}),
 	beacon.Module,

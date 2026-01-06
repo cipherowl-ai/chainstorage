@@ -62,11 +62,11 @@ It aims to provide an efficient and flexible way to access the on-chain data:
 This section will guide you through setting up ChainStorage on your local machine for development.
 
 ### Prerequisites
-1.  **Go (version 1.22):**
+1.  **Go (version 1.24):**
     ```shell
-    brew install go@1.22
+    brew install go@1.24
     brew unlink go
-    brew link go@1.22
+    brew link go@1.24
     ```
     Verify your Go installation:
     ```shell
