@@ -2,7 +2,7 @@ version: 2.1
 jobs:
   build_and_test:
     docker:
-      - image: ${CIPHEROWL_ECR_URL}/cipherowl/circleci:01fca3dabc0cc050a73bc926fe0704a26bf5af8b
+      - image: ${CIPHEROWL_ECR_URL}/cipherowl/circleci:46f1d6a4caf201933914e8813b9c32b2f746d5f8
     working_directory: ~/chainstorage
     steps:
       - checkout
@@ -40,7 +40,7 @@ jobs:
               -e CHAINSTORAGE_AWS_POSTGRES_USER=postgres \
               -e CHAINSTORAGE_AWS_POSTGRES_PASSWORD=postgres \
               -e CHAINSTORAGE_AWS_POSTGRES_DATABASE=postgres \
-              ${CIPHEROWL_ECR_URL}/cipherowl/circleci:01fca3dabc0cc050a73bc926fe0704a26bf5af8b \
+              ${CIPHEROWL_ECR_URL}/cipherowl/circleci:46f1d6a4caf201933914e8813b9c32b2f746d5f8 \
               /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && \
                 echo '🔧 Test databases already set up by init script' && \
                 TEST_TYPE=integration go test ./... -v -p=1 -parallel=1 -timeout=15m -failfast -run=TestIntegration"
@@ -53,7 +53,7 @@ jobs:
             # docker run --network chainstorage_default \
             #  --volumes-from chainstorage \
             #  -w /home/circleci/chainstorage \
-            #  ${CIPHEROWL_ECR_URL}/cipherowl/circleci:01fca3dabc0cc050a73bc926fe0704a26bf5af8b \
+            #  ${CIPHEROWL_ECR_URL}/cipherowl/circleci:46f1d6a4caf201933914e8813b9c32b2f746d5f8 \
             #  /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=functional go test ./... -v -p=1 -parallel=1 -timeout=45m -failfast -run=TestIntegration"
             
             docker-compose -f docker-compose-testing.yml down
