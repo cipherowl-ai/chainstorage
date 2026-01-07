@@ -29,6 +29,7 @@ enum Blockchain {
     BLOCKCHAIN_MONAD = 63; // Monad
     BLOCKCHAIN_ABSTRACT = 64; // Abstract
     BLOCKCHAIN_MEGAETH = 65; // MegaETH
+    BLOCKCHAIN_SEISMIC = 66; // Seismic
 }
 
 // Network defines an enumeration of supported networks.
@@ -96,4 +97,7 @@ enum Network {
     NETWORK_ABSTRACT_MAINNET = 144;
 
     NETWORK_MEGAETH_MAINNET = 145;
+
+    NETWORK_SEISMIC_TESTNET = 146;
+    NETWORK_SEISMIC_MAINNET = 147;
 }

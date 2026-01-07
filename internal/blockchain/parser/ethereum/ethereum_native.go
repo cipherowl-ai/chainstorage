@@ -238,18 +238,20 @@ type (
 	}
 
 	ethereumNativeParserImpl struct {
-		Logger    *zap.Logger
-		validate  *validator.Validate
-		nodeType  types.EthereumNodeType
-		traceType types.TraceType
-		config    *config.Config
-		metrics   *ethereumNativeParserMetrics
+		Logger      *zap.Logger
+		validate    *validator.Validate
+		nodeType    types.EthereumNodeType
+		traceType   types.TraceType
+		config      *config.Config
+		metrics     *ethereumNativeParserMetrics
+		src20Parser SRC20TokenTransferParser // Optional, only Seismic sets this
 	}
 
 	ethereumParserOptions struct {
 		nodeType        types.EthereumNodeType
 		traceType       types.TraceType
 		checksumAddress bool
+		src20Parser     SRC20TokenTransferParser
 	}
 
 	nestedParityTrace struct {
@@ -449,12 +451,13 @@ func NewEthereumNativeParser(params internal.ParserParams, opts ...internal.Pars
 	}
 
 	return &ethereumNativeParserImpl{
-		Logger:    log.WithPackage(params.Logger),
-		validate:  validator.New(),
-		nodeType:  options.nodeType,
-		traceType: options.traceType,
-		config:    params.Config,
-		metrics:   newEthereumNativeParserMetrics(params.Metrics),
+		Logger:      log.WithPackage(params.Logger),
+		validate:    validator.New(),
+		nodeType:    options.nodeType,
+		traceType:   options.traceType,
+		config:      params.Config,
+		metrics:     newEthereumNativeParserMetrics(params.Metrics),
+		src20Parser: options.src20Parser,
 	}, nil
 }
 
@@ -489,6 +492,15 @@ func WithEthereumChecksumAddress() internal.ParserFactoryOption {
 	return func(options any) {
 		if v, ok := options.(*ethereumParserOptions); ok {
 			v.checksumAddress = true
+		}
+	}
+}
+
+// WithSRC20Parser sets the SRC20 token transfer parser for Seismic chain.
+func WithSRC20Parser(parser SRC20TokenTransferParser) internal.ParserFactoryOption {
+	return func(options any) {
+		if v, ok := options.(*ethereumParserOptions); ok {
+			v.src20Parser = parser
 		}
 	}
 }
@@ -1257,7 +1269,6 @@ func (p *ethereumNativeParserImpl) parseTokenTransfers(transactionReceipts []*ap
 			if len(eventLog.Topics) == 3 && eventLog.Topics[0] == TransferEventTopic {
 				// Parse ERC-20 token
 				// https://ethereum.org/en/developers/docs/standards/tokens/erc-20/
-
 				tokenTransfer, err := p.parseERC20TokenTransfer(eventLog)
 				if err != nil {
 					return nil, xerrors.Errorf("failed to parse erc20 token transfer: %w", err)
@@ -1271,6 +1282,17 @@ func (p *ethereumNativeParserImpl) parseTokenTransfers(transactionReceipts []*ap
 				tokenTransfer, err := p.parseERC721TokenTransfer(eventLog)
 				if err != nil {
 					return nil, xerrors.Errorf("failed to parse erc721 token transfer: %w", err)
+				}
+				if tokenTransfer != nil {
+					tokenTransfers = append(tokenTransfers, tokenTransfer)
+				}
+			} else if p.src20Parser != nil && len(eventLog.Topics) == 4 && eventLog.Topics[0] == SRCTransferEventTopic {
+				// Parse SRC-20 token (Seismic only)
+				// Outer topic check avoids unnecessary function calls
+				// SRCTransferEventTopic is exported from seismic_native.go
+				tokenTransfer, err := p.src20Parser.ParseSRC20TokenTransfer(eventLog)
+				if err != nil {
+					return nil, xerrors.Errorf("failed to parse src20 token transfer: %w", err)
 				}
 				if tokenTransfer != nil {
 					tokenTransfers = append(tokenTransfers, tokenTransfer)
