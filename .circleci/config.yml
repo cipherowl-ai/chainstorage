@@ -21,7 +21,7 @@ jobs:
           command: |
             set +x
 
-            docker-compose -f docker-compose-testing.yml up -d --force-recreate
+            docker compose -f docker-compose-testing.yml up -d --force-recreate
             sleep 10
 
             # Due to how the remote docker engine works with docker-compose
@@ -56,7 +56,7 @@ jobs:
             #  ${CIPHEROWL_ECR_URL}/cipherowl/circleci:46f1d6a4caf201933914e8813b9c32b2f746d5f8 \
             #  /bin/bash -c "sudo chown -R circleci:circleci ~/ && make bootstrap && TEST_TYPE=functional go test ./... -v -p=1 -parallel=1 -timeout=45m -failfast -run=TestIntegration"
             
-            docker-compose -f docker-compose-testing.yml down
+            docker compose -f docker-compose-testing.yml down
 
 workflows:
   version: 2
