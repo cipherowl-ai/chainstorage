@@ -122,6 +122,10 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Plasma
 		case common.Blockchain_BLOCKCHAIN_MONAD:
 			factory = params.Monad
+		case common.Blockchain_BLOCKCHAIN_ABSTRACT:
+			factory = params.Abstract
+		case common.Blockchain_BLOCKCHAIN_MEGAETH:
+			factory = params.Megaeth
 		case common.Blockchain_BLOCKCHAIN_SEISMIC:
 			factory = params.Seismic
 		default:
