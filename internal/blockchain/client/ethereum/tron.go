@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"go.uber.org/fx"
+	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
@@ -18,6 +19,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/dlq"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/retry"
 )
 
 type (
@@ -128,6 +130,24 @@ func (c *TronClient) makeTronHttpCall(ctx context.Context, httpMethod *restapi.R
 	if err != nil {
 		return nil, xerrors.Errorf("failed to call Tron API: %w", err)
 	}
+
+	// Validate that the response is valid JSON to detect truncated responses
+	if len(response) > 0 && !json.Valid(response) {
+		// Log the truncated response for debugging
+		preview := string(response)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		c.logger.Warn(
+			"received invalid/truncated JSON response from Tron API",
+			zap.String("method", httpMethod.Name),
+			zap.Uint64("block_num", requestData.Num),
+			zap.Int("response_length", len(response)),
+			zap.String("response_preview", preview),
+		)
+		return nil, retry.Retryable(xerrors.Errorf("received invalid/truncated JSON response from %s (length=%d): response is not valid JSON", httpMethod.Name, len(response)))
+	}
+
 	return response, nil
 }
 
