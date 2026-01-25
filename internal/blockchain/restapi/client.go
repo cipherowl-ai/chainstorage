@@ -206,6 +206,19 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, method *RequestMethod,
 		return nil, retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
 	}
 
+	// Check for incomplete response based on Content-Length header
+	expectedLen := response.ContentLength
+	if expectedLen > 0 && int64(len(responseBody)) != expectedLen {
+		c.logger.Warn(
+			"incomplete http response detected",
+			zap.String("method", method.Name),
+			zap.Int64("expected_bytes", expectedLen),
+			zap.Int("actual_bytes", len(responseBody)),
+			zap.String("response_preview", truncateString(string(responseBody), 200)),
+		)
+		return nil, retry.Retryable(xerrors.Errorf("incomplete http response: received %d bytes, expected %d bytes", len(responseBody), expectedLen))
+	}
+
 	if response.StatusCode != http.StatusOK {
 		errHTTP := xerrors.Errorf("received http error: %w", &HTTPError{
 			Code:     response.StatusCode,
@@ -267,4 +280,15 @@ func (c *clientImpl) sanitizedError(err error) error {
 		err = uerr.Err
 	}
 	return err
+}
+
+// truncateString truncates a string to the specified max length, adding "..." if truncated.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
 }
