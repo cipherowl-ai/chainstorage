@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/uber-go/tally/v4"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -33,8 +33,8 @@ type (
 	Migrator struct {
 		baseActivity
 		config       *config.Config
-		session      *session.Session
-		dynamoClient *dynamodb.DynamoDB
+		awsConfig    aws.Config
+		dynamoClient *dynamodb.Client
 		blockTable   string
 		metrics      tally.Scope
 	}
@@ -50,8 +50,8 @@ type (
 	GetLatestBlockHeightActivity struct {
 		baseActivity
 		config       *config.Config
-		session      *session.Session
-		dynamoClient *dynamodb.DynamoDB
+		awsConfig    aws.Config
+		dynamoClient *dynamodb.Client
 		blockTable   string
 		metrics      tally.Scope
 	}
@@ -70,16 +70,16 @@ type (
 
 	GetMaxEventIdActivity struct {
 		baseActivity
-		config  *config.Config
-		session *session.Session
-		metrics tally.Scope
+		config    *config.Config
+		awsConfig aws.Config
+		metrics   tally.Scope
 	}
 
 	MigratorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime cadence.Runtime
-		Session *session.Session
+		Runtime   cadence.Runtime
+		AWSConfig aws.Config
 	}
 
 	MigratorRequest struct {
@@ -101,7 +101,7 @@ type (
 		SourceStorage metastorage.MetaStorage
 		DestStorage   metastorage.MetaStorage
 		Config        *config.Config
-		DynamoClient  *dynamodb.DynamoDB
+		DynamoClient  *dynamodb.Client
 		BlockTable    string
 	}
 )
@@ -110,8 +110,8 @@ func NewMigrator(params MigratorParams) *Migrator {
 	a := &Migrator{
 		baseActivity: newBaseActivity(ActivityMigrator, params.Runtime),
 		config:       params.Config,
-		session:      params.Session,
-		dynamoClient: dynamodb.New(params.Session),
+		awsConfig:    params.AWSConfig,
+		dynamoClient: dynamodb.NewFromConfig(params.AWSConfig),
 		blockTable:   params.Config.AWS.DynamoDB.BlockTable,
 		metrics:      params.Metrics,
 	}
@@ -123,8 +123,8 @@ func NewGetLatestBlockHeightActivity(params MigratorParams) *GetLatestBlockHeigh
 	a := &GetLatestBlockHeightActivity{
 		baseActivity: newBaseActivity(ActivityGetLatestBlockHeight, params.Runtime),
 		config:       params.Config,
-		session:      params.Session,
-		dynamoClient: dynamodb.New(params.Session),
+		awsConfig:    params.AWSConfig,
+		dynamoClient: dynamodb.NewFromConfig(params.AWSConfig),
 		blockTable:   params.Config.AWS.DynamoDB.BlockTable,
 		metrics:      params.Metrics,
 	}
@@ -156,7 +156,7 @@ func NewGetMaxEventIdActivity(params MigratorParams) *GetMaxEventIdActivity {
 	a := &GetMaxEventIdActivity{
 		baseActivity: newBaseActivity(ActivityGetMaxEventId, params.Runtime),
 		config:       params.Config,
-		session:      params.Session,
+		awsConfig:    params.AWSConfig,
 		metrics:      params.Metrics,
 	}
 	a.register(a.execute)
@@ -261,7 +261,7 @@ func (a *Migrator) createStorageInstances(ctx context.Context) (*MigrationData, 
 			Logger:  logger,
 			Metrics: a.metrics,
 		},
-		Session: a.session,
+		AWSConfig: a.awsConfig,
 	}
 	sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
 	if err != nil {
@@ -836,7 +836,7 @@ func (a *GetMaxEventIdActivity) execute(ctx context.Context, request *GetMaxEven
 			Logger:  logger,
 			Metrics: a.metrics,
 		},
-		Session: a.session,
+		AWSConfig: a.awsConfig,
 	}
 	sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
 	if err != nil {
@@ -875,7 +875,7 @@ func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Contex
 			Logger:  logger,
 			Metrics: a.metrics,
 		},
-		Session: a.session,
+		AWSConfig: a.awsConfig,
 	}
 	sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
 	if err != nil {

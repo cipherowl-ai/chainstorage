@@ -1,7 +1,7 @@
 package dynamodb
 
 import (
-	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"golang.org/x/xerrors"
 
 	"go.uber.org/fx"
@@ -20,7 +20,7 @@ type (
 	Params struct {
 		fx.In
 		fxparams.Params
-		Session *session.Session
+		AWSConfig aws.Config
 	}
 
 	metaStorageFactory struct {

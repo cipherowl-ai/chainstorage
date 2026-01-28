@@ -6,8 +6,8 @@ import (
 	"reflect"
 	"sort"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
@@ -42,7 +42,7 @@ type (
 )
 
 func newBlockStorage(params Params) (internal.BlockStorage, error) {
-	attrDefs := []*dynamodb.AttributeDefinition{
+	attrDefs := []types.AttributeDefinition{
 		{
 			AttributeName: aws.String(blockPidKeyName),
 			AttributeType: awsStringType,
@@ -52,7 +52,7 @@ func newBlockStorage(params Params) (internal.BlockStorage, error) {
 			AttributeType: awsStringType,
 		},
 	}
-	keySchema := []*dynamodb.KeySchemaElement{
+	keySchema := []types.KeySchemaElement{
 		{
 			AttributeName: aws.String(blockPidKeyName),
 			KeyType:       hashKeyType,
@@ -62,7 +62,7 @@ func newBlockStorage(params Params) (internal.BlockStorage, error) {
 			KeyType:       rangeKeyType,
 		},
 	}
-	var globalSecondaryIndexes []*dynamodb.GlobalSecondaryIndex
+	var globalSecondaryIndexes []types.GlobalSecondaryIndex
 	metadataTable, err := newDDBTable(
 		params.Config.AWS.DynamoDB.BlockTable,
 		reflect.TypeOf(model.BlockMetaDataDDBEntry{}),
