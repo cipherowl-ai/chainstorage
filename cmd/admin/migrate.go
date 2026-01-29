@@ -539,7 +539,7 @@ func (m *DataMigrator) getCanonicalBlockAtHeight(ctx context.Context, blockPid s
 		TableName:              awssdk.String(m.blockTable),
 		KeyConditionExpression: awssdk.String("block_pid = :blockPid AND block_rid = :canonical"),
 		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
-			":blockPid":   &dynamodbtypes.AttributeValueMemberS{Value: blockPid},
+			":blockPid":  &dynamodbtypes.AttributeValueMemberS{Value: blockPid},
 			":canonical": &dynamodbtypes.AttributeValueMemberS{Value: "canonical"},
 		},
 		ConsistentRead: awssdk.Bool(true),

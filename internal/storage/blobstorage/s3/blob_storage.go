@@ -7,10 +7,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/uber-go/tally/v4"
@@ -214,7 +214,7 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 		}
 
 		key := metadata.ObjectKeyMain
-		buf := &writeAtBuffer{}
+		buf := manager.NewWriteAtBuffer([]byte{})
 
 		size, err := s.downloader.Download(ctx, buf, &awss3.GetObjectInput{
 			Bucket: aws.String(s.bucket),
@@ -269,27 +269,4 @@ func (s *blobStorageImpl) logDuration(method string, start time.Time) {
 		zap.String("method", method),
 		zap.Duration("duration", time.Since(start)),
 	)
-}
-
-// writeAtBuffer is a simple io.WriterAt implementation that wraps a byte slice.
-type writeAtBuffer struct {
-	buf []byte
-}
-
-func (w *writeAtBuffer) WriteAt(p []byte, off int64) (n int, err error) {
-	if off < 0 {
-		return 0, io.ErrShortWrite
-	}
-	end := int(off) + len(p)
-	if end > len(w.buf) {
-		newBuf := make([]byte, end)
-		copy(newBuf, w.buf)
-		w.buf = newBuf
-	}
-	copy(w.buf[off:], p)
-	return len(p), nil
-}
-
-func (w *writeAtBuffer) Bytes() []byte {
-	return w.buf
 }
