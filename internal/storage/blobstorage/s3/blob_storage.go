@@ -5,14 +5,14 @@ import (
 	"context"
 	"crypto/md5" // #nosec G501
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/request"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -22,7 +22,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
-	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
+	storageerrors "github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
@@ -67,9 +67,6 @@ const (
 	blobUploaderScopeName   = "uploader"
 	blobDownloaderScopeName = "downloader"
 	blobSizeMetricName      = "blob_size"
-
-	// https://docs.aws.amazon.com/AmazonS3/latest/userguide/acl-overview.html#CannedACL
-	bucketOwnerFullControl = "bucket-owner-full-control"
 )
 
 var _ internal.BlobStorage = (*blobStorageImpl)(nil)
@@ -144,12 +141,12 @@ func (s *blobStorageImpl) uploadRaw(ctx context.Context, rawBlockData *internal.
 
 	checksum := base64.StdEncoding.EncodeToString(h.Sum(nil))
 
-	if _, err := s.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	if _, err := s.uploader.Upload(ctx, &awss3.PutObjectInput{
 		Bucket:     aws.String(s.bucket),
 		Key:        aws.String(key),
 		Body:       bytes.NewReader(rawBlockData.BlockData),
 		ContentMD5: aws.String(checksum),
-		ACL:        aws.String(bucketOwnerFullControl),
+		ACL:        awss3types.ObjectCannedACLBucketOwnerFullControl,
 	}); err != nil {
 		return "", xerrors.Errorf("failed to upload to s3: %w", err)
 	}
@@ -217,15 +214,15 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 		}
 
 		key := metadata.ObjectKeyMain
-		buf := aws.NewWriteAtBuffer([]byte{})
+		buf := manager.NewWriteAtBuffer([]byte{})
 
-		size, err := s.downloader.DownloadWithContext(ctx, buf, &awss3.GetObjectInput{
+		size, err := s.downloader.Download(ctx, buf, &awss3.GetObjectInput{
 			Bucket: aws.String(s.bucket),
 			Key:    aws.String(key),
 		})
 		if err != nil {
-			if aerr, ok := err.(awserr.Error); ok && aerr.Code() == request.CanceledErrorCode {
-				return nil, errors.ErrRequestCanceled
+			if errors.Is(err, context.Canceled) {
+				return nil, storageerrors.ErrRequestCanceled
 			}
 			return nil, xerrors.Errorf("failed to download from s3 (bucket=%s, key=%s): %w", s.bucket, key, err)
 		}
@@ -254,15 +251,15 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 }
 
 func (s *blobStorageImpl) PreSign(ctx context.Context, objectKey string) (string, error) {
-	getObjectReq, _ := s.client.GetObjectRequest(&awss3.GetObjectInput{
+	presignClient := awss3.NewPresignClient(s.client.(*awss3.Client))
+	presignResult, err := presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
 		Bucket: aws.String(s.config.AWS.Bucket),
 		Key:    aws.String(objectKey),
-	})
-	fileUrl, err := getObjectReq.Presign(s.config.AWS.PresignedUrlExpiration)
+	}, awss3.WithPresignExpires(s.config.AWS.PresignedUrlExpiration))
 	if err != nil {
 		return "", xerrors.Errorf("failed to generate presigned url: %w", err)
 	}
-	return fileUrl, nil
+	return presignResult.URL, nil
 }
 
 func (s *blobStorageImpl) logDuration(method string, start time.Time) {

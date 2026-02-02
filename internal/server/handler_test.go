@@ -10,10 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	awsClient "github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/awstesting"
-	"github.com/aws/aws-sdk-go/awstesting/unit"
 	geth "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/stretchr/testify/suite"
@@ -81,7 +77,6 @@ type handlerTestSuite struct {
 	suite.Suite
 	ctrl                  *gomock.Controller
 	app                   testapp.TestApp
-	awsClient             *awsClient.Client
 	metaStorage           *metastoragemocks.MockMetaStorage
 	blobStorage           *blobstoragemocks.MockBlobStorage
 	transactionStorage    *metastoragemocks.MockTransactionStorage
@@ -100,9 +95,6 @@ func TestHandlerSuite(t *testing.T) {
 
 func (s *handlerTestSuite) SetupTest() {
 	s.ctrl = gomock.NewController(s.T())
-	s.awsClient = awstesting.NewClient(&aws.Config{
-		Region: unit.Session.Config.Region,
-	})
 	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
 	s.transactionStorage = metastoragemocks.NewMockTransactionStorage(s.ctrl)

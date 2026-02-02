@@ -2,18 +2,16 @@ package s3
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/awstesting"
-	"github.com/aws/aws-sdk-go/awstesting/unit"
-	awss3 "github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
+	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
 
-	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
 	"github.com/coinbase/chainstorage/internal/s3"
 	s3mocks "github.com/coinbase/chainstorage/internal/s3/mocks"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
@@ -34,8 +32,8 @@ func TestBlobStorage_NoCompression(t *testing.T) {
 	defer ctrl.Finish()
 
 	downloader := s3mocks.NewMockDownloader(ctrl)
-	downloader.EXPECT().DownloadWithContext(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...jsonrpc.Option) (int64, error) {
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...func(*manager.Downloader)) (int64, error) {
 			require.NotNil(input.Bucket)
 			require.NotEmpty(*input.Bucket)
 			require.NotNil(input.Key)
@@ -45,8 +43,8 @@ func TestBlobStorage_NoCompression(t *testing.T) {
 		})
 
 	uploader := s3mocks.NewMockUploader(ctrl)
-	uploader.EXPECT().UploadWithContext(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, input *s3manager.UploadInput, opts ...jsonrpc.Option) (*s3manager.UploadOutput, error) {
+	uploader.EXPECT().Upload(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*manager.Uploader)) (*manager.UploadOutput, error) {
 			require.NotNil(input.Bucket)
 			require.NotEmpty(*input.Bucket)
 			require.NotNil(input.Key)
@@ -54,7 +52,7 @@ func TestBlobStorage_NoCompression(t *testing.T) {
 			require.NotNil(input.ContentMD5)
 			require.NotEmpty(*input.ContentMD5)
 
-			return &s3manager.UploadOutput{}, nil
+			return &manager.UploadOutput{}, nil
 		})
 	client := s3mocks.NewMockClient(ctrl)
 
@@ -103,8 +101,8 @@ func TestBlobStorage_NoCompression_WithSidechain(t *testing.T) {
 	defer ctrl.Finish()
 
 	downloader := s3mocks.NewMockDownloader(ctrl)
-	downloader.EXPECT().DownloadWithContext(gomock.Any(), gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...jsonrpc.Option) (int64, error) {
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...func(*manager.Downloader)) (int64, error) {
 			require.NotNil(input.Bucket)
 			require.NotEmpty(*input.Bucket)
 			require.NotNil(input.Key)
@@ -114,17 +112,17 @@ func TestBlobStorage_NoCompression_WithSidechain(t *testing.T) {
 		})
 
 	uploader := s3mocks.NewMockUploader(ctrl)
-	uploader.EXPECT().UploadWithContext(gomock.Any(), gomock.Any()).
-		DoAndReturn(func(ctx context.Context, input *s3manager.UploadInput, opts ...jsonrpc.Option) (*s3manager.UploadOutput, error) {
+	uploader.EXPECT().Upload(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*manager.Uploader)) (*manager.UploadOutput, error) {
 			require.NotNil(input.Bucket)
 			require.NotEmpty(*input.Bucket)
 			require.NotNil(input.Key)
 			require.Equal(expectedObjectKey, *input.Key)
 			require.NotNil(input.ContentMD5)
 			require.NotEmpty(*input.ContentMD5)
-			require.Equal(*input.ACL, bucketOwnerFullControl)
+			require.Equal(awss3types.ObjectCannedACLBucketOwnerFullControl, input.ACL)
 
-			return &s3manager.UploadOutput{}, nil
+			return &manager.UploadOutput{}, nil
 		})
 	client := s3mocks.NewMockClient(ctrl)
 
@@ -211,8 +209,14 @@ func TestBlobStorage_DownloadErrRequestCanceled(t *testing.T) {
 	defer ctrl.Finish()
 
 	uploader := s3mocks.NewMockUploader(ctrl)
-	downloader := s3manager.NewDownloader(unit.Session)
+	downloader := s3mocks.NewMockDownloader(ctrl)
 	client := s3mocks.NewMockClient(ctrl)
+
+	// Setup mock to return context canceled error
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...func(*manager.Downloader)) (int64, error) {
+			return 0, context.Canceled
+		})
 
 	var blobStorage internal.BlobStorage
 	app := testapp.New(
@@ -226,17 +230,16 @@ func TestBlobStorage_DownloadErrRequestCanceled(t *testing.T) {
 	defer app.Close()
 	require.NotNil(blobStorage)
 
-	ctx := &awstesting.FakeContext{DoneCh: make(chan struct{})}
-	ctx.Error = fmt.Errorf("context canceled")
-	close(ctx.DoneCh)
-
 	metadata := &api.BlockMetadata{
 		Tag:           1,
 		Height:        12345,
 		Hash:          "0xabcde",
 		ObjectKeyMain: "some download key",
 	}
-	_, err := blobStorage.Download(ctx, metadata)
+	_, err := blobStorage.Download(context.Background(), metadata)
 	require.Error(err)
 	require.Equal(errors.ErrRequestCanceled, err)
 }
+
+// Silence unused import warning
+var _ = aws.String

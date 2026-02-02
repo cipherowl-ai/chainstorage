@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	awssdk "github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/dynamodb"
-	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/dynamodb/attributevalue"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	dynamodbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/spf13/cobra"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -177,9 +177,9 @@ Examples:
 
 			var deps struct {
 				fx.In
-				Config  *config.Config
-				Session *session.Session
-				Params  fxparams.Params
+				Config    *config.Config
+				AWSConfig awssdk.Config
+				Params    fxparams.Params
 			}
 
 			app := startApp(
@@ -193,8 +193,8 @@ Examples:
 
 			// Create DynamoDB storage directly
 			dynamoDBParams := dynamodb_storage.Params{
-				Params:  deps.Params,
-				Session: deps.Session,
+				Params:    deps.Params,
+				AWSConfig: deps.AWSConfig,
 			}
 			sourceResult, err := dynamodb_storage.NewMetaStorage(dynamoDBParams)
 			if err != nil {
@@ -316,7 +316,7 @@ Examples:
 					migrateFlags.startHeight, migrateFlags.endHeight)
 			}
 			// Create DynamoDB client for direct queries
-			dynamoClient := dynamodb.New(deps.Session)
+			dynamoClient := dynamodb.NewFromConfig(deps.AWSConfig)
 			blockTable := deps.Config.AWS.DynamoDB.BlockTable
 
 			migrator := &DataMigrator{
@@ -381,7 +381,7 @@ type DataMigrator struct {
 	config        *config.Config
 	logger        *zap.Logger
 	// Direct DynamoDB access for querying all blocks
-	dynamoClient *dynamodb.DynamoDB
+	dynamoClient *dynamodb.Client
 	blockTable   string
 }
 
@@ -502,15 +502,13 @@ func (m *DataMigrator) getNonCanonicalBlocksAtHeight(ctx context.Context, blockP
 	input := &dynamodb.QueryInput{
 		TableName:              awssdk.String(m.blockTable),
 		KeyConditionExpression: awssdk.String("block_pid = :blockPid"),
-		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":blockPid": {
-				S: awssdk.String(blockPid),
-			},
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+			":blockPid": &dynamodbtypes.AttributeValueMemberS{Value: blockPid},
 		},
 		ConsistentRead: awssdk.Bool(true),
 	}
 
-	result, err := m.dynamoClient.QueryWithContext(ctx, input)
+	result, err := m.dynamoClient.Query(ctx, input)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query blocks at height: %w", err)
 	}
@@ -519,7 +517,7 @@ func (m *DataMigrator) getNonCanonicalBlocksAtHeight(ctx context.Context, blockP
 	var nonCanonicalBlocks []*api.BlockMetadata
 	for _, item := range result.Items {
 		var blockEntry model.BlockMetaDataDDBEntry
-		err := dynamodbattribute.UnmarshalMap(item, &blockEntry)
+		err := attributevalue.UnmarshalMap(item, &blockEntry)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to unmarshal DynamoDB item: %w", err)
 		}
@@ -540,18 +538,14 @@ func (m *DataMigrator) getCanonicalBlockAtHeight(ctx context.Context, blockPid s
 	input := &dynamodb.QueryInput{
 		TableName:              awssdk.String(m.blockTable),
 		KeyConditionExpression: awssdk.String("block_pid = :blockPid AND block_rid = :canonical"),
-		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":blockPid": {
-				S: awssdk.String(blockPid),
-			},
-			":canonical": {
-				S: awssdk.String("canonical"),
-			},
+		ExpressionAttributeValues: map[string]dynamodbtypes.AttributeValue{
+			":blockPid":  &dynamodbtypes.AttributeValueMemberS{Value: blockPid},
+			":canonical": &dynamodbtypes.AttributeValueMemberS{Value: "canonical"},
 		},
 		ConsistentRead: awssdk.Bool(true),
 	}
 
-	result, err := m.dynamoClient.QueryWithContext(ctx, input)
+	result, err := m.dynamoClient.Query(ctx, input)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query canonical block: %w", err)
 	}
@@ -565,7 +559,7 @@ func (m *DataMigrator) getCanonicalBlockAtHeight(ctx context.Context, blockPid s
 	}
 
 	var blockEntry model.BlockMetaDataDDBEntry
-	err = dynamodbattribute.UnmarshalMap(result.Items[0], &blockEntry)
+	err = attributevalue.UnmarshalMap(result.Items[0], &blockEntry)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal canonical block: %w", err)
 	}
