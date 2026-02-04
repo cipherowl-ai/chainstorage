@@ -3,7 +3,6 @@ package ethereum
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"math/big"
 	"regexp"
 	"time"
@@ -498,7 +497,6 @@ func (c *EthereumClient) GetBlockByHash(ctx context.Context, tag uint32, height 
 func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, headerResult *ethereumBlockHeaderResultHolder) (*api.Block, error) {
 	height := headerResult.header.Number.Value()
 	hash := headerResult.header.Hash.Value()
-	fmt.Println("all txs length", len(headerResult.header.Transactions))
 	// For receipts: use filtered block to skip unnecessary per-txn RPC calls.
 	blockForReceipts := headerResult.header
 	if c.txnFilter != nil {
@@ -506,7 +504,6 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 		filteredBlock.Transactions = c.filterTransactions(headerResult.header.Transactions)
 		blockForReceipts = &filteredBlock
 	}
-	fmt.Println("filtered txs length", len(blockForReceipts.Transactions))
 
 	transactionReceipts, err := c.getBlockTransactionReceipts(ctx, blockForReceipts)
 	if err != nil {
