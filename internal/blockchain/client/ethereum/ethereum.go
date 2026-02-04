@@ -3,6 +3,7 @@ package ethereum
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"regexp"
 	"time"
@@ -41,6 +42,7 @@ type (
 		nodeType        types.EthereumNodeType
 		traceType       types.TraceType
 		commitmentLevel types.CommitmentLevel
+		txnFilter       func(txn *ethereum.EthereumTransactionLit) bool
 	}
 
 	EthereumBlockTracer interface {
@@ -287,6 +289,12 @@ func WithEthereumCommitmentLevel(commitmentLevel types.CommitmentLevel) Ethereum
 	}
 }
 
+func WithTransactionFilter(fn func(txn *ethereum.EthereumTransactionLit) bool) EthereumClientOption {
+	return func(client *EthereumClient) {
+		client.txnFilter = fn
+	}
+}
+
 func newEthereumClientMetrics(scope tally.Scope) *ethereumClientMetrics {
 	scope = scope.SubScope(subScope)
 
@@ -490,8 +498,17 @@ func (c *EthereumClient) GetBlockByHash(ctx context.Context, tag uint32, height 
 func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, headerResult *ethereumBlockHeaderResultHolder) (*api.Block, error) {
 	height := headerResult.header.Number.Value()
 	hash := headerResult.header.Hash.Value()
+	fmt.Println("all txs length", len(headerResult.header.Transactions))
+	// For receipts: use filtered block to skip unnecessary per-txn RPC calls.
+	blockForReceipts := headerResult.header
+	if c.txnFilter != nil {
+		filteredBlock := *headerResult.header
+		filteredBlock.Transactions = c.filterTransactions(headerResult.header.Transactions)
+		blockForReceipts = &filteredBlock
+	}
+	fmt.Println("filtered txs length", len(blockForReceipts.Transactions))
 
-	transactionReceipts, err := c.getBlockTransactionReceipts(ctx, headerResult.header)
+	transactionReceipts, err := c.getBlockTransactionReceipts(ctx, blockForReceipts)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to fetch transaction receipts for block %v: %w", height, err)
 	}
@@ -501,9 +518,15 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 	} else {
 		tracer = c
 	}
+
+	// For traces: use original block so block-level trace (1 RPC) works correctly,
+	// then filter the results afterward.
 	transactionTraces, err := tracer.getBlockTraces(ctx, tag, headerResult.header)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to fetch traces for block %v: %w", height, err)
+	}
+	if c.txnFilter != nil {
+		transactionTraces = c.filterTraceResults(headerResult.header.Transactions, transactionTraces)
 	}
 
 	uncles, err := c.getBlockUncles(ctx, hash, uint64(len(headerResult.header.Uncles)))
@@ -1419,6 +1442,29 @@ func (c *EthereumClient) getNumTraces(transactions []*ethereum.EthereumTransacti
 	}
 
 	return numTraces
+}
+
+func (c *EthereumClient) filterTransactions(txns []*ethereum.EthereumTransactionLit) []*ethereum.EthereumTransactionLit {
+	filtered := make([]*ethereum.EthereumTransactionLit, 0, len(txns))
+	for _, txn := range txns {
+		if !c.txnFilter(txn) {
+			filtered = append(filtered, txn)
+		}
+	}
+	return filtered
+}
+
+func (c *EthereumClient) filterTraceResults(originalTxns []*ethereum.EthereumTransactionLit, traces [][]byte) [][]byte {
+	filtered := make([][]byte, 0, len(traces))
+	for i, txn := range originalTxns {
+		if i >= len(traces) {
+			break
+		}
+		if !c.txnFilter(txn) {
+			filtered = append(filtered, traces[i])
+		}
+	}
+	return filtered
 }
 
 func (c *EthereumClient) GetAccountProof(ctx context.Context, req *api.GetVerifiedAccountStateRequest) (*api.GetAccountProofResponse, error) {

@@ -5,6 +5,6 @@ import (
 )
 
 func NewMegaethNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
-	// Reuse the Ethereum native parser since its an EVM chain.
+	opts = append(opts, WithParserTransactionFilter(IsMegaethFilteredTransaction))
 	return NewEthereumNativeParser(params, opts...)
 }

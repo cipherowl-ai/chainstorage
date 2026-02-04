@@ -245,6 +245,7 @@ type (
 		config      *config.Config
 		metrics     *ethereumNativeParserMetrics
 		src20Parser SRC20TokenTransferParser // Optional, only Seismic sets this
+		txnFilter   func(from, to string) bool
 	}
 
 	ethereumParserOptions struct {
@@ -252,6 +253,7 @@ type (
 		traceType       types.TraceType
 		checksumAddress bool
 		src20Parser     SRC20TokenTransferParser
+		txnFilter       func(from, to string) bool
 	}
 
 	nestedParityTrace struct {
@@ -458,6 +460,7 @@ func NewEthereumNativeParser(params internal.ParserParams, opts ...internal.Pars
 		config:      params.Config,
 		metrics:     newEthereumNativeParserMetrics(params.Metrics),
 		src20Parser: options.src20Parser,
+		txnFilter:   options.txnFilter,
 	}, nil
 }
 
@@ -496,6 +499,15 @@ func WithEthereumChecksumAddress() internal.ParserFactoryOption {
 	}
 }
 
+// WithParserTransactionFilter sets a transaction filter for skipping transactions in ParseBlock.
+func WithParserTransactionFilter(fn func(from, to string) bool) internal.ParserFactoryOption {
+	return func(options any) {
+		if v, ok := options.(*ethereumParserOptions); ok {
+			v.txnFilter = fn
+		}
+	}
+}
+
 // WithSRC20Parser sets the SRC20 token transfer parser for Seismic chain.
 func WithSRC20Parser(parser SRC20TokenTransferParser) internal.ParserFactoryOption {
 	return func(options any) {
@@ -503,6 +515,16 @@ func WithSRC20Parser(parser SRC20TokenTransferParser) internal.ParserFactoryOpti
 			v.src20Parser = parser
 		}
 	}
+}
+
+func (p *ethereumNativeParserImpl) filterTransactions(transactions []*api.EthereumTransaction) []*api.EthereumTransaction {
+	filtered := make([]*api.EthereumTransaction, 0, len(transactions))
+	for _, txn := range transactions {
+		if !p.txnFilter(txn.From, txn.To) {
+			filtered = append(filtered, txn)
+		}
+	}
+	return filtered
 }
 
 func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
@@ -521,9 +543,17 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 		return nil, xerrors.Errorf("failed to parse header: %w", err)
 	}
 
-	numTransactions := len(header.Transactions)
-	if numTransactions != len(transactions) {
-		return nil, xerrors.Errorf("unexpected number of transactions: expected=%v actual=%v", numTransactions, len(transactions))
+	// Filter transactions if filter is set. Header rawJson still contains all transactions,
+	// but we only process non-filtered transactions for receipts, traces, and token transfers.
+	if p.txnFilter != nil {
+		transactions = p.filterTransactions(transactions)
+	}
+
+	numTransactions := len(transactions)
+
+	// Validate header.Transactions count only when not filtering.
+	if p.txnFilter == nil && len(header.Transactions) != numTransactions {
+		return nil, xerrors.Errorf("unexpected number of transactions: expected=%v actual=%v", len(header.Transactions), numTransactions)
 	}
 
 	var transactionReceipts []*api.EthereumTransactionReceipt
