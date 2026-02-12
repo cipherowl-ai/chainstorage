@@ -543,9 +543,12 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 		return nil, xerrors.Errorf("failed to parse header: %w", err)
 	}
 
+	txNum := len(header.Transactions)
+	filteredTracesNum := len(blobdata.TransactionTraces)
+
 	// Filter transactions if filter is set. Header rawJson still contains all transactions,
 	// but we only process non-filtered transactions for receipts, traces, and token transfers.
-	if p.txnFilter != nil {
+	if p.txnFilter != nil  && txNum != filteredTracesNum{
 		transactions = p.filterTransactions(transactions)
 	}
 
@@ -1051,6 +1054,8 @@ func (p *ethereumNativeParserImpl) parseTransactionTraces(blobdata *api.Ethereum
 	}
 
 	switch len(blobdata.TransactionTraces) {
+	case 0:
+		return traces, nil
 	case numTransactions:
 		return traces, nil
 	case numTransactions - 1:

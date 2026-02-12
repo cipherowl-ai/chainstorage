@@ -498,14 +498,14 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 	height := headerResult.header.Number.Value()
 	hash := headerResult.header.Hash.Value()
 	// For receipts: use filtered block to skip unnecessary per-txn RPC calls.
-	blockForReceipts := headerResult.header
+	blockHeader := headerResult.header
 	if c.txnFilter != nil {
 		filteredBlock := *headerResult.header
 		filteredBlock.Transactions = c.filterTransactions(headerResult.header.Transactions)
-		blockForReceipts = &filteredBlock
+		blockHeader = &filteredBlock
 	}
 
-	transactionReceipts, err := c.getBlockTransactionReceipts(ctx, blockForReceipts)
+	transactionReceipts, err := c.getBlockTransactionReceipts(ctx, blockHeader)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to fetch transaction receipts for block %v: %w", height, err)
 	}
@@ -515,15 +515,14 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 	} else {
 		tracer = c
 	}
-
-	// For traces: use original block so block-level trace (1 RPC) works correctly,
-	// then filter the results afterward.
-	transactionTraces, err := tracer.getBlockTraces(ctx, tag, headerResult.header)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to fetch traces for block %v: %w", height, err)
-	}
-	if c.txnFilter != nil {
-		transactionTraces = c.filterTraceResults(headerResult.header.Transactions, transactionTraces)
+	transactionTraces := make([][]byte, 0)
+	if c.txnFilter == nil || len(headerResult.header.Transactions) == len(blockHeader.Transactions) {
+		// For traces: use original block so block-level trace (1 RPC) works correctly,
+		// then filter the results afterward.
+		transactionTraces, err = tracer.getBlockTraces(ctx, tag, headerResult.header)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to fetch traces for block %v: %w", height, err)
+		}
 	}
 
 	uncles, err := c.getBlockUncles(ctx, hash, uint64(len(headerResult.header.Uncles)))
@@ -1446,19 +1445,6 @@ func (c *EthereumClient) filterTransactions(txns []*ethereum.EthereumTransaction
 	for _, txn := range txns {
 		if !c.txnFilter(txn) {
 			filtered = append(filtered, txn)
-		}
-	}
-	return filtered
-}
-
-func (c *EthereumClient) filterTraceResults(originalTxns []*ethereum.EthereumTransactionLit, traces [][]byte) [][]byte {
-	filtered := make([][]byte, 0, len(traces))
-	for i, txn := range originalTxns {
-		if i >= len(traces) {
-			break
-		}
-		if !c.txnFilter(txn) {
-			filtered = append(filtered, traces[i])
 		}
 	}
 	return filtered
