@@ -41,6 +41,26 @@ func (m *MockClient) EXPECT() *MockClientMockRecorder {
 	return m.recorder
 }
 
+// AutoBatchCall mocks base method.
+func (m *MockClient) AutoBatchCall(arg0 context.Context, arg1 *jsonrpc.RequestMethod, arg2 []jsonrpc.Params, arg3 ...jsonrpc.Option) ([]*jsonrpc.Response, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2}
+	for _, a := range arg3 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "AutoBatchCall", varargs...)
+	ret0, _ := ret[0].([]*jsonrpc.Response)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AutoBatchCall indicates an expected call of AutoBatchCall.
+func (mr *MockClientMockRecorder) AutoBatchCall(arg0, arg1, arg2 any, arg3 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2}, arg3...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AutoBatchCall", reflect.TypeOf((*MockClient)(nil).AutoBatchCall), varargs...)
+}
+
 // BatchCall mocks base method.
 func (m *MockClient) BatchCall(arg0 context.Context, arg1 *jsonrpc.RequestMethod, arg2 []jsonrpc.Params, arg3 ...jsonrpc.Option) ([]*jsonrpc.Response, error) {
 	m.ctrl.T.Helper()
@@ -55,9 +75,9 @@ func (m *MockClient) BatchCall(arg0 context.Context, arg1 *jsonrpc.RequestMethod
 }
 
 // BatchCall indicates an expected call of BatchCall.
-func (mr *MockClientMockRecorder) BatchCall(arg0, arg1, arg2 any, arg3 ...any) *gomock.Call {
+func (mr *MockClientMockRecorder) BatchCall(arg0, arg1, arg2 interface{}, arg3 ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	varargs := append([]any{arg0, arg1, arg2}, arg3...)
+	varargs := append([]interface{}{arg0, arg1, arg2}, arg3...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BatchCall", reflect.TypeOf((*MockClient)(nil).BatchCall), varargs...)
 }
 
@@ -75,9 +95,9 @@ func (m *MockClient) Call(arg0 context.Context, arg1 *jsonrpc.RequestMethod, arg
 }
 
 // Call indicates an expected call of Call.
-func (mr *MockClientMockRecorder) Call(arg0, arg1, arg2 any, arg3 ...any) *gomock.Call {
+func (mr *MockClientMockRecorder) Call(arg0, arg1, arg2 interface{}, arg3 ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	varargs := append([]any{arg0, arg1, arg2}, arg3...)
+	varargs := append([]interface{}{arg0, arg1, arg2}, arg3...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Call", reflect.TypeOf((*MockClient)(nil).Call), varargs...)
 }
 
@@ -114,7 +134,7 @@ func (m *MockHTTPClient) Do(arg0 *http.Request) (*http.Response, error) {
 }
 
 // Do indicates an expected call of Do.
-func (mr *MockHTTPClientMockRecorder) Do(arg0 any) *gomock.Call {
+func (mr *MockHTTPClientMockRecorder) Do(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Do", reflect.TypeOf((*MockHTTPClient)(nil).Do), arg0)
 }

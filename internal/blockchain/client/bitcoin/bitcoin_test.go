@@ -226,7 +226,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHeight() {
 			jsonrpc.Params{id, true},
 		)
 	}
-	s.rpcClient.EXPECT().BatchCall(
+	s.rpcClient.EXPECT().AutoBatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
 	).Return(getRawTransactionResponse, nil)
 
@@ -387,7 +387,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash() {
 			jsonrpc.Params{id, true},
 		)
 	}
-	s.rpcClient.EXPECT().BatchCall(
+	s.rpcClient.EXPECT().AutoBatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
 	).Return(getRawTransactionResponse, nil)
 
@@ -549,7 +549,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_GetInputTransa
 			jsonrpc.Params{id, true},
 		)
 	}
-	s.rpcClient.EXPECT().BatchCall(
+	s.rpcClient.EXPECT().AutoBatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
 	).Return(nil, xerrors.Errorf("error making http requests"))
 
@@ -594,7 +594,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_GetRawTransact
 			jsonrpc.Params{id, true},
 		)
 	}
-	s.rpcClient.EXPECT().BatchCall(
+	s.rpcClient.EXPECT().AutoBatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
 	).Return(getRawTransactionResponse, xerrors.Errorf("error making http requests"))
 
@@ -659,7 +659,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_InputTransacti
 			jsonrpc.Params{id, true},
 		)
 	}
-	s.rpcClient.EXPECT().BatchCall(
+	s.rpcClient.EXPECT().AutoBatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
 	).Return(getRawTransactionResponse, nil)
 
