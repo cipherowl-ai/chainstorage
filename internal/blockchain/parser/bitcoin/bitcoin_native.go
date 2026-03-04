@@ -39,6 +39,9 @@ const (
 	// TODO, Create litecoin parser for LTC address
 	bitcoinScriptTypeMwebPegin   string = "witness_mweb_pegin"
 	bitcoinScriptTypeMwebHogaddr string = "witness_mweb_hogaddr"
+	// BCH-specific: p2s (pay-to-script) introduced in BCHN upgrade 12
+	// Covers bare scripts <= 201 bytes that were previously classified as nonstandard
+	bitcoinScriptTypeBCHScript string = "script"
 )
 
 type (
@@ -201,6 +204,8 @@ func validateBitcoinScriptPubKey(sl validator.StructLevel) {
 		} // Types that we expect to be able to parse address for
 	case bitcoinScriptTypeMwebPegin, bitcoinScriptTypeMwebHogaddr:
 		// https://github.com/litecoin-project/litecoin/blob/cd1660afaf5b31a80e797668b12b5b3933844842/src/script/standard.cpp#L60
+	// BCH p2s: bare scripts that don't match standard templates; may or may not have an address
+	case bitcoinScriptTypeBCHScript:
 	default:
 		sl.ReportError(address, "Address[unsupported]", "Address[unsupported]", "bspk_as", "")
 	}
