@@ -74,7 +74,7 @@ type (
 	BitcoinTransaction struct {
 		Hex       BitcoinHexString            `json:"hex"`
 		TxId      BitcoinHexString            `json:"txid" validate:"required"`
-		Hash      BitcoinHexString            `json:"hash" validate:"required"`
+		Hash      BitcoinHexString            `json:"hash"`
 		Size      BitcoinQuantity             `json:"size"`
 		Vsize     BitcoinQuantity             `json:"vsize"`
 		Weight    BitcoinQuantity             `json:"weight"`
@@ -390,10 +390,17 @@ func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[
 		fee = inputValue - outputValue
 	}
 
+	// For non-SegWit chains (e.g. Dash), the hash field is not present.
+	// Fall back to txid, which equals hash for non-SegWit transactions.
+	txHash := t.Hash.Value()
+	if txHash == "" {
+		txHash = t.TxId.Value()
+	}
+
 	return &api.BitcoinTransaction{
 		Hex:           t.Hex.Value(),
 		TransactionId: t.TxId.Value(),
-		Hash:          t.Hash.Value(),
+		Hash:          txHash,
 		Size:          t.Size.Value(),
 		VirtualSize:   t.Vsize.Value(),
 		Weight:        t.Weight.Value(),
