@@ -30,6 +30,7 @@ enum Blockchain {
     BLOCKCHAIN_ABSTRACT = 64; // Abstract
     BLOCKCHAIN_MEGAETH = 65; // MegaETH
     BLOCKCHAIN_SEISMIC = 66; // Seismic
+    BLOCKCHAIN_DASH = 67; // Dash
 }
 
 // Network defines an enumeration of supported networks.
@@ -100,4 +101,7 @@ enum Network {
 
     NETWORK_SEISMIC_TESTNET = 146;
     NETWORK_SEISMIC_MAINNET = 147;
+
+    NETWORK_DASH_TESTNET = 148;
+    NETWORK_DASH_MAINNET = 149;
 }

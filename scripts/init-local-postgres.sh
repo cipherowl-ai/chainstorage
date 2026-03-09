@@ -34,6 +34,7 @@ story_mainnet
 dogecoin_mainnet
 litecoin_mainnet
 bitcoincash_mainnet
+dash_mainnet
 "
 
 # --- Helper Functions ---
