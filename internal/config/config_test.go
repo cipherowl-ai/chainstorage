@@ -1090,6 +1090,51 @@ func TestGetCommonTags(t *testing.T) {
 	}, cfg.GetCommonTags())
 }
 
+func TestEndpointBatchConfigDefaults(t *testing.T) {
+	require := testutil.Require(t)
+
+	// Test default values when fields are not specified
+	text := `
+	{
+		"endpoints": [
+			{
+				"name": "testEndpoint",
+				"url": "http://test.example.com",
+				"weight": 1
+			}
+		]
+	}
+	`
+
+	var endpointGroup config.EndpointGroup
+	require.NoError(endpointGroup.UnmarshalText([]byte(text)))
+	require.Len(endpointGroup.Endpoints, 1)
+
+	endpoint := endpointGroup.Endpoints[0]
+	// Verify default values
+	require.False(endpoint.DisableTxBatch, "DisableTxBatch should default to false")
+	require.Equal(0, endpoint.TxConcurrency, "TxConcurrency should default to 0")
+	text = `
+	{
+		"endpoints": [
+			{
+				"name": "testEndpoint",
+				"url": "http://test.example.com",
+				"weight": 1,
+				"disable_tx_batch": true,
+				"tx_concurrency": 50
+			}
+		]
+	}
+	`
+
+	require.NoError(endpointGroup.UnmarshalText([]byte(text)))
+
+	require.True(endpointGroup.Endpoints[0].DisableTxBatch, "DisableTxBatch should be parsed as true")
+	require.Equal(50, endpointGroup.Endpoints[0].TxConcurrency, "TxConcurrency should be parsed as 50")
+
+}
+
 func TestDefaultHttpTimeout(t *testing.T) {
 	require := testutil.Require(t)
 
