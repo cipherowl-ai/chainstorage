@@ -3,6 +3,7 @@ package ethereum
 import (
 	"crypto/cipher"
 	"encoding/hex"
+	"math/big"
 	"os"
 	"strings"
 
@@ -107,11 +108,15 @@ func (p *seismicSRC20Parser) ParseSRC20TokenTransfer(eventLog *api.EthereumEvent
 	if err := p.src20ABI.UnpackIntoInterface(&transferEvent, "Transfer", logData); err != nil {
 		return nil, xerrors.Errorf("failed to unpack Transfer event: %w", err)
 	}
-
-	// Decrypt amount
-	value, err := aes.DecryptAESGCM(transferEvent.EncryptedAmount, p.aesGCM)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to decrypt amount: %w", err)
+	var value *big.Int
+	if len(transferEvent.EncryptedAmount) == 0 {
+		value = big.NewInt(0)
+	} else {
+		// Decrypt amount
+		value, err = aes.DecryptAESGCM(transferEvent.EncryptedAmount, p.aesGCM)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to decrypt amount: %w", err)
+		}
 	}
 
 	// Clean addresses from indexed topics
