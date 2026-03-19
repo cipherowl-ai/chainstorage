@@ -3,7 +3,6 @@ package ethereum
 import (
 	"crypto/cipher"
 	"encoding/hex"
-	"math/big"
 	"os"
 	"strings"
 
@@ -56,6 +55,7 @@ type SRC20TokenTransferParser interface {
 type seismicSRC20Parser struct {
 	src20ABI *abi.ABI
 	aesGCM   cipher.AEAD
+	keyHash  string
 }
 
 // NewSeismicSRC20Parser creates a new SRC20 token transfer parser.
@@ -86,12 +86,14 @@ func NewSeismicSRC20Parser(aesKeyHex string) (SRC20TokenTransferParser, error) {
 	return &seismicSRC20Parser{
 		src20ABI: &contractAbi,
 		aesGCM:   aesGCM,
+		keyHash:  aes.Keccak256Hash(aesKey).Hex(),
 	}, nil
 }
 
 func (p *seismicSRC20Parser) ParseSRC20TokenTransfer(eventLog *api.EthereumEventLog) (*api.EthereumTokenTransfer, error) {
 	// Defensive check: although the outer layer already checks the topic, we verify here for safety
-	if len(eventLog.Topics) != 4 || eventLog.Topics[0] != SRCTransferEventTopic {
+	// and the key hash is the last topic, only keep those have same key hash with hash of the AES key
+	if len(eventLog.Topics) != 4 || eventLog.Topics[0] != SRCTransferEventTopic || eventLog.Topics[3] != p.keyHash {
 		return nil, nil
 	}
 
@@ -108,17 +110,11 @@ func (p *seismicSRC20Parser) ParseSRC20TokenTransfer(eventLog *api.EthereumEvent
 	if err := p.src20ABI.UnpackIntoInterface(&transferEvent, "Transfer", logData); err != nil {
 		return nil, xerrors.Errorf("failed to unpack Transfer event: %w", err)
 	}
-	var value *big.Int
-	if len(transferEvent.EncryptedAmount) == 0 {
-		value = big.NewInt(0)
-	} else {
-		// Decrypt amount
-		value, err = aes.DecryptAESGCM(transferEvent.EncryptedAmount, p.aesGCM)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to decrypt amount: %w", err)
-		}
-	}
 
+	value, err := aes.DecryptAESGCM(transferEvent.EncryptedAmount, p.aesGCM)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to decrypt amount: %w", err)
+	}
 	// Clean addresses from indexed topics
 	tokenAddress, err := internal.CleanAddress(eventLog.Address)
 	if err != nil {
