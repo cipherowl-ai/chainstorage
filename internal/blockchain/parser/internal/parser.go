@@ -69,6 +69,7 @@ type (
 		Abstract        ParserFactory `name:"abstract" optional:"true"`
 		Megaeth         ParserFactory `name:"megaeth" optional:"true"`
 		Seismic         ParserFactory `name:"seismic" optional:"true"`
+		Dash            ParserFactory `name:"dash" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -90,8 +91,10 @@ func NewParser(params Params) (Parser, error) {
 	sidechain := params.Config.Chain.Sidechain
 	if sidechain == api.SideChain_SIDECHAIN_NONE {
 		switch blockchain {
-		case common.Blockchain_BLOCKCHAIN_BITCOIN, common.Blockchain_BLOCKCHAIN_BITCOINCASH, common.Blockchain_BLOCKCHAIN_LITECOIN, common.Blockchain_BLOCKCHAIN_DASH:
+		case common.Blockchain_BLOCKCHAIN_BITCOIN, common.Blockchain_BLOCKCHAIN_BITCOINCASH, common.Blockchain_BLOCKCHAIN_LITECOIN:
 			factory = params.Bitcoin
+		case common.Blockchain_BLOCKCHAIN_DASH:
+			factory = params.Dash
 		case common.Blockchain_BLOCKCHAIN_BSC:
 			factory = params.Bsc
 		case common.Blockchain_BLOCKCHAIN_ETHEREUM:
