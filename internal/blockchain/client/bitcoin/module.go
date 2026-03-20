@@ -7,4 +7,8 @@ var Module = fx.Options(
 		Name:   "bitcoin",
 		Target: NewBitcoinClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "dash",
+		Target: NewDashClientFactory,
+	}),
 )

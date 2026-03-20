@@ -252,7 +252,7 @@ func (b *bitcoinClient) getBlockFromHeader(
 ) (*api.Block, error) {
 	blockHash := headerResult.header.Hash.Value()
 
-	inputTransactionsData, err := b.getInputTransactions(ctx, headerResult.header)
+	inputTransactionsData, _, err := b.getInputTransactions(ctx, headerResult.header)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get previous transactions for block %s: %w", blockHash, err)
 	}
@@ -292,7 +292,7 @@ func (b *bitcoinClient) getBlockFromHeader(
 func (b *bitcoinClient) getInputTransactions(
 	ctx context.Context,
 	header *bitcoin.BitcoinBlockLit,
-) ([][][]byte, error) {
+) ([][][]byte, map[string][]byte, error) {
 	transactions := header.Transactions
 	blockHash := header.Hash.Value()
 	txBatchSize := b.config.Chain.Client.TxBatchSize
@@ -335,7 +335,7 @@ func (b *bitcoinClient) getInputTransactions(
 
 		batchResponses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
 		if err != nil {
-			return nil, xerrors.Errorf(
+			return nil, nil, xerrors.Errorf(
 				"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
 				bitcoinGetRawTransactionMethod.Name,
 				blockHash,
@@ -364,7 +364,7 @@ func (b *bitcoinClient) getInputTransactions(
 				inputID := input.Identifier.Value()
 				rawTransaction, ok := inputTransactionsMap[inputID]
 				if !ok {
-					return nil, xerrors.Errorf(
+					return nil, nil, xerrors.Errorf(
 						"input transaction id not found in map (blockHash=%s, transactionID=%v, inputTransactionID=%v)",
 						blockHash,
 						tx.Identifier,
@@ -374,7 +374,7 @@ func (b *bitcoinClient) getInputTransactions(
 
 				data, err := b.processInputTransactionRawData(rawTransaction, input.Vout.Value())
 				if err != nil {
-					return nil, xerrors.Errorf(
+					return nil, nil, xerrors.Errorf(
 						"error processing input transaction data (blockHash=%s, transactionID=%v, inputTransactionID=%v): %w",
 						blockHash,
 						tx.Identifier,
@@ -388,7 +388,7 @@ func (b *bitcoinClient) getInputTransactions(
 		}
 		results[index] = inputTransactions
 	}
-	return results, nil
+	return results, inputTransactionsMap, nil
 }
 
 func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64, to uint64) ([]string, error) {
