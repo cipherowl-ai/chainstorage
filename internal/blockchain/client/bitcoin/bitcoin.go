@@ -20,10 +20,11 @@ import (
 
 type (
 	bitcoinClient struct {
-		config   *config.Config
-		logger   *zap.Logger
-		client   jsonrpc.Client
-		validate *validator.Validate
+		config                       *config.Config
+		logger                       *zap.Logger
+		client                       jsonrpc.Client
+		validate                     *validator.Validate
+		preserveRawInputTransactions bool
 	}
 
 	bitcoinBlockHeaderResultHolder struct {
@@ -252,7 +253,7 @@ func (b *bitcoinClient) getBlockFromHeader(
 ) (*api.Block, error) {
 	blockHash := headerResult.header.Hash.Value()
 
-	inputTransactionsData, _, err := b.getInputTransactions(ctx, headerResult.header)
+	inputTransactionsData, rawInputTransactionsMap, err := b.getInputTransactions(ctx, headerResult.header)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get previous transactions for block %s: %w", blockHash, err)
 	}
@@ -260,6 +261,14 @@ func (b *bitcoinClient) getBlockFromHeader(
 	inputTransactions := make([]*api.RepeatedBytes, len(inputTransactionsData))
 	for i, data := range inputTransactionsData {
 		inputTransactions[i] = &api.RepeatedBytes{Data: data}
+	}
+
+	blobdata := &api.BitcoinBlobdata{
+		Header:            headerResult.rawJson,
+		InputTransactions: inputTransactions,
+	}
+	if b.preserveRawInputTransactions {
+		blobdata.RawInputTransactions = rawInputTransactionsMap
 	}
 
 	block := &api.Block{
@@ -274,10 +283,7 @@ func (b *bitcoinClient) getBlockFromHeader(
 			Timestamp:    utils.ToTimestamp(int64(headerResult.header.Time.Value())),
 		},
 		Blobdata: &api.Block_Bitcoin{
-			Bitcoin: &api.BitcoinBlobdata{
-				Header:            headerResult.rawJson,
-				InputTransactions: inputTransactions,
-			},
+			Bitcoin: blobdata,
 		},
 	}
 
