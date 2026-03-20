@@ -9,6 +9,10 @@ import "google/protobuf/timestamp.proto";
 message BitcoinBlobdata {
   bytes header = 1;
   repeated RepeatedBytes input_transactions = 2;
+  // Full raw JSON from getrawtransaction, keyed by txid.
+  // Preserves complete transaction data including chain-specific fields
+  // (e.g. Dash special transaction payloads) that are stripped from input_transactions.
+  map<string, bytes> raw_input_transactions = 3;
 }
 
 message RepeatedBytes {

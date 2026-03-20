@@ -78,6 +78,7 @@ type (
 		Abstract        ClientFactory `name:"abstract" optional:"true"`
 		Megaeth         ClientFactory `name:"megaeth" optional:"true"`
 		Seismic         ClientFactory `name:"seismic" optional:"true"`
+		Dash            ClientFactory `name:"dash" optional:"true"`
 	}
 
 	ClientParams struct {
@@ -121,6 +122,8 @@ func NewClient(params Params) (Result, error) {
 		switch blockchain {
 		case common.Blockchain_BLOCKCHAIN_BITCOIN, common.Blockchain_BLOCKCHAIN_BITCOINCASH, common.Blockchain_BLOCKCHAIN_LITECOIN:
 			factory = params.Bitcoin
+		case common.Blockchain_BLOCKCHAIN_DASH:
+			factory = params.Dash
 		case common.Blockchain_BLOCKCHAIN_BSC:
 			factory = params.Bsc
 		case common.Blockchain_BLOCKCHAIN_ETHEREUM:

@@ -154,8 +154,13 @@ type (
 	}
 
 	bitcoinNativeParserImpl struct {
-		logger   *zap.Logger
-		validate *validator.Validate
+		logger          *zap.Logger
+		validate        *validator.Validate
+		// preprocessBlock is an optional chain-specific normalization hook.
+		// It runs after JSON unmarshal but before shared validation so callers can
+		// backfill fields that are omitted by a chain's RPC without weakening the
+		// default Bitcoin validation rules.
+		preprocessBlock func(*BitcoinBlock)
 	}
 )
 
@@ -234,6 +239,10 @@ func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.
 	var block BitcoinBlock
 	if err := json.Unmarshal(blobdata.GetHeader(), &block); err != nil {
 		return nil, xerrors.Errorf("failed to parse bitcoin block with %+v: %w", metadata, err)
+	}
+
+	if b.preprocessBlock != nil {
+		b.preprocessBlock(&block)
 	}
 
 	if err := b.validateStruct(block); err != nil {
