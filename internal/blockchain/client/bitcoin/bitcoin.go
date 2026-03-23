@@ -25,6 +25,10 @@ type (
 		client                       jsonrpc.Client
 		validate                     *validator.Validate
 		preserveRawInputTransactions bool
+		// Optional hook to customize getrawtransaction RPC params.
+		// Args: (txid, current block hash). Returns: RPC call params.
+		// nil means default behavior: jsonrpc.Params{txid, 1}
+		getRawTxParams func(txid string, blockHash string) jsonrpc.Params
 	}
 
 	bitcoinBlockHeaderResultHolder struct {
@@ -333,9 +337,13 @@ func (b *bitcoinClient) getInputTransactions(
 
 		batchParams := make([]jsonrpc.Params, batchEnd-batchStart)
 		for i, transactionID := range inputTransactionIDs[batchStart:batchEnd] {
-			batchParams[i] = jsonrpc.Params{
-				transactionID,
-				true,
+			if b.getRawTxParams != nil {
+				batchParams[i] = b.getRawTxParams(transactionID, blockHash)
+			} else {
+				batchParams[i] = jsonrpc.Params{
+					transactionID,
+					true,
+				}
 			}
 		}
 

@@ -7,10 +7,12 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/log"
 )
 
-func NewDashNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
+func NewZcashNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
 	v := validator.New()
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
-	v.RegisterStructValidation(validateBitcoinTransactionVinVout, BitcoinTransaction{})
+	// Note: validateBitcoinTransactionVinVout is intentionally NOT registered.
+	// Zcash shielded transactions can have empty vin (shielded-to-transparent)
+	// or empty vout (transparent-to-shielded).
 	return &bitcoinNativeParserImpl{
 		logger:          log.WithPackage(params.Logger),
 		validate:        v,

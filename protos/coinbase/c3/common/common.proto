@@ -31,6 +31,7 @@ enum Blockchain {
     BLOCKCHAIN_MEGAETH = 65; // MegaETH
     BLOCKCHAIN_SEISMIC = 66; // Seismic
     BLOCKCHAIN_DASH = 67; // Dash
+    BLOCKCHAIN_ZCASH = 68; // Zcash
 }
 
 // Network defines an enumeration of supported networks.
@@ -104,4 +105,7 @@ enum Network {
 
     NETWORK_DASH_TESTNET = 148;
     NETWORK_DASH_MAINNET = 149;
+
+    NETWORK_ZCASH_MAINNET = 150;
+    NETWORK_ZCASH_TESTNET = 151;
 }
