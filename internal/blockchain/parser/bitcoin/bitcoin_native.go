@@ -167,8 +167,10 @@ type (
 		// preprocessBlock is an optional chain-specific normalization hook.
 		// It runs after JSON unmarshal but before shared validation so callers can
 		// backfill fields that are omitted by a chain's RPC without weakening the
-		// default Bitcoin validation rules.
-		preprocessBlock func(*BitcoinBlock)
+		// default Bitcoin validation rules. The raw header bytes are provided for
+		// chains that need to inspect fields not present in the shared structs
+		// (e.g. Zcash privacy fields).
+		preprocessBlock func(*BitcoinBlock, []byte)
 	}
 )
 
@@ -178,7 +180,7 @@ var _ internal.NativeParser = (*bitcoinNativeParserImpl)(nil)
 // Zcash) whose getblock RPC omits tx.hash. Because these chains have no witness
 // data, txid and hash are equivalent, so we can safely copy one to the other
 // and keep the shared Bitcoin validation rules intact.
-func backfillTxHash(block *BitcoinBlock) {
+func backfillTxHash(block *BitcoinBlock, _ []byte) {
 	for _, tx := range block.Tx {
 		if tx.Hash == "" {
 			tx.Hash = tx.TxId
@@ -274,8 +276,9 @@ func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.
 		return nil, xerrors.Errorf("failed to parse bitcoin block with %+v: %w", metadata, err)
 	}
 
+	rawHeader := blobdata.GetHeader()
 	if b.preprocessBlock != nil {
-		b.preprocessBlock(&block)
+		b.preprocessBlock(&block, rawHeader)
 	}
 
 	if err := b.validateStruct(block); err != nil {
@@ -311,9 +314,12 @@ func (b *bitcoinNativeParserImpl) GetTransaction(ctx context.Context, nativeBloc
 	return nil, internal.ErrNotImplemented
 }
 
-func (b *bitcoinNativeParserImpl) parseTransactions(
-	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction,
-) ([]*api.BitcoinTransaction, error) {
+// buildInputMetadataMap builds a lookup table from input transaction data in
+// blobdata. Each entry maps a transaction ID to its referenced outputs, which
+// are used later to resolve input values and compute fees.
+func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
+	data *api.BitcoinBlobdata,
+) (map[string][]*api.BitcoinTransactionOutput, error) {
 	metadataMap := make(map[string][]*api.BitcoinTransactionOutput)
 	for i, rawTransaction := range data.GetInputTransactions() {
 		for j, input := range rawTransaction.GetData() {
@@ -342,6 +348,17 @@ func (b *bitcoinNativeParserImpl) parseTransactions(
 
 			metadataMap[inputTxId] = append(metadataMap[inputTxId], outputTx)
 		}
+	}
+
+	return metadataMap, nil
+}
+
+func (b *bitcoinNativeParserImpl) parseTransactions(
+	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction,
+) ([]*api.BitcoinTransaction, error) {
+	metadataMap, err := b.buildInputMetadataMap(data)
+	if err != nil {
+		return nil, err
 	}
 
 	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap)
