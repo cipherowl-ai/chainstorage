@@ -10,7 +10,6 @@ import (
 func NewDashNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
 	v := validator.New()
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
-	v.RegisterStructValidation(validateBitcoinTransactionVinVout, BitcoinTransaction{})
 	return &bitcoinNativeParserImpl{
 		logger:          log.WithPackage(params.Logger),
 		validate:        v,
