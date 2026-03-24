@@ -50,6 +50,14 @@ type (
 	BitcoinHexString       string
 	BitcoinQuantity        uint64
 	BitcoinDecimalQuantity float64
+	// BitcoinNonce handles nonce fields that can be either a JSON number (Bitcoin)
+	// or a hex string (Zcash Equihash). String nonces are stored as-is; numeric
+	// nonces are converted to uint64.
+	BitcoinNonce struct {
+		value    uint64
+		strValue string
+		isString bool
+	}
 
 	// BitcoinBlock https://developer.bitcoin.org/reference/rpc/getblock.html
 	BitcoinBlock struct {
@@ -64,7 +72,7 @@ type (
 		Tx                []*BitcoinTransaction  `json:"tx" validate:"required,min=1,dive,required"`
 		Time              BitcoinQuantity        `json:"time" validate:"required"`
 		MedianTime        BitcoinQuantity        `json:"mediantime"`
-		Nonce             BitcoinQuantity        `json:"nonce"`
+		Nonce             BitcoinNonce           `json:"nonce"`
 		Bits              BitcoinHexString       `json:"bits"`
 		Difficulty        BitcoinDecimalQuantity `json:"difficulty"`
 		ChainWork         BitcoinHexString       `json:"chainwork"`
@@ -83,8 +91,8 @@ type (
 		Weight    BitcoinQuantity             `json:"weight"`
 		Version   BitcoinQuantity             `json:"version"`
 		LockTime  BitcoinQuantity             `json:"locktime"`
-		Vin       []*BitcoinTransactionInput  `json:"vin" validate:"required,min=1,dive,required"`
-		Vout      []*BitcoinTransactionOutput `json:"vout" validate:"required,min=1,dive,required"`
+		Vin       []*BitcoinTransactionInput  `json:"vin" validate:"required,dive,required"`
+		Vout      []*BitcoinTransactionOutput `json:"vout" validate:"required,dive,required"`
 		BlockHash BitcoinHexString            `json:"blockhash"`
 		BlockTime BitcoinQuantity             `json:"blocktime"`
 		Time      BitcoinQuantity             `json:"time"`
@@ -154,17 +162,31 @@ type (
 	}
 
 	bitcoinNativeParserImpl struct {
-		logger          *zap.Logger
-		validate        *validator.Validate
+		logger   *zap.Logger
+		validate *validator.Validate
 		// preprocessBlock is an optional chain-specific normalization hook.
 		// It runs after JSON unmarshal but before shared validation so callers can
 		// backfill fields that are omitted by a chain's RPC without weakening the
-		// default Bitcoin validation rules.
-		preprocessBlock func(*BitcoinBlock)
+		// default Bitcoin validation rules. The raw header bytes are provided for
+		// chains that need to inspect fields not present in the shared structs
+		// (e.g. Zcash privacy fields).
+		preprocessBlock func(*BitcoinBlock, []byte)
 	}
 )
 
 var _ internal.NativeParser = (*bitcoinNativeParserImpl)(nil)
+
+// backfillTxHash is a preprocessBlock hook for non-SegWit chains (e.g. Dash,
+// Zcash) whose getblock RPC omits tx.hash. Because these chains have no witness
+// data, txid and hash are equivalent, so we can safely copy one to the other
+// and keep the shared Bitcoin validation rules intact.
+func backfillTxHash(block *BitcoinBlock, _ []byte) {
+	for _, tx := range block.Tx {
+		if tx.Hash == "" {
+			tx.Hash = tx.TxId
+		}
+	}
+}
 
 var pubKeyScriptRegexp = regexp.MustCompile("^([[:xdigit:]]*) OP_CHECKSIG$")
 
@@ -216,9 +238,22 @@ func validateBitcoinScriptPubKey(sl validator.StructLevel) {
 	}
 }
 
+// validateBitcoinTransactionVinVout enforces min=1 on Vin and Vout at the
+// struct-level so that chains like Zcash can opt out by not registering it.
+func validateBitcoinTransactionVinVout(sl validator.StructLevel) {
+	tx := sl.Current().Interface().(BitcoinTransaction)
+	if len(tx.Vin) == 0 {
+		sl.ReportError(tx.Vin, "Vin", "Vin", "min", "1")
+	}
+	if len(tx.Vout) == 0 {
+		sl.ReportError(tx.Vout, "Vout", "Vout", "min", "1")
+	}
+}
+
 func NewBitcoinNativeParser(params internal.ParserParams, opts ...internal.ParserFactoryOption) (internal.NativeParser, error) {
 	v := validator.New()
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
+	v.RegisterStructValidation(validateBitcoinTransactionVinVout, BitcoinTransaction{})
 	return &bitcoinNativeParserImpl{
 		logger:   log.WithPackage(params.Logger),
 		validate: v,
@@ -241,8 +276,9 @@ func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.
 		return nil, xerrors.Errorf("failed to parse bitcoin block with %+v: %w", metadata, err)
 	}
 
+	rawHeader := blobdata.GetHeader()
 	if b.preprocessBlock != nil {
-		b.preprocessBlock(&block)
+		b.preprocessBlock(&block, rawHeader)
 	}
 
 	if err := b.validateStruct(block); err != nil {
@@ -278,9 +314,12 @@ func (b *bitcoinNativeParserImpl) GetTransaction(ctx context.Context, nativeBloc
 	return nil, internal.ErrNotImplemented
 }
 
-func (b *bitcoinNativeParserImpl) parseTransactions(
-	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction,
-) ([]*api.BitcoinTransaction, error) {
+// buildInputMetadataMap builds a lookup table from input transaction data in
+// blobdata. Each entry maps a transaction ID to its referenced outputs, which
+// are used later to resolve input values and compute fees.
+func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
+	data *api.BitcoinBlobdata,
+) (map[string][]*api.BitcoinTransactionOutput, error) {
 	metadataMap := make(map[string][]*api.BitcoinTransactionOutput)
 	for i, rawTransaction := range data.GetInputTransactions() {
 		for j, input := range rawTransaction.GetData() {
@@ -309,6 +348,17 @@ func (b *bitcoinNativeParserImpl) parseTransactions(
 
 			metadataMap[inputTxId] = append(metadataMap[inputTxId], outputTx)
 		}
+	}
+
+	return metadataMap, nil
+}
+
+func (b *bitcoinNativeParserImpl) parseTransactions(
+	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction,
+) ([]*api.BitcoinTransaction, error) {
+	metadataMap, err := b.buildInputMetadataMap(data)
+	if err != nil {
+		return nil, err
 	}
 
 	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap)
@@ -361,6 +411,7 @@ func (b *BitcoinBlock) GetApiBitcoinHeader() *api.BitcoinHeader {
 		Time:                 b.Time.Value(),
 		MedianTime:           b.MedianTime.Value(),
 		Nonce:                b.Nonce.Value(),
+		RawNonce:             b.Nonce.RawValue(),
 		Bits:                 b.Bits.Value(),
 		Difficulty:           b.Difficulty.String(),
 		ChainWork:            b.ChainWork.Value(),
@@ -570,6 +621,39 @@ func (v BitcoinHexString) Value() string {
 
 func (v BitcoinQuantity) Value() uint64 {
 	return uint64(v)
+}
+
+func (v *BitcoinNonce) UnmarshalJSON(input []byte) error {
+	// Try as number first (Bitcoin, Litecoin, etc.)
+	var num uint64
+	if err := json.Unmarshal(input, &num); err == nil {
+		v.value = num
+		v.isString = false
+		return nil
+	}
+
+	// Fall back to string (Zcash Equihash nonce)
+	var s string
+	if err := json.Unmarshal(input, &s); err != nil {
+		return err
+	}
+	v.strValue = s
+	v.isString = true
+	return nil
+}
+
+func (v BitcoinNonce) Value() uint64 {
+	return v.value
+}
+
+// RawValue returns the nonce as a string, preserving the original format.
+// For numeric nonces (Bitcoin), returns the decimal string representation.
+// For hex string nonces (Zcash), returns the original hex string.
+func (v BitcoinNonce) RawValue() string {
+	if v.isString {
+		return v.strValue
+	}
+	return fmt.Sprintf("%d", v.value)
 }
 
 func (v BitcoinDecimalQuantity) String() string {

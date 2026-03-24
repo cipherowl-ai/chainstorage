@@ -40,6 +40,9 @@ message BitcoinHeader {
   string previous_block_hash = 17;
   string next_block_hash = 18;
   google.protobuf.Timestamp timestamp = 19;
+  // raw_nonce stores the nonce as the original string from the RPC response,
+  // for chains where nonce is not a uint64 (e.g. Zcash Equihash 256-bit nonce).
+  string raw_nonce = 20;
 }
 
 // BitcoinTransaction https://developer.bitcoin.org/reference/rpc/getrawtransaction.html

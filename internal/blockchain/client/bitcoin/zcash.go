@@ -1,0 +1,25 @@
+package bitcoin
+
+import (
+	"github.com/go-playground/validator/v10"
+
+	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
+	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
+	"github.com/coinbase/chainstorage/internal/utils/log"
+)
+
+func NewZcashClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
+	return internal.NewJsonrpcClientFactory(params, func(client jsonrpc.Client) internal.Client {
+		logger := log.WithPackage(params.Logger)
+		return &bitcoinClient{
+			config:                       params.Config,
+			logger:                       logger,
+			client:                       client,
+			validate:                     validator.New(),
+			preserveRawInputTransactions: true,
+			getRawTxParams: func(txid string, _ string) jsonrpc.Params {
+				return jsonrpc.Params{txid, 1}
+			},
+		}
+	})
+}

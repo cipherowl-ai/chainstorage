@@ -70,6 +70,7 @@ type (
 		Megaeth         ParserFactory `name:"megaeth" optional:"true"`
 		Seismic         ParserFactory `name:"seismic" optional:"true"`
 		Dash            ParserFactory `name:"dash" optional:"true"`
+		Zcash           ParserFactory `name:"zcash" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -93,6 +94,8 @@ func NewParser(params Params) (Parser, error) {
 		switch blockchain {
 		case common.Blockchain_BLOCKCHAIN_BITCOIN, common.Blockchain_BLOCKCHAIN_BITCOINCASH, common.Blockchain_BLOCKCHAIN_LITECOIN:
 			factory = params.Bitcoin
+		case common.Blockchain_BLOCKCHAIN_ZCASH:
+			factory = params.Zcash
 		case common.Blockchain_BLOCKCHAIN_DASH:
 			factory = params.Dash
 		case common.Blockchain_BLOCKCHAIN_BSC:

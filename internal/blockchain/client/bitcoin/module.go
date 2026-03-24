@@ -11,4 +11,8 @@ var Module = fx.Options(
 		Name:   "dash",
 		Target: NewDashClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "zcash",
+		Target: NewZcashClientFactory,
+	}),
 )
