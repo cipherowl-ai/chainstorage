@@ -100,11 +100,12 @@ func TestParseSRC20TokenTransfer(t *testing.T) {
 		require.Equal(t, "0xblockhash", transfer.BlockHash)
 		require.Equal(t, uint64(100), transfer.BlockNumber)
 
-		erc20 := transfer.GetErc20()
-		require.NotNil(t, erc20)
-		require.Equal(t, "0xaabbccddee11223344556677889900aabbccddee", erc20.FromAddress)
-		require.Equal(t, "0x11223344556677889900aabbccddeeff00112233", erc20.ToAddress)
-		require.Equal(t, amount.String(), erc20.Value)
+		src20 := transfer.GetSrc20()
+		require.NotNil(t, src20)
+		require.Equal(t, "0xaabbccddee11223344556677889900aabbccddee", src20.FromAddress)
+		require.Equal(t, "0x11223344556677889900aabbccddeeff00112233", src20.ToAddress)
+		require.Equal(t, amount.String(), src20.Value)
+		require.Equal(t, keyHash, src20.EncryptKeyHash)
 	})
 
 	t.Run("ZeroAmount", func(t *testing.T) {
