@@ -143,10 +143,9 @@ func (p *seismicSRC20Parser) ParseSRC20TokenTransfer(eventLog *api.EthereumEvent
 		BlockNumber:      eventLog.BlockNumber,
 		TokenTransfer: &api.EthereumTokenTransfer_Src20{
 			Src20: &api.SRC20TokenTransfer{
-				FromAddress:    fromAddress,
-				ToAddress:      toAddress,
-				Value:          valueStr,
-				EncryptKeyHash: p.keyHash,
+				FromAddress: fromAddress,
+				ToAddress:   toAddress,
+				Value:       valueStr,
 			},
 		},
 	}, nil

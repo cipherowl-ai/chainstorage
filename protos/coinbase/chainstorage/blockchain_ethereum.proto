@@ -276,7 +276,6 @@ message SRC20TokenTransfer {
   string from_address = 1;
   string to_address = 2;
   string value = 3;
-  string encrypt_key_hash = 4;
 }
 
 message EthereumAccountStateProof {
