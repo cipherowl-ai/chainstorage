@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-playground/validator/v10"
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
@@ -49,6 +50,9 @@ const (
 	bitcoinBlockVerbosity = 2
 	// If verbosity is 1, returns a json object without full transaction data
 	bitcoinBlockMetadataVerbosity = 1
+
+	// Maximum number of concurrent batch RPC calls when fetching input transactions.
+	fetchInputTxConcurrency = 3
 
 	// err code defined by bitcoin.
 	// reference: https://github.com/bitcoin/bitcoin/blob/89d148c8c65b3e6b6a8fb8b722efb4b6a7d0a375/src/rpc/protocol.h#L23-L87
@@ -354,7 +358,7 @@ func collectInputTransactionIDs(transactions []*bitcoin.BitcoinTransactionLit) [
 }
 
 // fetchInputTransactions fetches raw transaction data for the given IDs via
-// batched getrawtransaction RPC calls. Returns a map of txid -> raw JSON.
+// concurrent batched getrawtransaction RPC calls. Returns a map of txid -> raw JSON.
 func (b *bitcoinClient) fetchInputTransactions(
 	ctx context.Context,
 	inputTransactionIDs []string,
@@ -362,7 +366,6 @@ func (b *bitcoinClient) fetchInputTransactions(
 ) (map[string][]byte, error) {
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 	numTransactions := len(inputTransactionIDs)
-	result := make(map[string][]byte, numTransactions)
 
 	b.logger.Debug(
 		"getting input transactions>>>",
@@ -370,8 +373,17 @@ func (b *bitcoinClient) fetchInputTransactions(
 		zap.Int("txBatchSize", txBatchSize),
 	)
 
-	for batchStart := 0; batchStart < numTransactions; batchStart += txBatchSize {
+	// Calculate number of batches and pre-allocate per-batch result slices.
+	numBatches := (numTransactions + txBatchSize - 1) / txBatchSize
+	batchResults := make([][]*jsonrpc.Response, numBatches)
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(fetchInputTxConcurrency)
+
+	for batchIdx := 0; batchIdx < numBatches; batchIdx++ {
+		batchStart := batchIdx * txBatchSize
 		batchEnd := min(batchStart+txBatchSize, numTransactions)
+		idx := batchIdx
 
 		batchParams := make([]jsonrpc.Params, batchEnd-batchStart)
 		for i, transactionID := range inputTransactionIDs[batchStart:batchEnd] {
@@ -382,20 +394,33 @@ func (b *bitcoinClient) fetchInputTransactions(
 			}
 		}
 
-		batchResponses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
-		if err != nil {
-			return nil, xerrors.Errorf(
-				"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
-				bitcoinGetRawTransactionMethod.Name,
-				blockHash,
-				inputTransactionIDs[batchStart],
-				batchEnd-batchStart,
-				err,
-			)
-		}
+		g.Go(func() error {
+			responses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
+			if err != nil {
+				return xerrors.Errorf(
+					"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
+					bitcoinGetRawTransactionMethod.Name,
+					blockHash,
+					inputTransactionIDs[batchStart],
+					batchEnd-batchStart,
+					err,
+				)
+			}
+			batchResults[idx] = responses
+			return nil
+		})
+	}
 
-		for respIndex, resp := range batchResponses {
-			result[inputTransactionIDs[batchStart+respIndex]] = resp.Result
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	// Merge batch results into a single map.
+	result := make(map[string][]byte, numTransactions)
+	for batchIdx, responses := range batchResults {
+		batchStart := batchIdx * txBatchSize
+		for respIdx, resp := range responses {
+			result[inputTransactionIDs[batchStart+respIdx]] = resp.Result
 		}
 	}
 
