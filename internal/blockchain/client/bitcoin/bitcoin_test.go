@@ -1143,6 +1143,207 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_BatchGetBlockMetadataByRange_
 	s.Nil(metadata)
 }
 
+// TestBitcoinClient_GetBlockByHash_SharedParentTxid verifies that when multiple
+// inputs across different transactions reference the same parent txid (but different
+// vout indices), the parent is only fetched once and each input gets the correct
+// filtered vout in its output.
+func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_SharedParentTxid() {
+	blockHash := "00000000000000000001blockhash"
+	parentTxA := "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+	parentTxB := "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"
+
+	// Block: coinbase + tx1 (input: parentA:0) + tx2 (inputs: parentA:1, parentB:0)
+	blockJSON := json.RawMessage(`{
+		"hash": "` + blockHash + `",
+		"previousblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+		"height": 100,
+		"time": 1629306034,
+		"tx": [
+			{"txid": "coinbasetx", "vin": [{"coinbase": "00"}]},
+			{"txid": "tx1", "vin": [{"txid": "` + parentTxA + `", "vout": 0}]},
+			{"txid": "tx2", "vin": [{"txid": "` + parentTxA + `", "vout": 1}, {"txid": "` + parentTxB + `", "vout": 0}]}
+		]
+	}`)
+
+	// parentA has 2 vouts
+	parentARespJSON := json.RawMessage(`{
+		"txid": "` + parentTxA + `",
+		"vout": [
+			{"value": 1.0, "n": 0, "scriptPubKey": {"asm": "a0", "hex": "a0", "type": "pubkeyhash", "address": "addrA0"}},
+			{"value": 2.0, "n": 1, "scriptPubKey": {"asm": "a1", "hex": "a1", "type": "pubkeyhash", "address": "addrA1"}}
+		]
+	}`)
+	// parentB has 1 vout
+	parentBRespJSON := json.RawMessage(`{
+		"txid": "` + parentTxB + `",
+		"vout": [
+			{"value": 3.0, "n": 0, "scriptPubKey": {"asm": "b0", "hex": "b0", "type": "pubkeyhash", "address": "addrB0"}}
+		]
+	}`)
+
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{blockHash, bitcoinBlockVerbosity},
+	).Return(&jsonrpc.Response{Result: blockJSON}, nil)
+
+	// Only 2 unique parent txids should be fetched (parentA, parentB) in one batch
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), bitcoinGetRawTransactionMethod,
+		[]jsonrpc.Params{{parentTxA, true}, {parentTxB, true}},
+	).Return([]*jsonrpc.Response{
+		{Result: parentARespJSON},
+		{Result: parentBRespJSON},
+	}, nil)
+
+	block, err := s.client.GetBlockByHash(context.Background(), btcTag, 100, blockHash)
+	s.NoError(err)
+
+	blobdata := block.GetBitcoin()
+	s.NotNil(blobdata)
+	s.Equal(3, len(blobdata.InputTransactions))
+
+	// tx[0] = coinbase -> empty
+	s.Equal(0, len(blobdata.InputTransactions[0].Data))
+
+	// tx[1] = 1 input (parentA:0) -> 1 entry with vout[0]
+	s.Equal(1, len(blobdata.InputTransactions[1].Data))
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":1.0,"n":0,"scriptPubKey":{"asm":"a0","hex":"a0","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addrA0"}}]}`,
+		string(blobdata.InputTransactions[1].Data[0]))
+
+	// tx[2] = 2 inputs (parentA:1, parentB:0)
+	s.Equal(2, len(blobdata.InputTransactions[2].Data))
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":2.0,"n":1,"scriptPubKey":{"asm":"a1","hex":"a1","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addrA1"}}]}`,
+		string(blobdata.InputTransactions[2].Data[0]))
+	s.JSONEq(`{"txid":"`+parentTxB+`","vout":[{"value":3.0,"n":0,"scriptPubKey":{"asm":"b0","hex":"b0","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addrB0"}}]}`,
+		string(blobdata.InputTransactions[2].Data[1]))
+}
+
+// TestBitcoinClient_GetBlockByHash_DuplicateTxidVout verifies that when two inputs
+// in different transactions reference the exact same (txid, vout) pair, both get
+// identical output data.
+func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_DuplicateTxidVout() {
+	blockHash := "00000000000000000002blockhash"
+	parentTxA := "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+
+	blockJSON := json.RawMessage(`{
+		"hash": "` + blockHash + `",
+		"previousblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+		"height": 200,
+		"time": 1629306034,
+		"tx": [
+			{"txid": "coinbasetx", "vin": [{"coinbase": "00"}]},
+			{"txid": "tx1", "vin": [{"txid": "` + parentTxA + `", "vout": 0}]},
+			{"txid": "tx2", "vin": [{"txid": "` + parentTxA + `", "vout": 0}]}
+		]
+	}`)
+
+	parentARespJSON := json.RawMessage(`{
+		"txid": "` + parentTxA + `",
+		"vout": [
+			{"value": 5.0, "n": 0, "scriptPubKey": {"asm": "a0", "hex": "a0", "type": "pubkeyhash", "address": "addrA0"}}
+		]
+	}`)
+
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{blockHash, bitcoinBlockVerbosity},
+	).Return(&jsonrpc.Response{Result: blockJSON}, nil)
+
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), bitcoinGetRawTransactionMethod,
+		[]jsonrpc.Params{{parentTxA, true}},
+	).Return([]*jsonrpc.Response{
+		{Result: parentARespJSON},
+	}, nil)
+
+	block, err := s.client.GetBlockByHash(context.Background(), btcTag, 200, blockHash)
+	s.NoError(err)
+
+	blobdata := block.GetBitcoin()
+	s.Equal(3, len(blobdata.InputTransactions))
+	s.Equal(0, len(blobdata.InputTransactions[0].Data))
+	s.Equal(1, len(blobdata.InputTransactions[1].Data))
+	s.Equal(1, len(blobdata.InputTransactions[2].Data))
+
+	// Both should produce identical output
+	s.JSONEq(string(blobdata.InputTransactions[1].Data[0]), string(blobdata.InputTransactions[2].Data[0]))
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":5.0,"n":0,"scriptPubKey":{"asm":"a0","hex":"a0","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addrA0"}}]}`,
+		string(blobdata.InputTransactions[1].Data[0]))
+}
+
+// TestBitcoinClient_GetBlockByHash_OutputShapeAndOrder verifies the strict contract:
+// - results outer length == len(transactions)
+// - coinbase (index 0) always has empty Data
+// - each input maps to one entry with exactly one vout
+// - entry order matches vin order within each transaction
+func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_OutputShapeAndOrder() {
+	blockHash := "00000000000000000003blockhash"
+	parentTxA := "aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"
+
+	// tx2 has 3 inputs from the same parent, referencing vouts 2, 0, 1 (out of order)
+	blockJSON := json.RawMessage(`{
+		"hash": "` + blockHash + `",
+		"previousblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+		"height": 300,
+		"time": 1629306034,
+		"tx": [
+			{"txid": "coinbasetx", "vin": [{"coinbase": "00"}]},
+			{"txid": "tx2", "vin": [
+				{"txid": "` + parentTxA + `", "vout": 2},
+				{"txid": "` + parentTxA + `", "vout": 0},
+				{"txid": "` + parentTxA + `", "vout": 1}
+			]}
+		]
+	}`)
+
+	parentARespJSON := json.RawMessage(`{
+		"txid": "` + parentTxA + `",
+		"vout": [
+			{"value": 10.0, "n": 0, "scriptPubKey": {"asm": "v0", "hex": "v0", "type": "pubkeyhash", "address": "addr0"}},
+			{"value": 20.0, "n": 1, "scriptPubKey": {"asm": "v1", "hex": "v1", "type": "pubkeyhash", "address": "addr1"}},
+			{"value": 30.0, "n": 2, "scriptPubKey": {"asm": "v2", "hex": "v2", "type": "pubkeyhash", "address": "addr2"}}
+		]
+	}`)
+
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{blockHash, bitcoinBlockVerbosity},
+	).Return(&jsonrpc.Response{Result: blockJSON}, nil)
+
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), bitcoinGetRawTransactionMethod,
+		[]jsonrpc.Params{{parentTxA, true}},
+	).Return([]*jsonrpc.Response{
+		{Result: parentARespJSON},
+	}, nil)
+
+	block, err := s.client.GetBlockByHash(context.Background(), btcTag, 300, blockHash)
+	s.NoError(err)
+
+	blobdata := block.GetBitcoin()
+	s.Require().Equal(2, len(blobdata.InputTransactions))
+
+	// coinbase
+	s.Equal(0, len(blobdata.InputTransactions[0].Data))
+
+	// tx2: 3 inputs, order must match vin order (vout 2, 0, 1)
+	s.Require().Equal(3, len(blobdata.InputTransactions[1].Data))
+
+	// Each entry must have exactly 1 vout
+	for i, data := range blobdata.InputTransactions[1].Data {
+		var parsed map[string]json.RawMessage
+		s.NoError(json.Unmarshal(data, &parsed))
+		var vouts []json.RawMessage
+		s.NoError(json.Unmarshal(parsed["vout"], &vouts))
+		s.Equal(1, len(vouts), "entry %d should have exactly 1 vout", i)
+	}
+
+	// Verify order: first entry is vout 2 (value 30), second is vout 0 (value 10), third is vout 1 (value 20)
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":30.0,"n":2,"scriptPubKey":{"asm":"v2","hex":"v2","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addr2"}}]}`,
+		string(blobdata.InputTransactions[1].Data[0]))
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":10.0,"n":0,"scriptPubKey":{"asm":"v0","hex":"v0","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addr0"}}]}`,
+		string(blobdata.InputTransactions[1].Data[1]))
+	s.JSONEq(`{"txid":"`+parentTxA+`","vout":[{"value":20.0,"n":1,"scriptPubKey":{"asm":"v1","hex":"v1","reqSigs":0,"type":"pubkeyhash","addresses":null,"address":"addr1"}}]}`,
+		string(blobdata.InputTransactions[1].Data[2]))
+}
+
 func testModule(client *jsonrpcmocks.MockClient) fx.Option {
 	return fx.Options(
 		internal.Module,
