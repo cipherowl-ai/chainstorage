@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -365,6 +366,29 @@ func (b *bitcoinClient) getInputTransactions(
 		}
 	}
 
+	// Phase A: Parse each unique parent transaction once and build vout index map.
+	type parsedTx struct {
+		tx      *bitcoin.BitcoinInputTransactionLit
+		voutMap map[uint64]*bitcoin.BitcoinTransactionOutput
+	}
+	parsedTxCache := make(map[string]*parsedTx, len(inputTransactionsMap))
+	for txID, rawData := range inputTransactionsMap {
+		var tx bitcoin.BitcoinInputTransactionLit
+		if err := json.Unmarshal(rawData, &tx); err != nil {
+			return nil, nil, xerrors.Errorf("failed to unmarshal input transaction %s: %w", txID, err)
+		}
+		if err := b.validate.Struct(tx); err != nil {
+			return nil, nil, xerrors.Errorf("failed to validate input transaction %s: %w", txID, err)
+		}
+		vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(tx.Vout))
+		for _, o := range tx.Vout {
+			vm[o.N.Value()] = o
+		}
+		parsedTxCache[txID] = &parsedTx{tx: &tx, voutMap: vm}
+	}
+
+	// Phase B: Build results, caching marshalled (txid, voutIndex) pairs.
+	marshalCache := make(map[string][]byte)
 	results := make([][][]byte, len(transactions))
 	for index, tx := range transactions {
 		var inputTransactions [][]byte
@@ -376,7 +400,15 @@ func (b *bitcoinClient) getInputTransactions(
 
 			for inputIndex, input := range tx.Inputs {
 				inputID := input.Identifier.Value()
-				rawTransaction, ok := inputTransactionsMap[inputID]
+				voutIdx := input.Vout.Value()
+				cacheKey := inputID + ":" + strconv.FormatUint(voutIdx, 10)
+
+				if cached, ok := marshalCache[cacheKey]; ok {
+					inputTransactions[inputIndex] = cached
+					continue
+				}
+
+				parsed, ok := parsedTxCache[inputID]
 				if !ok {
 					return nil, nil, xerrors.Errorf(
 						"input transaction id not found in map (blockHash=%s, transactionID=%v, inputTransactionID=%v)",
@@ -386,17 +418,33 @@ func (b *bitcoinClient) getInputTransactions(
 					)
 				}
 
-				data, err := b.processInputTransactionRawData(rawTransaction, input.Vout.Value())
-				if err != nil {
+				output, ok := parsed.voutMap[voutIdx]
+				if !ok {
 					return nil, nil, xerrors.Errorf(
-						"error processing input transaction data (blockHash=%s, transactionID=%v, inputTransactionID=%v): %w",
+						"vout not found (blockHash=%s, transactionID=%v, inputTransactionID=%v, voutIndex=%d)",
 						blockHash,
 						tx.Identifier,
 						inputID,
+						voutIdx,
+					)
+				}
+
+				filtered := bitcoin.BitcoinInputTransactionLit{
+					TxId: parsed.tx.TxId,
+					Vout: []*bitcoin.BitcoinTransactionOutput{output},
+				}
+				data, err := json.Marshal(&filtered)
+				if err != nil {
+					return nil, nil, xerrors.Errorf(
+						"failed to marshal filtered input transaction (blockHash=%s, inputTransactionID=%v, voutIndex=%d): %w",
+						blockHash,
+						inputID,
+						voutIdx,
 						err,
 					)
 				}
 
+				marshalCache[cacheKey] = data
 				inputTransactions[inputIndex] = data
 			}
 		}
@@ -433,38 +481,3 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 	return blockHashes, nil
 }
 
-func (b *bitcoinClient) processInputTransactionRawData(data json.RawMessage, voutIndex uint64) ([]byte, error) {
-	var transaction bitcoin.BitcoinInputTransactionLit
-	if err := json.Unmarshal(data, &transaction); err != nil {
-		return nil, xerrors.Errorf("failed to unmarshal data into bitcoin input transaction lite: %w", err)
-	}
-
-	if err := b.validate.Struct(transaction); err != nil {
-		return nil, xerrors.Errorf("failed to validate bitcoin input transaction lite %+v: %w", transaction, err)
-	}
-
-	if voutIndex >= uint64(len(transaction.Vout)) {
-		return nil, xerrors.Errorf("vout index out of bound (index=%d, len=%d)", voutIndex, len(transaction.Vout))
-	}
-
-	var output *bitcoin.BitcoinTransactionOutput
-	for _, o := range transaction.Vout {
-		if voutIndex == uint64(o.N) {
-			output = o
-			break
-		}
-	}
-
-	if output == nil {
-		return nil, xerrors.Errorf("vout not found for index: %d", voutIndex)
-	}
-
-	// ignore other outputs
-	transaction.Vout = []*bitcoin.BitcoinTransactionOutput{output}
-
-	result, err := json.Marshal(&transaction)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to marshal input transaction data %v: %w", transaction, err)
-	}
-	return result, nil
-}
