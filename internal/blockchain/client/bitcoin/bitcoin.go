@@ -322,7 +322,12 @@ func (b *bitcoinClient) getInputTransactions(
 		return nil, nil, err
 	}
 
-	results, err := b.buildInputTransactionResults(transactions, inputTransactionsMap, blockHash)
+	parsedCache, err := parseInputTransactions(inputTransactionsMap)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	results, err := buildInputTransactionResults(transactions, parsedCache, blockHash)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -397,31 +402,39 @@ func (b *bitcoinClient) fetchInputTransactions(
 	return result, nil
 }
 
-// buildInputTransactionResults parses raw input transactions, builds a vout
-// index for O(1) lookup, and assembles the per-vin filtered results with
-// marshal caching to avoid redundant work for shared (txid, vout) pairs.
-func (b *bitcoinClient) buildInputTransactionResults(
-	transactions []*bitcoin.BitcoinTransactionLit,
-	inputTransactionsMap map[string][]byte,
-	blockHash string,
-) ([][][]byte, error) {
-	// Parse each unique parent transaction once and build vout index map.
-	parsedCache := make(map[string]*parsedInputTx, len(inputTransactionsMap))
-	for txID, rawData := range inputTransactionsMap {
+// parseInputTransactions unmarshals, validates, and indexes raw input
+// transactions. Each unique txid is parsed once and its vouts are indexed
+// by N for O(1) lookup. Replaces reflection-based validator.Struct with
+// direct checks to avoid per-call reflection overhead.
+func parseInputTransactions(rawMap map[string][]byte) (map[string]*parsedInputTx, error) {
+	parsed := make(map[string]*parsedInputTx, len(rawMap))
+	for txID, rawData := range rawMap {
 		var tx bitcoin.BitcoinInputTransactionLit
 		if err := json.Unmarshal(rawData, &tx); err != nil {
 			return nil, xerrors.Errorf("failed to unmarshal input transaction %s: %w", txID, err)
 		}
-		if err := b.validate.Struct(tx); err != nil {
-			return nil, xerrors.Errorf("failed to validate input transaction %s: %w", txID, err)
+		if tx.TxId.Value() == "" {
+			return nil, xerrors.Errorf("failed to validate input transaction %s: txid is required", txID)
+		}
+		if len(tx.Vout) == 0 {
+			return nil, xerrors.Errorf("failed to validate input transaction %s: vout must have at least 1 element", txID)
 		}
 		vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(tx.Vout))
 		for _, o := range tx.Vout {
 			vm[o.N.Value()] = o
 		}
-		parsedCache[txID] = &parsedInputTx{tx: &tx, voutMap: vm}
+		parsed[txID] = &parsedInputTx{tx: &tx, voutMap: vm}
 	}
+	return parsed, nil
+}
 
+// buildInputTransactionResults assembles per-vin filtered results with
+// marshal caching to avoid redundant work for shared (txid, vout) pairs.
+func buildInputTransactionResults(
+	transactions []*bitcoin.BitcoinTransactionLit,
+	parsedCache map[string]*parsedInputTx,
+	blockHash string,
+) ([][][]byte, error) {
 	// Build results, caching marshalled (txid, voutIndex) pairs.
 	marshalCache := make(map[string][]byte)
 	results := make([][][]byte, len(transactions))
