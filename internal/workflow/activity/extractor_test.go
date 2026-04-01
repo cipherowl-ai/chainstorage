@@ -89,7 +89,7 @@ func (s *ExtractorTestSuite) TestSuccess() {
 			Height: height,
 		},
 	}
-	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height).Return(block, nil)
+	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height, gomock.Any()).Return(block, nil)
 	s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey, nil)
 
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
@@ -125,7 +125,7 @@ func (s *ExtractorTestSuite) TestMiniBatch() {
 				Height: height + i,
 			},
 		}
-		s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height+i).Return(block, nil)
+		s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height+i, gomock.Any()).Return(block, nil)
 		s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey+strconv.Itoa(int(i)), nil)
 		heights[i] = height + i
 	}

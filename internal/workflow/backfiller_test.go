@@ -17,7 +17,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/blockchain/client"
 	clientmocks "github.com/coinbase/chainstorage/internal/blockchain/client/mocks"
 	"github.com/coinbase/chainstorage/internal/blockchain/endpoints"
-	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/dlq"
@@ -144,7 +143,7 @@ func (s *backfillerTestSuite) TestBackfiller() {
 			require.Equal(tag, tag_)
 			return s.getMockMetadata(height), nil
 		})
-	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
 		DoAndReturn(func(ctx context.Context, tag_ uint32, height uint64, opts ...client.ClientOption) (*api.Block, error) {
 			require.False(s.masterEndpointProvider.HasFailoverContext(ctx))
@@ -212,7 +211,7 @@ func (s *backfillerTestSuite) TestBackfiller_MiniBatch() {
 			require.Equal(tag, tag_)
 			return s.getMockMetadata(height), nil
 		})
-	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
 		DoAndReturn(func(ctx context.Context, tag_ uint32, height uint64, opts ...client.ClientOption) (*api.Block, error) {
 			require.False(s.masterEndpointProvider.HasFailoverContext(ctx))
@@ -282,9 +281,9 @@ func (s *backfillerTestSuite) TestBackfiller_Failover() {
 			require.Equal(tag, tag_)
 			return s.getMockMetadata(height), nil
 		})
-	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
-		DoAndReturn(func(ctx context.Context, tag_ uint32, height uint64, opts ...jsonrpc.Option) (*api.Block, error) {
+		DoAndReturn(func(ctx context.Context, tag_ uint32, height uint64, opts ...client.ClientOption) (*api.Block, error) {
 			require.True(s.masterEndpointProvider.HasFailoverContext(ctx))
 			require.True(s.slaveEndpointProvider.HasFailoverContext(ctx))
 			require.Equal(tag, tag_)

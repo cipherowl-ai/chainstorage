@@ -49,8 +49,8 @@ cadence:
 chain:
   block_start_height: 0
   block_tag:
-    latest: 2
-    stable: 2
+    latest: 1
+    stable: 1
   block_time: 10m
   blockchain: BLOCKCHAIN_DASH
   client:

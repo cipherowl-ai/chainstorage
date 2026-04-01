@@ -3,6 +3,7 @@ package activity
 import (
 	"context"
 
+	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -89,6 +90,10 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 		ctx = failoverCtx
 	}
 
+	heartbeatOpt := client.WithHeartbeat(func(ctx context.Context, details ...any) {
+		activity.RecordHeartbeat(ctx, details...)
+	})
+
 	result := make([]*api.BlockMetadata, len(request.Heights))
 	group, ctx := syncgroup.New(ctx)
 	for i, height := range request.Heights {
@@ -112,7 +117,7 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 			}
 
 			if block == nil {
-				var opts []client.ClientOption
+				opts := []client.ClientOption{heartbeatOpt}
 				if request.WithBestEffort {
 					// This option is enabled while reprocessing extractors.
 					// The block is queried in a best-effort manner and partial data may be returned.
@@ -125,6 +130,8 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 					return xerrors.Errorf("failed to extract block %v: %w", height, err)
 				}
 			}
+
+			activity.RecordHeartbeat(ctx, height)
 
 			objectKey, err := a.blobStorage.Upload(ctx, block, request.DataCompression)
 			if err != nil {

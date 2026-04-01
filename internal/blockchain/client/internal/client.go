@@ -102,6 +102,7 @@ type (
 
 	ClientOptions struct {
 		BestEffort bool
+		Heartbeat  func(ctx context.Context, details ...any)
 	}
 )
 
@@ -226,6 +227,21 @@ func NewClient(params Params) (Result, error) {
 func WithBestEffort() ClientOption {
 	return func(options *ClientOptions) {
 		options.BestEffort = true
+	}
+}
+
+// WithHeartbeat sets a heartbeat callback on the client options.
+// The callback is invoked during long-running operations to signal progress.
+func WithHeartbeat(fn func(ctx context.Context, details ...any)) ClientOption {
+	return func(options *ClientOptions) {
+		options.Heartbeat = fn
+	}
+}
+
+// RecordHeartbeat calls the heartbeat callback if one is set.
+func (o *ClientOptions) RecordHeartbeat(ctx context.Context, details ...any) {
+	if o != nil && o.Heartbeat != nil {
+		o.Heartbeat(ctx, details...)
 	}
 }
 
