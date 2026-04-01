@@ -364,6 +364,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 	inputTransactionIDs []string,
 	blockHash string,
 ) (map[string][]byte, error) {
+	opts := internal.OptionsFromContext(ctx)
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 	numTransactions := len(inputTransactionIDs)
 
@@ -407,6 +408,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 				)
 			}
 			batchResults[idx] = responses
+			opts.RecordHeartbeat(ctx, "fetchInputTx", idx)
 			return nil
 		})
 	}
@@ -544,4 +546,3 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 	}
 	return blockHashes, nil
 }
-
