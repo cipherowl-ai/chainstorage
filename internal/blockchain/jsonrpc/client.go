@@ -80,7 +80,9 @@ type (
 		Name    string
 		Timeout time.Duration
 	}
+)
 
+type (
 	Params []any
 
 	Option func(opts *options)

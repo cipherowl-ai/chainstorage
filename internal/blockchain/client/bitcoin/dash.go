@@ -16,6 +16,7 @@ func NewDashClientFactory(params internal.JsonrpcClientParams) internal.ClientFa
 			logger:                       logger,
 			client:                       client,
 			validate:                     validator.New(),
+			methods:                      newRPCMethods(),
 			preserveRawInputTransactions: true,
 		}
 	})

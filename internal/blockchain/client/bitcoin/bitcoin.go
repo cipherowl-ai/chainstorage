@@ -21,11 +21,25 @@ import (
 )
 
 type (
+	// rpcMethods holds the RPC method definitions for a Bitcoin-family client.
+	// Use newRPCMethods() for defaults, or pass rpcMethodsOverride to customize.
+	rpcMethods struct {
+		getBlockByHash    *jsonrpc.RequestMethod
+		getBlockHash      *jsonrpc.RequestMethod
+		getRawTransaction *jsonrpc.RequestMethod
+		getBlockCount     *jsonrpc.RequestMethod
+	}
+
+	rpcMethodName string
+
+	rpcMethodsOverride map[rpcMethodName]*jsonrpc.RequestMethod
+
 	bitcoinClient struct {
 		config                       *config.Config
 		logger                       *zap.Logger
 		client                       jsonrpc.Client
 		validate                     *validator.Validate
+		methods                      rpcMethods
 		preserveRawInputTransactions bool
 		// Optional hook to customize getrawtransaction RPC params.
 		// Args: (txid, current block hash). Returns: RPC call params.
@@ -62,26 +76,54 @@ const (
 	bitcoinErrMessageBlockOutOfRange  = "Block height out of range"
 )
 
+const (
+	rpcMethodGetBlockByHash    rpcMethodName = "getBlockByHash"
+	rpcMethodGetBlockHash      rpcMethodName = "getBlockHash"
+	rpcMethodGetRawTransaction rpcMethodName = "getRawTransaction"
+	rpcMethodGetBlockCount     rpcMethodName = "getBlockCount"
+)
+
 var _ internal.Client = (*bitcoinClient)(nil)
 
+// Default RPC method definitions shared across all Bitcoin-family chains.
 var (
-	bitcoinGetBlockByHashMethod = &jsonrpc.RequestMethod{
-		Name:    "getblock",
-		Timeout: time.Second * 10,
-	}
-	bitcoinGetBlockHashMethod = &jsonrpc.RequestMethod{
-		Name:    "getblockhash",
-		Timeout: time.Second * 5,
-	}
-	bitcoinGetRawTransactionMethod = &jsonrpc.RequestMethod{
-		Name:    "getrawtransaction",
-		Timeout: time.Second * 10,
-	}
-	bitcoinGetBlockCountMethod = &jsonrpc.RequestMethod{
-		Name:    "getblockcount",
-		Timeout: time.Second * 5,
-	}
+	defaultGetBlockByHash    = &jsonrpc.RequestMethod{Name: "getblock", Timeout: 10 * time.Second}
+	defaultGetBlockHash      = &jsonrpc.RequestMethod{Name: "getblockhash", Timeout: 5 * time.Second}
+	defaultGetRawTransaction = &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: 30 * time.Second}
+	defaultGetBlockCount     = &jsonrpc.RequestMethod{Name: "getblockcount", Timeout: 5 * time.Second}
 )
+
+func defaultRPCMethods() rpcMethods {
+	return rpcMethods{
+		getBlockByHash:    defaultGetBlockByHash,
+		getBlockHash:      defaultGetBlockHash,
+		getRawTransaction: defaultGetRawTransaction,
+		getBlockCount:     defaultGetBlockCount,
+	}
+}
+
+func newRPCMethods(overrides ...rpcMethodsOverride) rpcMethods {
+	methods := defaultRPCMethods()
+	for _, override := range overrides {
+		for methodName, method := range override {
+			if method == nil {
+				continue
+			}
+			switch methodName {
+			case rpcMethodGetBlockByHash:
+				methods.getBlockByHash = method
+			case rpcMethodGetBlockHash:
+				methods.getBlockHash = method
+			case rpcMethodGetRawTransaction:
+				methods.getRawTransaction = method
+			case rpcMethodGetBlockCount:
+				methods.getBlockCount = method
+			}
+		}
+	}
+
+	return methods
+}
 
 func NewBitcoinClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
 	return internal.NewJsonrpcClientFactory(params, func(client jsonrpc.Client) internal.Client {
@@ -91,6 +133,7 @@ func NewBitcoinClientFactory(params internal.JsonrpcClientParams) internal.Clien
 			logger:   logger,
 			client:   client,
 			validate: validator.New(),
+			methods:  newRPCMethods(),
 		}
 	})
 }
@@ -114,13 +157,13 @@ func (b *bitcoinClient) BatchGetBlockMetadata(ctx context.Context, tag uint32, f
 		}
 	}
 
-	responses, err := b.client.BatchCall(ctx, bitcoinGetBlockByHashMethod, params)
+	responses, err := b.client.BatchCall(ctx, b.methods.getBlockByHash, params)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block for blockhashes: %w", err)
 	}
 
 	if len(responses) != numBlocks {
-		return nil, xerrors.Errorf("missing blocks in BatchCall to %s", bitcoinGetBlockByHashMethod.Name)
+		return nil, xerrors.Errorf("missing blocks in BatchCall to %s", b.methods.getBlockByHash.Name)
 	}
 
 	results := make([]*api.BlockMetadata, len(responses))
@@ -158,7 +201,7 @@ func (b *bitcoinClient) GetBlockByHeight(ctx context.Context, tag uint32, height
 	ctx = internal.ContextWithOptions(ctx, opts...)
 	params := jsonrpc.Params{height}
 
-	response, err := b.client.Call(ctx, bitcoinGetBlockHashMethod, params)
+	response, err := b.client.Call(ctx, b.methods.getBlockHash, params)
 	if err != nil {
 		var rpcErr *jsonrpc.RPCError
 		if xerrors.As(err, &rpcErr) &&
@@ -194,7 +237,7 @@ func (b *bitcoinClient) GetBlockByHash(ctx context.Context, tag uint32, height u
 		bitcoinBlockVerbosity,
 	}
 
-	response, err := b.client.Call(ctx, bitcoinGetBlockByHashMethod, params)
+	response, err := b.client.Call(ctx, b.methods.getBlockByHash, params)
 	if err != nil {
 		var rpcErr *jsonrpc.RPCError
 		if xerrors.As(err, &rpcErr) &&
@@ -221,7 +264,7 @@ func (b *bitcoinClient) GetBlockByHash(ctx context.Context, tag uint32, height u
 func (b *bitcoinClient) GetLatestHeight(ctx context.Context) (uint64, error) {
 	params := jsonrpc.Params{}
 
-	response, err := b.client.Call(ctx, bitcoinGetBlockCountMethod, params)
+	response, err := b.client.Call(ctx, b.methods.getBlockCount, params)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to get the height of the most-work fully-validated chain: %w", err)
 	}
@@ -399,7 +442,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 		g.Go(func() error {
 			responses, err := b.client.BatchCall(
 				ctx,
-				bitcoinGetRawTransactionMethod,
+				b.methods.getRawTransaction,
 				batchParams,
 				jsonrpc.WithOnAttempt(func(ctx context.Context, attempt int) {
 					opts.RecordHeartbeat(ctx, "fetchInputTx.batch", idx, attempt)
@@ -408,7 +451,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 			if err != nil {
 				return xerrors.Errorf(
 					"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
-					bitcoinGetRawTransactionMethod.Name,
+					b.methods.getRawTransaction.Name,
 					blockHash,
 					inputTransactionIDs[batchStart],
 					batchEnd-batchStart,
@@ -536,13 +579,13 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 		params[i] = jsonrpc.Params{height}
 	}
 
-	responses, err := b.client.BatchCall(ctx, bitcoinGetBlockHashMethod, params)
+	responses, err := b.client.BatchCall(ctx, b.methods.getBlockHash, params)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block hashes for heights: %w", err)
 	}
 
 	if numBlocks != len(responses) {
-		return nil, xerrors.Errorf("missing block hashes in BatchCall to %s", bitcoinGetBlockHashMethod.Name)
+		return nil, xerrors.Errorf("missing block hashes in BatchCall to %s", b.methods.getBlockHash.Name)
 	}
 
 	blockHashes := make([]string, len(responses))
