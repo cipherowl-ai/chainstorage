@@ -11,8 +11,9 @@ func NewDashNativeParser(params internal.ParserParams, opts ...internal.ParserFa
 	v := validator.New()
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
 	return &bitcoinNativeParserImpl{
-		logger:          log.WithPackage(params.Logger),
-		validate:        v,
-		preprocessBlock: backfillTxHash,
+		logger:           log.WithPackage(params.Logger),
+		validate:         v,
+		preprocessBlock:  backfillTxHash,
+		p2pkhVersionByte: 0x4c,
 	}, nil
 }

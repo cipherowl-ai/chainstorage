@@ -113,7 +113,7 @@ func (p *zcashNativeParserImpl) buildZcashTransactions(
 			continue
 		}
 
-		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap)
+		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p.p2pkhVersionByte)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse tx[%d]: %w", i, err)
 		}
