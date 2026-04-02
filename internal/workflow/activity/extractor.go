@@ -100,6 +100,8 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 		i := i
 		height := height
 		group.Go(func() error {
+			activity.RecordHeartbeat(ctx, "extractor.block.start", height)
+
 			var block *api.Block
 			var err error
 			if request.UpgradeFromTag != nil {
@@ -131,13 +133,14 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 				}
 			}
 
-			activity.RecordHeartbeat(ctx, height)
+			activity.RecordHeartbeat(ctx, "extractor.block.fetched", height)
 
 			objectKey, err := a.blobStorage.Upload(ctx, block, request.DataCompression)
 			if err != nil {
 				logger.Error("failed to upload to blob store", zap.Error(err))
 				return xerrors.Errorf("failed to upload to blob store: %w", err)
 			}
+			activity.RecordHeartbeat(ctx, "extractor.block.uploaded", height)
 
 			block.Metadata.ObjectKeyMain = objectKey
 			result[i] = block.Metadata

@@ -367,6 +367,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 	opts := internal.OptionsFromContext(ctx)
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 	numTransactions := len(inputTransactionIDs)
+	opts.RecordHeartbeat(ctx, "fetchInputTx.begin", numTransactions)
 
 	b.logger.Debug(
 		"getting input transactions>>>",
@@ -396,6 +397,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 		}
 
 		g.Go(func() error {
+			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.start", idx)
 			responses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
 			if err != nil {
 				return xerrors.Errorf(
@@ -416,6 +418,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
+	opts.RecordHeartbeat(ctx, "fetchInputTx.done", numBatches)
 
 	// Merge batch results into a single map.
 	result := make(map[string][]byte, numTransactions)
