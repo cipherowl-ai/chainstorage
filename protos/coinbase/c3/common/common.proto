@@ -32,6 +32,7 @@ enum Blockchain {
     BLOCKCHAIN_SEISMIC = 66; // Seismic
     BLOCKCHAIN_DASH = 67; // Dash
     BLOCKCHAIN_ZCASH = 68; // Zcash
+    BLOCKCHAIN_TEMPO = 69; // Tempo
 }
 
 // Network defines an enumeration of supported networks.
@@ -108,4 +109,8 @@ enum Network {
 
     NETWORK_ZCASH_MAINNET = 150;
     NETWORK_ZCASH_TESTNET = 151;
+
+    NETWORK_TEMPO_TESTNET = 152;
+    NETWORK_TEMPO_MAINNET = 153;
+
 }

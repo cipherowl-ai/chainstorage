@@ -60,5 +60,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("seismic", NewSeismicNativeParser).
 		SetValidatorFactory(NewSeismicValidator).
 		Build(),
+	internal.NewParserBuilder("tempo", NewTempoNativeParser).
+		SetValidatorFactory(NewTempoValidator).
+		Build(),
 	beacon.Module,
 )
