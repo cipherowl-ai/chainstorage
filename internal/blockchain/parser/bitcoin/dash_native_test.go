@@ -38,6 +38,34 @@ func (s *dashNativeParserTestSuite) TearDownTest() {
 	s.app.Close()
 }
 
+func (s *dashNativeParserTestSuite) TestParseDashBlock_PubKeyAddress() {
+	require := testutil.Require(s.T())
+
+	// Dash P2PK outputs omit the "address" field; the parser must derive it
+	// using Dash's P2PKH version byte (0x4c) to produce an X-prefixed address.
+	header, err := fixtures.ReadFile("parser/bitcoin/dash_get_block_pubkey_case.json")
+	require.NoError(err)
+
+	block := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_DASH,
+		Network:    common.Network_NETWORK_DASH_MAINNET,
+		Metadata:   bitcoinMetadata,
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{
+				Header: header,
+			},
+		},
+	}
+
+	nativeBlock, err := s.parser.ParseBlock(context.Background(), block)
+	require.NoError(err)
+
+	output := nativeBlock.GetBitcoin().Transactions[0].Outputs[0]
+	require.Equal(bitcoinScriptTypePubKey, output.ScriptPublicKey.Type)
+	// The derived address must use Dash's version byte (0x4c), producing an X-prefix.
+	require.Equal("XbaQuXMDwGR6ns9LroMPCcEEuR4xr8L6ew", output.ScriptPublicKey.Address)
+}
+
 func (s *dashNativeParserTestSuite) TestParseDashBlock_AllowsMissingHash() {
 	require := testutil.Require(s.T())
 

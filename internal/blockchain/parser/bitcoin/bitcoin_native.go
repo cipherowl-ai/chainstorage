@@ -171,6 +171,10 @@ type (
 		// chains that need to inspect fields not present in the shared structs
 		// (e.g. Zcash privacy fields).
 		preprocessBlock func(*BitcoinBlock, []byte)
+		// p2pkhVersionByte is the chain-specific version byte used for P2PKH
+		// base58check encoding when deriving addresses from P2PK scripts.
+		// Bitcoin: 0x00, Dash: 0x4c, etc.
+		p2pkhVersionByte byte
 	}
 )
 
@@ -255,8 +259,9 @@ func NewBitcoinNativeParser(params internal.ParserParams, opts ...internal.Parse
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
 	v.RegisterStructValidation(validateBitcoinTransactionVinVout, BitcoinTransaction{})
 	return &bitcoinNativeParserImpl{
-		logger:   log.WithPackage(params.Logger),
-		validate: v,
+		logger:           log.WithPackage(params.Logger),
+		validate:         v,
+		p2pkhVersionByte: 0x00,
 	}, nil
 }
 
@@ -341,7 +346,7 @@ func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
 				metadataMap[inputTxId] = make([]*api.BitcoinTransactionOutput, 0)
 			}
 
-			outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput()
+			outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput(b.p2pkhVersionByte)
 			if err != nil {
 				return nil, xerrors.Errorf("failed to convert to transaction output: %w", err)
 			}
@@ -361,7 +366,7 @@ func (b *bitcoinNativeParserImpl) parseTransactions(
 		return nil, err
 	}
 
-	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap)
+	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap, b.p2pkhVersionByte)
 	if err != nil {
 		return nil, err
 	}
@@ -370,11 +375,11 @@ func (b *bitcoinNativeParserImpl) parseTransactions(
 }
 
 func (b *bitcoinNativeParserImpl) parseApiBitcoinTransactions(
-	rawTransactions []*BitcoinTransaction, metadataMap map[string][]*api.BitcoinTransactionOutput,
+	rawTransactions []*BitcoinTransaction, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte,
 ) ([]*api.BitcoinTransaction, error) {
 	transactions := make([]*api.BitcoinTransaction, len(rawTransactions))
 	for i, rawTx := range rawTransactions {
-		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap)
+		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p2pkhVersionByte)
 		if err != nil {
 			return nil, err
 		}
@@ -424,13 +429,13 @@ func (b *BitcoinBlock) GetApiBitcoinHeader() *api.BitcoinHeader {
 	}
 }
 
-func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[string][]*api.BitcoinTransactionOutput) (*api.BitcoinTransaction, error) {
+func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte) (*api.BitcoinTransaction, error) {
 	vin, err := parseVin(t.Vin, metadataMap)
 	if err != nil {
 		return nil, err
 	}
 
-	vout, err := parseVout(t.Vout)
+	vout, err := parseVout(t.Vout, p2pkhVersionByte)
 	if err != nil {
 		return nil, err
 	}
@@ -535,10 +540,10 @@ func hexStringsToStrings(hexStrings []BitcoinHexString) []string {
 	return result
 }
 
-func parseVout(vout []*BitcoinTransactionOutput) ([]*api.BitcoinTransactionOutput, error) {
+func parseVout(vout []*BitcoinTransactionOutput, p2pkhVersionByte byte) ([]*api.BitcoinTransactionOutput, error) {
 	outputs := make([]*api.BitcoinTransactionOutput, len(vout))
 	for i, outputTx := range vout {
-		output, err := outputTx.ToApiBitcoinTransactionOutput()
+		output, err := outputTx.ToApiBitcoinTransactionOutput(p2pkhVersionByte)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to convert transaction output: %w", err)
 		}
@@ -549,13 +554,13 @@ func parseVout(vout []*BitcoinTransactionOutput) ([]*api.BitcoinTransactionOutpu
 	return outputs, nil
 }
 
-func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput() (*api.BitcoinTransactionOutput, error) {
+func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput(p2pkhVersionByte byte) (*api.BitcoinTransactionOutput, error) {
 	value, err := btcutil.NewAmount(o.Value.Value())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to convert value %v to btc amount: %w", o.Value.Value(), err)
 	}
 
-	scriptPubKey, err := o.ScriptPubKey.ToApiBitcoinScriptPublicKey()
+	scriptPubKey, err := o.ScriptPubKey.ToApiBitcoinScriptPublicKey(p2pkhVersionByte)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to convert script public key: %w", err)
 	}
@@ -567,7 +572,7 @@ func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput() (*api.Bitcoin
 	}, nil
 }
 
-func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey() (*api.BitcoinScriptPublicKey, error) {
+func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey(p2pkhVersionByte byte) (*api.BitcoinScriptPublicKey, error) {
 	if k == nil {
 		return nil, nil
 	}
@@ -588,7 +593,7 @@ func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey() (*api.BitcoinScriptP
 		Address:  k.Address.Value(),
 	}
 
-	transformedScriptPublicKey, err := transformScriptPublicKey(scriptPublicKey)
+	transformedScriptPublicKey, err := transformScriptPublicKey(scriptPublicKey, p2pkhVersionByte)
 	if err != nil {
 		return nil, err
 	}
@@ -682,7 +687,7 @@ func (v *BitcoinTransactionLit) UnmarshalJSON(input []byte) error {
 }
 
 func transformScriptPublicKey(
-	scriptPubKey *api.BitcoinScriptPublicKey,
+	scriptPubKey *api.BitcoinScriptPublicKey, p2pkhVersionByte byte,
 ) (*api.BitcoinScriptPublicKey, error) {
 	switch scriptPubKey.Type {
 	case bitcoinScriptTypePubKey:
@@ -691,7 +696,7 @@ func transformScriptPublicKey(
 		}
 
 		// Attempt to fall back to parsing the address from the script.
-		account, err := parseAccountFromPubKeyScript(scriptPubKey)
+		account, err := parseAccountFromPubKeyScript(scriptPubKey, p2pkhVersionByte)
 		if err != nil {
 			return nil, err
 		}
@@ -704,7 +709,7 @@ func transformScriptPublicKey(
 }
 
 func parseAccountFromPubKeyScript(
-	scriptPubKey *api.BitcoinScriptPublicKey,
+	scriptPubKey *api.BitcoinScriptPublicKey, p2pkhVersionByte byte,
 ) (string, error) {
 	if scriptPubKey.Type != bitcoinScriptTypePubKey {
 		return "", xerrors.New("not of type pubkey")
@@ -725,7 +730,7 @@ func parseAccountFromPubKeyScript(
 	_, _ = sha256Hash.Write(pubKey)
 	ripemd160Hash := ripemd160.New()
 	_, _ = ripemd160Hash.Write(sha256Hash.Sum(nil))
-	address := base58.CheckEncode(ripemd160Hash.Sum(nil), 0)
+	address := base58.CheckEncode(ripemd160Hash.Sum(nil), p2pkhVersionByte)
 
 	return address, nil
 }
