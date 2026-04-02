@@ -97,7 +97,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHeight() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHeight(context.Background(), btcTag, btcFixtureBlockHeight)
@@ -212,7 +212,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHash() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)

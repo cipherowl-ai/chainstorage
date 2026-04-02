@@ -75,7 +75,7 @@ var (
 	}
 	bitcoinGetRawTransactionMethod = &jsonrpc.RequestMethod{
 		Name:    "getrawtransaction",
-		Timeout: time.Second * 30,
+		Timeout: time.Second * 10,
 	}
 	bitcoinGetBlockCountMethod = &jsonrpc.RequestMethod{
 		Name:    "getblockcount",
@@ -397,8 +397,14 @@ func (b *bitcoinClient) fetchInputTransactions(
 		}
 
 		g.Go(func() error {
-			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.start", idx)
-			responses, err := b.client.BatchCall(ctx, bitcoinGetRawTransactionMethod, batchParams)
+			responses, err := b.client.BatchCall(
+				ctx,
+				bitcoinGetRawTransactionMethod,
+				batchParams,
+				jsonrpc.WithOnAttempt(func(ctx context.Context, attempt int) {
+					opts.RecordHeartbeat(ctx, "fetchInputTx.batch", idx, attempt)
+				}),
+			)
 			if err != nil {
 				return xerrors.Errorf(
 					"failed to call %s for subset of (blockHash=%s, startTransactionID=%v, batchSize=%v): %w",
@@ -410,7 +416,7 @@ func (b *bitcoinClient) fetchInputTransactions(
 				)
 			}
 			batchResults[idx] = responses
-			opts.RecordHeartbeat(ctx, "fetchInputTx", idx)
+			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.done", idx)
 			return nil
 		})
 	}

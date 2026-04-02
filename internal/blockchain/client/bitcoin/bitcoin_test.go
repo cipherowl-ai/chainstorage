@@ -227,7 +227,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHeight() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHeight(context.Background(), btcTag, btcFixtureBlockHeight)
@@ -388,7 +388,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
@@ -550,7 +550,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_GetInputTransa
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(nil, xerrors.Errorf("error making http requests"))
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
@@ -595,7 +595,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_GetRawTransact
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, xerrors.Errorf("error making http requests"))
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
@@ -660,7 +660,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_InputTransacti
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
@@ -1188,7 +1188,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_SharedParentTx
 	// Only 2 unique parent txids should be fetched (parentA, parentB) in one batch
 	s.rpcClient.EXPECT().BatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod,
-		[]jsonrpc.Params{{parentTxA, true}, {parentTxB, true}},
+		[]jsonrpc.Params{{parentTxA, true}, {parentTxB, true}}, gomock.Any(),
 	).Return([]*jsonrpc.Response{
 		{Result: parentARespJSON},
 		{Result: parentBRespJSON},
@@ -1249,7 +1249,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_DuplicateTxidV
 
 	s.rpcClient.EXPECT().BatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod,
-		[]jsonrpc.Params{{parentTxA, true}},
+		[]jsonrpc.Params{{parentTxA, true}}, gomock.Any(),
 	).Return([]*jsonrpc.Response{
 		{Result: parentARespJSON},
 	}, nil)
@@ -1309,7 +1309,7 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_GetBlockByHash_OutputShapeAnd
 
 	s.rpcClient.EXPECT().BatchCall(
 		gomock.Any(), bitcoinGetRawTransactionMethod,
-		[]jsonrpc.Params{{parentTxA, true}},
+		[]jsonrpc.Params{{parentTxA, true}}, gomock.Any(),
 	).Return([]*jsonrpc.Response{
 		{Result: parentARespJSON},
 	}, nil)
