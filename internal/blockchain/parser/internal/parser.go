@@ -71,6 +71,7 @@ type (
 		Seismic         ParserFactory `name:"seismic" optional:"true"`
 		Dash            ParserFactory `name:"dash" optional:"true"`
 		Zcash           ParserFactory `name:"zcash" optional:"true"`
+		Tempo           ParserFactory `name:"tempo" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -134,6 +135,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Megaeth
 		case common.Blockchain_BLOCKCHAIN_SEISMIC:
 			factory = params.Seismic
+		case common.Blockchain_BLOCKCHAIN_TEMPO:
+			factory = params.Tempo
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta

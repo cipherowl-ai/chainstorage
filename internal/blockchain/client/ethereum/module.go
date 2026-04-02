@@ -71,5 +71,9 @@ var Module = fx.Options(
 		Name:   "seismic",
 		Target: NewSeismicClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "tempo",
+		Target: NewTempoClientFactory,
+	}),
 	beacon.Module,
 )
