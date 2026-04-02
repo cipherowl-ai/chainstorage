@@ -60,7 +60,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHeight() {
 		Result: json.RawMessage(btcFixtureGetBlockHashResponse),
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockHashMethod, jsonrpc.Params{
+		gomock.Any(), defaultGetBlockHash, jsonrpc.Params{
 			btcFixtureBlockHeight,
 		},
 	).Return(getBlockHashResponse, nil)
@@ -72,7 +72,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHeight() {
 		Error:  nil,
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{
+		gomock.Any(), defaultGetBlockByHash, jsonrpc.Params{
 			btcFixtureBlockHash,
 			bitcoinBlockVerbosity,
 		},
@@ -97,7 +97,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHeight() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), defaultGetRawTransaction, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHeight(context.Background(), btcTag, btcFixtureBlockHeight)
@@ -148,7 +148,7 @@ func (s *dashClientTestSuite) TestDashClient_GetGenesisBlockByHeight() {
 		Result: json.RawMessage(btcFixtureGenesisBlockHashResponse),
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockHashMethod, jsonrpc.Params{
+		gomock.Any(), defaultGetBlockHash, jsonrpc.Params{
 			uint64(0),
 		},
 	).Return(getBlockHashResponse, nil)
@@ -158,7 +158,7 @@ func (s *dashClientTestSuite) TestDashClient_GetGenesisBlockByHeight() {
 		Error:  nil,
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{
+		gomock.Any(), defaultGetBlockByHash, jsonrpc.Params{
 			btcFixtureGenesisBlockHash,
 			bitcoinBlockVerbosity,
 		},
@@ -187,7 +187,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHash() {
 		Error:  nil,
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockByHashMethod, jsonrpc.Params{
+		gomock.Any(), defaultGetBlockByHash, jsonrpc.Params{
 			btcFixtureBlockHash,
 			bitcoinBlockVerbosity,
 		},
@@ -212,7 +212,7 @@ func (s *dashClientTestSuite) TestDashClient_GetBlockByHash() {
 		)
 	}
 	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), bitcoinGetRawTransactionMethod, expectedParams,
+		gomock.Any(), defaultGetRawTransaction, expectedParams, gomock.Any(),
 	).Return(getRawTransactionResponse, nil)
 
 	block, err := s.client.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
@@ -242,7 +242,7 @@ func (s *dashClientTestSuite) TestDashClient_GetLatestHeight() {
 		Result: json.RawMessage(btcFixtureGetBlockCountResponse),
 	}
 	s.rpcClient.EXPECT().Call(
-		gomock.Any(), bitcoinGetBlockCountMethod, jsonrpc.Params{},
+		gomock.Any(), defaultGetBlockCount, jsonrpc.Params{},
 	).Return(getBlockCountResponse, nil)
 
 	height, err := s.client.GetLatestHeight(context.Background())

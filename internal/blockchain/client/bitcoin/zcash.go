@@ -1,6 +1,8 @@
 package bitcoin
 
 import (
+	"time"
+
 	"github.com/go-playground/validator/v10"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
@@ -16,6 +18,7 @@ func NewZcashClientFactory(params internal.JsonrpcClientParams) internal.ClientF
 			logger:                       logger,
 			client:                       client,
 			validate:                     validator.New(),
+			methods:                      newRPCMethods(rpcMethodsOverride{rpcMethodGetRawTransaction: &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: 10 * time.Second}}),
 			preserveRawInputTransactions: true,
 			getRawTxParams: func(txid string, _ string) jsonrpc.Params {
 				return jsonrpc.Params{txid, 1}

@@ -80,13 +80,16 @@ type (
 		Name    string
 		Timeout time.Duration
 	}
+)
 
+type (
 	Params []any
 
 	Option func(opts *options)
 
 	options struct {
 		allowsRPCError bool
+		onAttempt      func(ctx context.Context, attempt int)
 	}
 )
 
@@ -141,6 +144,15 @@ func WithAllowsRPCError() Option {
 	}
 }
 
+// WithOnAttempt registers a callback invoked at the start of each attempt
+// (including retries). This is useful for recording heartbeats so that
+// long-running retry loops do not appear idle to the caller.
+func WithOnAttempt(fn func(ctx context.Context, attempt int)) Option {
+	return func(opts *options) {
+		opts.onAttempt = fn
+	}
+}
+
 func newClient(params ClientParams, endpointProvider endpoints.EndpointProvider) (Client, error) {
 	logger := log.WithPackage(params.Logger)
 
@@ -188,7 +200,13 @@ func (c *clientImpl) Call(ctx context.Context, method *RequestMethod, params Par
 	}
 
 	var response *Response
+	attempt := 0
 	if err := c.wrap(ctx, method.Name, endpoint.Name, []Params{params}, func(ctx context.Context) error {
+		if options.onAttempt != nil {
+			options.onAttempt(ctx, attempt)
+		}
+		attempt++
+
 		response = new(Response)
 		if err := c.makeHTTPRequest(ctx, method.Timeout, endpoint, request, response); err != nil {
 			return xerrors.Errorf("failed to make http request (method=%v, params=%v, endpoint=%v): %w", method, params, endpoint.Name, err)
@@ -230,7 +248,13 @@ func (c *clientImpl) BatchCall(ctx context.Context, method *RequestMethod, batch
 	}
 
 	finalBatchResponses := make([]*Response, len(batchParams))
+	attempt := 0
 	if err := c.wrap(ctx, method.Name, endpoint.Name, batchParams, func(ctx context.Context) error {
+		if options.onAttempt != nil {
+			options.onAttempt(ctx, attempt)
+		}
+		attempt++
+
 		var batchResponses []Response
 		if err := c.makeHTTPRequest(ctx, method.Timeout, endpoint, batchRequests, &batchResponses); err != nil {
 			return xerrors.Errorf(
