@@ -175,5 +175,8 @@ func NewSeismicNativeParser(params internal.ParserParams, opts ...internal.Parse
 		params.Logger.Warn("SRC20_AES_KEY is not configured for Seismic parser; SRC20 token transfers will be skipped.")
 	}
 
+	// Seismic timestamps are in milliseconds, convert to seconds.
+	opts = append(opts, WithTimestampInMs())
+
 	return NewEthereumNativeParser(params, opts...)
 }
