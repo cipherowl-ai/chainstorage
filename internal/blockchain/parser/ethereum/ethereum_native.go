@@ -21,6 +21,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/utils"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -687,12 +688,9 @@ func (p *ethereumNativeParserImpl) GetTransaction(ctx context.Context, nativeBlo
 // If timestampInMs is true, preserves millisecond precision in the Nanos field.
 func (p *ethereumNativeParserImpl) toTimestamp(rawTimestamp int64) *timestamp.Timestamp {
 	if p.timestampInMs {
-		return &timestamp.Timestamp{
-			Seconds: rawTimestamp / 1000,
-			Nanos:   int32((rawTimestamp % 1000) * 1_000_000),
-		}
+		return utils.ToTimestampFromMs(rawTimestamp)
 	}
-	return &timestamp.Timestamp{Seconds: rawTimestamp}
+	return utils.ToTimestamp(rawTimestamp)
 }
 
 func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader, []*api.EthereumTransaction, error) {
