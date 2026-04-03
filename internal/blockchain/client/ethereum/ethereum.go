@@ -14,6 +14,7 @@ import (
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
@@ -41,6 +42,7 @@ type (
 		nodeType        types.EthereumNodeType
 		traceType       types.TraceType
 		commitmentLevel types.CommitmentLevel
+		timestampInMs   bool // If true, raw timestamps are in milliseconds and need to be converted to seconds
 	}
 
 	EthereumBlockTracer interface {
@@ -287,6 +289,21 @@ func WithEthereumCommitmentLevel(commitmentLevel types.CommitmentLevel) Ethereum
 	}
 }
 
+func WithEthereumTimestampInMs() EthereumClientOption {
+	return func(client *EthereumClient) {
+		client.timestampInMs = true
+	}
+}
+
+// toTimestamp converts a raw block timestamp to a protobuf Timestamp.
+// If timestampInMs is true, preserves millisecond precision in the Nanos field.
+func (c *EthereumClient) toTimestamp(rawTimestamp int64) *timestamppb.Timestamp {
+	if c.timestampInMs {
+		return utils.ToTimestampFromMs(rawTimestamp)
+	}
+	return utils.ToTimestamp(rawTimestamp)
+}
+
 func newEthereumClientMetrics(scope tally.Scope) *ethereumClientMetrics {
 	scope = scope.SubScope(subScope)
 
@@ -413,7 +430,7 @@ func (c *EthereumClient) batchGetBlockMetadata(ctx context.Context, tag uint32, 
 			ParentHeight: internal.GetParentHeight(height),
 			Hash:         headerResult.header.Hash.Value(),
 			ParentHash:   headerResult.header.ParentHash.Value(),
-			Timestamp:    utils.ToTimestamp(int64(headerResult.header.Timestamp.Value())),
+			Timestamp:    c.toTimestamp(int64(headerResult.header.Timestamp.Value())),
 		}
 	}
 
@@ -520,7 +537,7 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 			ParentHeight: internal.GetParentHeight(headerResult.header.Number.Value()),
 			Hash:         headerResult.header.Hash.Value(),
 			ParentHash:   headerResult.header.ParentHash.Value(),
-			Timestamp:    utils.ToTimestamp(int64(headerResult.header.Timestamp.Value())),
+			Timestamp:    c.toTimestamp(int64(headerResult.header.Timestamp.Value())),
 		},
 		Blobdata: &api.Block_Ethereum{
 			Ethereum: &api.EthereumBlobdata{

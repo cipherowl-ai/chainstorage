@@ -21,6 +21,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/utils"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -238,13 +239,14 @@ type (
 	}
 
 	ethereumNativeParserImpl struct {
-		Logger      *zap.Logger
-		validate    *validator.Validate
-		nodeType    types.EthereumNodeType
-		traceType   types.TraceType
-		config      *config.Config
-		metrics     *ethereumNativeParserMetrics
-		src20Parser SRC20TokenTransferParser // Optional, only Seismic sets this
+		Logger        *zap.Logger
+		validate      *validator.Validate
+		nodeType      types.EthereumNodeType
+		traceType     types.TraceType
+		config        *config.Config
+		metrics       *ethereumNativeParserMetrics
+		src20Parser   SRC20TokenTransferParser // Optional, only Seismic sets this
+		timestampInMs bool                     // If true, raw timestamps are in milliseconds and need to be converted to seconds
 	}
 
 	ethereumParserOptions struct {
@@ -252,6 +254,7 @@ type (
 		traceType       types.TraceType
 		checksumAddress bool
 		src20Parser     SRC20TokenTransferParser
+		timestampInMs   bool
 	}
 
 	nestedParityTrace struct {
@@ -451,13 +454,14 @@ func NewEthereumNativeParser(params internal.ParserParams, opts ...internal.Pars
 	}
 
 	return &ethereumNativeParserImpl{
-		Logger:      log.WithPackage(params.Logger),
-		validate:    validator.New(),
-		nodeType:    options.nodeType,
-		traceType:   options.traceType,
-		config:      params.Config,
-		metrics:     newEthereumNativeParserMetrics(params.Metrics),
-		src20Parser: options.src20Parser,
+		Logger:        log.WithPackage(params.Logger),
+		validate:      validator.New(),
+		nodeType:      options.nodeType,
+		traceType:     options.traceType,
+		config:        params.Config,
+		metrics:       newEthereumNativeParserMetrics(params.Metrics),
+		src20Parser:   options.src20Parser,
+		timestampInMs: options.timestampInMs,
 	}, nil
 }
 
@@ -501,6 +505,15 @@ func WithSRC20Parser(parser SRC20TokenTransferParser) internal.ParserFactoryOpti
 	return func(options any) {
 		if v, ok := options.(*ethereumParserOptions); ok {
 			v.src20Parser = parser
+		}
+	}
+}
+
+// WithTimestampInMs indicates that raw block timestamps are in milliseconds and should be converted to seconds.
+func WithTimestampInMs() internal.ParserFactoryOption {
+	return func(options any) {
+		if v, ok := options.(*ethereumParserOptions); ok {
+			v.timestampInMs = true
 		}
 	}
 }
@@ -671,6 +684,15 @@ func (p *ethereumNativeParserImpl) GetTransaction(ctx context.Context, nativeBlo
 	return nil, internal.ErrNotImplemented
 }
 
+// toTimestamp converts a raw block timestamp to a protobuf Timestamp.
+// If timestampInMs is true, preserves millisecond precision in the Nanos field.
+func (p *ethereumNativeParserImpl) toTimestamp(rawTimestamp int64) *timestamp.Timestamp {
+	if p.timestampInMs {
+		return utils.ToTimestampFromMs(rawTimestamp)
+	}
+	return utils.ToTimestamp(rawTimestamp)
+}
+
 func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader, []*api.EthereumTransaction, error) {
 	var block EthereumBlock
 	if err := json.Unmarshal(data, &block); err != nil {
@@ -699,7 +721,7 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 			Index:          transaction.Index.Value(),
 			Value:          transaction.Value.Value(),
 			Type:           transaction.Type.Value(),
-			BlockTimestamp: &timestamp.Timestamp{Seconds: int64(block.Timestamp.Value())},
+			BlockTimestamp: p.toTimestamp(int64(block.Timestamp.Value())),
 			V:              transaction.V.Value(),
 			S:              transaction.S.Value(),
 			R:              transaction.R.Value(),
@@ -797,7 +819,7 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 		Hash:                  block.Hash.Value(),
 		ParentHash:            block.ParentHash.Value(),
 		Number:                block.Number.Value(),
-		Timestamp:             &timestamp.Timestamp{Seconds: int64(block.Timestamp.Value())},
+		Timestamp:             p.toTimestamp(int64(block.Timestamp.Value())),
 		Transactions:          transactionHashes,
 		Nonce:                 block.Nonce.Value(),
 		Sha3Uncles:            block.Sha3Uncles.Value(),

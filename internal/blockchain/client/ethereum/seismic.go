@@ -6,5 +6,6 @@ import (
 
 func NewSeismicClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
 	// Shares the same data schema as Ethereum since it is an EVM chain.
-	return NewEthereumClientFactory(params)
+	// Seismic timestamps are in milliseconds, so we convert them to seconds.
+	return NewEthereumClientFactory(params, WithEthereumTimestampInMs())
 }
