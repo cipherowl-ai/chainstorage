@@ -14,6 +14,7 @@ import (
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
@@ -294,12 +295,13 @@ func WithEthereumTimestampInMs() EthereumClientOption {
 	}
 }
 
-// toSeconds converts a raw timestamp to seconds. If timestampInMs is true, divides by 1000.
-func (c *EthereumClient) toSeconds(rawTimestamp int64) int64 {
+// toTimestamp converts a raw block timestamp to a protobuf Timestamp.
+// If timestampInMs is true, preserves millisecond precision in the Nanos field.
+func (c *EthereumClient) toTimestamp(rawTimestamp int64) *timestamppb.Timestamp {
 	if c.timestampInMs {
-		return rawTimestamp / 1000
+		return utils.ToTimestampFromMs(rawTimestamp)
 	}
-	return rawTimestamp
+	return utils.ToTimestamp(rawTimestamp)
 }
 
 func newEthereumClientMetrics(scope tally.Scope) *ethereumClientMetrics {
@@ -428,7 +430,7 @@ func (c *EthereumClient) batchGetBlockMetadata(ctx context.Context, tag uint32, 
 			ParentHeight: internal.GetParentHeight(height),
 			Hash:         headerResult.header.Hash.Value(),
 			ParentHash:   headerResult.header.ParentHash.Value(),
-			Timestamp:    utils.ToTimestamp(c.toSeconds(int64(headerResult.header.Timestamp.Value()))),
+			Timestamp:    c.toTimestamp(int64(headerResult.header.Timestamp.Value())),
 		}
 	}
 
@@ -535,7 +537,7 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 			ParentHeight: internal.GetParentHeight(headerResult.header.Number.Value()),
 			Hash:         headerResult.header.Hash.Value(),
 			ParentHash:   headerResult.header.ParentHash.Value(),
-			Timestamp:    utils.ToTimestamp(c.toSeconds(int64(headerResult.header.Timestamp.Value()))),
+			Timestamp:    c.toTimestamp(int64(headerResult.header.Timestamp.Value())),
 		},
 		Blobdata: &api.Block_Ethereum{
 			Ethereum: &api.EthereumBlobdata{

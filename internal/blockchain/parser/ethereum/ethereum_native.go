@@ -683,12 +683,16 @@ func (p *ethereumNativeParserImpl) GetTransaction(ctx context.Context, nativeBlo
 	return nil, internal.ErrNotImplemented
 }
 
-// toSeconds converts a raw timestamp to seconds. If timestampInMs is true, divides by 1000.
-func (p *ethereumNativeParserImpl) toSeconds(rawTimestamp int64) int64 {
+// toTimestamp converts a raw block timestamp to a protobuf Timestamp.
+// If timestampInMs is true, preserves millisecond precision in the Nanos field.
+func (p *ethereumNativeParserImpl) toTimestamp(rawTimestamp int64) *timestamp.Timestamp {
 	if p.timestampInMs {
-		return rawTimestamp / 1000
+		return &timestamp.Timestamp{
+			Seconds: rawTimestamp / 1000,
+			Nanos:   int32((rawTimestamp % 1000) * 1_000_000),
+		}
 	}
-	return rawTimestamp
+	return &timestamp.Timestamp{Seconds: rawTimestamp}
 }
 
 func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader, []*api.EthereumTransaction, error) {
@@ -719,7 +723,7 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 			Index:          transaction.Index.Value(),
 			Value:          transaction.Value.Value(),
 			Type:           transaction.Type.Value(),
-			BlockTimestamp: &timestamp.Timestamp{Seconds: p.toSeconds(int64(block.Timestamp.Value()))},
+			BlockTimestamp: p.toTimestamp(int64(block.Timestamp.Value())),
 			V:              transaction.V.Value(),
 			S:              transaction.S.Value(),
 			R:              transaction.R.Value(),
@@ -817,7 +821,7 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 		Hash:                  block.Hash.Value(),
 		ParentHash:            block.ParentHash.Value(),
 		Number:                block.Number.Value(),
-		Timestamp:             &timestamp.Timestamp{Seconds: p.toSeconds(int64(block.Timestamp.Value()))},
+		Timestamp:             p.toTimestamp(int64(block.Timestamp.Value())),
 		Transactions:          transactionHashes,
 		Nonce:                 block.Nonce.Value(),
 		Sha3Uncles:            block.Sha3Uncles.Value(),
