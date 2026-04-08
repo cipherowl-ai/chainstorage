@@ -256,6 +256,7 @@ message EthereumTokenTransfer {
   oneof token_transfer {
     ERC20TokenTransfer erc20 = 100;
     ERC721TokenTransfer erc721 = 101;
+    SRC20TokenTransfer src20 = 102;
   }
 }
 
@@ -269,6 +270,12 @@ message ERC721TokenTransfer {
   string from_address = 1;
   string to_address = 2;
   string token_id = 3;
+}
+
+message SRC20TokenTransfer {
+  string from_address = 1;
+  string to_address = 2;
+  string value = 3;
 }
 
 message EthereumAccountStateProof {
