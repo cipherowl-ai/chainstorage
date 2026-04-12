@@ -14,11 +14,14 @@ func NewZcashClientFactory(params internal.JsonrpcClientParams) internal.ClientF
 	return internal.NewJsonrpcClientFactory(params, func(client jsonrpc.Client) internal.Client {
 		logger := log.WithPackage(params.Logger)
 		return &bitcoinClient{
-			config:                       params.Config,
-			logger:                       logger,
-			client:                       client,
-			validate:                     validator.New(),
-			methods:                      newRPCMethods(rpcMethodsOverride{rpcMethodGetRawTransaction: &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: 10 * time.Second}}),
+			config:   params.Config,
+			logger:   logger,
+			client:   client,
+			validate: validator.New(),
+			methods: newRPCMethods(
+				rpcMethodsOverrideFromConfig(params.Config),
+				rpcMethodsOverride{rpcMethodGetRawTransaction: &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: 10 * time.Second}},
+			),
 			preserveRawInputTransactions: true,
 			getRawTxParams: func(txid string, _ string) jsonrpc.Params {
 				return jsonrpc.Params{txid, 1}

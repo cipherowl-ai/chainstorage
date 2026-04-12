@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
+	"github.com/coinbase/chainstorage/internal/config"
 	jsonrpcmocks "github.com/coinbase/chainstorage/internal/blockchain/jsonrpc/mocks"
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/blockchain/restapi"
@@ -128,6 +130,39 @@ type bitcoinClientTestSuite struct {
 	testapp   testapp.TestApp
 	rpcClient *jsonrpcmocks.MockClient
 	client    internal.Client
+}
+
+func TestRpcMethodsOverrideFromConfig(t *testing.T) {
+	t.Run("NoOverrides", func(t *testing.T) {
+		require := testutil.Require(t)
+		cfg := &config.Config{}
+		methods := newRPCMethods(rpcMethodsOverrideFromConfig(cfg))
+		require.Equal(defaultGetBlockByHash.Timeout, methods.getBlockByHash.Timeout)
+		require.Equal(defaultGetRawTransaction.Timeout, methods.getRawTransaction.Timeout)
+		require.Equal(defaultGetBlockHash.Timeout, methods.getBlockHash.Timeout)
+	})
+
+	t.Run("OverrideGetRawTx", func(t *testing.T) {
+		require := testutil.Require(t)
+		cfg := &config.Config{}
+		cfg.Chain.Client.RpcTimeoutGetRawTx = 60 * time.Second
+		methods := newRPCMethods(rpcMethodsOverrideFromConfig(cfg))
+		require.Equal(60*time.Second, methods.getRawTransaction.Timeout)
+		require.Equal(defaultGetBlockByHash.Timeout, methods.getBlockByHash.Timeout)
+		require.Equal(defaultGetBlockHash.Timeout, methods.getBlockHash.Timeout)
+	})
+
+	t.Run("OverrideAll", func(t *testing.T) {
+		require := testutil.Require(t)
+		cfg := &config.Config{}
+		cfg.Chain.Client.RpcTimeoutGetBlock = 20 * time.Second
+		cfg.Chain.Client.RpcTimeoutGetRawTx = 60 * time.Second
+		cfg.Chain.Client.RpcTimeoutGetBlockHash = 10 * time.Second
+		methods := newRPCMethods(rpcMethodsOverrideFromConfig(cfg))
+		require.Equal(20*time.Second, methods.getBlockByHash.Timeout)
+		require.Equal(60*time.Second, methods.getRawTransaction.Timeout)
+		require.Equal(10*time.Second, methods.getBlockHash.Timeout)
+	})
 }
 
 func TestBitcoinClientTestSuite(t *testing.T) {
