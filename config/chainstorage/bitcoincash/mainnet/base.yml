@@ -59,6 +59,7 @@ chain:
     http_timeout: 0s
     master:
       endpoint_group: ""
+    rpc_timeout_get_block: 30s
     rpc_timeout_get_raw_tx: 60s
     slave:
       endpoint_group: ""

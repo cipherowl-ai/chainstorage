@@ -132,13 +132,13 @@ func rpcMethodsOverrideFromConfig(cfg *config.Config) rpcMethodsOverride {
 	override := make(rpcMethodsOverride)
 	clientCfg := cfg.Chain.Client
 	if clientCfg.RpcTimeoutGetBlock > 0 {
-		override[rpcMethodGetBlockByHash] = &jsonrpc.RequestMethod{Name: "getblock", Timeout: clientCfg.RpcTimeoutGetBlock}
+		override[rpcMethodGetBlockByHash] = &jsonrpc.RequestMethod{Name: defaultGetBlockByHash.Name, Timeout: clientCfg.RpcTimeoutGetBlock}
 	}
 	if clientCfg.RpcTimeoutGetRawTx > 0 {
-		override[rpcMethodGetRawTransaction] = &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: clientCfg.RpcTimeoutGetRawTx}
+		override[rpcMethodGetRawTransaction] = &jsonrpc.RequestMethod{Name: defaultGetRawTransaction.Name, Timeout: clientCfg.RpcTimeoutGetRawTx}
 	}
 	if clientCfg.RpcTimeoutGetBlockHash > 0 {
-		override[rpcMethodGetBlockHash] = &jsonrpc.RequestMethod{Name: "getblockhash", Timeout: clientCfg.RpcTimeoutGetBlockHash}
+		override[rpcMethodGetBlockHash] = &jsonrpc.RequestMethod{Name: defaultGetBlockHash.Name, Timeout: clientCfg.RpcTimeoutGetBlockHash}
 	}
 	return override
 }

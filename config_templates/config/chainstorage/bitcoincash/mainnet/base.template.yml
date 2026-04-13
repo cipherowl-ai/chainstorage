@@ -8,6 +8,7 @@ aws:
 chain:
   client:
     tx_batch_size: 100
+    rpc_timeout_get_block: 30s
     rpc_timeout_get_raw_tx: 60s
   block_tag:
     latest: 2

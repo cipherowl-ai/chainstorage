@@ -19,8 +19,8 @@ func NewZcashClientFactory(params internal.JsonrpcClientParams) internal.ClientF
 			client:   client,
 			validate: validator.New(),
 			methods: newRPCMethods(
+				rpcMethodsOverride{rpcMethodGetRawTransaction: &jsonrpc.RequestMethod{Name: defaultGetRawTransaction.Name, Timeout: 10 * time.Second}},
 				rpcMethodsOverrideFromConfig(params.Config),
-				rpcMethodsOverride{rpcMethodGetRawTransaction: &jsonrpc.RequestMethod{Name: "getrawtransaction", Timeout: 10 * time.Second}},
 			),
 			preserveRawInputTransactions: true,
 			getRawTxParams: func(txid string, _ string) jsonrpc.Params {
