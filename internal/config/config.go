@@ -76,14 +76,17 @@ type (
 	}
 
 	ClientConfig struct {
-		Master      JSONRPCConfig     `mapstructure:"master"`
-		Slave       JSONRPCConfig     `mapstructure:"slave"`
-		Validator   JSONRPCConfig     `mapstructure:"validator"`
-		Consensus   JSONRPCConfig     `mapstructure:"consensus"`
-		Additional  JSONRPCConfig     `mapstructure:"additional"`
-		Retry       ClientRetryConfig `mapstructure:"retry"`
-		HttpTimeout time.Duration     `mapstructure:"http_timeout"`
-		TxBatchSize int               `mapstructure:"tx_batch_size"`
+		Master                 JSONRPCConfig     `mapstructure:"master"`
+		Slave                  JSONRPCConfig     `mapstructure:"slave"`
+		Validator              JSONRPCConfig     `mapstructure:"validator"`
+		Consensus              JSONRPCConfig     `mapstructure:"consensus"`
+		Additional             JSONRPCConfig     `mapstructure:"additional"`
+		Retry                  ClientRetryConfig `mapstructure:"retry"`
+		HttpTimeout            time.Duration     `mapstructure:"http_timeout"`
+		TxBatchSize            int               `mapstructure:"tx_batch_size"`
+		RpcTimeoutGetBlock     time.Duration     `mapstructure:"rpc_timeout_get_block"`
+		RpcTimeoutGetRawTx     time.Duration     `mapstructure:"rpc_timeout_get_raw_tx"`
+		RpcTimeoutGetBlockHash time.Duration     `mapstructure:"rpc_timeout_get_block_hash"`
 	}
 
 	JSONRPCConfig struct {

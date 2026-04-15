@@ -125,6 +125,24 @@ func newRPCMethods(overrides ...rpcMethodsOverride) rpcMethods {
 	return methods
 }
 
+// rpcMethodsOverrideFromConfig builds an rpcMethodsOverride from configurable
+// timeout values in ClientConfig. Zero-value durations are skipped, preserving
+// the compiled defaults.
+func rpcMethodsOverrideFromConfig(cfg *config.Config) rpcMethodsOverride {
+	override := make(rpcMethodsOverride)
+	clientCfg := cfg.Chain.Client
+	if clientCfg.RpcTimeoutGetBlock > 0 {
+		override[rpcMethodGetBlockByHash] = &jsonrpc.RequestMethod{Name: defaultGetBlockByHash.Name, Timeout: clientCfg.RpcTimeoutGetBlock}
+	}
+	if clientCfg.RpcTimeoutGetRawTx > 0 {
+		override[rpcMethodGetRawTransaction] = &jsonrpc.RequestMethod{Name: defaultGetRawTransaction.Name, Timeout: clientCfg.RpcTimeoutGetRawTx}
+	}
+	if clientCfg.RpcTimeoutGetBlockHash > 0 {
+		override[rpcMethodGetBlockHash] = &jsonrpc.RequestMethod{Name: defaultGetBlockHash.Name, Timeout: clientCfg.RpcTimeoutGetBlockHash}
+	}
+	return override
+}
+
 func NewBitcoinClientFactory(params internal.JsonrpcClientParams) internal.ClientFactory {
 	return internal.NewJsonrpcClientFactory(params, func(client jsonrpc.Client) internal.Client {
 		logger := log.WithPackage(params.Logger)
@@ -133,7 +151,7 @@ func NewBitcoinClientFactory(params internal.JsonrpcClientParams) internal.Clien
 			logger:   logger,
 			client:   client,
 			validate: validator.New(),
-			methods:  newRPCMethods(),
+			methods:  newRPCMethods(rpcMethodsOverrideFromConfig(params.Config)),
 		}
 	})
 }
