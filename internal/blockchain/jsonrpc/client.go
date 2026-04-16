@@ -357,12 +357,13 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 	finalizer := finalizer.WithCloser(response.Body)
 	defer finalizer.Finalize()
 
-	responseBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
-	}
-
 	if response.StatusCode != http.StatusOK {
+		// Error path: read the full body for diagnostics (errors are small).
+		responseBody, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			return retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
+		}
+
 		errHTTP := xerrors.Errorf("received http error: %w", &HTTPError{
 			Code:     response.StatusCode,
 			Response: string(responseBody),
@@ -386,10 +387,11 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 		return errHTTP
 	}
 
-	if err := json.Unmarshal(responseBody, out); err != nil {
-		// Some upstream clients (e.g. Erigon client for ETH) return invalid JSON responses for otherwise retryable
-		// errors such as execution timeouts.
-		return retry.Retryable(xerrors.Errorf("failed to decode response %v: %w", string(responseBody), err))
+	// Success path: decode directly from the HTTP stream to avoid buffering
+	// the full response body. Eliminates one full copy of the response in
+	// memory (the intermediate []byte from ioutil.ReadAll).
+	if err := json.NewDecoder(response.Body).Decode(out); err != nil {
+		return retry.Retryable(xerrors.Errorf("failed to decode response: %w", err))
 	}
 
 	return finalizer.Close()
