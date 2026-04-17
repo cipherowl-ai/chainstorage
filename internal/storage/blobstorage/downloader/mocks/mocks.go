@@ -69,3 +69,17 @@ func (mr *MockBlockDownloaderMockRecorder) DownloadStream(arg0, arg1, arg2 any) 
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStream", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStream), arg0, arg1, arg2)
 }
+
+// DownloadStreamBitcoin mocks base method.
+func (m *MockBlockDownloader) DownloadStreamBitcoin(arg0 context.Context, arg1 *chainstorage.BlockFile, arg2 downloader.BitcoinStreamConsumer) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DownloadStreamBitcoin", arg0, arg1, arg2)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// DownloadStreamBitcoin indicates an expected call of DownloadStreamBitcoin.
+func (mr *MockBlockDownloaderMockRecorder) DownloadStreamBitcoin(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStreamBitcoin", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStreamBitcoin), arg0, arg1, arg2)
+}

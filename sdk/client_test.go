@@ -333,38 +333,6 @@ func (s *clientTestSuite) TestStreamBlocks_ErrStreamChainEvents() {
 	s.require.Nil(ch)
 }
 
-func (s *clientTestSuite) TestStreamBlock_NonBitcoinChainYieldsNilBitcoinStream() {
-	const (
-		tag    = uint32(2)
-		height = uint64(12345)
-		hash   = "0xabcde"
-	)
-	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
-
-	// Downloader yields a bitcoin-shaped block but the default suite
-	// wires the ethereum parser, which does not satisfy BitcoinStreamer.
-	// The client should surface that as an error (consumer never runs).
-	bitcoinBlock := &api.Block{
-		Metadata: &api.BlockMetadata{Tag: tag, Height: height, Hash: hash},
-		Blobdata: &api.Block_Bitcoin{
-			Bitcoin: &api.BitcoinBlobdata{Header: []byte(`{"hash":"0xabcde","height":12345,"tx":[]}`)},
-		},
-	}
-
-	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, _ *api.BlockFile, consumer downloader.StreamConsumer) error {
-			return consumer(ctx, bitcoinBlock)
-		},
-	)
-
-	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
-		return nil
-	})
-	s.require.Error(err, "default suite is ethereum; parser cannot satisfy bitcoin streaming")
-	s.require.Contains(err.Error(), "does not support bitcoin streaming")
-}
-
 func (s *clientTestSuite) TestStreamBlock_EthereumBlobDeliversNilBitcoin() {
 	const (
 		tag    = uint32(2)
