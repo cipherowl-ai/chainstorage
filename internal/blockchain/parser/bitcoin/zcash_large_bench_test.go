@@ -1,7 +1,6 @@
 package bitcoin
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -19,8 +18,8 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-// TestZcashLargeBlockBench runs a one-shot benchmark comparing ParseBlock
-// and StreamBlock on a real pre-downloaded, pre-decompressed zcash block.
+// TestZcashLargeBlockBench runs a one-shot ParseBlock benchmark on a real
+// pre-downloaded, pre-decompressed zcash block.
 //
 // Gated by env var CHAINSTORAGE_BENCH_ZCASH_BLOCK (path to the .pb file)
 // so it does not run in the default `go test` sweep. Optional:
@@ -71,8 +70,7 @@ func TestZcashLargeBlockBench(t *testing.T) {
 	if blob == nil {
 		t.Fatalf("no bitcoin blobdata")
 	}
-	headerJSON := blob.GetHeader()
-	t.Logf("header JSON size: %.2f MB", mbf(len(headerJSON)))
+	t.Logf("header JSON size: %.2f MB", mbf(len(blob.GetHeader())))
 	t.Logf("input tx groups:  %d", len(blob.GetInputTransactions()))
 
 	opts := buildBenchOpts(t, os.Getenv("CHAINSTORAGE_BENCH_OPTS"))
@@ -100,58 +98,6 @@ func TestZcashLargeBlockBench(t *testing.T) {
 	t.Logf("  heap after:           %s", humanBytes(after))
 	t.Logf("  heap peak:            %s (+%s)", humanBytes(peak.peak), humanBytes(subU(peak.peak, before)))
 	t.Logf("  persistent NB size:   %s", humanBytes(uint64(proto.Size(nb))))
-	nb = nil
-
-	runtime.GC()
-	runtime.GC()
-
-	// ----- StreamBlock -----
-	t.Logf("\n=== StreamBlock ===")
-	// zcashNativeParserImpl embeds bitcoinNativeParserImpl which
-	// implements StreamingNativeParser. Type-assert to reach it.
-	streamer, ok := parser.(StreamingNativeParser)
-	if !ok {
-		// Try the embedded bitcoin impl on zcash.
-		type hasBitcoin interface{ Base() *bitcoinNativeParserImpl }
-		if hb, ok := parser.(hasBitcoin); ok {
-			streamer = hb.Base()
-		}
-	}
-	if streamer == nil {
-		// zcashNativeParserImpl embeds *bitcoinNativeParserImpl by
-		// pointer, so method promotion exposes StreamBlock directly.
-		// The previous assertion should have succeeded.
-		t.Fatalf("parser %T does not implement StreamingNativeParser", parser)
-	}
-
-	runtime.GC()
-	runtime.GC()
-	before = heapAlloc()
-	peak = newHeapPeak()
-	peak.start()
-
-	txCount := 0
-	visitor := BitcoinBlockVisitorFunc(func(tx *api.BitcoinTransaction) error {
-		txCount++
-		return nil
-	})
-	r := bytes.NewReader(headerJSON)
-	streamStart := time.Now()
-	loadGroup := NewInMemoryInputTxGroupLoader(blob.GetInputTransactions())
-	header, err := streamer.StreamBlock(ctx, r, loadGroup, visitor, opts...)
-	streamElapsed := time.Since(streamStart)
-	peak.stop()
-	if err != nil {
-		t.Fatalf("StreamBlock: %v", err)
-	}
-	after = heapAlloc()
-	t.Logf("  elapsed:              %s", streamElapsed)
-	t.Logf("  tx count (visited):   %d", txCount)
-	t.Logf("  heap before:          %s", humanBytes(before))
-	t.Logf("  heap after:           %s", humanBytes(after))
-	t.Logf("  heap peak:            %s (+%s)", humanBytes(peak.peak), humanBytes(subU(peak.peak, before)))
-	t.Logf("  header hash:          %s", header.GetHash())
-	t.Logf("  header height:        %d", header.GetHeight())
 }
 
 func buildBenchOpts(t *testing.T, s string) []internal.ParseOption {
