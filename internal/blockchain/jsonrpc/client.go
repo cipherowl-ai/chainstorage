@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -403,8 +404,14 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 	// Success path: decode directly from the HTTP stream to avoid buffering
 	// the full response body. Eliminates one full copy of the response in
 	// memory (the intermediate []byte from ioutil.ReadAll).
-	if err := json.NewDecoder(response.Body).Decode(out); err != nil {
-		return retry.Retryable(xerrors.Errorf("failed to decode response: %w", err))
+	//
+	// To preserve diagnostics for malformed 200 OK responses (e.g., Erigon
+	// returning invalid JSON on execution timeouts), capture up to 1KB of
+	// the stream alongside the decode so we can include it in the error.
+	var bodyPreview bytes.Buffer
+	tee := io.TeeReader(response.Body, &limitWriter{w: &bodyPreview, n: 1024})
+	if err := json.NewDecoder(tee).Decode(out); err != nil {
+		return retry.Retryable(xerrors.Errorf("failed to decode response %v: %w", bodyPreview.String(), err))
 	}
 
 	return finalizer.Close()
@@ -471,6 +478,26 @@ func IsNullOrEmpty(r json.RawMessage) bool {
 	}
 
 	return false
+}
+
+// limitWriter wraps a writer and silently stops writing after n bytes.
+// Used to capture a bounded preview of the response body for error diagnostics
+// without buffering the entire response.
+type limitWriter struct {
+	w io.Writer
+	n int
+}
+
+func (lw *limitWriter) Write(p []byte) (int, error) {
+	if lw.n <= 0 {
+		return len(p), nil // discard silently
+	}
+	if len(p) > lw.n {
+		p = p[:lw.n]
+	}
+	n, err := lw.w.Write(p)
+	lw.n -= n
+	return len(p), err // report full length to TeeReader
 }
 
 func (c *clientImpl) sanitizedError(err error) error {

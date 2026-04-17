@@ -490,8 +490,14 @@ func (b *bitcoinClient) fetchAndParseInputTransactions(
 				)
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
+			// Parse outside the lock — json.Unmarshal + voutMap building
+			// is CPU-intensive and should not serialize goroutines.
+			type batchEntry struct {
+				txID   string
+				parsed *parsedInputTx
+				raw    []byte
+			}
+			entries := make([]batchEntry, 0, len(responses))
 			for respIdx, resp := range responses {
 				txID := inputTransactionIDs[batchStart+respIdx]
 				var tx bitcoin.BitcoinInputTransactionLit
@@ -508,11 +514,25 @@ func (b *bitcoinClient) fetchAndParseInputTransactions(
 				for _, o := range tx.Vout {
 					vm[o.N.Value()] = o
 				}
-				parsed[txID] = &parsedInputTx{tx: &tx, voutMap: vm}
+				entry := batchEntry{
+					txID:   txID,
+					parsed: &parsedInputTx{tx: &tx, voutMap: vm},
+				}
 				if preserveRaw {
-					rawMap[txID] = resp.Result
+					entry.raw = resp.Result
+				}
+				entries = append(entries, entry)
+			}
+
+			// Lock only for the map merge — fast O(n) pointer assignments.
+			mu.Lock()
+			for _, e := range entries {
+				parsed[e.txID] = e.parsed
+				if preserveRaw {
+					rawMap[e.txID] = e.raw
 				}
 			}
+			mu.Unlock()
 			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.done", idx)
 			return nil
 		})
