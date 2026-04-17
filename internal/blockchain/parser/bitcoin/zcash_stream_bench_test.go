@@ -2,7 +2,6 @@ package bitcoin
 
 import (
 	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -107,33 +106,32 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		headerCost      time.Duration
 	)
 	start := time.Now()
-	err = dl.DownloadStreamBitcoin(ctx, bf, func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error), loadGroup func(int) (*api.RepeatedBytes, error)) error {
-		stream := bitcoinImpl.StreamBlockIter(ctx, openHeaderReader, loadGroup, opts...)
-
-		for tx, err := range stream.Transactions() {
-			if err != nil {
-				return err
-			}
-			txCount++
-			_ = tx
-		}
-
-		// Header after iteration should be "free" per the BlockStream contract.
-		headerCostStart = time.Now()
-		h, err := stream.Header()
-		headerCost = time.Since(headerCostStart)
-		if err != nil {
-			return err
-		}
-		headerHash = h.GetHash()
-		headerHeight = h.GetHeight()
-		return nil
-	})
-	elapsed := time.Since(start)
-	peak.stop()
+	dlStream, err := dl.DownloadStreamBitcoin(ctx, bf)
 	if err != nil {
 		t.Fatalf("DownloadStreamBitcoin: %v", err)
 	}
+	defer dlStream.Close()
+
+	bstream := bitcoinImpl.StreamBlockIter(ctx, dlStream.OpenHeaderReader, dlStream.LoadInputTxGroup, opts...)
+	for tx, err := range bstream.Transactions() {
+		if err != nil {
+			t.Fatalf("iterate tx: %v", err)
+		}
+		txCount++
+		_ = tx
+	}
+
+	// Header after iteration should be "free" per the BlockStream contract.
+	headerCostStart = time.Now()
+	h, err := bstream.Header()
+	headerCost = time.Since(headerCostStart)
+	if err != nil {
+		t.Fatalf("Header: %v", err)
+	}
+	headerHash = h.GetHash()
+	headerHeight = h.GetHeight()
+	elapsed := time.Since(start)
+	peak.stop()
 	after := heapAlloc()
 
 	t.Logf("\n=== Phase 2 streaming (DownloadStreamBitcoin -> StreamBlockIter) ===")
@@ -185,17 +183,16 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	peak3.start()
 
 	start3 := time.Now()
-	var nb3 *api.NativeBlock
-	err = dl.DownloadStream(ctx, bf, func(ctx context.Context, block *api.Block) error {
-		var parseErr error
-		nb3, parseErr = parser.ParseBlock(ctx, block, opts...)
-		return parseErr
-	})
-	elapsed3 := time.Since(start3)
-	peak3.stop()
+	block3, err := dl.DownloadStream(ctx, bf)
 	if err != nil {
 		t.Fatalf("DownloadStream: %v", err)
 	}
+	nb3, err := parser.ParseBlock(ctx, block3, opts...)
+	if err != nil {
+		t.Fatalf("ParseBlock: %v", err)
+	}
+	elapsed3 := time.Since(start3)
+	peak3.stop()
 	after3 := heapAlloc()
 
 	t.Logf("\n=== Phase 2 generic (DownloadStream -> ParseBlock) ===")

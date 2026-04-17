@@ -194,21 +194,14 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_Success() {
 		fx.Populate(&s.downloader),
 	)
 
-	var consumerCalls int
-	var observedHeader string
-	err = s.downloader.DownloadStream(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block) error {
-		consumerCalls++
-		require.NotNil(block.GetMetadata())
-		require.Equal(uint64(123), block.GetMetadata().Height)
-
-		blob := block.GetBitcoin()
-		require.NotNil(blob)
-		observedHeader = string(blob.GetHeader())
-		return nil
-	})
+	block, err := s.downloader.DownloadStream(context.Background(), s.blockFile)
 	require.NoError(err)
-	require.Equal(1, consumerCalls)
-	require.Equal(`{"hash":"0xabc","height":123,"tx":[]}`, observedHeader)
+	require.NotNil(block.GetMetadata())
+	require.Equal(uint64(123), block.GetMetadata().Height)
+
+	blob := block.GetBitcoin()
+	require.NotNil(blob)
+	require.Equal(`{"hash":"0xabc","height":123,"tx":[]}`, string(blob.GetHeader()))
 }
 
 func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
@@ -220,16 +213,11 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
 		fx.Provide(s.newHttpClientFunc()),
 	)
 
-	var consumerCalls int
-	err := s.downloader.DownloadStream(context.Background(), s.skippedBlockFile, func(ctx context.Context, block *api.Block) error {
-		consumerCalls++
-		require.NotNil(block.GetMetadata())
-		require.True(block.GetMetadata().Skipped)
-		require.Nil(block.GetBlobdata())
-		return nil
-	})
+	block, err := s.downloader.DownloadStream(context.Background(), s.skippedBlockFile)
 	require.NoError(err)
-	require.Equal(1, consumerCalls)
+	require.NotNil(block.GetMetadata())
+	require.True(block.GetMetadata().Skipped)
+	require.Nil(block.GetBlobdata())
 }
 
 func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Success() {
@@ -261,39 +249,35 @@ func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Success() {
 		fx.Populate(&s.downloader),
 	)
 
-	var consumerCalls int
-	err = s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block, openHeader func() (io.ReadCloser, error), loadGroup func(int) (*api.RepeatedBytes, error)) error {
-		consumerCalls++
-		// Header and InputTransactions are BOTH lazy now.
-		require.Equal(uint64(42), block.GetMetadata().Height)
-		require.Nil(block.GetBitcoin().GetHeader(), "header must be nil — exposed via openHeader")
-		require.Nil(block.GetBitcoin().GetInputTransactions(), "input_transactions must be nil — loaded on demand via loadGroup")
-
-		// openHeader should be re-callable.
-		for i := 0; i < 2; i++ {
-			rc, err := openHeader()
-			require.NoError(err)
-			got, err := io.ReadAll(rc)
-			require.NoError(err)
-			require.NoError(rc.Close())
-			require.Equal(headerJSON, got, "header reader attempt %d", i)
-		}
-
-		// loadGroup returns the i-th group's prev-tx bytes.
-		group, err := loadGroup(0)
-		require.NoError(err)
-		require.NotNil(group)
-		require.Equal([][]byte{[]byte("prev1-json"), []byte("prev2-json")}, group.Data)
-
-		// Out-of-range returns nil group, no error.
-		group, err = loadGroup(99)
-		require.NoError(err)
-		require.Nil(group)
-
-		return nil
-	})
+	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile)
 	require.NoError(err)
-	require.Equal(1, consumerCalls)
+	defer stream.Close()
+
+	// Header and InputTransactions are BOTH lazy now.
+	require.Equal(uint64(42), stream.Block.GetMetadata().Height)
+	require.Nil(stream.Block.GetBitcoin().GetHeader(), "header must be nil — exposed via OpenHeaderReader")
+	require.Nil(stream.Block.GetBitcoin().GetInputTransactions(), "input_transactions must be nil — loaded on demand via LoadInputTxGroup")
+
+	// OpenHeaderReader should be re-callable.
+	for i := 0; i < 2; i++ {
+		rc, err := stream.OpenHeaderReader()
+		require.NoError(err)
+		got, err := io.ReadAll(rc)
+		require.NoError(err)
+		require.NoError(rc.Close())
+		require.Equal(headerJSON, got, "header reader attempt %d", i)
+	}
+
+	// LoadInputTxGroup returns the i-th group's prev-tx bytes.
+	group, err := stream.LoadInputTxGroup(0)
+	require.NoError(err)
+	require.NotNil(group)
+	require.Equal([][]byte{[]byte("prev1-json"), []byte("prev2-json")}, group.Data)
+
+	// Out-of-range returns nil group, no error.
+	group, err = stream.LoadInputTxGroup(99)
+	require.NoError(err)
+	require.Nil(group)
 }
 
 func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Skipped() {
@@ -305,37 +289,34 @@ func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Skipped() {
 		fx.Provide(s.newHttpClientFunc()),
 	)
 
-	var consumerCalls int
-	err := s.downloader.DownloadStreamBitcoin(context.Background(), s.skippedBlockFile, func(ctx context.Context, block *api.Block, openHeader func() (io.ReadCloser, error), loadGroup func(int) (*api.RepeatedBytes, error)) error {
-		consumerCalls++
-		require.True(block.GetMetadata().Skipped)
-		require.Nil(block.GetBlobdata())
-		// openHeader returns an empty reader for skipped blocks.
-		rc, err := openHeader()
-		require.NoError(err)
-		defer rc.Close()
-		got, err := io.ReadAll(rc)
-		require.NoError(err)
-		require.Empty(got)
-		// loadGroup always returns nil for skipped blocks.
-		g, err := loadGroup(0)
-		require.NoError(err)
-		require.Nil(g)
-		return nil
-	})
+	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.skippedBlockFile)
 	require.NoError(err)
-	require.Equal(1, consumerCalls)
+	defer stream.Close()
+
+	require.True(stream.Block.GetMetadata().Skipped)
+	require.Nil(stream.Block.GetBlobdata())
+	// OpenHeaderReader returns an empty reader for skipped blocks.
+	rc, err := stream.OpenHeaderReader()
+	require.NoError(err)
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	require.NoError(err)
+	require.Empty(got)
+	// LoadInputTxGroup always returns nil for skipped blocks.
+	g, err := stream.LoadInputTxGroup(0)
+	require.NoError(err)
+	require.Nil(g)
 }
 
-func (s *blockDownloaderTestSuite) TestDownloadStream_ConsumerError() {
+func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_CloseRemovesSpool() {
 	require := testutil.Require(s.T())
 
 	bitcoinBlock := &api.Block{
 		Blockchain: common.Blockchain_BLOCKCHAIN_BITCOIN,
 		Network:    common.Network_NETWORK_BITCOIN_MAINNET,
-		Metadata:   &api.BlockMetadata{Tag: 1, Height: 123},
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 42, Hash: "0xabc"},
 		Blobdata: &api.Block_Bitcoin{
-			Bitcoin: &api.BitcoinBlobdata{Header: []byte(`{}`)},
+			Bitcoin: &api.BitcoinBlobdata{Header: []byte(`{"hash":"0xabc"}`)},
 		},
 	}
 	blockBytes, err := proto.Marshal(bitcoinBlock)
@@ -350,11 +331,21 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_ConsumerError() {
 		fx.Populate(&s.downloader),
 	)
 
-	sentinel := xerrors.New("consumer exploded")
-	err = s.downloader.DownloadStream(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block) error {
-		return sentinel
-	})
-	require.ErrorIs(err, sentinel)
+	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile)
+	require.NoError(err)
+
+	// Reader works before Close.
+	rc, err := stream.OpenHeaderReader()
+	require.NoError(err)
+	require.NoError(rc.Close())
+
+	require.NoError(stream.Close())
+	// Second Close must be a no-op.
+	require.NoError(stream.Close())
+
+	// After Close, OpenHeaderReader fails (spool removed).
+	_, err = stream.OpenHeaderReader()
+	require.Error(err)
 }
 
 func (s *blockDownloaderTestSuite) newHttpClientFunc() httpClientFunc {

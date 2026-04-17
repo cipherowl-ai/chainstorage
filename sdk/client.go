@@ -2,7 +2,6 @@ package sdk
 
 import (
 	"context"
-	"io"
 
 	"google.golang.org/grpc/codes"
 
@@ -103,24 +102,25 @@ type (
 		// This is useful if the caller needs a consistent snapshot of chain metadata during its current lifecycle.
 		GetStaticChainMetadata(ctx context.Context, req *api.GetChainMetadataRequest) (*api.GetChainMetadataResponse, error)
 
-		// StreamBlock downloads a block via disk spool and invokes
-		// consumer with a chain-agnostic StreamedBlock view. The
-		// chain-specific field on the view (e.g. GetBitcoin()) is
-		// populated based on the underlying blobdata; non-matching
-		// chain fields return nil.
+		// StreamBlock downloads a block via disk spool and returns a
+		// chain-agnostic StreamedBlock view. The chain-specific field
+		// on the view (e.g. GetBitcoin()) is populated based on the
+		// underlying blobdata; non-matching chain fields return nil.
 		//
-		// The download lifecycle (temp file, HTTP body) is released
-		// before StreamBlock returns, regardless of consumer error.
+		// The returned StreamedBlock may hold backing resources (a
+		// disk spool for bitcoin-family chains). Callers MUST call
+		// Close() when done to release them. A runtime cleanup is
+		// wired as a safety net but should not be relied on.
 		//
-		// For bitcoin-family chains, consumer iterates
-		// view.GetBitcoin().Transactions() and calls
+		// For bitcoin-family chains, callers iterate
+		// view.GetBitcoin().Transactions() and call
 		// view.GetBitcoin().Header() before or after iteration (see
 		// BitcoinBlockStream's ordering contract).
 		//
 		// For chains without a streaming parser implementation today
 		// (ethereum, solana, etc.), view.GetBitcoin() is nil and
-		// consumer should fall back to GetBlock + ParseNativeBlock.
-		StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, consumer func(*StreamedBlock) error, opts ...ParseOption) error
+		// callers should fall back to GetBlock + ParseNativeBlock.
+		StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (*StreamedBlock, error)
 	}
 
 	ChainEventResult struct {
@@ -530,46 +530,46 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 func (c *clientImpl) StreamBlock(
 	ctx context.Context,
 	tag uint32, height uint64, hash string,
-	consumer func(*StreamedBlock) error,
 	opts ...ParseOption,
-) error {
-	if consumer == nil {
-		return xerrors.New("StreamBlock requires a non-nil consumer")
-	}
-
+) (*StreamedBlock, error) {
 	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
 		Tag:    tag,
 		Height: height,
 		Hash:   hash,
 	})
 	if err != nil {
-		return xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
+		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
 	}
 
-	// For bitcoin-family chains, use the Phase 2 wire walker path:
-	// peak RAM is O(input_transactions) instead of O(2× block size).
-	// The BitcoinBlobdata.Header bytes never materialize in RAM —
-	// they're read on-demand from the decompressed spool file via
-	// openHeaderReader.
+	// For bitcoin-family chains, use the wire-walker path: peak RAM
+	// is O(input_transactions) instead of O(2× block size). The
+	// BitcoinBlobdata.Header and InputTransactions bytes never
+	// materialize in RAM — they're read on-demand from the
+	// decompressed spool file held open by the returned stream.
 	if isBitcoinFamilyChain(c.config.Chain.Blockchain) {
-		return c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error), loadInputTxGroup func(int) (*api.RepeatedBytes, error)) error {
-			stream, err := c.parser.StreamBitcoinBlock(ctx, openHeaderReader, loadInputTxGroup, opts...)
-			if err != nil {
-				return xerrors.Errorf("failed to create bitcoin block stream: %w", err)
-			}
-			return consumer(&StreamedBlock{
-				Metadata: rawBlock.GetMetadata(),
-				bitcoin:  stream,
-			})
-		})
+		dl, err := c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile())
+		if err != nil {
+			return nil, err
+		}
+		bitcoinStream, err := c.parser.StreamBitcoinBlock(ctx, dl.OpenHeaderReader, dl.LoadInputTxGroup, opts...)
+		if err != nil {
+			dl.Close()
+			return nil, xerrors.Errorf("failed to create bitcoin block stream: %w", err)
+		}
+		return &StreamedBlock{
+			Metadata: dl.Block.GetMetadata(),
+			bitcoin:  bitcoinStream,
+			closeFn:  dl.Close,
+		}, nil
 	}
 
-	// Non-bitcoin chains: chain-agnostic Phase 1 path. Consumer gets
-	// a view with GetBitcoin() == nil and should fall back to
-	// GetBlock + ParseNativeBlock for chain-specific parsing.
-	return c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block) error {
-		return consumer(&StreamedBlock{Metadata: rawBlock.GetMetadata()})
-	})
+	// Non-bitcoin chains: chain-agnostic walker path. Block is fully
+	// materialized, no backing resources — Close is a no-op.
+	rawBlock, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
+	if err != nil {
+		return nil, err
+	}
+	return &StreamedBlock{Metadata: rawBlock.GetMetadata()}, nil
 }
 
 func isBitcoinFamilyChain(b common.Blockchain) bool {

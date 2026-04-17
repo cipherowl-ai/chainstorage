@@ -23,26 +23,33 @@ type BitcoinBlockStream = parser.BitcoinBlockStream
 // locally-spooled copy of the decompressed proto.
 type BitcoinInputTxGroupLoader = parser.BitcoinInputTxGroupLoader
 
-// StreamedBlock is the chain-agnostic view delivered by Client.StreamBlock.
+// StreamedBlock is the chain-agnostic view returned by Client.StreamBlock.
 // It mirrors the shape of *api.Block: a metadata field plus one
 // chain-specific field populated based on the block's underlying
 // blobdata. All non-matching chain fields are nil.
 //
-// Consumer code pattern matches the GetBlock ergonomics:
+// A StreamedBlock may own backing resources (a disk spool for bitcoin
+// chains); callers MUST call Close() when done. A runtime cleanup is
+// wired as a safety net but should not be relied on.
 //
-//	client.StreamBlock(ctx, tag, height, hash, func(s *sdk.StreamedBlock) error {
-//	    if bs := s.GetBitcoin(); bs != nil {
-//	        for tx, err := range bs.Transactions() {
-//	            ...
-//	        }
+// Consumer pattern parallels GetBlock:
+//
+//	view, err := client.StreamBlock(ctx, tag, height, hash)
+//	if err != nil { return err }
+//	defer view.Close()
+//
+//	if bs := view.GetBitcoin(); bs != nil {
+//	    for tx, err := range bs.Transactions() {
+//	        ...
 //	    }
-//	    return nil
-//	})
+//	}
 type StreamedBlock struct {
 	// Metadata mirrors api.Block.Metadata from the downloaded envelope.
 	Metadata *api.BlockMetadata
 	// bitcoin is populated for bitcoin-family blocks; nil otherwise.
 	bitcoin BitcoinBlockStream
+	// closeFn releases backing resources (disk spool, etc.); may be nil.
+	closeFn func() error
 }
 
 // GetMetadata returns the block metadata.
@@ -61,6 +68,16 @@ func (s *StreamedBlock) GetBitcoin() BitcoinBlockStream {
 		return nil
 	}
 	return s.bitcoin
+}
+
+// Close releases any backing resources held by the StreamedBlock (most
+// notably the disk-spool file that backs bitcoin-family streams). Safe
+// to call multiple times; no-op on non-bitcoin chains.
+func (s *StreamedBlock) Close() error {
+	if s == nil || s.closeFn == nil {
+		return nil
+	}
+	return s.closeFn()
 }
 
 var (

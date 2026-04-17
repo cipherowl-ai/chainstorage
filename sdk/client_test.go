@@ -347,24 +347,16 @@ func (s *clientTestSuite) TestStreamBlock_EthereumBlobDeliversNilBitcoin() {
 	}
 
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, _ *api.BlockFile, consumer downloader.StreamConsumer) error {
-			return consumer(ctx, ethBlock)
-		},
-	)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(ethBlock, nil)
 
-	var consumerCalled bool
-	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
-		consumerCalled = true
-		s.require.NotNil(view.GetMetadata())
-		s.require.Equal(uint64(height), view.GetMetadata().Height)
-		// Non-bitcoin chain → GetBitcoin() must return nil so callers
-		// can fall back to GetBlock + ParseNativeBlock.
-		s.require.Nil(view.GetBitcoin())
-		return nil
-	})
+	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
 	s.require.NoError(err)
-	s.require.True(consumerCalled)
+	defer view.Close()
+	s.require.NotNil(view.GetMetadata())
+	s.require.Equal(uint64(height), view.GetMetadata().Height)
+	// Non-bitcoin chain → GetBitcoin() must return nil so callers
+	// can fall back to GetBlock + ParseNativeBlock.
+	s.require.Nil(view.GetBitcoin())
 }
 
 func (s *clientTestSuite) TestStreamBlock_DownloadError() {
@@ -377,21 +369,11 @@ func (s *clientTestSuite) TestStreamBlock_DownloadError() {
 
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 	sentinel := xerrors.New("download exploded")
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).Return(sentinel)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(nil, sentinel)
 
-	var consumerCalled bool
-	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
-		consumerCalled = true
-		return nil
-	})
+	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
 	s.require.ErrorIs(err, sentinel)
-	s.require.False(consumerCalled)
-}
-
-func (s *clientTestSuite) TestStreamBlock_NilConsumer() {
-	err := s.client.StreamBlock(context.Background(), 1, 123, "0xabc", nil)
-	s.require.Error(err)
-	s.require.Contains(err.Error(), "non-nil consumer")
+	s.require.Nil(view)
 }
 
 func (s *clientTestSuite) TestStreamBlocks_ErrRecv() {
