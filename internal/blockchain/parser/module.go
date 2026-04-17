@@ -23,14 +23,18 @@ type (
 	// subpackage directly.
 	ParseOption = internal.ParseOption
 
-	// StreamedBlock is the chain-agnostic stream returned by
-	// Parser.StreamBlock. Re-exported so SDK consumers can reference
-	// it without importing internal.
-	StreamedBlock = internal.StreamedBlock
+	// NativeStreamedBlock is the chain-agnostic container returned
+	// by Parser.ParseStreamNative. Re-exported so SDK consumers can
+	// reference it without importing internal.
+	NativeStreamedBlock = internal.NativeStreamedBlock
 
-	// BitcoinStreamedBlock is the bitcoin-family extension of
-	// StreamedBlock (iter.Seq2 transactions + lazy Header).
-	BitcoinStreamedBlock = internal.BitcoinStreamedBlock
+	// BitcoinNativeStream is the bitcoin-family iterator view.
+	// Exposed via NativeStreamedBlock.GetBitcoin().
+	BitcoinNativeStream = internal.BitcoinNativeStream
+
+	// EthereumNativeStream is the ethereum iterator view. Stub
+	// interface until the ethereum streaming walker lands.
+	EthereumNativeStream = internal.EthereumNativeStream
 
 	// BitcoinInputTxGroupLoader is re-exported so SDK callers can
 	// type their consumer lambdas without importing internal.

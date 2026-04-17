@@ -29,19 +29,18 @@ type (
 		ValidateAccountState(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error)
 		// ValidateRosettaBlock Given other block source (native, etc), validates whether transaction operations show the correct balance transfer.
 		ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error
-		// StreamBitcoinBlock returns a BitcoinStreamedBlock over the
-		// spooled bytes. Errors if the configured chain is not
-		// bitcoin-family.
+		// ParseStreamNative returns a chain-agnostic NativeStreamedBlock
+		// over the spooled bytes. Dispatches per chain internally:
+		// for bitcoin-family chains the returned block's GetBitcoin()
+		// is populated; for other (or unimplemented) chains all
+		// Get<Chain>() accessors return nil and callers should fall
+		// back to GetBlock + ParseNativeBlock.
 		//
 		// Ownership of the SpooledBlock transfers to the returned
 		// stream — calling stream.Close() also closes the spool. On
 		// error, the caller retains ownership and must close the
 		// spool itself.
-		//
-		// Future chains will add typed counterparts
-		// (StreamEthereumBlock, StreamSolanaBlock, ...) once those
-		// parsers grow streaming support.
-		StreamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error)
+		ParseStreamNative(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (NativeStreamedBlock, error)
 	}
 
 	NativeParser interface {
@@ -210,53 +209,96 @@ func (p *parserImpl) ValidateRosettaBlock(ctx context.Context, req *api.Validate
 	return p.checker.ValidateRosettaBlock(ctx, req, actualRosettaBlock)
 }
 
-func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error) {
+func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (NativeStreamedBlock, error) {
 	if spooled == nil {
 		return nil, xerrors.New("nil spooled block")
 	}
 
-	streamer, ok := p.nativeParser.(BitcoinStreamer)
-	if !ok {
-		return nil, xerrors.Errorf("native parser %T does not support bitcoin streaming", p.nativeParser)
-	}
-
-	// Skipped blocks have no payload. Return a placeholder stream
-	// carrying just the metadata synthesized from BlockFile.
+	// Skipped blocks have no payload. Return an empty native stream
+	// carrying just the metadata synthesized from BlockFile. If the
+	// underlying chain is bitcoin-family, the skipped-bitcoin inner
+	// stream yields no transactions; otherwise GetBitcoin() is nil.
 	if spooled.BlockFile.GetSkipped() {
-		return &skippedBitcoinStream{
-			metadata: &api.BlockMetadata{
-				Tag:     spooled.BlockFile.Tag,
-				Height:  spooled.BlockFile.Height,
-				Skipped: true,
-			},
-			spooled: spooled,
-		}, nil
+		metadata := &api.BlockMetadata{
+			Tag:     spooled.BlockFile.Tag,
+			Height:  spooled.BlockFile.Height,
+			Skipped: true,
+		}
+		wrapper := &nativeStreamedBlock{metadata: metadata, spooled: spooled}
+		if _, ok := p.nativeParser.(BitcoinStreamer); ok {
+			wrapper.bitcoin = skippedBitcoinNativeStream{}
+		}
+		return wrapper, nil
 	}
 
-	return streamBitcoinBlock(ctx, spooled, streamer, opts...)
+	// Bitcoin-family: walk the envelope, wire loaders, delegate to
+	// the native parser's StreamBlockIter.
+	if streamer, ok := p.nativeParser.(BitcoinStreamer); ok {
+		return buildBitcoinNativeStreamedBlock(ctx, spooled, streamer, opts...)
+	}
+
+	// No chain-specific streaming available. Return metadata-only
+	// wrapper; caller falls back to GetBlock + ParseNativeBlock.
+	r, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool for metadata walk: %w", err)
+	}
+	defer r.Close()
+	block, err := api.WalkBlockEnvelope(r)
+	if err != nil {
+		return nil, xerrors.Errorf("walk block envelope: %w", err)
+	}
+	return &nativeStreamedBlock{
+		metadata: block.GetMetadata(),
+		spooled:  spooled,
+	}, nil
 }
 
-// skippedBitcoinStream is returned for blocks flagged skipped in the
-// BlockFile. Exposes metadata only, yields no transactions, and
-// closes the (empty) spool.
-type skippedBitcoinStream struct {
+// nativeStreamedBlock is the chain-agnostic NativeStreamedBlock
+// implementation. Per-chain inner streams are populated when the
+// configured chain's native parser supports streaming; otherwise the
+// corresponding Get<Chain>() returns nil.
+type nativeStreamedBlock struct {
 	metadata *api.BlockMetadata
 	spooled  *downloader.SpooledBlock
+	bitcoin  BitcoinNativeStream
+	// ethereum is always nil today; added when the ethereum streaming
+	// walker lands.
+	ethereum EthereumNativeStream
 }
 
-func (s *skippedBitcoinStream) GetMetadata() *api.BlockMetadata { return s.metadata }
-func (s *skippedBitcoinStream) Close() error                    { return s.spooled.Close() }
-func (s *skippedBitcoinStream) Transactions() iter.Seq2[*api.BitcoinTransaction, error] {
+func (n *nativeStreamedBlock) GetMetadata() *api.BlockMetadata { return n.metadata }
+func (n *nativeStreamedBlock) Close() error                    { return n.spooled.Close() }
+func (n *nativeStreamedBlock) GetBitcoin() BitcoinNativeStream {
+	if n == nil {
+		return nil
+	}
+	return n.bitcoin
+}
+func (n *nativeStreamedBlock) GetEthereum() EthereumNativeStream {
+	if n == nil {
+		return nil
+	}
+	return n.ethereum
+}
+
+// skippedBitcoinNativeStream is the bitcoin inner stream returned for
+// skipped bitcoin-family blocks. Yields no transactions and reports
+// "no header" on Header().
+type skippedBitcoinNativeStream struct{}
+
+func (skippedBitcoinNativeStream) Transactions() iter.Seq2[*api.BitcoinTransaction, error] {
 	return func(yield func(*api.BitcoinTransaction, error) bool) {}
 }
-func (s *skippedBitcoinStream) Header() (*api.BitcoinHeader, error) {
+func (skippedBitcoinNativeStream) Header() (*api.BitcoinHeader, error) {
 	return nil, xerrors.New("skipped block has no header")
 }
 
-// streamBitcoinBlock walks the bitcoin proto envelope, wires lazy
-// seek-based loaders over the spool, and delegates to the native
-// parser's StreamBlockIter.
-func streamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer BitcoinStreamer, opts ...ParseOption) (BitcoinStreamedBlock, error) {
+// buildBitcoinNativeStreamedBlock walks the bitcoin proto envelope,
+// wires lazy seek-based loaders over the spool, and delegates to the
+// native parser's StreamBlockIter. The returned NativeStreamedBlock
+// has GetBitcoin() populated and GetEthereum() nil.
+func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer BitcoinStreamer, opts ...ParseOption) (NativeStreamedBlock, error) {
 	r, err := spooled.Open()
 	if err != nil {
 		return nil, xerrors.Errorf("open spool for walk: %w", err)
@@ -316,25 +358,12 @@ func streamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, s
 	}
 
 	inner := streamer.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
-	return &bitcoinStreamedBlock{
-		BitcoinBlockIter: inner,
-		block:            block,
-		spooled:          spooled,
+	return &nativeStreamedBlock{
+		metadata: block.GetMetadata(),
+		spooled:  spooled,
+		bitcoin:  inner,
 	}, nil
 }
-
-// bitcoinStreamedBlock wraps the native parser's iterator stream with
-// the chain-agnostic StreamedBlock contract plus ownership of the
-// underlying spool. The embedded BitcoinBlockIter forwards
-// Transactions() and Header() to the inner stream.
-type bitcoinStreamedBlock struct {
-	BitcoinBlockIter
-	block   *api.Block
-	spooled *downloader.SpooledBlock
-}
-
-func (b *bitcoinStreamedBlock) GetMetadata() *api.BlockMetadata { return b.block.GetMetadata() }
-func (b *bitcoinStreamedBlock) Close() error                    { return b.spooled.Close() }
 
 // seekedHeaderReader is an io.ReadCloser that reads up to `limit`
 // bytes from `f` (an io.ReadCloser) and closes `f` on Close.

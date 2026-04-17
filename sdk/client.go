@@ -101,18 +101,18 @@ type (
 		// This is useful if the caller needs a consistent snapshot of chain metadata during its current lifecycle.
 		GetStaticChainMetadata(ctx context.Context, req *api.GetChainMetadataRequest) (*api.GetChainMetadataResponse, error)
 
-		// StreamBitcoinBlock downloads a bitcoin-family block to a
-		// local disk spool and returns a BitcoinStreamedBlock. Errors
-		// if the configured chain is not bitcoin-family.
+		// StreamNativeBlock downloads a block to a local disk spool
+		// and returns a chain-agnostic NativeStreamedBlock. Callers
+		// pick the chain-matching accessor (GetBitcoin, GetEthereum,
+		// ...) to iterate. Accessors that don't match the configured
+		// chain — or that correspond to chains whose streaming walker
+		// hasn't landed yet — return nil; callers should fall back to
+		// GetBlock + ParseNativeBlock in that case.
 		//
-		// The returned stream owns the disk spool. Callers MUST
-		// call Close() when done. A runtime cleanup is wired as a
-		// safety net but should not be relied on.
-		//
-		// Future chains will add typed counterparts
-		// (StreamEthereumBlock, StreamSolanaBlock, ...) as their
-		// parsers grow streaming support.
-		StreamBitcoinBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (BitcoinStreamedBlock, error)
+		// The returned stream owns the disk spool. Callers MUST call
+		// Close() when done. A runtime cleanup is wired as a safety
+		// net but should not be relied on.
+		StreamNativeBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (NativeStreamedBlock, error)
 	}
 
 	ChainEventResult struct {
@@ -519,11 +519,20 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 	return block, nil
 }
 
-func (c *clientImpl) StreamBitcoinBlock(
+// streamingParser is an unexported mirror of the internal parser's
+// streaming method. The injected c.parser always implements this (it
+// comes from the internal parser impl), but sdk.Parser is deliberately
+// trimmed to exclude it — consumers stream via Client.StreamNativeBlock
+// rather than holding a Parser + constructing a SpooledBlock themselves.
+type streamingParser interface {
+	ParseStreamNative(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (NativeStreamedBlock, error)
+}
+
+func (c *clientImpl) StreamNativeBlock(
 	ctx context.Context,
 	tag uint32, height uint64, hash string,
 	opts ...ParseOption,
-) (BitcoinStreamedBlock, error) {
+) (NativeStreamedBlock, error) {
 	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
 		Tag:    tag,
 		Height: height,
@@ -537,10 +546,16 @@ func (c *clientImpl) StreamBitcoinBlock(
 	if err != nil {
 		return nil, err
 	}
-	stream, err := c.parser.StreamBitcoinBlock(ctx, spooled, opts...)
+
+	sp, ok := c.parser.(streamingParser)
+	if !ok {
+		spooled.Close()
+		return nil, xerrors.Errorf("parser %T does not support streaming", c.parser)
+	}
+	stream, err := sp.ParseStreamNative(ctx, spooled, opts...)
 	if err != nil {
 		spooled.Close()
-		return nil, xerrors.Errorf("failed to create bitcoin block stream: %w", err)
+		return nil, xerrors.Errorf("failed to create native stream: %w", err)
 	}
 	return stream, nil
 }
