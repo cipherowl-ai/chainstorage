@@ -78,9 +78,9 @@ func benchmarkEthereum(b *testing.B) {
 
 	httpClient := &fixtureHTTPClient{
 		singleHandlers: map[string][]byte{
-			"eth_getBlockByNumber": blockFixture,
-			"eth_getBlockByHash":   blockFixture,
-			"eth_blockNumber":      []byte(`"0x17bc000"`),
+			"eth_getBlockByNumber":   blockFixture,
+			"eth_getBlockByHash":     blockFixture,
+			"eth_blockNumber":        []byte(`"0x17bc000"`),
 			"debug_traceBlockByHash": traceFixture,
 		},
 		batchResultFn: func(method string, index int) []byte {
