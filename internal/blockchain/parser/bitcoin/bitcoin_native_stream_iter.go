@@ -58,7 +58,7 @@ var errIterStopped = errors.New("bitcoin: block stream iteration stopped by cons
 type bitcoinBlockStream struct {
 	ctx        context.Context
 	parser     *bitcoinNativeParserImpl
-	blob       *api.BitcoinBlobdata
+	loadGroup  InputTxGroupLoader
 	opts       []internal.ParseOption
 	openReader func() (io.ReadCloser, error)
 
@@ -68,25 +68,30 @@ type bitcoinBlockStream struct {
 	headerSet bool
 }
 
-// StreamBlockIter returns a BlockStream that consumes block JSON via the
-// supplied reader factory. The factory may be called more than once —
-// once for each Transactions() iteration and at most once more for an
-// early Header() call. It must return a freshly-positioned reader on
-// each call.
+// StreamBlockIter returns a BlockStream that consumes block JSON via
+// the supplied reader factory. The factory may be called more than
+// once — once for each Transactions() iteration and at most once more
+// for an early Header() call. It must return a freshly-positioned
+// reader on each call.
 //
-// The InputTransactions in blobdata must be available up front; they
-// are used to build the prev-output metadata map required for each
-// transaction.
+// loadGroup resolves prev-output transactions for each block tx. It
+// is invoked once per tx during iteration; callers that populate
+// InputTransactions in memory can use NewInMemoryInputTxGroupLoader,
+// while the disk-spooled DownloadStreamBitcoin path hands in a
+// loader that seeks into the spool file on demand. The loader's
+// return value for each call is allowed to be GC'd as soon as the
+// tx is yielded, so peak parser memory is bounded by the largest
+// single tx's prev-output bytes.
 func (b *bitcoinNativeParserImpl) StreamBlockIter(
 	ctx context.Context,
 	openReader func() (io.ReadCloser, error),
-	blobdata *api.BitcoinBlobdata,
+	loadGroup InputTxGroupLoader,
 	opts ...internal.ParseOption,
 ) BlockStream {
 	return &bitcoinBlockStream{
 		ctx:        ctx,
 		parser:     b,
-		blob:       blobdata,
+		loadGroup:  loadGroup,
 		opts:       opts,
 		openReader: openReader,
 	}
@@ -115,7 +120,7 @@ func (s *bitcoinBlockStream) Transactions() iter.Seq2[*api.BitcoinTransaction, e
 			return nil
 		})
 
-		hdr, err := s.parser.StreamBlock(s.ctx, r, s.blob, visitor, s.opts...)
+		hdr, err := s.parser.StreamBlock(s.ctx, r, s.loadGroup, visitor, s.opts...)
 		switch {
 		case errors.Is(err, errIterStopped):
 			// Consumer broke the range. Nothing to report; defers clean up.

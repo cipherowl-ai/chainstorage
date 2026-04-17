@@ -150,7 +150,7 @@ func (mr *MockParserMockRecorder) ValidateRosettaBlock(arg0, arg1, arg2 any) *go
 }
 
 // StreamBitcoinBlock mocks base method.
-func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 *chainstorage.Block, arg3 ...parser.ParseOption) (parser.BitcoinBlockStream, error) {
+func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 parser.BitcoinInputTxGroupLoader, arg3 ...parser.ParseOption) (parser.BitcoinBlockStream, error) {
 	m.ctrl.T.Helper()
 	varargs := []any{arg0, arg1, arg2}
 	for _, a := range arg3 {

@@ -17,13 +17,42 @@ type BitcoinBlockVisitor interface {
 	VisitTransaction(tx *api.BitcoinTransaction) error
 }
 
+// InputTxGroupLoader returns the prev-output transactions
+// corresponding to the inputs of the i-th block transaction. The
+// returned RepeatedBytes may be nil for txs with no inputs (e.g.
+// coinbase) or when no input_transactions are available for the
+// block.
+//
+// Callers may implement this against in-memory data (adapting
+// *api.BitcoinBlobdata.InputTransactions) or against a spooled copy
+// of the proto bytes (per-group seek+proto.Unmarshal). The lazy
+// spool-based implementation is what drops parser peak RAM from
+// ~O(block) to ~O(largest tx's input_transactions) on zcash.
+//
+// Alias of internal.BitcoinInputTxGroupLoader so the streamer
+// interface and its bitcoin-family implementation share the same
+// underlying type.
+type InputTxGroupLoader = internal.BitcoinInputTxGroupLoader
+
+// NewInMemoryInputTxGroupLoader adapts the legacy in-memory
+// []*api.RepeatedBytes layout to the loader interface. Memory
+// characteristics are unchanged vs directly passing the blobdata.
+func NewInMemoryInputTxGroupLoader(groups []*api.RepeatedBytes) InputTxGroupLoader {
+	return func(i int) (*api.RepeatedBytes, error) {
+		if i < 0 || i >= len(groups) {
+			return nil, nil
+		}
+		return groups[i], nil
+	}
+}
+
 // StreamingNativeParser is implemented by bitcoin-family native parsers
 // that support streaming decoding via StreamBlock.
 type StreamingNativeParser interface {
 	StreamBlock(
 		ctx context.Context,
 		r io.Reader,
-		blobdata *api.BitcoinBlobdata,
+		loadGroup InputTxGroupLoader,
 		visitor BitcoinBlockVisitor,
 		opts ...internal.ParseOption,
 	) (*api.BitcoinHeader, error)
@@ -56,7 +85,7 @@ func (f BitcoinBlockVisitorFunc) VisitTransaction(tx *api.BitcoinTransaction) er
 func (b *bitcoinNativeParserImpl) StreamBlock(
 	ctx context.Context,
 	r io.Reader,
-	blobdata *api.BitcoinBlobdata,
+	loadGroup InputTxGroupLoader,
 	visitor BitcoinBlockVisitor,
 	opts ...internal.ParseOption,
 ) (*api.BitcoinHeader, error) {
@@ -65,11 +94,6 @@ func (b *bitcoinNativeParserImpl) StreamBlock(
 	}
 
 	optView := internal.ResolveParseOptions(opts)
-
-	metadataMap, err := b.buildInputMetadataMap(blobdata, optView)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to build input metadata: %w", err)
-	}
 
 	dec := json.NewDecoder(r)
 	openTok, err := dec.Token()
@@ -109,6 +133,22 @@ func (b *bitcoinNativeParserImpl) StreamBlock(
 				if err := dec.Decode(&rawTx); err != nil {
 					return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
 				}
+
+				// Lazy: load only this tx's prev-output group,
+				// build a per-tx metadata map, and let it go
+				// out of scope immediately after parsing.
+				var metadataMap map[string][]*api.BitcoinTransactionOutput
+				if loadGroup != nil {
+					group, err := loadGroup(txIdx)
+					if err != nil {
+						return nil, xerrors.Errorf("load input tx group [%d]: %w", txIdx, err)
+					}
+					metadataMap, err = b.buildMetadataForGroup(group, optView)
+					if err != nil {
+						return nil, xerrors.Errorf("build metadata for tx[%d]: %w", txIdx, err)
+					}
+				}
+
 				apiTx, err := rawTx.ToApiBitcoinTransaction(txIdx, metadataMap, b.p2pkhVersionByte, optView)
 				if err != nil {
 					return nil, xerrors.Errorf("failed to convert tx[%d]: %w", txIdx, err)

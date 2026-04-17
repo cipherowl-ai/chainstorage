@@ -51,6 +51,34 @@ func WalkBlockEnvelope(r io.Reader) (*Block, error) {
 type walker struct {
 	br  *bufio.Reader
 	pos int64
+
+	// scratch is a reusable buffer for discardFast. Sized so that
+	// skipping large fields doesn't trigger io.Copy's default 32 KB
+	// per-call allocation or a fresh LimitedReader wrapper. The
+	// bufio.Reader's internal buffer handles the actual read
+	// amplification to the underlying stream.
+	scratch [64 * 1024]byte
+}
+
+// discardFast reads and discards n bytes from the bufio reader without
+// the io.CopyN allocation (io.CopyN wraps with io.LimitReader and
+// allocates a fresh buffer per call; over thousands of calls this
+// dominates allocator pressure). Uses the walker's pre-allocated
+// scratch buffer instead.
+func (w *walker) discardFast(n int64) error {
+	for n > 0 {
+		chunk := int64(len(w.scratch))
+		if chunk > n {
+			chunk = n
+		}
+		got, err := io.ReadFull(w.br, w.scratch[:chunk])
+		w.pos += int64(got)
+		n -= int64(got)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // walkMessage reads wire-format fields into dst until endPos (absolute

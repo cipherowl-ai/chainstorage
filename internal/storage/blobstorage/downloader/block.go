@@ -86,10 +86,22 @@ type (
 		DownloadStreamBitcoin(ctx context.Context, blockFile *api.BlockFile, consumer BitcoinStreamConsumer) error
 	}
 
-	// BitcoinStreamConsumer receives a partial api.Block (with
-	// BitcoinBlobdata.Header = nil) plus a factory for opening a
-	// reader over the header bytes.
-	BitcoinStreamConsumer func(ctx context.Context, block *api.Block, openHeaderReader func() (io.ReadCloser, error)) error
+	// BitcoinStreamConsumer receives a partial api.Block (with both
+	// BitcoinBlobdata.Header and BitcoinBlobdata.InputTransactions
+	// left nil) plus (a) a factory for opening a reader over the
+	// Header bytes and (b) a loader that returns prev-output
+	// transactions for the i-th block tx on demand.
+	//
+	// Both factories read from a locally-spooled copy of the
+	// decompressed block, so memory use is bounded by whatever the
+	// consumer actively holds (one header reader, one tx group at a
+	// time) rather than by the full InputTransactions set.
+	BitcoinStreamConsumer func(
+		ctx context.Context,
+		block *api.Block,
+		openHeaderReader func() (io.ReadCloser, error),
+		loadInputTxGroup func(i int) (*api.RepeatedBytes, error),
+	) error
 
 	BlockDownloaderParams struct {
 		fx.In
@@ -269,6 +281,10 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 // copy of the decompressed block.
 func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFile *api.BlockFile, consumer BitcoinStreamConsumer) error {
 	if blockFile.Skipped {
+		emptyHeader := func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		}
+		noGroups := func(i int) (*api.RepeatedBytes, error) { return nil, nil }
 		return consumer(ctx, &api.Block{
 			Blockchain: d.config.Chain.Blockchain,
 			Network:    d.config.Chain.Network,
@@ -276,9 +292,7 @@ func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFi
 				Tag: blockFile.Tag, Height: blockFile.Height, Skipped: true,
 			},
 			Blobdata: nil,
-		}, func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(nil)), nil
-		})
+		}, emptyHeader, noGroups)
 	}
 
 	defer d.logDuration(time.Now())
@@ -321,12 +335,11 @@ func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFi
 	}
 
 	tee := io.TeeReader(dec, tmpDecompressed)
-	block, headerOffset, headerLength, walkErr := api.WalkBitcoinEnvelope(tee)
+	block, chunks, walkErr := api.WalkBitcoinEnvelope(tee)
 
 	// Fully drain the tee so the remaining bytes (if any) land in the
-	// decompressed spool. WalkBitcoinEnvelope already consumes exactly
-	// up to the end of the Block message; if there are trailing bytes
-	// in the stream, we copy them through to keep tmpDecompressed faithful.
+	// decompressed spool. WalkBitcoinEnvelope consumes exactly up to
+	// the end of the Block message; drain anything past that.
 	if walkErr == nil {
 		_, _ = io.Copy(io.Discard, tee)
 	}
@@ -343,7 +356,7 @@ func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFi
 	if walkErr != nil {
 		return xerrors.Errorf("walk bitcoin envelope: %w", walkErr)
 	}
-	if headerOffset < 0 {
+	if chunks.Header.Length == 0 && chunks.Header.Offset == 0 {
 		return xerrors.Errorf("block at (tag=%v, height=%v) has no bitcoin header", blockFile.Tag, blockFile.Height)
 	}
 
@@ -352,14 +365,44 @@ func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFi
 		if err != nil {
 			return nil, xerrors.Errorf("open decompressed spool for header read: %w", err)
 		}
-		if _, err := f.Seek(headerOffset, io.SeekStart); err != nil {
+		if _, err := f.Seek(chunks.Header.Offset, io.SeekStart); err != nil {
 			f.Close()
 			return nil, xerrors.Errorf("seek to header: %w", err)
 		}
-		return &seekedHeaderReader{f: f, limit: io.LimitReader(f, headerLength)}, nil
+		return &seekedHeaderReader{f: f, limit: io.LimitReader(f, chunks.Header.Length)}, nil
 	}
 
-	return consumer(ctx, block, openHeaderReader)
+	// Lazy per-tx input-transaction loader: seek + read + Unmarshal
+	// one RepeatedBytes group from the decompressed spool per call.
+	// The returned *api.RepeatedBytes is expected to be discarded by
+	// the caller after the corresponding tx is parsed, so each call's
+	// allocation scope stays bounded.
+	groups := chunks.InputTransactionsGroups
+	loadGroup := func(i int) (*api.RepeatedBytes, error) {
+		if i < 0 || i >= len(groups) {
+			return nil, nil
+		}
+		ref := groups[i]
+		f, err := os.Open(decompressedPath)
+		if err != nil {
+			return nil, xerrors.Errorf("open decompressed spool for input tx group [%d]: %w", i, err)
+		}
+		defer f.Close()
+		if _, err := f.Seek(ref.Offset, io.SeekStart); err != nil {
+			return nil, xerrors.Errorf("seek to input tx group [%d]: %w", i, err)
+		}
+		b := make([]byte, ref.Length)
+		if _, err := io.ReadFull(f, b); err != nil {
+			return nil, xerrors.Errorf("read input tx group [%d]: %w", i, err)
+		}
+		rb := &api.RepeatedBytes{}
+		if err := proto.Unmarshal(b, rb); err != nil {
+			return nil, xerrors.Errorf("unmarshal input tx group [%d]: %w", i, err)
+		}
+		return rb, nil
+	}
+
+	return consumer(ctx, block, openHeaderReader, loadGroup)
 }
 
 // seekedHeaderReader is an io.ReadCloser that reads up to `limit`

@@ -131,7 +131,18 @@ func DecompressReader(r io.Reader, compression api.Compression) (io.ReadCloser, 
 		}
 		return gr, nil
 	case api.Compression_ZSTD:
-		zr, err := zstd.NewReader(r)
+		// WithDecoderConcurrency(1): sequential decoding only.
+		// WithDecoderLowmem(true): enable the low-memory decoder path;
+		// the concurrent decoder otherwise pre-decodes blocks ahead of
+		// the reader and retains them in an internal channel, which on
+		// a multi-GB zcash block balloons to several GB of transient
+		// heap even though the caller never asks for that much at
+		// once.
+		zr, err := zstd.NewReader(r,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxMemory(256*1024*1024),
+		)
 		if err != nil {
 			return nil, xerrors.Errorf("zstd reader: %w", err)
 		}

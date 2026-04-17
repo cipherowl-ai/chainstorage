@@ -19,6 +19,11 @@ type BitcoinBlockStream interface {
 	Header() (*api.BitcoinHeader, error)
 }
 
+// BitcoinInputTxGroupLoader returns the prev-output transactions for
+// the i-th block transaction. See bitcoin.InputTxGroupLoader for
+// details.
+type BitcoinInputTxGroupLoader func(i int) (*api.RepeatedBytes, error)
+
 // BitcoinStreamer identifies bitcoin-family NativeParser implementations
 // that support streaming via StreamBlockIter.
 //
@@ -29,7 +34,7 @@ type BitcoinStreamer interface {
 	StreamBlockIter(
 		ctx context.Context,
 		openReader func() (io.ReadCloser, error),
-		blobdata *api.BitcoinBlobdata,
+		loadGroup BitcoinInputTxGroupLoader,
 		opts ...ParseOption,
 	) BitcoinBlockStream
 }

@@ -156,6 +156,6 @@ func (i *instrumentInterceptor) ValidateRosettaBlock(ctx context.Context, req *a
 // instrumentation (per-tx counters, per-block duration) would require
 // hooking the visitor/iterator; for now the call is passed through
 // unwrapped so consumers see the real stream object.
-func (i *instrumentInterceptor) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
-	return i.parser.StreamBitcoinBlock(ctx, openReader, rawBlock, opts...)
+func (i *instrumentInterceptor) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
+	return i.parser.StreamBitcoinBlock(ctx, openReader, loadGroup, opts...)
 }

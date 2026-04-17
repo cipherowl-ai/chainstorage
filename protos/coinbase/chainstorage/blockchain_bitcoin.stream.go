@@ -93,127 +93,158 @@ var KnownBitcoinBlobFields = map[protoreflect.FieldNumber]WireWalkerKnownField{
 	bitcoinBlobFieldRawInputTransactions: {Kind: protoreflect.MessageKind, Repeated: true, Map: true, Process: true},
 }
 
+// BitcoinChunkRef points at a byte range within the walked stream.
+// Zero-value means "not present" (Length == 0 distinguishes empty).
+type BitcoinChunkRef struct {
+	Offset int64
+	Length int64
+}
+
+// BitcoinChunks summarizes the byte ranges the walker skipped inside
+// BitcoinBlobdata so the caller can stream each chunk on demand
+// without retaining the whole blob in memory.
+type BitcoinChunks struct {
+	// Header is the range of BitcoinBlobdata.Header bytes.
+	Header BitcoinChunkRef
+	// InputTransactionsGroups is one entry per element of
+	// BitcoinBlobdata.InputTransactions (a RepeatedBytes message).
+	// Each range is the raw message bytes; the consumer can
+	// proto.Unmarshal them into a RepeatedBytes on demand.
+	InputTransactionsGroups []BitcoinChunkRef
+}
+
 // WalkBitcoinEnvelope reads a proto-encoded Block from r and returns
-// a partially-populated *Block where BitcoinBlobdata.Header is left
-// nil. The offset and length of the Header field within the walked
-// stream are returned so the caller can seek into a spooled copy of
-// r and read the header JSON without ever materializing it as a
-// []byte in memory.
+// a *Block where BitcoinBlobdata.Header AND
+// BitcoinBlobdata.InputTransactions are left nil. The byte ranges of
+// those fields within the walked stream are returned via
+// BitcoinChunks so the caller can seek into a spooled copy of r and
+// load each chunk on demand.
 //
-// Every other field (including BitcoinBlobdata.InputTransactions,
-// other blobdata variants, Block metadata) is decoded normally via
-// the generic walker's reflection-driven path — so peak RAM on
-// InputTransactions-heavy zcash blocks is bounded by the materialized
-// api.Block, not by an intermediate []byte copy of the decompressed
-// proto.
+// All other fields (Block metadata, other blobdata variants, and any
+// non-{Header, InputTransactions} fields on BitcoinBlobdata) are
+// decoded normally.
 //
-// Unknown field numbers on the wire return an error. The contract +
-// switch-coverage tests in protos/coinbase/chainstorage/ ensure any
-// proto edit that adds a field either gets registered here or fails
-// CI.
-func WalkBitcoinEnvelope(r io.Reader) (*Block, int64, int64, error) {
+// Peak RAM during this call is bounded by the materialized parts of
+// the Block — which for bitcoin-family blocks is just metadata + the
+// tiny RawInputTransactions map if populated. The big InputTransactions
+// and Header fields are only streamed when the parser asks for them.
+//
+// Unknown field numbers on the wire return an error. See
+// Known{Block,BitcoinBlob}Fields and the contract + switch-coverage
+// tests for drift-defense guarantees.
+func WalkBitcoinEnvelope(r io.Reader) (*Block, BitcoinChunks, error) {
 	block := &Block{}
+	chunks := BitcoinChunks{}
 	w := &walker{br: bufio.NewReaderSize(r, 64*1024)}
 	blockMsg := block.ProtoReflect()
 	blockDesc := blockMsg.Descriptor()
-
-	var headerOffset, headerLength int64 = -1, 0
 
 	for {
 		if _, err := w.br.Peek(1); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return nil, 0, 0, xerrors.Errorf("peek at top-level: %w", err)
+			return nil, BitcoinChunks{}, xerrors.Errorf("peek at top-level: %w", err)
 		}
 		tag, err := w.readVarint()
 		if err != nil {
-			return nil, 0, 0, xerrors.Errorf("read top-level tag: %w", err)
+			return nil, BitcoinChunks{}, xerrors.Errorf("read top-level tag: %w", err)
 		}
 		fieldNum := protoreflect.FieldNumber(tag >> 3)
 		wireType := int(tag & 0x7)
 
 		fd := blockDesc.Fields().ByNumber(fieldNum)
 		if fd == nil {
-			return nil, 0, 0, xerrors.Errorf("unknown Block field %d (wt=%d): proto changed; update KnownBlockFields + switch in blockchain_bitcoin.stream.go", fieldNum, wireType)
+			return nil, BitcoinChunks{}, xerrors.Errorf("unknown Block field %d (wt=%d): proto changed; update KnownBlockFields + switch in blockchain_bitcoin.stream.go", fieldNum, wireType)
 		}
 
 		// Specialized: when descending into the bitcoin blob, track
-		// Header offset instead of materializing it.
+		// Header + InputTransactions group offsets instead of
+		// materializing them.
 		if fieldNum == blockFieldBitcoin {
 			length, err := w.readVarint()
 			if err != nil {
-				return nil, 0, 0, xerrors.Errorf("read bitcoin length: %w", err)
+				return nil, BitcoinChunks{}, xerrors.Errorf("read bitcoin length: %w", err)
 			}
 			blob := &BitcoinBlobdata{}
 			block.Blobdata = &Block_Bitcoin{Bitcoin: blob}
 			endPos := w.pos + int64(length)
-			hoff, hlen, err := w.walkBitcoinBlob(blob, endPos)
+			blobChunks, err := w.walkBitcoinBlob(blob, endPos)
 			if err != nil {
-				return nil, 0, 0, xerrors.Errorf("walk bitcoin blob: %w", err)
+				return nil, BitcoinChunks{}, xerrors.Errorf("walk bitcoin blob: %w", err)
 			}
-			if hoff >= 0 {
-				headerOffset = hoff
-				headerLength = hlen
-			}
+			chunks = blobChunks
 			continue
 		}
 
 		// All other fields: delegate to the generic walker's
-		// reflection-driven decoder. This gives us direct-read
-		// efficiency for repeated bytes inside sub-messages without
-		// proto.Unmarshal transient buffers.
+		// reflection-driven decoder.
 		if err := w.decodeField(blockMsg, fd, wireType); err != nil {
-			return nil, 0, 0, xerrors.Errorf("decode Block.%s: %w", fd.Name(), err)
+			return nil, BitcoinChunks{}, xerrors.Errorf("decode Block.%s: %w", fd.Name(), err)
 		}
 	}
 
-	return block, headerOffset, headerLength, nil
+	return block, chunks, nil
 }
 
-// walkBitcoinBlob walks a BitcoinBlobdata sub-message. The Header
-// field (bitcoinBlobFieldHeader) is skipped — its offset + length are
-// recorded so the caller can seek back into the spool file and stream
-// the bytes later. All other fields delegate to the generic walker.
-func (w *walker) walkBitcoinBlob(blob *BitcoinBlobdata, endPos int64) (int64, int64, error) {
-	var headerOffset, headerLength int64 = -1, 0
-	blobMsg := blob.ProtoReflect()
-	blobDesc := blobMsg.Descriptor()
+// walkBitcoinBlob walks a BitcoinBlobdata sub-message. Header and
+// InputTransactions have their byte ranges recorded; every other
+// field is decoded normally via the generic walker.
+func (w *walker) walkBitcoinBlob(blob *BitcoinBlobdata, endPos int64) (BitcoinChunks, error) {
+	_ = blob // blob is populated lazily via chunks; no fields are decoded here
+	chunks := BitcoinChunks{}
 
 	for w.pos < endPos {
 		tag, err := w.readVarint()
 		if err != nil {
-			return 0, 0, xerrors.Errorf("read bitcoin tag: %w", err)
+			return BitcoinChunks{}, xerrors.Errorf("read bitcoin tag: %w", err)
 		}
 		fieldNum := protoreflect.FieldNumber(tag >> 3)
 		wireType := int(tag & 0x7)
 
-		if fieldNum == bitcoinBlobFieldHeader {
+		switch fieldNum {
+		case bitcoinBlobFieldHeader:
 			length, err := w.readVarint()
 			if err != nil {
-				return 0, 0, xerrors.Errorf("read header length: %w", err)
+				return BitcoinChunks{}, xerrors.Errorf("read header length: %w", err)
 			}
-			headerOffset = w.pos
-			headerLength = int64(length)
-			n, err := io.CopyN(io.Discard, w.br, int64(length))
-			w.pos += n
+			chunks.Header = BitcoinChunkRef{Offset: w.pos, Length: int64(length)}
+			if err := w.discardFast(int64(length)); err != nil {
+				return BitcoinChunks{}, xerrors.Errorf("discard header bytes: %w", err)
+			}
+		case bitcoinBlobFieldInputTransactions:
+			length, err := w.readVarint()
 			if err != nil {
-				return 0, 0, xerrors.Errorf("discard header bytes: %w", err)
+				return BitcoinChunks{}, xerrors.Errorf("read input_transactions length: %w", err)
 			}
-			continue
-		}
-
-		fd := blobDesc.Fields().ByNumber(fieldNum)
-		if fd == nil {
-			return 0, 0, xerrors.Errorf("unknown BitcoinBlobdata field %d (wt=%d): proto changed; update KnownBitcoinBlobFields + switch in blockchain_bitcoin.stream.go", fieldNum, wireType)
-		}
-		if err := w.decodeField(blobMsg, fd, wireType); err != nil {
-			return 0, 0, xerrors.Errorf("decode BitcoinBlobdata.%s: %w", fd.Name(), err)
+			chunks.InputTransactionsGroups = append(chunks.InputTransactionsGroups,
+				BitcoinChunkRef{Offset: w.pos, Length: int64(length)})
+			if err := w.discardFast(int64(length)); err != nil {
+				return BitcoinChunks{}, xerrors.Errorf("discard input_transactions bytes: %w", err)
+			}
+		case bitcoinBlobFieldRawInputTransactions:
+			// raw_input_transactions is a map<string, bytes> storing
+			// duplicate raw-JSON copies of the prev-tx data. The
+			// bitcoin parser only reads input_transactions (field 2);
+			// materializing raw_input_transactions would double peak
+			// RAM on zcash (the two fields together are ~4 GB). Skip
+			// it unconditionally in the streaming path — if some
+			// future caller needs it, they can add a Chunks
+			// accessor.
+			length, err := w.readVarint()
+			if err != nil {
+				return BitcoinChunks{}, xerrors.Errorf("read raw_input_transactions length: %w", err)
+			}
+			if err := w.discardFast(int64(length)); err != nil {
+				return BitcoinChunks{}, xerrors.Errorf("discard raw_input_transactions bytes: %w", err)
+			}
+		default:
+			return BitcoinChunks{}, xerrors.Errorf("unknown BitcoinBlobdata field %d (wt=%d): proto changed; update KnownBitcoinBlobFields + switch in blockchain_bitcoin.stream.go", fieldNum, wireType)
 		}
 	}
 
 	if w.pos != endPos {
-		return 0, 0, xerrors.Errorf("bitcoin blob consumed %d bytes, expected %d", w.pos, endPos)
+		return BitcoinChunks{}, xerrors.Errorf("bitcoin blob consumed %d bytes, expected %d", w.pos, endPos)
 	}
-	return headerOffset, headerLength, nil
+	return chunks, nil
 }

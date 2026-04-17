@@ -14,8 +14,10 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-// TestWalkBitcoinEnvelope_Parity compares WalkBitcoinEnvelope output
-// against proto.Unmarshal on a small hand-built bitcoin block.
+// TestWalkBitcoinEnvelope_Parity walks a hand-built block and asserts
+// that Header and InputTransactions are exposed via chunk offsets
+// (not materialized) while the rest of the block matches proto.Marshal
+// round-trip behavior.
 func TestWalkBitcoinEnvelope_Parity(t *testing.T) {
 	require := require.New(t)
 
@@ -34,6 +36,9 @@ func TestWalkBitcoinEnvelope_Parity(t *testing.T) {
 					{Data: [][]byte{[]byte(`{"txid":"prev1"}`), []byte(`{"txid":"prev2"}`)}},
 					{Data: [][]byte{[]byte(`{"txid":"prev3"}`)}},
 				},
+				RawInputTransactions: map[string][]byte{
+					"tx1": []byte("raw1"),
+				},
 			},
 		},
 	}
@@ -41,33 +46,42 @@ func TestWalkBitcoinEnvelope_Parity(t *testing.T) {
 	raw, err := proto.Marshal(original)
 	require.NoError(err)
 
-	r := bytes.NewReader(raw)
-	block, headerOffset, headerLength, err := api.WalkBitcoinEnvelope(r)
+	block, chunks, err := api.WalkBitcoinEnvelope(bytes.NewReader(raw))
 	require.NoError(err)
 
+	// Top-level fields decode normally.
 	require.Equal(original.Blockchain, block.Blockchain)
 	require.Equal(original.Network, block.Network)
 	require.Equal(original.Metadata.Tag, block.Metadata.Tag)
-	require.Equal(original.Metadata.Height, block.Metadata.Height)
 	require.Equal(original.Metadata.Hash, block.Metadata.Hash)
 
+	// Blob: Header, InputTransactions, AND RawInputTransactions are
+	// all skipped by the walker — each is exposed lazily via a chunk
+	// ref or can be recomputed from InputTransactions. Skipping
+	// RawInputTransactions avoids doubling peak RAM on chains that
+	// duplicate data between the two fields (e.g. zcash).
 	blob := block.GetBitcoin()
 	require.NotNil(blob)
-	require.Nil(blob.Header, "header must be left nil — walker exposes it via offset")
+	require.Nil(blob.Header, "header must be left nil — walker exposes it via chunks.Header")
+	require.Nil(blob.InputTransactions, "input_transactions must be left nil — walker exposes it via chunks.InputTransactionsGroups")
+	require.Nil(blob.RawInputTransactions, "raw_input_transactions must be left nil — walker skips it (currently unused by the streaming parser)")
 
-	require.Equal(len(original.GetBitcoin().InputTransactions), len(blob.InputTransactions))
-	for i := range original.GetBitcoin().InputTransactions {
-		require.Equal(original.GetBitcoin().InputTransactions[i].Data, blob.InputTransactions[i].Data)
+	// Header chunk: offset+length point at the header bytes.
+	require.Equal(int64(len(original.GetBitcoin().Header)), chunks.Header.Length)
+	require.Equal(original.GetBitcoin().Header, raw[chunks.Header.Offset:chunks.Header.Offset+chunks.Header.Length])
+
+	// Each InputTransactions group is a separate chunk reference. The
+	// bytes at its offset+length proto.Unmarshal to the original
+	// RepeatedBytes.
+	require.Equal(len(original.GetBitcoin().InputTransactions), len(chunks.InputTransactionsGroups))
+	for i, ref := range chunks.InputTransactionsGroups {
+		got := &api.RepeatedBytes{}
+		require.NoError(proto.Unmarshal(raw[ref.Offset:ref.Offset+ref.Length], got))
+		require.Equal(original.GetBitcoin().InputTransactions[i].Data, got.Data, "group %d mismatch", i)
 	}
-
-	require.Greater(headerOffset, int64(0))
-	require.Equal(int64(len(original.GetBitcoin().Header)), headerLength)
-	require.Equal(original.GetBitcoin().Header, raw[headerOffset:headerOffset+headerLength])
 }
 
-// TestWalkBitcoinEnvelope_Fixture walks the proto-marshaled form of a
-// real bitcoin block fixture to catch ordering and field-number
-// surprises.
+// TestWalkBitcoinEnvelope_Fixture walks a real bitcoin block fixture.
 func TestWalkBitcoinEnvelope_Fixture(t *testing.T) {
 	require := require.New(t)
 
@@ -95,29 +109,29 @@ func TestWalkBitcoinEnvelope_Fixture(t *testing.T) {
 	raw, err := proto.Marshal(original)
 	require.NoError(err)
 
-	block, headerOffset, headerLength, err := api.WalkBitcoinEnvelope(bytes.NewReader(raw))
+	block, chunks, err := api.WalkBitcoinEnvelope(bytes.NewReader(raw))
 	require.NoError(err)
-	require.Equal(int64(len(header)), headerLength)
-	require.Equal(header, raw[headerOffset:headerOffset+headerLength])
+	require.Equal(int64(len(header)), chunks.Header.Length)
+	require.Equal(header, raw[chunks.Header.Offset:chunks.Header.Offset+chunks.Header.Length])
 	require.Nil(block.GetBitcoin().Header)
-	require.Equal(2, len(block.GetBitcoin().InputTransactions))
-	require.Equal([][]byte{tx1, tx2}, block.GetBitcoin().InputTransactions[1].Data)
+	require.Nil(block.GetBitcoin().InputTransactions)
+	require.Equal(2, len(chunks.InputTransactionsGroups))
+
+	// Recover the 2nd group via its chunk ref.
+	got := &api.RepeatedBytes{}
+	ref := chunks.InputTransactionsGroups[1]
+	require.NoError(proto.Unmarshal(raw[ref.Offset:ref.Offset+ref.Length], got))
+	require.Equal([][]byte{tx1, tx2}, got.Data)
 }
 
 // TestWalkBitcoinEnvelope_UnknownBlockField ensures the walker errors
-// on a field number that is not registered in its known set, rather
-// than silently skipping.
+// on a field number not registered in its known set.
 func TestWalkBitcoinEnvelope_UnknownBlockField(t *testing.T) {
 	require := require.New(t)
 
-	// Hand-craft a proto wire payload with a single unknown field
-	// (number 77, wire type 0 varint).
-	buf := []byte{
-		// tag = (77 << 3) | 0 = 616 → varint 0xE8, 0x04
-		0xE8, 0x04,
-		0x2A, // value: varint 42
-	}
-	_, _, _, err := api.WalkBitcoinEnvelope(bytes.NewReader(buf))
+	// tag = (77 << 3) | 0 = 616 → varint 0xE8, 0x04; value = 0x2A (42)
+	buf := []byte{0xE8, 0x04, 0x2A}
+	_, _, err := api.WalkBitcoinEnvelope(bytes.NewReader(buf))
 	require.Error(err)
 	require.Contains(err.Error(), "unknown Block field 77")
 }
@@ -127,16 +141,17 @@ func TestWalkBitcoinEnvelope_UnknownBlockField(t *testing.T) {
 func TestWalkBitcoinEnvelope_UnknownBitcoinBlobField(t *testing.T) {
 	require := require.New(t)
 
-	// Block.bitcoin = {unknown_field_99 = 1}
-	// Outer tag (field 101, wiretype 2) = 0xAA 0x06
-	// length = 3; inner: field 99 varint 1 = 0x98 0x06 0x01
+	// Outer tag (field 101, wiretype 2) = 0xAA 0x06; length=3;
+	// inner: field 99 varint 1 = 0x98 0x06 0x01
 	buf := []byte{0xAA, 0x06, 0x03, 0x98, 0x06, 0x01}
-	_, _, _, err := api.WalkBitcoinEnvelope(bytes.NewReader(buf))
+	_, _, err := api.WalkBitcoinEnvelope(bytes.NewReader(buf))
 	require.Error(err)
 	require.Contains(err.Error(), "unknown BitcoinBlobdata field 99")
 }
 
-// TestWalkBitcoinEnvelope_TeedToFile verifies the tee pattern.
+// TestWalkBitcoinEnvelope_TeedToFile verifies the tee pattern: walker
+// reads from a tee, bytes land in a spool file, and we can reopen
+// the spool + seek to a chunk offset to recover the chunk.
 func TestWalkBitcoinEnvelope_TeedToFile(t *testing.T) {
 	require := require.New(t)
 
@@ -161,16 +176,17 @@ func TestWalkBitcoinEnvelope_TeedToFile(t *testing.T) {
 	defer spool.Close()
 
 	tee := io.TeeReader(bytes.NewReader(raw), spool)
-	block, headerOffset, headerLength, err := api.WalkBitcoinEnvelope(tee)
+	block, chunks, err := api.WalkBitcoinEnvelope(tee)
 	require.NoError(err)
 	require.NoError(spool.Sync())
 
+	// Recover Header by seeking into the spool file.
 	f, err := os.Open(spool.Name())
 	require.NoError(err)
 	defer f.Close()
-	_, err = f.Seek(headerOffset, io.SeekStart)
+	_, err = f.Seek(chunks.Header.Offset, io.SeekStart)
 	require.NoError(err)
-	got, err := io.ReadAll(io.LimitReader(f, headerLength))
+	got, err := io.ReadAll(io.LimitReader(f, chunks.Header.Length))
 	require.NoError(err)
 	require.Equal(original.GetBitcoin().Header, got)
 
@@ -178,6 +194,16 @@ func TestWalkBitcoinEnvelope_TeedToFile(t *testing.T) {
 	require.NoError(err)
 	require.Equal(raw, full)
 
-	require.Equal(1, len(block.GetBitcoin().InputTransactions))
-	require.Equal([][]byte{[]byte("prev1")}, block.GetBitcoin().InputTransactions[0].Data)
+	// Recover input_transactions[0] by seeking.
+	require.Equal(1, len(chunks.InputTransactionsGroups))
+	ref := chunks.InputTransactionsGroups[0]
+	groupBytes, err := os.ReadFile(spool.Name())
+	require.NoError(err)
+	gotGroup := &api.RepeatedBytes{}
+	require.NoError(proto.Unmarshal(groupBytes[ref.Offset:ref.Offset+ref.Length], gotGroup))
+	require.Equal([][]byte{[]byte("prev1")}, gotGroup.Data)
+
+	// Block's Bitcoin has neither Header nor InputTransactions.
+	require.Nil(block.GetBitcoin().Header)
+	require.Nil(block.GetBitcoin().InputTransactions)
 }

@@ -18,6 +18,11 @@ type ParseOption = parser.ParseOption
 // Header() semantics, lifecycle bound to iteration).
 type BitcoinBlockStream = parser.BitcoinBlockStream
 
+// BitcoinInputTxGroupLoader resolves prev-output transactions for the
+// i-th block tx on demand. Implementations typically seek into a
+// locally-spooled copy of the decompressed proto.
+type BitcoinInputTxGroupLoader = parser.BitcoinInputTxGroupLoader
+
 // StreamedBlock is the chain-agnostic view delivered by Client.StreamBlock.
 // It mirrors the shape of *api.Block: a metadata field plus one
 // chain-specific field populated based on the block's underlying
@@ -71,5 +76,5 @@ type Parser interface {
 	ValidateBlock(ctx context.Context, nativeBlock *api.NativeBlock) error
 	// StreamBitcoinBlock returns a bitcoin-family BlockStream for iterator
 	// traversal. Non-bitcoin chains return an error.
-	StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error)
+	StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error)
 }

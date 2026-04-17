@@ -44,7 +44,7 @@ func TestBitcoinStreamBlock(t *testing.T) {
 	// Streamed.
 	var streamed []*api.BitcoinTransaction
 	r := bytes.NewReader(rawBlock.GetBitcoin().GetHeader())
-	header, err := impl.StreamBlock(ctx, r, rawBlock.GetBitcoin(),
+	header, err := impl.StreamBlock(ctx, r, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()),
 		BitcoinBlockVisitorFunc(func(tx *api.BitcoinTransaction) error {
 			streamed = append(streamed, tx)
 			return nil
@@ -88,7 +88,7 @@ func TestBitcoinStreamBlock_VisitorError(t *testing.T) {
 	require.NoError(err)
 
 	r := bytes.NewReader(rawBlock.GetBitcoin().GetHeader())
-	_, err = impl.StreamBlock(context.Background(), r, rawBlock.GetBitcoin(),
+	_, err = impl.StreamBlock(context.Background(), r, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()),
 		BitcoinBlockVisitorFunc(func(tx *api.BitcoinTransaction) error {
 			return context.DeadlineExceeded
 		}),
@@ -123,7 +123,7 @@ func TestBitcoinStreamBlock_PeakMemory(t *testing.T) {
 	runtime.ReadMemStats(&ms)
 	baseHeap := ms.HeapAlloc
 
-	_, err = impl.StreamBlock(context.Background(), r, rawBlock.GetBitcoin(),
+	_, err = impl.StreamBlock(context.Background(), r, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()),
 		BitcoinBlockVisitorFunc(func(tx *api.BitcoinTransaction) error {
 			runtime.ReadMemStats(&ms)
 			if ms.HeapAlloc > peakHeap {

@@ -91,7 +91,7 @@ func BenchmarkBitcoinStreamBlock(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		r := bytes.NewReader(headerBytes)
-		if _, err := impl.StreamBlock(ctx, r, rawBlock.GetBitcoin(), visitor); err != nil {
+		if _, err := impl.StreamBlock(ctx, r, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()), visitor); err != nil {
 			b.Fatalf("StreamBlock: %v", err)
 		}
 	}

@@ -407,7 +407,7 @@ func (mr *MockParserMockRecorder) ValidateBlock(arg0, arg1 any) *gomock.Call {
 }
 
 // StreamBitcoinBlock mocks base method.
-func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 *chainstorage.Block, arg3 ...sdk.ParseOption) (sdk.BitcoinBlockStream, error) {
+func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 sdk.BitcoinInputTxGroupLoader, arg3 ...sdk.ParseOption) (sdk.BitcoinBlockStream, error) {
 	m.ctrl.T.Helper()
 	varargs := []any{arg0, arg1, arg2}
 	for _, a := range arg3 {

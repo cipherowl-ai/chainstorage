@@ -129,7 +129,7 @@ func TestWireWalkerSwitchCoverage_Block(t *testing.T) {
 			raw, err := proto.Marshal(m.Interface())
 			require.NoError(t, err)
 
-			_, _, _, err = api.WalkBitcoinEnvelope(bytes.NewReader(raw))
+			_, _, err = api.WalkBitcoinEnvelope(bytes.NewReader(raw))
 			require.NoErrorf(t, err,
 				"walker returned an error on a Block containing only field %q (number %d).\n"+
 					"If the error mentions \"unknown Block field\", the switch in WalkBitcoinEnvelope is missing a case for this field — either handle it (Process) or add its number to the known-but-unused skip group in blockchain_bitcoin.stream.go.",
@@ -161,7 +161,7 @@ func TestWireWalkerSwitchCoverage_BitcoinBlobdata(t *testing.T) {
 			raw, err := proto.Marshal(block)
 			require.NoError(t, err)
 
-			_, _, _, err = api.WalkBitcoinEnvelope(bytes.NewReader(raw))
+			_, _, err = api.WalkBitcoinEnvelope(bytes.NewReader(raw))
 			require.NoErrorf(t, err,
 				"walker returned an error on a Block containing only BitcoinBlobdata.%s (number %d).\n"+
 					"If the error mentions \"unknown BitcoinBlobdata field\", the switch in walkBitcoinBlob is missing a case for this field — either handle it (Process) or add its number to the known-but-unused skip group in blockchain_bitcoin.stream.go.",
