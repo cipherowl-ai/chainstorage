@@ -172,15 +172,47 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	peak2.stop()
 	after2 := heapAlloc()
 
-	t.Logf("\n=== Non-streaming baseline (Download -> ParseBlock) ===")
+	t.Logf("\n=== Legacy baseline (Download -> ParseBlock) ===")
 	t.Logf("total elapsed:          %s", elapsed2)
 	t.Logf("tx count:               %d", nb.NumTransactions)
 	t.Logf("heap before:            %s", humanBytes(before2))
 	t.Logf("heap after:             %s", humanBytes(after2))
 	t.Logf("heap peak:              %s (+%s)", humanBytes(peak2.peak), humanBytes(subU(peak2.peak, before2)))
 	t.Logf("persistent NB size:     %s", humanBytes(uint64(protoSize(nb))))
-	t.Logf("\n=== Delta (streaming vs baseline) ===")
-	t.Logf("elapsed:                %s vs %s (%.0f%%)", elapsed, elapsed2, float64(elapsed)/float64(elapsed2)*100)
-	t.Logf("peak delta:             %s vs %s", humanBytes(subU(peak.peak, before)), humanBytes(subU(peak2.peak, before2)))
+
+	// ----- Phase 2 chain-agnostic: DownloadStream (generic walker) + ParseBlock -----
+	nb = nil
+	runtime.GC()
+	runtime.GC()
+	before3 := heapAlloc()
+	peak3 := newHeapPeak()
+	peak3.start()
+
+	start3 := time.Now()
+	var nb3 *api.NativeBlock
+	err = dl.DownloadStream(ctx, bf, func(ctx context.Context, block *api.Block) error {
+		var parseErr error
+		nb3, parseErr = parser.ParseBlock(ctx, block, opts...)
+		return parseErr
+	})
+	elapsed3 := time.Since(start3)
+	peak3.stop()
+	if err != nil {
+		t.Fatalf("DownloadStream: %v", err)
+	}
+	after3 := heapAlloc()
+
+	t.Logf("\n=== Phase 2 generic (DownloadStream -> ParseBlock) ===")
+	t.Logf("total elapsed:          %s", elapsed3)
+	t.Logf("tx count:               %d", nb3.NumTransactions)
+	t.Logf("heap before:            %s", humanBytes(before3))
+	t.Logf("heap after:             %s", humanBytes(after3))
+	t.Logf("heap peak:              %s (+%s)", humanBytes(peak3.peak), humanBytes(subU(peak3.peak, before3)))
+	t.Logf("persistent NB size:     %s", humanBytes(uint64(protoSize(nb3))))
+
+	t.Logf("\n=== Peak heap summary ===")
+	t.Logf("legacy (Download):                %s", humanBytes(subU(peak2.peak, before2)))
+	t.Logf("Phase 2 generic (DownloadStream): %s", humanBytes(subU(peak3.peak, before3)))
+	t.Logf("Phase 2 bitcoin (DownloadStreamBitcoin + iter): %s", humanBytes(subU(peak.peak, before)))
 }
 

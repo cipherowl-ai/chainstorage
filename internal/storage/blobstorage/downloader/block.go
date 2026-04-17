@@ -234,8 +234,6 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 		return xerrors.Errorf("close temp spool: %w", err)
 	}
 
-	// Phase 1: decompress the full file, proto.Unmarshal. This still
-	// materializes the api.Block in memory. See NOTE on the interface.
 	rf, err := os.Open(tmpPath)
 	if err != nil {
 		return xerrors.Errorf("reopen temp spool: %w", err)
@@ -248,18 +246,14 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 	}
 	defer dec.Close()
 
-	blockData, err := ioutil.ReadAll(dec)
+	// Wire-walk the decompressed stream directly into *api.Block. This
+	// avoids the `ioutil.ReadAll + proto.Unmarshal` pair's ~2× peak
+	// memory, dropping resident RAM during parse to ~1× block size for
+	// all chains (not just bitcoin).
+	block, err := api.WalkBlockEnvelope(dec)
 	if err != nil {
-		return xerrors.Errorf("read decompressed: %w", err)
+		return xerrors.Errorf("walk block envelope: %v: %w", err, errors.ErrDownloadFailure)
 	}
-
-	block := new(api.Block)
-	if err := proto.Unmarshal(blockData, block); err != nil {
-		return xerrors.Errorf("proto.Unmarshal: %v: %w", err, errors.ErrDownloadFailure)
-	}
-	// Release our local handle on the big decompressed buffer; api.Block
-	// retains the slices it needs.
-	blockData = nil
 
 	return consumer(ctx, block)
 }
