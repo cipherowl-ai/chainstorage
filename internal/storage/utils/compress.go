@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"path/filepath"
 
@@ -112,4 +113,41 @@ func (z *ZstdCompressor) Decompress(data []byte) ([]byte, error) {
 
 func (z *ZstdCompressor) GetObjectKey(key string) string {
 	return fmt.Sprintf("%s%s", key, ZstdFileSuffix)
+}
+
+// DecompressReader wraps r in a streaming decompressor for the given
+// compression type. The returned reader must be closed.
+//
+// For api.Compression_NONE, returns an io.NopCloser around r so callers
+// can uniformly defer Close().
+func DecompressReader(r io.Reader, compression api.Compression) (io.ReadCloser, error) {
+	switch compression {
+	case api.Compression_NONE:
+		return io.NopCloser(r), nil
+	case api.Compression_GZIP:
+		gr, err := gzip.NewReader(r)
+		if err != nil {
+			return nil, xerrors.Errorf("gzip reader: %w", err)
+		}
+		return gr, nil
+	case api.Compression_ZSTD:
+		zr, err := zstd.NewReader(r)
+		if err != nil {
+			return nil, xerrors.Errorf("zstd reader: %w", err)
+		}
+		return &zstdReadCloser{zr}, nil
+	default:
+		return nil, xerrors.Errorf("unsupported compression type: %v", compression)
+	}
+}
+
+// zstdReadCloser adapts *zstd.Decoder (whose Close returns nothing) to
+// io.ReadCloser.
+type zstdReadCloser struct {
+	*zstd.Decoder
+}
+
+func (z *zstdReadCloser) Close() error {
+	z.Decoder.Close()
+	return nil
 }

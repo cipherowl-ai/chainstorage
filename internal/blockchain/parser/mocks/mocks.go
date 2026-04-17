@@ -11,8 +11,10 @@ package parsermocks
 
 import (
 	context "context"
+	io "io"
 	reflect "reflect"
 
+	parser "github.com/coinbase/chainstorage/internal/blockchain/parser"
 	chainstorage "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -70,18 +72,23 @@ func (mr *MockParserMockRecorder) GetNativeTransaction(arg0, arg1, arg2 any) *go
 }
 
 // ParseNativeBlock mocks base method.
-func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block) (*chainstorage.NativeBlock, error) {
+func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block, arg2 ...parser.ParseOption) (*chainstorage.NativeBlock, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ParseNativeBlock", arg0, arg1)
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "ParseNativeBlock", varargs...)
 	ret0, _ := ret[0].(*chainstorage.NativeBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ParseNativeBlock indicates an expected call of ParseNativeBlock.
-func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any) *gomock.Call {
+func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), arg0, arg1)
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), varargs...)
 }
 
 // ParseRosettaBlock mocks base method.
@@ -140,4 +147,24 @@ func (m *MockParser) ValidateRosettaBlock(arg0 context.Context, arg1 *chainstora
 func (mr *MockParserMockRecorder) ValidateRosettaBlock(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateRosettaBlock", reflect.TypeOf((*MockParser)(nil).ValidateRosettaBlock), arg0, arg1, arg2)
+}
+
+// StreamBitcoinBlock mocks base method.
+func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 *chainstorage.Block, arg3 ...parser.ParseOption) (parser.BitcoinBlockStream, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2}
+	for _, a := range arg3 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "StreamBitcoinBlock", varargs...)
+	ret0, _ := ret[0].(parser.BitcoinBlockStream)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StreamBitcoinBlock indicates an expected call of StreamBitcoinBlock.
+func (mr *MockParserMockRecorder) StreamBitcoinBlock(arg0, arg1, arg2 any, arg3 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2}, arg3...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBitcoinBlock", reflect.TypeOf((*MockParser)(nil).StreamBitcoinBlock), varargs...)
 }

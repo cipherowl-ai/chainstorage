@@ -43,7 +43,7 @@ func NewZcashNativeParser(params internal.ParserParams, opts ...internal.ParserF
 	}, nil
 }
 
-func (p *zcashNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+func (p *zcashNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block, opts ...internal.ParseOption) (*api.NativeBlock, error) {
 	metadata := rawBlock.GetMetadata()
 	if metadata == nil {
 		return nil, xerrors.New("metadata not found")
@@ -56,6 +56,8 @@ func (p *zcashNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Bl
 
 	rawHeader := blobdata.GetHeader()
 
+	optView := internal.ResolveParseOptions(opts)
+
 	var block BitcoinBlock
 	if err := json.Unmarshal(rawHeader, &block); err != nil {
 		return nil, xerrors.Errorf("failed to parse zcash block with %+v: %w", metadata, err)
@@ -67,12 +69,12 @@ func (p *zcashNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Bl
 		return nil, xerrors.Errorf("failed to validate zcash block %+v: %w", metadata, err)
 	}
 
-	metadataMap, err := p.buildInputMetadataMap(blobdata)
+	metadataMap, err := p.buildInputMetadataMap(blobdata, optView)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to build input metadata for %+v: %w", metadata, err)
 	}
 
-	transactions, err := p.buildZcashTransactions(rawHeader, block.Tx, metadataMap)
+	transactions, err := p.buildZcashTransactions(rawHeader, block.Tx, metadataMap, optView)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to build zcash transactions for %+v: %w", metadata, err)
 	}
@@ -101,6 +103,7 @@ func (p *zcashNativeParserImpl) buildZcashTransactions(
 	rawHeader []byte,
 	rawTransactions []*BitcoinTransaction,
 	metadataMap map[string][]*api.BitcoinTransactionOutput,
+	optView internal.ParseOptionsView,
 ) ([]*api.BitcoinTransaction, error) {
 	keepMask, err := buildTransparentTransactionMask(rawHeader, len(rawTransactions))
 	if err != nil {
@@ -113,7 +116,7 @@ func (p *zcashNativeParserImpl) buildZcashTransactions(
 			continue
 		}
 
-		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p.p2pkhVersionByte)
+		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p.p2pkhVersionByte, optView)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to parse tx[%d]: %w", i, err)
 		}

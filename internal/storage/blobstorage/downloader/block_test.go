@@ -168,6 +168,99 @@ func (s *blockDownloaderTestSuite) TestSkipped() {
 	}
 }
 
+func (s *blockDownloaderTestSuite) TestDownloadStream_Success() {
+	require := testutil.Require(s.T())
+
+	bitcoinBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_BITCOIN,
+		Network:    common.Network_NETWORK_BITCOIN_MAINNET,
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 123, Hash: "0xabc"},
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{
+				Header: []byte(`{"hash":"0xabc","height":123,"tx":[]}`),
+			},
+		},
+	}
+	blockBytes, err := proto.Marshal(bitcoinBlock)
+	require.NoError(err)
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, blockBytes)),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	var consumerCalls int
+	var observedHeader string
+	err = s.downloader.DownloadStream(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block) error {
+		consumerCalls++
+		require.NotNil(block.GetMetadata())
+		require.Equal(uint64(123), block.GetMetadata().Height)
+
+		blob := block.GetBitcoin()
+		require.NotNil(blob)
+		observedHeader = string(blob.GetHeader())
+		return nil
+	})
+	require.NoError(err)
+	require.Equal(1, consumerCalls)
+	require.Equal(`{"hash":"0xabc","height":123,"tx":[]}`, observedHeader)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+		fx.Provide(s.newHttpClientFunc()),
+	)
+
+	var consumerCalls int
+	err := s.downloader.DownloadStream(context.Background(), s.skippedBlockFile, func(ctx context.Context, block *api.Block) error {
+		consumerCalls++
+		require.NotNil(block.GetMetadata())
+		require.True(block.GetMetadata().Skipped)
+		require.Nil(block.GetBlobdata())
+		return nil
+	})
+	require.NoError(err)
+	require.Equal(1, consumerCalls)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadStream_ConsumerError() {
+	require := testutil.Require(s.T())
+
+	bitcoinBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_BITCOIN,
+		Network:    common.Network_NETWORK_BITCOIN_MAINNET,
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 123},
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{Header: []byte(`{}`)},
+		},
+	}
+	blockBytes, err := proto.Marshal(bitcoinBlock)
+	require.NoError(err)
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, blockBytes)),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	sentinel := xerrors.New("consumer exploded")
+	err = s.downloader.DownloadStream(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block) error {
+		return sentinel
+	})
+	require.ErrorIs(err, sentinel)
+}
+
 func (s *blockDownloaderTestSuite) newHttpClientFunc() httpClientFunc {
 	return func() HTTPClient {
 		return s.httpServer.Client()

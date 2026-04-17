@@ -265,7 +265,7 @@ func NewBitcoinNativeParser(params internal.ParserParams, opts ...internal.Parse
 	}, nil
 }
 
-func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block, opts ...internal.ParseOption) (*api.NativeBlock, error) {
 	metadata := rawBlock.GetMetadata()
 	if metadata == nil {
 		return nil, xerrors.New("metadata not found")
@@ -275,6 +275,8 @@ func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.
 	if blobdata == nil {
 		return nil, xerrors.New("bitcoin blobdata not found")
 	}
+
+	optView := internal.ResolveParseOptions(opts)
 
 	var block BitcoinBlock
 	if err := json.Unmarshal(blobdata.GetHeader(), &block); err != nil {
@@ -291,7 +293,7 @@ func (b *bitcoinNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.
 	}
 
 	header := block.GetApiBitcoinHeader()
-	transactions, err := b.parseTransactions(blobdata, block.Tx)
+	transactions, err := b.parseTransactions(blobdata, block.Tx, optView)
 	if err != nil {
 		return nil, xerrors.Errorf("parseTransactions failed for %+v: %w", metadata, err)
 	}
@@ -323,7 +325,7 @@ func (b *bitcoinNativeParserImpl) GetTransaction(ctx context.Context, nativeBloc
 // blobdata. Each entry maps a transaction ID to its referenced outputs, which
 // are used later to resolve input values and compute fees.
 func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
-	data *api.BitcoinBlobdata,
+	data *api.BitcoinBlobdata, optView internal.ParseOptionsView,
 ) (map[string][]*api.BitcoinTransactionOutput, error) {
 	metadataMap := make(map[string][]*api.BitcoinTransactionOutput)
 	for i, rawTransaction := range data.GetInputTransactions() {
@@ -346,7 +348,7 @@ func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
 				metadataMap[inputTxId] = make([]*api.BitcoinTransactionOutput, 0)
 			}
 
-			outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput(b.p2pkhVersionByte)
+			outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput(b.p2pkhVersionByte, optView)
 			if err != nil {
 				return nil, xerrors.Errorf("failed to convert to transaction output: %w", err)
 			}
@@ -359,14 +361,14 @@ func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
 }
 
 func (b *bitcoinNativeParserImpl) parseTransactions(
-	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction,
+	data *api.BitcoinBlobdata, rawTransactions []*BitcoinTransaction, optView internal.ParseOptionsView,
 ) ([]*api.BitcoinTransaction, error) {
-	metadataMap, err := b.buildInputMetadataMap(data)
+	metadataMap, err := b.buildInputMetadataMap(data, optView)
 	if err != nil {
 		return nil, err
 	}
 
-	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap, b.p2pkhVersionByte)
+	transactions, err := b.parseApiBitcoinTransactions(rawTransactions, metadataMap, b.p2pkhVersionByte, optView)
 	if err != nil {
 		return nil, err
 	}
@@ -375,11 +377,11 @@ func (b *bitcoinNativeParserImpl) parseTransactions(
 }
 
 func (b *bitcoinNativeParserImpl) parseApiBitcoinTransactions(
-	rawTransactions []*BitcoinTransaction, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte,
+	rawTransactions []*BitcoinTransaction, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte, optView internal.ParseOptionsView,
 ) ([]*api.BitcoinTransaction, error) {
 	transactions := make([]*api.BitcoinTransaction, len(rawTransactions))
 	for i, rawTx := range rawTransactions {
-		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p2pkhVersionByte)
+		transaction, err := rawTx.ToApiBitcoinTransaction(i, metadataMap, p2pkhVersionByte, optView)
 		if err != nil {
 			return nil, err
 		}
@@ -429,13 +431,13 @@ func (b *BitcoinBlock) GetApiBitcoinHeader() *api.BitcoinHeader {
 	}
 }
 
-func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte) (*api.BitcoinTransaction, error) {
-	vin, err := parseVin(t.Vin, metadataMap)
+func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[string][]*api.BitcoinTransactionOutput, p2pkhVersionByte byte, optView internal.ParseOptionsView) (*api.BitcoinTransaction, error) {
+	vin, err := parseVin(t.Vin, metadataMap, optView)
 	if err != nil {
 		return nil, err
 	}
 
-	vout, err := parseVout(t.Vout, p2pkhVersionByte)
+	vout, err := parseVout(t.Vout, p2pkhVersionByte, optView)
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +462,13 @@ func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[
 		fee = inputValue - outputValue
 	}
 
+	hexValue := t.Hex.Value()
+	if optView.SkipScripts() {
+		hexValue = ""
+	}
+
 	return &api.BitcoinTransaction{
-		Hex:           t.Hex.Value(),
+		Hex:           hexValue,
 		TransactionId: t.TxId.Value(),
 		Hash:          t.Hash.Value(),
 		Size:          t.Size.Value(),
@@ -484,10 +491,10 @@ func (t *BitcoinTransaction) ToApiBitcoinTransaction(index int, metadataMap map[
 	}, nil
 }
 
-func parseVin(vin []*BitcoinTransactionInput, metadataMap map[string][]*api.BitcoinTransactionOutput) ([]*api.BitcoinTransactionInput, error) {
+func parseVin(vin []*BitcoinTransactionInput, metadataMap map[string][]*api.BitcoinTransactionOutput, optView internal.ParseOptionsView) ([]*api.BitcoinTransactionInput, error) {
 	inputs := make([]*api.BitcoinTransactionInput, len(vin))
 	for i, inputTx := range vin {
-		input := inputTx.ToApiBitcoinTransactionInput(uint64(i))
+		input := inputTx.ToApiBitcoinTransactionInput(uint64(i), optView)
 		// Note that there is no transaction ID for coinbase transaction
 		if input.TransactionId != "" && metadataMap != nil {
 			outputs, ok := metadataMap[input.TransactionId]
@@ -513,9 +520,12 @@ func parseVin(vin []*BitcoinTransactionInput, metadataMap map[string][]*api.Bitc
 	return inputs, nil
 }
 
-func (i *BitcoinTransactionInput) ToApiBitcoinTransactionInput(index uint64) *api.BitcoinTransactionInput {
-	scriptSig := i.ScriptSig.ToApiBitcoinScriptSignature()
-	witnesses := hexStringsToStrings(i.TxInWitness)
+func (i *BitcoinTransactionInput) ToApiBitcoinTransactionInput(index uint64, optView internal.ParseOptionsView) *api.BitcoinTransactionInput {
+	scriptSig := i.ScriptSig.ToApiBitcoinScriptSignature(optView)
+	var witnesses []string
+	if !optView.SkipWitnesses() {
+		witnesses = hexStringsToStrings(i.TxInWitness)
+	}
 	return &api.BitcoinTransactionInput{
 		Coinbase:                  i.Coinbase.Value(),
 		TransactionId:             i.TxId.Value(),
@@ -540,10 +550,10 @@ func hexStringsToStrings(hexStrings []BitcoinHexString) []string {
 	return result
 }
 
-func parseVout(vout []*BitcoinTransactionOutput, p2pkhVersionByte byte) ([]*api.BitcoinTransactionOutput, error) {
+func parseVout(vout []*BitcoinTransactionOutput, p2pkhVersionByte byte, optView internal.ParseOptionsView) ([]*api.BitcoinTransactionOutput, error) {
 	outputs := make([]*api.BitcoinTransactionOutput, len(vout))
 	for i, outputTx := range vout {
-		output, err := outputTx.ToApiBitcoinTransactionOutput(p2pkhVersionByte)
+		output, err := outputTx.ToApiBitcoinTransactionOutput(p2pkhVersionByte, optView)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to convert transaction output: %w", err)
 		}
@@ -554,13 +564,13 @@ func parseVout(vout []*BitcoinTransactionOutput, p2pkhVersionByte byte) ([]*api.
 	return outputs, nil
 }
 
-func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput(p2pkhVersionByte byte) (*api.BitcoinTransactionOutput, error) {
+func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput(p2pkhVersionByte byte, optView internal.ParseOptionsView) (*api.BitcoinTransactionOutput, error) {
 	value, err := btcutil.NewAmount(o.Value.Value())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to convert value %v to btc amount: %w", o.Value.Value(), err)
 	}
 
-	scriptPubKey, err := o.ScriptPubKey.ToApiBitcoinScriptPublicKey(p2pkhVersionByte)
+	scriptPubKey, err := o.ScriptPubKey.ToApiBitcoinScriptPublicKey(p2pkhVersionByte, optView)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to convert script public key: %w", err)
 	}
@@ -572,7 +582,7 @@ func (o *BitcoinTransactionOutput) ToApiBitcoinTransactionOutput(p2pkhVersionByt
 	}, nil
 }
 
-func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey(p2pkhVersionByte byte) (*api.BitcoinScriptPublicKey, error) {
+func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey(p2pkhVersionByte byte, optView internal.ParseOptionsView) (*api.BitcoinScriptPublicKey, error) {
 	if k == nil {
 		return nil, nil
 	}
@@ -598,14 +608,22 @@ func (k *BitcoinScriptPubKey) ToApiBitcoinScriptPublicKey(p2pkhVersionByte byte)
 		return nil, err
 	}
 
+	if optView.SkipScripts() {
+		// Drop the assembly/hex after any address derivation that needs them.
+		transformedScriptPublicKey.Assembly = ""
+		transformedScriptPublicKey.Hex = ""
+	}
+
 	return transformedScriptPublicKey, nil
 }
 
-func (s *BitcoinScriptSig) ToApiBitcoinScriptSignature() *api.BitcoinScriptSignature {
+func (s *BitcoinScriptSig) ToApiBitcoinScriptSignature(optView internal.ParseOptionsView) *api.BitcoinScriptSignature {
 	if s == nil {
 		return nil
 	}
-
+	if optView.SkipScripts() {
+		return &api.BitcoinScriptSignature{}
+	}
 	return &api.BitcoinScriptSignature{
 		Assembly: s.Asm.Value(),
 		Hex:      s.Hex.Value(),

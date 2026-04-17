@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"io"
 
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/zap"
@@ -62,11 +63,11 @@ func newInstrumentWithResult[T any](method string, scope tally.Scope, logger *za
 	)
 }
 
-func (i *instrumentInterceptor) ParseNativeBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+func (i *instrumentInterceptor) ParseNativeBlock(ctx context.Context, rawBlock *api.Block, opts ...ParseOption) (*api.NativeBlock, error) {
 	return i.instrumentParseNativeBlock.Instrument(
 		ctx,
 		func(ctx context.Context) (*api.NativeBlock, error) {
-			return i.parser.ParseNativeBlock(ctx, rawBlock)
+			return i.parser.ParseNativeBlock(ctx, rawBlock, opts...)
 		},
 		instrument.WithLoggerFields(
 			zap.Reflect("block", rawBlock.Metadata),
@@ -149,4 +150,12 @@ func (i *instrumentInterceptor) ValidateRosettaBlock(ctx context.Context, req *a
 			zap.String("blockHash", actualRosettaBlock.Block.BlockIdentifier.Hash),
 		),
 	)
+}
+
+// StreamBitcoinBlock passes through to the wrapped parser. Streaming
+// instrumentation (per-tx counters, per-block duration) would require
+// hooking the visitor/iterator; for now the call is passed through
+// unwrapped so consumers see the real stream object.
+func (i *instrumentInterceptor) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
+	return i.parser.StreamBitcoinBlock(ctx, openReader, rawBlock, opts...)
 }

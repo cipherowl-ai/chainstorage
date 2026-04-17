@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"io"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -14,7 +15,7 @@ import (
 
 type (
 	Parser interface {
-		ParseNativeBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error)
+		ParseNativeBlock(ctx context.Context, rawBlock *api.Block, opts ...ParseOption) (*api.NativeBlock, error)
 		GetNativeTransaction(ctx context.Context, nativeBlock *api.NativeBlock, transactionHash string) (*api.NativeTransaction, error)
 		ParseRosettaBlock(ctx context.Context, rawBlock *api.Block) (*api.RosettaBlock, error)
 		CompareNativeBlocks(ctx context.Context, height uint64, expectedBlock, actualBlock *api.NativeBlock) error
@@ -24,10 +25,15 @@ type (
 		ValidateAccountState(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error)
 		// ValidateRosettaBlock Given other block source (native, etc), validates whether transaction operations show the correct balance transfer.
 		ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error
+		// StreamBitcoinBlock returns a BitcoinBlockStream for iterator-based
+		// traversal of a bitcoin-family block. Returns an error for chains
+		// that do not implement bitcoin streaming or for blocks whose
+		// Blobdata is not bitcoin-shaped.
+		StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error)
 	}
 
 	NativeParser interface {
-		ParseBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error)
+		ParseBlock(ctx context.Context, rawBlock *api.Block, opts ...ParseOption) (*api.NativeBlock, error)
 		GetTransaction(ctx context.Context, nativeBlock *api.NativeBlock, transactionHash string) (*api.NativeTransaction, error)
 	}
 
@@ -164,8 +170,8 @@ func NewParser(params Params) (Parser, error) {
 	return parser, nil
 }
 
-func (p *parserImpl) ParseNativeBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
-	return p.nativeParser.ParseBlock(ctx, rawBlock)
+func (p *parserImpl) ParseNativeBlock(ctx context.Context, rawBlock *api.Block, opts ...ParseOption) (*api.NativeBlock, error) {
+	return p.nativeParser.ParseBlock(ctx, rawBlock, opts...)
 }
 
 func (p *parserImpl) GetNativeTransaction(ctx context.Context, nativeBlock *api.NativeBlock, transactionHash string) (*api.NativeTransaction, error) {
@@ -190,4 +196,16 @@ func (p *parserImpl) ValidateAccountState(ctx context.Context, req *api.Validate
 
 func (p *parserImpl) ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error {
 	return p.checker.ValidateRosettaBlock(ctx, req, actualRosettaBlock)
+}
+
+func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
+	streamer, ok := p.nativeParser.(BitcoinStreamer)
+	if !ok {
+		return nil, xerrors.Errorf("native parser %T does not support bitcoin streaming", p.nativeParser)
+	}
+	blob := rawBlock.GetBitcoin()
+	if blob == nil {
+		return nil, xerrors.New("StreamBitcoinBlock requires bitcoin blobdata on rawBlock")
+	}
+	return streamer.StreamBlockIter(ctx, openReader, blob, opts...), nil
 }
