@@ -247,9 +247,37 @@ func (b *bitcoinNativeParserImpl) decodeBlockStream(
 				return nil, xerrors.Errorf("expected '[' for tx, got %v", openArr)
 			}
 			for dec.More() {
-				var rawTx BitcoinTransaction
-				if err := dec.Decode(&rawTx); err != nil {
+				// Decode as raw JSON first so the chain-specific
+				// txFilter (e.g. Zcash shielded-tx drop) can
+				// inspect fields not present in the shared
+				// BitcoinTransaction struct. txIdx is always
+				// incremented to preserve the source position
+				// as the tx's index, matching ParseBlock.
+				var rawMsg json.RawMessage
+				if err := dec.Decode(&rawMsg); err != nil {
 					return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
+				}
+
+				if b.txFilter != nil {
+					keep, err := b.txFilter(rawMsg)
+					if err != nil {
+						return nil, xerrors.Errorf("tx filter failed at [%d]: %w", txIdx, err)
+					}
+					if !keep {
+						txIdx++
+						continue
+					}
+				}
+
+				var rawTx BitcoinTransaction
+				if err := json.Unmarshal(rawMsg, &rawTx); err != nil {
+					return nil, xerrors.Errorf("failed to unmarshal tx[%d]: %w", txIdx, err)
+				}
+
+				// Chain-specific normalization (e.g. Dash/Zcash
+				// hash backfill) before conversion.
+				if b.preprocessTx != nil {
+					b.preprocessTx(&rawTx)
 				}
 
 				// Lazy: load only this tx's prev-output group,
