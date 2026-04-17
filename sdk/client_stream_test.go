@@ -106,10 +106,14 @@ func (s *streamBitcoinClientSuite) TestStreamBlock_BitcoinEndToEnd() {
 	}
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
-	bs, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
+	native, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
 	s.require.NoError(err)
-	defer bs.Close()
-	s.require.NotNil(bs.GetMetadata())
+	defer native.Close()
+	s.require.NotNil(native.GetMetadata())
+
+	bs := native.GetBitcoin()
+	s.require.NotNil(bs, "bitcoin-configured client must populate GetBitcoin()")
+	s.require.Nil(native.GetEthereum(), "non-ethereum config must leave GetEthereum() nil")
 
 	var txCount int
 	for tx, iterErr := range bs.Transactions() {

@@ -335,7 +335,7 @@ func (s *clientTestSuite) TestStreamBlocks_ErrStreamChainEvents() {
 	s.require.Nil(ch)
 }
 
-func (s *clientTestSuite) TestStreamBitcoinBlock_NonBitcoinChainErrors() {
+func (s *clientTestSuite) TestStreamNativeBlock_EthereumReturnsNilAccessors() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -353,14 +353,17 @@ func (s *clientTestSuite) TestStreamBitcoinBlock_NonBitcoinChainErrors() {
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
-	// Default config is ethereum. StreamBitcoinBlock must error —
-	// native parser does not implement BitcoinStreamer.
-	view, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
-	s.require.Error(err)
-	s.require.Nil(view)
+	// Default config is ethereum. StreamNativeBlock returns a stream
+	// but GetBitcoin() is nil (native parser does not implement
+	// BitcoinStreamer). GetEthereum() is also nil today (no walker).
+	native, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
+	s.require.NoError(err)
+	defer native.Close()
+	s.require.Nil(native.GetBitcoin(), "ethereum config must not populate GetBitcoin()")
+	s.require.Nil(native.GetEthereum(), "no ethereum streaming walker exists yet")
 }
 
-func (s *clientTestSuite) TestStreamBitcoinBlock_DownloadError() {
+func (s *clientTestSuite) TestStreamNativeBlock_DownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -372,7 +375,7 @@ func (s *clientTestSuite) TestStreamBitcoinBlock_DownloadError() {
 	sentinel := xerrors.New("download exploded")
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(nil, sentinel)
 
-	view, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
+	view, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
 	s.require.ErrorIs(err, sentinel)
 	s.require.Nil(view)
 }

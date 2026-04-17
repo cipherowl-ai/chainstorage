@@ -149,22 +149,22 @@ func (mr *MockParserMockRecorder) ValidateRosettaBlock(arg0, arg1, arg2 any) *go
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateRosettaBlock", reflect.TypeOf((*MockParser)(nil).ValidateRosettaBlock), arg0, arg1, arg2)
 }
 
-// StreamBitcoinBlock mocks base method.
-func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 *downloader.SpooledBlock, arg2 ...parser.ParseOption) (parser.BitcoinStreamedBlock, error) {
+// ParseStreamNative mocks base method.
+func (m *MockParser) ParseStreamNative(arg0 context.Context, arg1 *downloader.SpooledBlock, arg2 ...parser.ParseOption) (parser.NativeStreamedBlock, error) {
 	m.ctrl.T.Helper()
 	varargs := []any{arg0, arg1}
 	for _, a := range arg2 {
 		varargs = append(varargs, a)
 	}
-	ret := m.ctrl.Call(m, "StreamBitcoinBlock", varargs...)
-	ret0, _ := ret[0].(parser.BitcoinStreamedBlock)
+	ret := m.ctrl.Call(m, "ParseStreamNative", varargs...)
+	ret0, _ := ret[0].(parser.NativeStreamedBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// StreamBitcoinBlock indicates an expected call of StreamBitcoinBlock.
-func (mr *MockParserMockRecorder) StreamBitcoinBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
+// ParseStreamNative indicates an expected call of ParseStreamNative.
+func (mr *MockParserMockRecorder) ParseStreamNative(arg0, arg1 any, arg2 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{arg0, arg1}, arg2...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBitcoinBlock", reflect.TypeOf((*MockParser)(nil).StreamBitcoinBlock), varargs...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseStreamNative", reflect.TypeOf((*MockParser)(nil).ParseStreamNative), varargs...)
 }
