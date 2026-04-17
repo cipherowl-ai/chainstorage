@@ -247,18 +247,22 @@ func (b *bitcoinNativeParserImpl) decodeBlockStream(
 				return nil, xerrors.Errorf("expected '[' for tx, got %v", openArr)
 			}
 			for dec.More() {
-				// Decode as raw JSON first so the chain-specific
-				// txFilter (e.g. Zcash shielded-tx drop) can
-				// inspect fields not present in the shared
-				// BitcoinTransaction struct. txIdx is always
-				// incremented to preserve the source position
-				// as the tx's index, matching ParseBlock.
-				var rawMsg json.RawMessage
-				if err := dec.Decode(&rawMsg); err != nil {
-					return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
-				}
-
+				// When a chain-specific txFilter is set (e.g. Zcash
+				// shielded-tx drop), decode as raw JSON first so
+				// the filter can inspect fields not present in the
+				// shared BitcoinTransaction struct. Otherwise decode
+				// directly into BitcoinTransaction to avoid a
+				// two-stage decode.
+				//
+				// txIdx is always incremented (including for
+				// filtered txs) to preserve the source position as
+				// the tx's index, matching ParseBlock.
+				var rawTx BitcoinTransaction
 				if b.txFilter != nil {
+					var rawMsg json.RawMessage
+					if err := dec.Decode(&rawMsg); err != nil {
+						return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
+					}
 					keep, err := b.txFilter(rawMsg)
 					if err != nil {
 						return nil, xerrors.Errorf("tx filter failed at [%d]: %w", txIdx, err)
@@ -267,11 +271,13 @@ func (b *bitcoinNativeParserImpl) decodeBlockStream(
 						txIdx++
 						continue
 					}
-				}
-
-				var rawTx BitcoinTransaction
-				if err := json.Unmarshal(rawMsg, &rawTx); err != nil {
-					return nil, xerrors.Errorf("failed to unmarshal tx[%d]: %w", txIdx, err)
+					if err := json.Unmarshal(rawMsg, &rawTx); err != nil {
+						return nil, xerrors.Errorf("failed to unmarshal tx[%d]: %w", txIdx, err)
+					}
+				} else {
+					if err := dec.Decode(&rawTx); err != nil {
+						return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
+					}
 				}
 
 				// Chain-specific normalization (e.g. Dash/Zcash
