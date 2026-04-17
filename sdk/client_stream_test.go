@@ -106,13 +106,10 @@ func (s *streamBitcoinClientSuite) TestStreamBlock_BitcoinEndToEnd() {
 	}
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
-	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
+	bs, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
 	s.require.NoError(err)
-	defer view.Close()
-	s.require.NotNil(view.GetMetadata())
-
-	bs, ok := view.(BitcoinStreamedBlock)
-	s.require.True(ok, "bitcoin-configured client must return BitcoinStreamedBlock")
+	defer bs.Close()
+	s.require.NotNil(bs.GetMetadata())
 
 	var txCount int
 	for tx, iterErr := range bs.Transactions() {

@@ -299,24 +299,24 @@ func (mr *MockClientMockRecorder) StreamChainEvents(arg0, arg1 any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamChainEvents", reflect.TypeOf((*MockClient)(nil).StreamChainEvents), arg0, arg1)
 }
 
-// StreamBlock mocks base method.
-func (m *MockClient) StreamBlock(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string, arg4 ...sdk.ParseOption) (sdk.StreamedBlock, error) {
+// StreamBitcoinBlock mocks base method.
+func (m *MockClient) StreamBitcoinBlock(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string, arg4 ...sdk.ParseOption) (sdk.BitcoinStreamedBlock, error) {
 	m.ctrl.T.Helper()
 	varargs := []any{arg0, arg1, arg2, arg3}
 	for _, a := range arg4 {
 		varargs = append(varargs, a)
 	}
-	ret := m.ctrl.Call(m, "StreamBlock", varargs...)
-	ret0, _ := ret[0].(sdk.StreamedBlock)
+	ret := m.ctrl.Call(m, "StreamBitcoinBlock", varargs...)
+	ret0, _ := ret[0].(sdk.BitcoinStreamedBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// StreamBlock indicates an expected call of StreamBlock.
-func (mr *MockClientMockRecorder) StreamBlock(arg0, arg1, arg2, arg3 any, arg4 ...any) *gomock.Call {
+// StreamBitcoinBlock indicates an expected call of StreamBitcoinBlock.
+func (mr *MockClientMockRecorder) StreamBitcoinBlock(arg0, arg1, arg2, arg3 any, arg4 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{arg0, arg1, arg2, arg3}, arg4...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBlock", reflect.TypeOf((*MockClient)(nil).StreamBlock), varargs...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBitcoinBlock", reflect.TypeOf((*MockClient)(nil).StreamBitcoinBlock), varargs...)
 }
 
 // MockParser is a mock of Parser interface.
@@ -406,24 +406,24 @@ func (mr *MockParserMockRecorder) ValidateBlock(arg0, arg1 any) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateBlock", reflect.TypeOf((*MockParser)(nil).ValidateBlock), arg0, arg1)
 }
 
-// StreamBlock mocks base method.
-func (m *MockParser) StreamBlock(arg0 context.Context, arg1 *sdk.SpooledBlock, arg2 ...sdk.ParseOption) (sdk.StreamedBlock, error) {
+// StreamBitcoinBlock mocks base method.
+func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 *sdk.SpooledBlock, arg2 ...sdk.ParseOption) (sdk.BitcoinStreamedBlock, error) {
 	m.ctrl.T.Helper()
 	varargs := []any{arg0, arg1}
 	for _, a := range arg2 {
 		varargs = append(varargs, a)
 	}
-	ret := m.ctrl.Call(m, "StreamBlock", varargs...)
-	ret0, _ := ret[0].(sdk.StreamedBlock)
+	ret := m.ctrl.Call(m, "StreamBitcoinBlock", varargs...)
+	ret0, _ := ret[0].(sdk.BitcoinStreamedBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// StreamBlock indicates an expected call of StreamBlock.
-func (mr *MockParserMockRecorder) StreamBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
+// StreamBitcoinBlock indicates an expected call of StreamBitcoinBlock.
+func (mr *MockParserMockRecorder) StreamBitcoinBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{arg0, arg1}, arg2...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBlock", reflect.TypeOf((*MockParser)(nil).StreamBlock), varargs...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBitcoinBlock", reflect.TypeOf((*MockParser)(nil).StreamBitcoinBlock), varargs...)
 }
 
 // MockSession is a mock of Session interface.

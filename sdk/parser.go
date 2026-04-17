@@ -57,8 +57,9 @@ type Parser interface {
 	GetNativeTransaction(ctx context.Context, nativeBlock *api.NativeBlock, transactionHash string) (*api.NativeTransaction, error)
 	ParseRosettaBlock(ctx context.Context, rawBlock *api.Block) (*api.RosettaBlock, error)
 	ValidateBlock(ctx context.Context, nativeBlock *api.NativeBlock) error
-	// StreamBlock returns a chain-specific StreamedBlock view over a
-	// spooled block. Callers type-assert to BitcoinStreamedBlock for
-	// bitcoin-family chains.
-	StreamBlock(ctx context.Context, spooled *SpooledBlock, opts ...ParseOption) (StreamedBlock, error)
+	// StreamBitcoinBlock returns a BitcoinStreamedBlock over a
+	// spooled block. Errors if the configured chain is not bitcoin-
+	// family. Future chains add typed counterparts (StreamEthereumBlock,
+	// StreamSolanaBlock, ...) as their parsers grow streaming support.
+	StreamBitcoinBlock(ctx context.Context, spooled *SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error)
 }

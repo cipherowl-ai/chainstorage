@@ -335,7 +335,7 @@ func (s *clientTestSuite) TestStreamBlocks_ErrStreamChainEvents() {
 	s.require.Nil(ch)
 }
 
-func (s *clientTestSuite) TestStreamBlock_EthereumIsNotBitcoinStream() {
+func (s *clientTestSuite) TestStreamBitcoinBlock_NonBitcoinChainErrors() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -343,9 +343,6 @@ func (s *clientTestSuite) TestStreamBlock_EthereumIsNotBitcoinStream() {
 	)
 	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash, Skipped: true}
 
-	// Skipped path avoids needing to marshal ethereum bytes into a
-	// spool file — the generic parser synthesizes metadata from
-	// BlockFile for skipped entries.
 	spooled := &downloader.SpooledBlock{
 		BlockFile: bf,
 		Open: func() (io.ReadCloser, error) {
@@ -356,18 +353,14 @@ func (s *clientTestSuite) TestStreamBlock_EthereumIsNotBitcoinStream() {
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
-	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
-	s.require.NoError(err)
-	defer view.Close()
-	s.require.NotNil(view.GetMetadata())
-	s.require.Equal(uint64(height), view.GetMetadata().Height)
-
-	// Non-bitcoin config → type-assert to BitcoinStreamedBlock must fail.
-	_, ok := view.(BitcoinStreamedBlock)
-	s.require.False(ok, "non-bitcoin config must not return BitcoinStreamedBlock")
+	// Default config is ethereum. StreamBitcoinBlock must error —
+	// native parser does not implement BitcoinStreamer.
+	view, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
+	s.require.Error(err)
+	s.require.Nil(view)
 }
 
-func (s *clientTestSuite) TestStreamBlock_DownloadError() {
+func (s *clientTestSuite) TestStreamBitcoinBlock_DownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -379,7 +372,7 @@ func (s *clientTestSuite) TestStreamBlock_DownloadError() {
 	sentinel := xerrors.New("download exploded")
 	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(nil, sentinel)
 
-	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
+	view, err := s.client.StreamBitcoinBlock(context.Background(), tag, height, hash)
 	s.require.ErrorIs(err, sentinel)
 	s.require.Nil(view)
 }

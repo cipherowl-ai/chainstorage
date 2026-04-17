@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"io"
+	"iter"
 	"os"
 
 	"go.uber.org/fx"
@@ -28,18 +29,19 @@ type (
 		ValidateAccountState(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error)
 		// ValidateRosettaBlock Given other block source (native, etc), validates whether transaction operations show the correct balance transfer.
 		ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error
-		// StreamBlock returns a chain-specific StreamedBlock view over
-		// a spooled block. The concrete type depends on the configured
-		// chain: for bitcoin-family chains it is a BitcoinStreamedBlock
-		// (callers type-assert to access iterators); for other chains
-		// the returned StreamedBlock exposes metadata only and the
-		// underlying block is fully materialized.
+		// StreamBitcoinBlock returns a BitcoinStreamedBlock over the
+		// spooled bytes. Errors if the configured chain is not
+		// bitcoin-family.
 		//
 		// Ownership of the SpooledBlock transfers to the returned
-		// StreamedBlock — calling StreamedBlock.Close() also closes
-		// the spool. On error, the caller retains ownership and must
-		// close the spool itself.
-		StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error)
+		// stream — calling stream.Close() also closes the spool. On
+		// error, the caller retains ownership and must close the
+		// spool itself.
+		//
+		// Future chains will add typed counterparts
+		// (StreamEthereumBlock, StreamSolanaBlock, ...) once those
+		// parsers grow streaming support.
+		StreamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error)
 	}
 
 	NativeParser interface {
@@ -208,15 +210,20 @@ func (p *parserImpl) ValidateRosettaBlock(ctx context.Context, req *api.Validate
 	return p.checker.ValidateRosettaBlock(ctx, req, actualRosettaBlock)
 }
 
-func (p *parserImpl) StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error) {
+func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error) {
 	if spooled == nil {
 		return nil, xerrors.New("nil spooled block")
+	}
+
+	streamer, ok := p.nativeParser.(BitcoinStreamer)
+	if !ok {
+		return nil, xerrors.Errorf("native parser %T does not support bitcoin streaming", p.nativeParser)
 	}
 
 	// Skipped blocks have no payload. Return a placeholder stream
 	// carrying just the metadata synthesized from BlockFile.
 	if spooled.BlockFile.GetSkipped() {
-		return &skippedStreamedBlock{
+		return &skippedBitcoinStream{
 			metadata: &api.BlockMetadata{
 				Tag:     spooled.BlockFile.Tag,
 				Height:  spooled.BlockFile.Height,
@@ -226,56 +233,30 @@ func (p *parserImpl) StreamBlock(ctx context.Context, spooled *downloader.Spoole
 		}, nil
 	}
 
-	// Bitcoin-family: walk the proto envelope once to collect chunk
-	// offsets, then wire seek-based loaders over the spool file and
-	// hand them to the native parser's iterator.
-	if streamer, ok := p.nativeParser.(BitcoinStreamer); ok {
-		return streamBitcoinBlock(ctx, spooled, streamer, opts...)
-	}
-
-	// Generic: fully materialize via the chain-agnostic walker.
-	r, err := spooled.Open()
-	if err != nil {
-		return nil, xerrors.Errorf("open spool: %w", err)
-	}
-	defer r.Close()
-	block, err := api.WalkBlockEnvelope(r)
-	if err != nil {
-		return nil, xerrors.Errorf("walk block envelope: %w", err)
-	}
-	return &genericStreamedBlock{block: block, spooled: spooled}, nil
+	return streamBitcoinBlock(ctx, spooled, streamer, opts...)
 }
 
-// genericStreamedBlock is the chain-agnostic StreamedBlock returned
-// for non-bitcoin chains. The underlying *api.Block is fully
-// materialized; the spool is closed via Close.
-type genericStreamedBlock struct {
-	block   *api.Block
-	spooled *downloader.SpooledBlock
-}
-
-func (g *genericStreamedBlock) GetMetadata() *api.BlockMetadata { return g.block.GetMetadata() }
-func (g *genericStreamedBlock) Close() error                    { return g.spooled.Close() }
-
-// Block returns the fully-materialized block for non-bitcoin chains.
-// Exposed so consumers that need the complete *api.Block (e.g. to
-// run a non-streaming parser) can reach it without re-downloading.
-func (g *genericStreamedBlock) Block() *api.Block { return g.block }
-
-// skippedStreamedBlock is returned for blocks flagged skipped in the
-// BlockFile. Exposes only metadata and closes the (empty) spool.
-type skippedStreamedBlock struct {
+// skippedBitcoinStream is returned for blocks flagged skipped in the
+// BlockFile. Exposes metadata only, yields no transactions, and
+// closes the (empty) spool.
+type skippedBitcoinStream struct {
 	metadata *api.BlockMetadata
 	spooled  *downloader.SpooledBlock
 }
 
-func (s *skippedStreamedBlock) GetMetadata() *api.BlockMetadata { return s.metadata }
-func (s *skippedStreamedBlock) Close() error                    { return s.spooled.Close() }
+func (s *skippedBitcoinStream) GetMetadata() *api.BlockMetadata { return s.metadata }
+func (s *skippedBitcoinStream) Close() error                    { return s.spooled.Close() }
+func (s *skippedBitcoinStream) Transactions() iter.Seq2[*api.BitcoinTransaction, error] {
+	return func(yield func(*api.BitcoinTransaction, error) bool) {}
+}
+func (s *skippedBitcoinStream) Header() (*api.BitcoinHeader, error) {
+	return nil, xerrors.New("skipped block has no header")
+}
 
 // streamBitcoinBlock walks the bitcoin proto envelope, wires lazy
 // seek-based loaders over the spool, and delegates to the native
 // parser's StreamBlockIter.
-func streamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer BitcoinStreamer, opts ...ParseOption) (StreamedBlock, error) {
+func streamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer BitcoinStreamer, opts ...ParseOption) (BitcoinStreamedBlock, error) {
 	r, err := spooled.Open()
 	if err != nil {
 		return nil, xerrors.Errorf("open spool for walk: %w", err)

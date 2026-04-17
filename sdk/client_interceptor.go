@@ -176,11 +176,11 @@ func (c *timeoutableClient) GetStaticChainMetadata(ctx context.Context, req *api
 	return c.client.GetStaticChainMetadata(ctx, req)
 }
 
-// StreamBlock passes through to the wrapped client. No timeout
+// StreamBitcoinBlock passes through to the wrapped client. No timeout
 // wrapping: the download + iterator lifetime is user-controlled and may
 // intentionally exceed short/medium/long defaults.
-func (c *timeoutableClient) StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (StreamedBlock, error) {
-	return c.client.StreamBlock(ctx, tag, height, hash, opts...)
+func (c *timeoutableClient) StreamBitcoinBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (BitcoinStreamedBlock, error) {
+	return c.client.StreamBitcoinBlock(ctx, tag, height, hash, opts...)
 }
 
 func intercept[T any](ctx context.Context, logger *zap.Logger, operation retry.OperationWithResultFn[T]) (T, error) {
