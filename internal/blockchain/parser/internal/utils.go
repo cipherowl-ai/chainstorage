@@ -3,7 +3,6 @@ package internal
 import (
 	"context"
 	"fmt"
-	"io"
 	"math/big"
 	"strings"
 
@@ -12,6 +11,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/downloader"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -56,8 +56,8 @@ func (p nopParser) ValidateRosettaBlock(ctx context.Context, req *api.ValidateRo
 	return nil
 }
 
-func (p nopParser) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
-	return nil, xerrors.New("nopParser does not support bitcoin streaming")
+func (p nopParser) StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error) {
+	return nil, xerrors.New("nopParser does not support streaming")
 }
 
 // ValidateChain checks if the chain is continuous.

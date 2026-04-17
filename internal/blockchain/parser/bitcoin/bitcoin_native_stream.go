@@ -43,13 +43,12 @@ func NewInMemoryInputTxGroupLoader(groups []*api.RepeatedBytes) InputTxGroupLoad
 	}
 }
 
-// BlockStream is a bitcoin-package alias for internal.BitcoinBlockStream.
+// BlockStream is a bitcoin-package alias for internal.BitcoinBlockIter.
 // The stream is an iterator-based view over a bitcoin-family block.
 //
-// The stream owns the decoder lifecycle: resources acquired by the
-// underlying reader factory (file handles, decompressors) are released
-// when Transactions() iteration completes, breaks, returns, or panics.
-// There is no explicit Close method.
+// Ownership of backing resources (spool file, decompressors) lives
+// above this type — see internal.BitcoinStreamedBlock (returned by
+// Parser.StreamBlock) for the full contract that includes Close.
 //
 // # Header() and the "free after iteration" optimization
 //
@@ -77,7 +76,7 @@ func NewInMemoryInputTxGroupLoader(groups []*api.RepeatedBytes) InputTxGroupLoad
 //
 // BlockStream is not safe for concurrent use across goroutines. The
 // typical single-goroutine range-loop pattern is always safe.
-type BlockStream = internal.BitcoinBlockStream
+type BlockStream = internal.BitcoinBlockIter
 
 // errIterStopped is an internal sentinel used to unwind the decode pass
 // when the iterator consumer breaks. It is not exposed to callers.

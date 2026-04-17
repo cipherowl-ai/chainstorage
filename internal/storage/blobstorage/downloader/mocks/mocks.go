@@ -57,10 +57,10 @@ func (mr *MockBlockDownloaderMockRecorder) Download(arg0, arg1 any) *gomock.Call
 }
 
 // DownloadStream mocks base method.
-func (m *MockBlockDownloader) DownloadStream(arg0 context.Context, arg1 *chainstorage.BlockFile) (*chainstorage.Block, error) {
+func (m *MockBlockDownloader) DownloadStream(arg0 context.Context, arg1 *chainstorage.BlockFile) (*downloader.SpooledBlock, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "DownloadStream", arg0, arg1)
-	ret0, _ := ret[0].(*chainstorage.Block)
+	ret0, _ := ret[0].(*downloader.SpooledBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -69,19 +69,4 @@ func (m *MockBlockDownloader) DownloadStream(arg0 context.Context, arg1 *chainst
 func (mr *MockBlockDownloaderMockRecorder) DownloadStream(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStream", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStream), arg0, arg1)
-}
-
-// DownloadStreamBitcoin mocks base method.
-func (m *MockBlockDownloader) DownloadStreamBitcoin(arg0 context.Context, arg1 *chainstorage.BlockFile) (*downloader.BitcoinStream, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DownloadStreamBitcoin", arg0, arg1)
-	ret0, _ := ret[0].(*downloader.BitcoinStream)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// DownloadStreamBitcoin indicates an expected call of DownloadStreamBitcoin.
-func (mr *MockBlockDownloaderMockRecorder) DownloadStreamBitcoin(arg0, arg1 any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStreamBitcoin", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStreamBitcoin), arg0, arg1)
 }

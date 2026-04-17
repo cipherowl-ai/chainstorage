@@ -3,10 +3,13 @@ package internal
 import (
 	"context"
 	"io"
+	"os"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/downloader"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -25,14 +28,18 @@ type (
 		ValidateAccountState(ctx context.Context, req *api.ValidateAccountStateRequest) (*api.ValidateAccountStateResponse, error)
 		// ValidateRosettaBlock Given other block source (native, etc), validates whether transaction operations show the correct balance transfer.
 		ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error
-		// StreamBitcoinBlock returns a BitcoinBlockStream for iterator-based
-		// traversal of a bitcoin-family block. Returns an error for chains
-		// that do not implement bitcoin streaming.
+		// StreamBlock returns a chain-specific StreamedBlock view over
+		// a spooled block. The concrete type depends on the configured
+		// chain: for bitcoin-family chains it is a BitcoinStreamedBlock
+		// (callers type-assert to access iterators); for other chains
+		// the returned StreamedBlock exposes metadata only and the
+		// underlying block is fully materialized.
 		//
-		// loadGroup resolves prev-output transactions for each block tx
-		// on demand. If nil, tx fees and vin from-outputs are not
-		// populated (useful for callers that only need transaction ids).
-		StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error)
+		// Ownership of the SpooledBlock transfers to the returned
+		// StreamedBlock — calling StreamedBlock.Close() also closes
+		// the spool. On error, the caller retains ownership and must
+		// close the spool itself.
+		StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error)
 	}
 
 	NativeParser interface {
@@ -201,10 +208,162 @@ func (p *parserImpl) ValidateRosettaBlock(ctx context.Context, req *api.Validate
 	return p.checker.ValidateRosettaBlock(ctx, req, actualRosettaBlock)
 }
 
-func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
-	streamer, ok := p.nativeParser.(BitcoinStreamer)
-	if !ok {
-		return nil, xerrors.Errorf("native parser %T does not support bitcoin streaming", p.nativeParser)
+func (p *parserImpl) StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error) {
+	if spooled == nil {
+		return nil, xerrors.New("nil spooled block")
 	}
-	return streamer.StreamBlockIter(ctx, openReader, loadGroup, opts...), nil
+
+	// Skipped blocks have no payload. Return a placeholder stream
+	// carrying just the metadata synthesized from BlockFile.
+	if spooled.BlockFile.GetSkipped() {
+		return &skippedStreamedBlock{
+			metadata: &api.BlockMetadata{
+				Tag:     spooled.BlockFile.Tag,
+				Height:  spooled.BlockFile.Height,
+				Skipped: true,
+			},
+			spooled: spooled,
+		}, nil
+	}
+
+	// Bitcoin-family: walk the proto envelope once to collect chunk
+	// offsets, then wire seek-based loaders over the spool file and
+	// hand them to the native parser's iterator.
+	if streamer, ok := p.nativeParser.(BitcoinStreamer); ok {
+		return streamBitcoinBlock(ctx, spooled, streamer, opts...)
+	}
+
+	// Generic: fully materialize via the chain-agnostic walker.
+	r, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool: %w", err)
+	}
+	defer r.Close()
+	block, err := api.WalkBlockEnvelope(r)
+	if err != nil {
+		return nil, xerrors.Errorf("walk block envelope: %w", err)
+	}
+	return &genericStreamedBlock{block: block, spooled: spooled}, nil
 }
+
+// genericStreamedBlock is the chain-agnostic StreamedBlock returned
+// for non-bitcoin chains. The underlying *api.Block is fully
+// materialized; the spool is closed via Close.
+type genericStreamedBlock struct {
+	block   *api.Block
+	spooled *downloader.SpooledBlock
+}
+
+func (g *genericStreamedBlock) GetMetadata() *api.BlockMetadata { return g.block.GetMetadata() }
+func (g *genericStreamedBlock) Close() error                    { return g.spooled.Close() }
+
+// Block returns the fully-materialized block for non-bitcoin chains.
+// Exposed so consumers that need the complete *api.Block (e.g. to
+// run a non-streaming parser) can reach it without re-downloading.
+func (g *genericStreamedBlock) Block() *api.Block { return g.block }
+
+// skippedStreamedBlock is returned for blocks flagged skipped in the
+// BlockFile. Exposes only metadata and closes the (empty) spool.
+type skippedStreamedBlock struct {
+	metadata *api.BlockMetadata
+	spooled  *downloader.SpooledBlock
+}
+
+func (s *skippedStreamedBlock) GetMetadata() *api.BlockMetadata { return s.metadata }
+func (s *skippedStreamedBlock) Close() error                    { return s.spooled.Close() }
+
+// streamBitcoinBlock walks the bitcoin proto envelope, wires lazy
+// seek-based loaders over the spool, and delegates to the native
+// parser's StreamBlockIter.
+func streamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer BitcoinStreamer, opts ...ParseOption) (StreamedBlock, error) {
+	r, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool for walk: %w", err)
+	}
+	block, chunks, walkErr := api.WalkBitcoinEnvelope(r)
+	r.Close()
+	if walkErr != nil {
+		return nil, xerrors.Errorf("walk bitcoin envelope: %w", walkErr)
+	}
+	if chunks.Header.Length == 0 && chunks.Header.Offset == 0 {
+		return nil, xerrors.Errorf("bitcoin block at height %d has no header", spooled.BlockFile.GetHeight())
+	}
+
+	openHeader := func() (io.ReadCloser, error) {
+		f, err := spooled.Open()
+		if err != nil {
+			return nil, xerrors.Errorf("open spool for header: %w", err)
+		}
+		if seeker, ok := f.(io.Seeker); ok {
+			if _, err := seeker.Seek(chunks.Header.Offset, io.SeekStart); err != nil {
+				f.Close()
+				return nil, xerrors.Errorf("seek to header: %w", err)
+			}
+			return &seekedHeaderReader{f: f, limit: io.LimitReader(f, chunks.Header.Length)}, nil
+		}
+		f.Close()
+		return nil, xerrors.Errorf("spool reader does not support seek")
+	}
+
+	groups := chunks.InputTransactionsGroups
+	loadGroup := func(i int) (*api.RepeatedBytes, error) {
+		if i < 0 || i >= len(groups) {
+			return nil, nil
+		}
+		ref := groups[i]
+		f, err := spooled.Open()
+		if err != nil {
+			return nil, xerrors.Errorf("open spool for input tx group [%d]: %w", i, err)
+		}
+		defer f.Close()
+		seeker, ok := f.(io.Seeker)
+		if !ok {
+			return nil, xerrors.Errorf("spool reader does not support seek")
+		}
+		if _, err := seeker.Seek(ref.Offset, io.SeekStart); err != nil {
+			return nil, xerrors.Errorf("seek to input tx group [%d]: %w", i, err)
+		}
+		b := make([]byte, ref.Length)
+		if _, err := io.ReadFull(f, b); err != nil {
+			return nil, xerrors.Errorf("read input tx group [%d]: %w", i, err)
+		}
+		rb := &api.RepeatedBytes{}
+		if err := proto.Unmarshal(b, rb); err != nil {
+			return nil, xerrors.Errorf("unmarshal input tx group [%d]: %w", i, err)
+		}
+		return rb, nil
+	}
+
+	inner := streamer.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
+	return &bitcoinStreamedBlock{
+		BitcoinBlockIter: inner,
+		block:            block,
+		spooled:          spooled,
+	}, nil
+}
+
+// bitcoinStreamedBlock wraps the native parser's iterator stream with
+// the chain-agnostic StreamedBlock contract plus ownership of the
+// underlying spool. The embedded BitcoinBlockIter forwards
+// Transactions() and Header() to the inner stream.
+type bitcoinStreamedBlock struct {
+	BitcoinBlockIter
+	block   *api.Block
+	spooled *downloader.SpooledBlock
+}
+
+func (b *bitcoinStreamedBlock) GetMetadata() *api.BlockMetadata { return b.block.GetMetadata() }
+func (b *bitcoinStreamedBlock) Close() error                    { return b.spooled.Close() }
+
+// seekedHeaderReader is an io.ReadCloser that reads up to `limit`
+// bytes from `f` (an io.ReadCloser) and closes `f` on Close.
+type seekedHeaderReader struct {
+	f     io.ReadCloser
+	limit io.Reader
+}
+
+func (r *seekedHeaderReader) Read(p []byte) (int, error) { return r.limit.Read(p) }
+func (r *seekedHeaderReader) Close() error               { return r.f.Close() }
+
+// Ensure os.File satisfies the reader contract we seek against.
+var _ io.ReadSeekCloser = (*os.File)(nil)

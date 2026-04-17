@@ -2,6 +2,7 @@ package bitcoin
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,14 @@ import (
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
+
+// benchSeekedReader wraps a ReadCloser with a LimitReader view.
+type benchSeekedReader struct {
+	io.ReadCloser
+	limit io.Reader
+}
+
+func (b *benchSeekedReader) Read(p []byte) (int, error) { return b.limit.Read(p) }
 
 func protoSize(m proto.Message) int { return proto.Size(m) }
 
@@ -106,13 +115,60 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		headerCost      time.Duration
 	)
 	start := time.Now()
-	dlStream, err := dl.DownloadStreamBitcoin(ctx, bf)
+	spooled, err := dl.DownloadStream(ctx, bf)
 	if err != nil {
-		t.Fatalf("DownloadStreamBitcoin: %v", err)
+		t.Fatalf("DownloadStream: %v", err)
 	}
-	defer dlStream.Close()
+	defer spooled.Close()
 
-	bstream := bitcoinImpl.StreamBlockIter(ctx, dlStream.OpenHeaderReader, dlStream.LoadInputTxGroup, opts...)
+	// Walk the proto envelope once to collect chunk offsets.
+	r, err := spooled.Open()
+	if err != nil {
+		t.Fatalf("open spool: %v", err)
+	}
+	_, chunks, walkErr := api.WalkBitcoinEnvelope(r)
+	r.Close()
+	if walkErr != nil {
+		t.Fatalf("walk bitcoin envelope: %v", walkErr)
+	}
+
+	openHeader := func() (io.ReadCloser, error) {
+		f, err := spooled.Open()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := f.(*os.File).Seek(chunks.Header.Offset, io.SeekStart); err != nil {
+			f.Close()
+			return nil, err
+		}
+		return &benchSeekedReader{ReadCloser: f, limit: io.LimitReader(f, chunks.Header.Length)}, nil
+	}
+	groups := chunks.InputTransactionsGroups
+	loadGroup := func(i int) (*api.RepeatedBytes, error) {
+		if i < 0 || i >= len(groups) {
+			return nil, nil
+		}
+		ref := groups[i]
+		f, err := spooled.Open()
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		if _, err := f.(*os.File).Seek(ref.Offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+		b := make([]byte, ref.Length)
+		if _, err := io.ReadFull(f, b); err != nil {
+			return nil, err
+		}
+		rb := &api.RepeatedBytes{}
+		if err := proto.Unmarshal(b, rb); err != nil {
+			return nil, err
+		}
+		return rb, nil
+	}
+
+	bstream := bitcoinImpl.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
 	for tx, err := range bstream.Transactions() {
 		if err != nil {
 			t.Fatalf("iterate tx: %v", err)
@@ -183,11 +239,21 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	peak3.start()
 
 	start3 := time.Now()
-	block3, err := dl.DownloadStream(ctx, bf)
+	spooled3, err := dl.DownloadStream(ctx, bf)
 	if err != nil {
 		t.Fatalf("DownloadStream: %v", err)
 	}
+	spoolReader, err := spooled3.Open()
+	if err != nil {
+		t.Fatalf("open spool: %v", err)
+	}
+	block3, err := api.WalkBlockEnvelope(spoolReader)
+	spoolReader.Close()
+	if err != nil {
+		t.Fatalf("WalkBlockEnvelope: %v", err)
+	}
 	nb3, err := parser.ParseBlock(ctx, block3, opts...)
+	spooled3.Close()
 	if err != nil {
 		t.Fatalf("ParseBlock: %v", err)
 	}
@@ -195,7 +261,7 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	peak3.stop()
 	after3 := heapAlloc()
 
-	t.Logf("\n=== Phase 2 generic (DownloadStream -> ParseBlock) ===")
+	t.Logf("\n=== Phase 2 generic (DownloadStream -> WalkBlockEnvelope -> ParseBlock) ===")
 	t.Logf("total elapsed:          %s", elapsed3)
 	t.Logf("tx count:               %d", nb3.NumTransactions)
 	t.Logf("heap before:            %s", humanBytes(before3))
@@ -204,8 +270,8 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	t.Logf("persistent NB size:     %s", humanBytes(uint64(protoSize(nb3))))
 
 	t.Logf("\n=== Peak heap summary ===")
-	t.Logf("legacy (Download):                %s", humanBytes(subU(peak2.peak, before2)))
-	t.Logf("Phase 2 generic (DownloadStream): %s", humanBytes(subU(peak3.peak, before3)))
-	t.Logf("Phase 2 bitcoin (DownloadStreamBitcoin + iter): %s", humanBytes(subU(peak.peak, before)))
+	t.Logf("legacy (Download):                     %s", humanBytes(subU(peak2.peak, before2)))
+	t.Logf("Phase 2 generic (DownloadStream):      %s", humanBytes(subU(peak3.peak, before3)))
+	t.Logf("Phase 2 bitcoin (DownloadStream+iter): %s", humanBytes(subU(peak.peak, before)))
 }
 

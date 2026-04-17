@@ -23,8 +23,14 @@ type (
 	// subpackage directly.
 	ParseOption = internal.ParseOption
 
-	// BitcoinBlockStream is re-exported for SDK/mocks consumers.
-	BitcoinBlockStream = internal.BitcoinBlockStream
+	// StreamedBlock is the chain-agnostic stream returned by
+	// Parser.StreamBlock. Re-exported so SDK consumers can reference
+	// it without importing internal.
+	StreamedBlock = internal.StreamedBlock
+
+	// BitcoinStreamedBlock is the bitcoin-family extension of
+	// StreamedBlock (iter.Seq2 transactions + lazy Header).
+	BitcoinStreamedBlock = internal.BitcoinStreamedBlock
 
 	// BitcoinInputTxGroupLoader is re-exported so SDK callers can
 	// type their consumer lambdas without importing internal.
