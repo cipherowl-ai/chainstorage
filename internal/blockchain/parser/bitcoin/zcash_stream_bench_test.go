@@ -115,13 +115,16 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		headerCost      time.Duration
 	)
 	start := time.Now()
+	dlStart := time.Now()
 	spooled, err := dl.DownloadStream(ctx, bf)
 	if err != nil {
 		t.Fatalf("DownloadStream: %v", err)
 	}
 	defer spooled.Close()
+	dlElapsed := time.Since(dlStart)
 
 	// Walk the proto envelope once to collect chunk offsets.
+	walkStart := time.Now()
 	r, err := spooled.Open()
 	if err != nil {
 		t.Fatalf("open spool: %v", err)
@@ -131,6 +134,7 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	if walkErr != nil {
 		t.Fatalf("walk bitcoin envelope: %v", walkErr)
 	}
+	walkElapsed := time.Since(walkStart)
 
 	openHeader := func() (io.ReadCloser, error) {
 		f, err := spooled.Open()
@@ -168,6 +172,7 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		return rb, nil
 	}
 
+	iterStart := time.Now()
 	bstream := bitcoinImpl.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
 	for tx, err := range bstream.Transactions() {
 		if err != nil {
@@ -176,6 +181,7 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		txCount++
 		_ = tx
 	}
+	iterElapsed := time.Since(iterStart)
 
 	// Header after iteration should be "free" per the BlockStream contract.
 	headerCostStart = time.Now()
@@ -192,6 +198,9 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 
 	t.Logf("\n=== Phase 2 streaming (DownloadStreamBitcoin -> StreamBlockIter) ===")
 	t.Logf("total elapsed:          %s", elapsed)
+	t.Logf("  download+spool:       %s", dlElapsed)
+	t.Logf("  walk envelope:        %s", walkElapsed)
+	t.Logf("  iter transactions:    %s", iterElapsed)
 	t.Logf("tx count (visited):     %d", txCount)
 	t.Logf("Header() cost:          %s (free after iteration)", headerCost)
 	t.Logf("heap before:            %s", humanBytes(before))
@@ -210,20 +219,26 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	peak2.start()
 
 	start2 := time.Now()
+	dl2Start := time.Now()
 	rawBlock, err := dl.Download(ctx, bf)
 	if err != nil {
 		t.Fatalf("Download: %v", err)
 	}
+	dl2Elapsed := time.Since(dl2Start)
+	parse2Start := time.Now()
 	nb, err := parser.ParseBlock(ctx, rawBlock, opts...)
 	if err != nil {
 		t.Fatalf("ParseBlock: %v", err)
 	}
+	parse2Elapsed := time.Since(parse2Start)
 	elapsed2 := time.Since(start2)
 	peak2.stop()
 	after2 := heapAlloc()
 
 	t.Logf("\n=== Legacy baseline (Download -> ParseBlock) ===")
 	t.Logf("total elapsed:          %s", elapsed2)
+	t.Logf("  download+unmarshal:   %s", dl2Elapsed)
+	t.Logf("  parse block:          %s", parse2Elapsed)
 	t.Logf("tx count:               %d", nb.NumTransactions)
 	t.Logf("heap before:            %s", humanBytes(before2))
 	t.Logf("heap after:             %s", humanBytes(after2))
