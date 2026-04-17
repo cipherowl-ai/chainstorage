@@ -13,7 +13,7 @@ func NewDashNativeParser(params internal.ParserParams, opts ...internal.ParserFa
 	return &bitcoinNativeParserImpl{
 		logger:           log.WithPackage(params.Logger),
 		validate:         v,
-		preprocessBlock:  backfillTxHash,
+		preprocessTx:     backfillTxHashSingle,
 		p2pkhVersionByte: 0x4c,
 	}, nil
 }
