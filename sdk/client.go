@@ -19,7 +19,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/internal/utils/retry"
 	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
-	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -102,25 +101,21 @@ type (
 		// This is useful if the caller needs a consistent snapshot of chain metadata during its current lifecycle.
 		GetStaticChainMetadata(ctx context.Context, req *api.GetChainMetadataRequest) (*api.GetChainMetadataResponse, error)
 
-		// StreamBlock downloads a block via disk spool and returns a
-		// chain-agnostic StreamedBlock view. The chain-specific field
-		// on the view (e.g. GetBitcoin()) is populated based on the
-		// underlying blobdata; non-matching chain fields return nil.
+		// StreamBlock downloads a block to a local disk spool, hands
+		// it to the configured chain-specific parser, and returns a
+		// StreamedBlock. Callers type-assert the result to a
+		// chain-specific extension (e.g. BitcoinStreamedBlock) to
+		// reach iterators and lazy accessors.
 		//
-		// The returned StreamedBlock may hold backing resources (a
-		// disk spool for bitcoin-family chains). Callers MUST call
-		// Close() when done to release them. A runtime cleanup is
-		// wired as a safety net but should not be relied on.
+		// The returned StreamedBlock owns a disk spool (for
+		// bitcoin-family chains). Callers MUST call Close() when done.
+		// A runtime cleanup is wired as a safety net but should not
+		// be relied on.
 		//
-		// For bitcoin-family chains, callers iterate
-		// view.GetBitcoin().Transactions() and call
-		// view.GetBitcoin().Header() before or after iteration (see
-		// BitcoinBlockStream's ordering contract).
-		//
-		// For chains without a streaming parser implementation today
-		// (ethereum, solana, etc.), view.GetBitcoin() is nil and
-		// callers should fall back to GetBlock + ParseNativeBlock.
-		StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (*StreamedBlock, error)
+		// For chains without a streaming parser, the returned
+		// StreamedBlock has metadata only; callers should fall back
+		// to GetBlock + ParseNativeBlock for chain-specific parsing.
+		StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (StreamedBlock, error)
 	}
 
 	ChainEventResult struct {
@@ -531,7 +526,7 @@ func (c *clientImpl) StreamBlock(
 	ctx context.Context,
 	tag uint32, height uint64, hash string,
 	opts ...ParseOption,
-) (*StreamedBlock, error) {
+) (StreamedBlock, error) {
 	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
 		Tag:    tag,
 		Height: height,
@@ -541,48 +536,16 @@ func (c *clientImpl) StreamBlock(
 		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
 	}
 
-	// For bitcoin-family chains, use the wire-walker path: peak RAM
-	// is O(input_transactions) instead of O(2× block size). The
-	// BitcoinBlobdata.Header and InputTransactions bytes never
-	// materialize in RAM — they're read on-demand from the
-	// decompressed spool file held open by the returned stream.
-	if isBitcoinFamilyChain(c.config.Chain.Blockchain) {
-		dl, err := c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile())
-		if err != nil {
-			return nil, err
-		}
-		bitcoinStream, err := c.parser.StreamBitcoinBlock(ctx, dl.OpenHeaderReader, dl.LoadInputTxGroup, opts...)
-		if err != nil {
-			dl.Close()
-			return nil, xerrors.Errorf("failed to create bitcoin block stream: %w", err)
-		}
-		return &StreamedBlock{
-			Metadata: dl.Block.GetMetadata(),
-			bitcoin:  bitcoinStream,
-			closeFn:  dl.Close,
-		}, nil
-	}
-
-	// Non-bitcoin chains: chain-agnostic walker path. Block is fully
-	// materialized, no backing resources — Close is a no-op.
-	rawBlock, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
+	spooled, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
 	if err != nil {
 		return nil, err
 	}
-	return &StreamedBlock{Metadata: rawBlock.GetMetadata()}, nil
-}
-
-func isBitcoinFamilyChain(b common.Blockchain) bool {
-	switch b {
-	case common.Blockchain_BLOCKCHAIN_BITCOIN,
-		common.Blockchain_BLOCKCHAIN_BITCOINCASH,
-		common.Blockchain_BLOCKCHAIN_LITECOIN,
-		common.Blockchain_BLOCKCHAIN_DOGECOIN,
-		common.Blockchain_BLOCKCHAIN_DASH,
-		common.Blockchain_BLOCKCHAIN_ZCASH:
-		return true
+	stream, err := c.parser.StreamBlock(ctx, spooled, opts...)
+	if err != nil {
+		spooled.Close()
+		return nil, xerrors.Errorf("failed to create block stream: %w", err)
 	}
-	return false
+	return stream, nil
 }
 
 func (c *clientImpl) validateBlock(ctx context.Context, rawBlock *api.Block) error {

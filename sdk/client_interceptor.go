@@ -179,7 +179,7 @@ func (c *timeoutableClient) GetStaticChainMetadata(ctx context.Context, req *api
 // StreamBlock passes through to the wrapped client. No timeout
 // wrapping: the download + iterator lifetime is user-controlled and may
 // intentionally exceed short/medium/long defaults.
-func (c *timeoutableClient) StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (*StreamedBlock, error) {
+func (c *timeoutableClient) StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (StreamedBlock, error) {
 	return c.client.StreamBlock(ctx, tag, height, hash, opts...)
 }
 

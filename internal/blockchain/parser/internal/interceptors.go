@@ -3,12 +3,12 @@ package internal
 import (
 	"context"
 	"fmt"
-	"io"
 
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/downloader"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -152,10 +152,10 @@ func (i *instrumentInterceptor) ValidateRosettaBlock(ctx context.Context, req *a
 	)
 }
 
-// StreamBitcoinBlock passes through to the wrapped parser. Streaming
+// StreamBlock passes through to the wrapped parser. Streaming
 // instrumentation (per-tx counters, per-block duration) would require
-// hooking the visitor/iterator; for now the call is passed through
-// unwrapped so consumers see the real stream object.
-func (i *instrumentInterceptor) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
-	return i.parser.StreamBitcoinBlock(ctx, openReader, loadGroup, opts...)
+// hooking the iterator; for now the call is passed through unwrapped
+// so consumers see the real stream object.
+func (i *instrumentInterceptor) StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error) {
+	return i.parser.StreamBlock(ctx, spooled, opts...)
 }

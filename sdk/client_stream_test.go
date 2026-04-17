@@ -1,9 +1,9 @@
 package sdk
 
 import (
-	"bytes"
 	"context"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -24,7 +24,7 @@ import (
 )
 
 // streamBitcoinClientSuite brings up an SDK Client wired for
-// bitcoin-mainnet so StreamBitcoinBlock can actually stream through the
+// bitcoin-mainnet so StreamBlock can actually stream through the
 // bitcoin parser.
 type streamBitcoinClientSuite struct {
 	suite.Suite
@@ -64,10 +64,10 @@ func (s *streamBitcoinClientSuite) TearDownTest() {
 	s.ctrl.Finish()
 }
 
-// TestStreamBitcoinBlock_EndToEnd verifies that a bitcoin-configured
+// TestStreamBlock_BitcoinEndToEnd verifies that a bitcoin-configured
 // SDK client plumbs a streamed block through the downloader into the
 // bitcoin parser's iterator and delivers transactions to the caller.
-func (s *streamBitcoinClientSuite) TestStreamBitcoinBlock_EndToEnd() {
+func (s *streamBitcoinClientSuite) TestStreamBlock_BitcoinEndToEnd() {
 	const (
 		tag    = uint32(1)
 		height = uint64(696402)
@@ -83,40 +83,36 @@ func (s *streamBitcoinClientSuite) TestStreamBitcoinBlock_EndToEnd() {
 	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 
-	// For bitcoin-configured SDK, sdk.Client.StreamBlock invokes
-	// DownloadStreamBitcoin which returns a BitcoinStream whose
-	// Block.Bitcoin has Header = nil and InputTransactions = nil,
-	// plus lazy loaders for both.
-	headerBytes := rawBlock.GetBitcoin().GetHeader()
-	blockForStream := proto.Clone(rawBlock).(*api.Block)
-	blockForStream.Blobdata = &api.Block_Bitcoin{
-		Bitcoin: &api.BitcoinBlobdata{
-			Header:            nil, // walker would leave this empty
-			InputTransactions: nil, // walker now also leaves this empty
+	// Produce the proto-marshaled decompressed bytes the SpooledBlock
+	// Open() would return. The parser walks these bytes to collect
+	// chunk offsets, so it's critical we give it the full
+	// BitcoinBlobdata including Header + InputTransactions.
+	blockBytes, err := proto.Marshal(rawBlock)
+	s.require.NoError(err)
+
+	// Write to a temp file so the parser's seek-based loaders can use
+	// io.Seeker semantics on what Open() returns.
+	spoolFile, err := os.CreateTemp(s.T().TempDir(), "chainstorage-spool-*.bin")
+	s.require.NoError(err)
+	_, err = spoolFile.Write(blockBytes)
+	s.require.NoError(err)
+	s.require.NoError(spoolFile.Close())
+
+	spooled := &downloader.SpooledBlock{
+		BlockFile: bf,
+		Open: func() (io.ReadCloser, error) {
+			return os.Open(spoolFile.Name())
 		},
 	}
-	groups := rawBlock.GetBitcoin().GetInputTransactions()
-	stream := &downloader.BitcoinStream{
-		Block: blockForStream,
-		OpenHeaderReader: func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(headerBytes)), nil
-		},
-		LoadInputTxGroup: func(i int) (*api.RepeatedBytes, error) {
-			if i < 0 || i >= len(groups) {
-				return nil, nil
-			}
-			return groups[i], nil
-		},
-	}
-	s.downloaderClient.EXPECT().DownloadStreamBitcoin(gomock.Any(), bf).Return(stream, nil)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
 	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
 	s.require.NoError(err)
 	defer view.Close()
 	s.require.NotNil(view.GetMetadata())
 
-	bs := view.GetBitcoin()
-	s.require.NotNil(bs)
+	bs, ok := view.(BitcoinStreamedBlock)
+	s.require.True(ok, "bitcoin-configured client must return BitcoinStreamedBlock")
 
 	var txCount int
 	for tx, iterErr := range bs.Transactions() {
@@ -168,3 +164,4 @@ func buildBitcoinFixtureBlock(t *testing.T) *api.Block {
 		},
 	}
 }
+

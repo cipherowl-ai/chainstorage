@@ -1,7 +1,9 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -333,30 +335,36 @@ func (s *clientTestSuite) TestStreamBlocks_ErrStreamChainEvents() {
 	s.require.Nil(ch)
 }
 
-func (s *clientTestSuite) TestStreamBlock_EthereumBlobDeliversNilBitcoin() {
+func (s *clientTestSuite) TestStreamBlock_EthereumIsNotBitcoinStream() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
 		hash   = "0xabcde"
 	)
-	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash, Skipped: true}
 
-	ethBlock := &api.Block{
-		Metadata: &api.BlockMetadata{Tag: tag, Height: height, Hash: hash},
-		Blobdata: &api.Block_Ethereum{Ethereum: &api.EthereumBlobdata{}},
+	// Skipped path avoids needing to marshal ethereum bytes into a
+	// spool file — the generic parser synthesizes metadata from
+	// BlockFile for skipped entries.
+	spooled := &downloader.SpooledBlock{
+		BlockFile: bf,
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		},
 	}
 
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(ethBlock, nil)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(spooled, nil)
 
 	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
 	s.require.NoError(err)
 	defer view.Close()
 	s.require.NotNil(view.GetMetadata())
 	s.require.Equal(uint64(height), view.GetMetadata().Height)
-	// Non-bitcoin chain → GetBitcoin() must return nil so callers
-	// can fall back to GetBlock + ParseNativeBlock.
-	s.require.Nil(view.GetBitcoin())
+
+	// Non-bitcoin config → type-assert to BitcoinStreamedBlock must fail.
+	_, ok := view.(BitcoinStreamedBlock)
+	s.require.False(ok, "non-bitcoin config must not return BitcoinStreamedBlock")
 }
 
 func (s *clientTestSuite) TestStreamBlock_DownloadError() {

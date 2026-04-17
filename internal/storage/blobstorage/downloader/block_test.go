@@ -194,14 +194,20 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_Success() {
 		fx.Populate(&s.downloader),
 	)
 
-	block, err := s.downloader.DownloadStream(context.Background(), s.blockFile)
+	spooled, err := s.downloader.DownloadStream(context.Background(), s.blockFile)
 	require.NoError(err)
-	require.NotNil(block.GetMetadata())
-	require.Equal(uint64(123), block.GetMetadata().Height)
+	defer spooled.Close()
 
-	blob := block.GetBitcoin()
-	require.NotNil(blob)
-	require.Equal(`{"hash":"0xabc","height":123,"tx":[]}`, string(blob.GetHeader()))
+	require.Equal(s.blockFile, spooled.BlockFile)
+
+	// Open should yield the full decompressed proto bytes (no
+	// compression in this test since the HTTP body is already raw).
+	rc, err := spooled.Open()
+	require.NoError(err)
+	defer rc.Close()
+	gotBytes, err := io.ReadAll(rc)
+	require.NoError(err)
+	require.Equal(blockBytes, gotBytes)
 }
 
 func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
@@ -213,102 +219,20 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
 		fx.Provide(s.newHttpClientFunc()),
 	)
 
-	block, err := s.downloader.DownloadStream(context.Background(), s.skippedBlockFile)
+	spooled, err := s.downloader.DownloadStream(context.Background(), s.skippedBlockFile)
 	require.NoError(err)
-	require.NotNil(block.GetMetadata())
-	require.True(block.GetMetadata().Skipped)
-	require.Nil(block.GetBlobdata())
-}
+	defer spooled.Close()
 
-func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Success() {
-	require := testutil.Require(s.T())
-
-	headerJSON := []byte(`{"hash":"0xabc","height":42,"tx":[{"txid":"tx1"},{"txid":"tx2"}]}`)
-	bitcoinBlock := &api.Block{
-		Blockchain: common.Blockchain_BLOCKCHAIN_BITCOIN,
-		Network:    common.Network_NETWORK_BITCOIN_MAINNET,
-		Metadata:   &api.BlockMetadata{Tag: 1, Height: 42, Hash: "0xabc"},
-		Blobdata: &api.Block_Bitcoin{
-			Bitcoin: &api.BitcoinBlobdata{
-				Header: headerJSON,
-				InputTransactions: []*api.RepeatedBytes{
-					{Data: [][]byte{[]byte("prev1-json"), []byte("prev2-json")}},
-				},
-			},
-		},
-	}
-	blockBytes, err := proto.Marshal(bitcoinBlock)
-	require.NoError(err)
-
-	s.app = testapp.New(
-		s.T(),
-		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, blockBytes)),
-		fx.Populate(&s.httpServer),
-		fx.Provide(s.newHttpClientFunc()),
-		fx.Provide(NewBlockDownloader),
-		fx.Populate(&s.downloader),
-	)
-
-	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile)
-	require.NoError(err)
-	defer stream.Close()
-
-	// Header and InputTransactions are BOTH lazy now.
-	require.Equal(uint64(42), stream.Block.GetMetadata().Height)
-	require.Nil(stream.Block.GetBitcoin().GetHeader(), "header must be nil — exposed via OpenHeaderReader")
-	require.Nil(stream.Block.GetBitcoin().GetInputTransactions(), "input_transactions must be nil — loaded on demand via LoadInputTxGroup")
-
-	// OpenHeaderReader should be re-callable.
-	for i := 0; i < 2; i++ {
-		rc, err := stream.OpenHeaderReader()
-		require.NoError(err)
-		got, err := io.ReadAll(rc)
-		require.NoError(err)
-		require.NoError(rc.Close())
-		require.Equal(headerJSON, got, "header reader attempt %d", i)
-	}
-
-	// LoadInputTxGroup returns the i-th group's prev-tx bytes.
-	group, err := stream.LoadInputTxGroup(0)
-	require.NoError(err)
-	require.NotNil(group)
-	require.Equal([][]byte{[]byte("prev1-json"), []byte("prev2-json")}, group.Data)
-
-	// Out-of-range returns nil group, no error.
-	group, err = stream.LoadInputTxGroup(99)
-	require.NoError(err)
-	require.Nil(group)
-}
-
-func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Skipped() {
-	require := testutil.Require(s.T())
-	s.app = testapp.New(
-		s.T(),
-		fx.Provide(NewBlockDownloader),
-		fx.Populate(&s.downloader),
-		fx.Provide(s.newHttpClientFunc()),
-	)
-
-	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.skippedBlockFile)
-	require.NoError(err)
-	defer stream.Close()
-
-	require.True(stream.Block.GetMetadata().Skipped)
-	require.Nil(stream.Block.GetBlobdata())
-	// OpenHeaderReader returns an empty reader for skipped blocks.
-	rc, err := stream.OpenHeaderReader()
+	require.True(spooled.BlockFile.GetSkipped())
+	rc, err := spooled.Open()
 	require.NoError(err)
 	defer rc.Close()
 	got, err := io.ReadAll(rc)
 	require.NoError(err)
 	require.Empty(got)
-	// LoadInputTxGroup always returns nil for skipped blocks.
-	g, err := stream.LoadInputTxGroup(0)
-	require.NoError(err)
-	require.Nil(g)
 }
 
-func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_CloseRemovesSpool() {
+func (s *blockDownloaderTestSuite) TestDownloadStream_CloseRemovesSpool() {
 	require := testutil.Require(s.T())
 
 	bitcoinBlock := &api.Block{
@@ -331,20 +255,20 @@ func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_CloseRemovesSpool()
 		fx.Populate(&s.downloader),
 	)
 
-	stream, err := s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile)
+	spooled, err := s.downloader.DownloadStream(context.Background(), s.blockFile)
 	require.NoError(err)
 
-	// Reader works before Close.
-	rc, err := stream.OpenHeaderReader()
+	// Open works before Close.
+	rc, err := spooled.Open()
 	require.NoError(err)
 	require.NoError(rc.Close())
 
-	require.NoError(stream.Close())
+	require.NoError(spooled.Close())
 	// Second Close must be a no-op.
-	require.NoError(stream.Close())
+	require.NoError(spooled.Close())
 
-	// After Close, OpenHeaderReader fails (spool removed).
-	_, err = stream.OpenHeaderReader()
+	// After Close, Open fails (spool removed).
+	_, err = spooled.Open()
 	require.Error(err)
 }
 
