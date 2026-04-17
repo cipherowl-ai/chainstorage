@@ -333,6 +333,99 @@ func (s *clientTestSuite) TestStreamBlocks_ErrStreamChainEvents() {
 	s.require.Nil(ch)
 }
 
+func (s *clientTestSuite) TestStreamBlock_NonBitcoinChainYieldsNilBitcoinStream() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+
+	// Downloader yields a bitcoin-shaped block but the default suite
+	// wires the ethereum parser, which does not satisfy BitcoinStreamer.
+	// The client should surface that as an error (consumer never runs).
+	bitcoinBlock := &api.Block{
+		Metadata: &api.BlockMetadata{Tag: tag, Height: height, Hash: hash},
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{Header: []byte(`{"hash":"0xabcde","height":12345,"tx":[]}`)},
+		},
+	}
+
+	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, _ *api.BlockFile, consumer downloader.StreamConsumer) error {
+			return consumer(ctx, bitcoinBlock)
+		},
+	)
+
+	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
+		return nil
+	})
+	s.require.Error(err, "default suite is ethereum; parser cannot satisfy bitcoin streaming")
+	s.require.Contains(err.Error(), "does not support bitcoin streaming")
+}
+
+func (s *clientTestSuite) TestStreamBlock_EthereumBlobDeliversNilBitcoin() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+
+	ethBlock := &api.Block{
+		Metadata: &api.BlockMetadata{Tag: tag, Height: height, Hash: hash},
+		Blobdata: &api.Block_Ethereum{Ethereum: &api.EthereumBlobdata{}},
+	}
+
+	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, _ *api.BlockFile, consumer downloader.StreamConsumer) error {
+			return consumer(ctx, ethBlock)
+		},
+	)
+
+	var consumerCalled bool
+	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
+		consumerCalled = true
+		s.require.NotNil(view.GetMetadata())
+		s.require.Equal(uint64(height), view.GetMetadata().Height)
+		// Non-bitcoin chain → GetBitcoin() must return nil so callers
+		// can fall back to GetBlock + ParseNativeBlock.
+		s.require.Nil(view.GetBitcoin())
+		return nil
+	})
+	s.require.NoError(err)
+	s.require.True(consumerCalled)
+}
+
+func (s *clientTestSuite) TestStreamBlock_DownloadError() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+
+	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
+	sentinel := xerrors.New("download exploded")
+	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).Return(sentinel)
+
+	var consumerCalled bool
+	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
+		consumerCalled = true
+		return nil
+	})
+	s.require.ErrorIs(err, sentinel)
+	s.require.False(consumerCalled)
+}
+
+func (s *clientTestSuite) TestStreamBlock_NilConsumer() {
+	err := s.client.StreamBlock(context.Background(), 1, 123, "0xabc", nil)
+	s.require.Error(err)
+	s.require.Contains(err.Error(), "non-nil consumer")
+}
+
 func (s *clientTestSuite) TestStreamBlocks_ErrRecv() {
 	mockError := xerrors.New("some mock error")
 	s.gatewayClient.EXPECT().StreamChainEvents(gomock.Any(), gomock.Any()).Return(s.streamClient, nil)

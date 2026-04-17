@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"fmt"
+	"io"
 	"math/big"
 	"strings"
 
@@ -27,7 +28,7 @@ func NewNop() Parser {
 	return nopParser{}
 }
 
-func (p nopParser) ParseNativeBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+func (p nopParser) ParseNativeBlock(ctx context.Context, rawBlock *api.Block, opts ...ParseOption) (*api.NativeBlock, error) {
 	return &api.NativeBlock{}, nil
 }
 
@@ -53,6 +54,10 @@ func (p nopParser) ValidateAccountState(ctx context.Context, req *api.ValidateAc
 
 func (p nopParser) ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error {
 	return nil
+}
+
+func (p nopParser) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
+	return nil, xerrors.New("nopParser does not support bitcoin streaming")
 }
 
 // ValidateChain checks if the chain is continuous.

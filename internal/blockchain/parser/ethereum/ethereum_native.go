@@ -518,7 +518,7 @@ func WithTimestampInMs() internal.ParserFactoryOption {
 	}
 }
 
-func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block, opts ...internal.ParseOption) (*api.NativeBlock, error) {
 	metadata := rawBlock.GetMetadata()
 	if metadata == nil {
 		return nil, xerrors.New("metadata not found")

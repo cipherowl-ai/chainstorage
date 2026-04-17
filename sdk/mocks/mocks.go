@@ -11,6 +11,7 @@ package sdkmocks
 
 import (
 	context "context"
+	io "io"
 	reflect "reflect"
 
 	chainstorage "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -299,6 +300,25 @@ func (mr *MockClientMockRecorder) StreamChainEvents(arg0, arg1 any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamChainEvents", reflect.TypeOf((*MockClient)(nil).StreamChainEvents), arg0, arg1)
 }
 
+// StreamBlock mocks base method.
+func (m *MockClient) StreamBlock(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string, arg4 func(*sdk.StreamedBlock) error, arg5 ...sdk.ParseOption) error {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2, arg3, arg4}
+	for _, a := range arg5 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "StreamBlock", varargs...)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// StreamBlock indicates an expected call of StreamBlock.
+func (mr *MockClientMockRecorder) StreamBlock(arg0, arg1, arg2, arg3, arg4 any, arg5 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2, arg3, arg4}, arg5...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBlock", reflect.TypeOf((*MockClient)(nil).StreamBlock), varargs...)
+}
+
 // MockParser is a mock of Parser interface.
 type MockParser struct {
 	ctrl     *gomock.Controller
@@ -338,18 +358,23 @@ func (mr *MockParserMockRecorder) GetNativeTransaction(arg0, arg1, arg2 any) *go
 }
 
 // ParseNativeBlock mocks base method.
-func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block) (*chainstorage.NativeBlock, error) {
+func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block, arg2 ...sdk.ParseOption) (*chainstorage.NativeBlock, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ParseNativeBlock", arg0, arg1)
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "ParseNativeBlock", varargs...)
 	ret0, _ := ret[0].(*chainstorage.NativeBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ParseNativeBlock indicates an expected call of ParseNativeBlock.
-func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any) *gomock.Call {
+func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), arg0, arg1)
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), varargs...)
 }
 
 // ParseRosettaBlock mocks base method.
@@ -379,6 +404,26 @@ func (m *MockParser) ValidateBlock(arg0 context.Context, arg1 *chainstorage.Nati
 func (mr *MockParserMockRecorder) ValidateBlock(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ValidateBlock", reflect.TypeOf((*MockParser)(nil).ValidateBlock), arg0, arg1)
+}
+
+// StreamBitcoinBlock mocks base method.
+func (m *MockParser) StreamBitcoinBlock(arg0 context.Context, arg1 func() (io.ReadCloser, error), arg2 *chainstorage.Block, arg3 ...sdk.ParseOption) (sdk.BitcoinBlockStream, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2}
+	for _, a := range arg3 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "StreamBitcoinBlock", varargs...)
+	ret0, _ := ret[0].(sdk.BitcoinBlockStream)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StreamBitcoinBlock indicates an expected call of StreamBitcoinBlock.
+func (mr *MockParserMockRecorder) StreamBitcoinBlock(arg0, arg1, arg2 any, arg3 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2}, arg3...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamBitcoinBlock", reflect.TypeOf((*MockParser)(nil).StreamBitcoinBlock), varargs...)
 }
 
 // MockSession is a mock of Session interface.

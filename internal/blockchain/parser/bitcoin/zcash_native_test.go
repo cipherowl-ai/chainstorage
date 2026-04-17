@@ -219,6 +219,58 @@ func TestZcashNativeParser_FiltersTransactionsMissingEitherVinOrVout(t *testing.
 	require.Equal("coinbase-tx", bitcoinBlock.Transactions[0].TransactionId)
 }
 
+func TestZcashNativeParser_ParseOptionsPassthrough(t *testing.T) {
+	require := require.New(t)
+	parser, app := newZcashNativeParser(t)
+	defer app.Close()
+
+	block := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_ZCASH,
+		Network:    common.Network_NETWORK_ZCASH_MAINNET,
+		Metadata: &api.BlockMetadata{
+			Tag: 1, Hash: "blockhash", ParentHash: "parenthash",
+			Height: 1, ParentHeight: 0,
+		},
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{
+				Header: []byte(`{
+					"hash":"blockhash","height":1,"time":1,"nTx":1,
+					"previousblockhash":"parenthash",
+					"tx":[{
+						"txid":"coinbase-tx","hash":"coinbase-tx",
+						"vin":[{"coinbase":"01","sequence":4294967295}],
+						"vout":[{"value":12.5,"n":0,"scriptPubKey":{
+							"asm":"OP_DUP OP_HASH160 1111111111111111111111111111111111111111 OP_EQUALVERIFY OP_CHECKSIG",
+							"hex":"76a914111111111111111111111111111111111111111188ac",
+							"type":"pubkeyhash","address":"t1coinbase"
+						}}]
+					}],
+					"vShieldedSpend":[{"dummy":"value"}]
+				}`),
+				InputTransactions: []*api.RepeatedBytes{{Data: [][]byte{}}},
+			},
+		},
+	}
+
+	// All three options applied; should not break zcash parse.
+	nb, err := parser.ParseBlock(context.Background(),
+		block,
+		internal.WithSkipScripts(),
+		internal.WithSkipWitnesses(),
+		internal.WithSkipShielded(),
+	)
+	require.NoError(err)
+	require.NotNil(nb.GetBitcoin())
+	require.Equal(uint64(1), nb.NumTransactions)
+
+	tx := nb.GetBitcoin().Transactions[0]
+	require.Empty(tx.Hex)
+	for _, out := range tx.Outputs {
+		require.Empty(out.ScriptPublicKey.Assembly)
+		require.Empty(out.ScriptPublicKey.Hex)
+	}
+}
+
 func newZcashNativeParser(t *testing.T) (internal.NativeParser, testapp.TestApp) {
 	t.Helper()
 
