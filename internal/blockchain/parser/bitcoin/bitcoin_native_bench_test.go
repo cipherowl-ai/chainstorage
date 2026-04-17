@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	"go.uber.org/fx"
@@ -11,7 +12,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
-	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 // BenchmarkBitcoinParseBlock measures memory + allocations for a single
@@ -59,11 +59,11 @@ func BenchmarkBitcoinParseBlock(b *testing.B) {
 	}
 }
 
-// BenchmarkBitcoinStreamBlock measures StreamBlock on the same 15MB
-// witness-heavy mainnet block. The visitor drops each transaction
+// BenchmarkBitcoinStreamBlockIter measures StreamBlockIter on the same
+// 15MB witness-heavy mainnet block. The loop drops each transaction
 // reference immediately so allocations-per-op reflect streaming overhead
 // rather than aggregate block size.
-func BenchmarkBitcoinStreamBlock(b *testing.B) {
+func BenchmarkBitcoinStreamBlockIter(b *testing.B) {
 	var parser internal.NativeParser
 	app := testapp.New(b,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_BITCOIN, common.Network_NETWORK_BITCOIN_MAINNET),
@@ -80,19 +80,20 @@ func BenchmarkBitcoinStreamBlock(b *testing.B) {
 	}
 
 	headerBytes := rawBlock.GetBitcoin().GetHeader()
+	loadGroup := NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions())
 	ctx := context.Background()
-
-	visitor := BitcoinBlockVisitorFunc(func(tx *api.BitcoinTransaction) error {
-		_ = tx
-		return nil
-	})
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		r := bytes.NewReader(headerBytes)
-		if _, err := impl.StreamBlock(ctx, r, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()), visitor); err != nil {
-			b.Fatalf("StreamBlock: %v", err)
+		opener := func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(headerBytes)), nil
+		}
+		stream := impl.StreamBlockIter(ctx, opener, loadGroup)
+		for _, err := range stream.Transactions() {
+			if err != nil {
+				b.Fatalf("stream: %v", err)
+			}
 		}
 	}
 }
