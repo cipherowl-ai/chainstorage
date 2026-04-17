@@ -1,7 +1,9 @@
 package sdk
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -79,9 +81,24 @@ func (s *streamBitcoinClientSuite) TestStreamBitcoinBlock_EndToEnd() {
 
 	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, _ *api.BlockFile, consumer downloader.StreamConsumer) error {
-			return consumer(ctx, rawBlock)
+
+	// For bitcoin-configured SDK, sdk.Client.StreamBlock uses the
+	// Phase 2 path: DownloadStreamBitcoin delivers an api.Block with
+	// Bitcoin.Header = nil plus an openHeaderReader factory.
+	headerBytes := rawBlock.GetBitcoin().GetHeader()
+	blockForStream := *rawBlock
+	blockForStream.Blobdata = &api.Block_Bitcoin{
+		Bitcoin: &api.BitcoinBlobdata{
+			Header:            nil, // walker would leave this empty
+			InputTransactions: rawBlock.GetBitcoin().InputTransactions,
+		},
+	}
+	openHeaderReader := func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(headerBytes)), nil
+	}
+	s.downloaderClient.EXPECT().DownloadStreamBitcoin(gomock.Any(), bf, gomock.Any()).DoAndReturn(
+		func(ctx context.Context, _ *api.BlockFile, consumer downloader.BitcoinStreamConsumer) error {
+			return consumer(ctx, &blockForStream, openHeaderReader)
 		},
 	)
 

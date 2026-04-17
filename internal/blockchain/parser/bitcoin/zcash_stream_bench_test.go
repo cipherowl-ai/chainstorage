@@ -1,7 +1,6 @@
 package bitcoin
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -108,16 +107,12 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		headerCost      time.Duration
 	)
 	start := time.Now()
-	err = dl.DownloadStream(ctx, bf, func(ctx context.Context, rawBlock *api.Block) error {
+	err = dl.DownloadStreamBitcoin(ctx, bf, func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error)) error {
 		blob := rawBlock.GetBitcoin()
 		if blob == nil {
 			t.Fatalf("rawBlock has no bitcoin blobdata")
 		}
-		headerBytes := blob.GetHeader()
-		openReader := func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(headerBytes)), nil
-		}
-		stream := bitcoinImpl.StreamBlockIter(ctx, openReader, blob, opts...)
+		stream := bitcoinImpl.StreamBlockIter(ctx, openHeaderReader, blob, opts...)
 
 		for tx, err := range stream.Transactions() {
 			if err != nil {
@@ -141,11 +136,11 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	elapsed := time.Since(start)
 	peak.stop()
 	if err != nil {
-		t.Fatalf("DownloadStream: %v", err)
+		t.Fatalf("DownloadStreamBitcoin: %v", err)
 	}
 	after := heapAlloc()
 
-	t.Logf("\n=== Streaming path (DownloadStream -> StreamBlockIter) ===")
+	t.Logf("\n=== Phase 2 streaming (DownloadStreamBitcoin -> StreamBlockIter) ===")
 	t.Logf("total elapsed:          %s", elapsed)
 	t.Logf("tx count (visited):     %d", txCount)
 	t.Logf("Header() cost:          %s (free after iteration)", headerCost)

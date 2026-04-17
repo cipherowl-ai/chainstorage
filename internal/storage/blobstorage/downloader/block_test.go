@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -225,6 +226,87 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_Skipped() {
 		require.NotNil(block.GetMetadata())
 		require.True(block.GetMetadata().Skipped)
 		require.Nil(block.GetBlobdata())
+		return nil
+	})
+	require.NoError(err)
+	require.Equal(1, consumerCalls)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Success() {
+	require := testutil.Require(s.T())
+
+	headerJSON := []byte(`{"hash":"0xabc","height":42,"tx":[{"txid":"tx1"},{"txid":"tx2"}]}`)
+	bitcoinBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_BITCOIN,
+		Network:    common.Network_NETWORK_BITCOIN_MAINNET,
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 42, Hash: "0xabc"},
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{
+				Header: headerJSON,
+				InputTransactions: []*api.RepeatedBytes{
+					{Data: [][]byte{[]byte("prev1-json"), []byte("prev2-json")}},
+				},
+			},
+		},
+	}
+	blockBytes, err := proto.Marshal(bitcoinBlock)
+	require.NoError(err)
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, blockBytes)),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	var consumerCalls int
+	err = s.downloader.DownloadStreamBitcoin(context.Background(), s.blockFile, func(ctx context.Context, block *api.Block, openHeader func() (io.ReadCloser, error)) error {
+		consumerCalls++
+		// Metadata, InputTransactions preserved.
+		require.Equal(uint64(42), block.GetMetadata().Height)
+		require.Nil(block.GetBitcoin().GetHeader(), "header must be nil — exposed via openHeader")
+		require.Equal(1, len(block.GetBitcoin().GetInputTransactions()))
+		require.Equal([][]byte{[]byte("prev1-json"), []byte("prev2-json")},
+			block.GetBitcoin().GetInputTransactions()[0].Data)
+
+		// openHeader should be re-callable.
+		for i := 0; i < 2; i++ {
+			rc, err := openHeader()
+			require.NoError(err)
+			got, err := io.ReadAll(rc)
+			require.NoError(err)
+			require.NoError(rc.Close())
+			require.Equal(headerJSON, got, "header reader attempt %d", i)
+		}
+		return nil
+	})
+	require.NoError(err)
+	require.Equal(1, consumerCalls)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadStreamBitcoin_Skipped() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+		fx.Provide(s.newHttpClientFunc()),
+	)
+
+	var consumerCalls int
+	err := s.downloader.DownloadStreamBitcoin(context.Background(), s.skippedBlockFile, func(ctx context.Context, block *api.Block, openHeader func() (io.ReadCloser, error)) error {
+		consumerCalls++
+		require.True(block.GetMetadata().Skipped)
+		require.Nil(block.GetBlobdata())
+		// openHeader returns an empty reader for skipped blocks.
+		rc, err := openHeader()
+		require.NoError(err)
+		defer rc.Close()
+		got, err := io.ReadAll(rc)
+		require.NoError(err)
+		require.Empty(got)
 		return nil
 	})
 	require.NoError(err)

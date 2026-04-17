@@ -1,7 +1,6 @@
 package sdk
 
 import (
-	"bytes"
 	"context"
 	"io"
 
@@ -21,6 +20,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/internal/utils/retry"
 	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
+	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -546,27 +546,43 @@ func (c *clientImpl) StreamBlock(
 		return xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
 	}
 
-	return c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block) error {
-		view := &StreamedBlock{Metadata: rawBlock.GetMetadata()}
-
-		// Populate the chain-specific field based on the blobdata.
-		// Only bitcoin-family streaming is implemented today; other
-		// chain fields stay nil and the consumer should fall back to
-		// GetBlock + ParseNativeBlock for those.
-		if blob := rawBlock.GetBitcoin(); blob != nil {
-			headerBytes := blob.GetHeader()
-			openReader := func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(headerBytes)), nil
-			}
-			stream, err := c.parser.StreamBitcoinBlock(ctx, openReader, rawBlock, opts...)
+	// For bitcoin-family chains, use the Phase 2 wire walker path:
+	// peak RAM is O(input_transactions) instead of O(2× block size).
+	// The BitcoinBlobdata.Header bytes never materialize in RAM —
+	// they're read on-demand from the decompressed spool file via
+	// openHeaderReader.
+	if isBitcoinFamilyChain(c.config.Chain.Blockchain) {
+		return c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error)) error {
+			stream, err := c.parser.StreamBitcoinBlock(ctx, openHeaderReader, rawBlock, opts...)
 			if err != nil {
 				return xerrors.Errorf("failed to create bitcoin block stream: %w", err)
 			}
-			view.bitcoin = stream
-		}
+			return consumer(&StreamedBlock{
+				Metadata: rawBlock.GetMetadata(),
+				bitcoin:  stream,
+			})
+		})
+	}
 
-		return consumer(view)
+	// Non-bitcoin chains: chain-agnostic Phase 1 path. Consumer gets
+	// a view with GetBitcoin() == nil and should fall back to
+	// GetBlock + ParseNativeBlock for chain-specific parsing.
+	return c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block) error {
+		return consumer(&StreamedBlock{Metadata: rawBlock.GetMetadata()})
 	})
+}
+
+func isBitcoinFamilyChain(b common.Blockchain) bool {
+	switch b {
+	case common.Blockchain_BLOCKCHAIN_BITCOIN,
+		common.Blockchain_BLOCKCHAIN_BITCOINCASH,
+		common.Blockchain_BLOCKCHAIN_LITECOIN,
+		common.Blockchain_BLOCKCHAIN_DOGECOIN,
+		common.Blockchain_BLOCKCHAIN_DASH,
+		common.Blockchain_BLOCKCHAIN_ZCASH:
+		return true
+	}
+	return false
 }
 
 func (c *clientImpl) validateBlock(ctx context.Context, rawBlock *api.Block) error {

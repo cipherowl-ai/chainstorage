@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"io/ioutil"
@@ -55,15 +56,40 @@ type (
 		// wishing to retry retry the whole call.
 		//
 		// NOTE: This is Phase 1. The envelope is still fully
-		// proto.Unmarshal'd into memory — resident peak is unchanged
-		// from Download. The Phase 1 win is removing the separate
-		// compressed-bytes in-memory buffer (disk-spool via io.Copy)
-		// and giving callers a hook point for streaming parsers.
-		// Phase 2 will replace proto.Unmarshal with a wire-format
-		// walker that streams selected proto fields directly off disk
-		// without materializing the full api.Block.
+		// proto.Unmarshal'd into memory — resident peak is
+		// decompressed_bytes + api.Block (roughly 2× block size).
+		// For the Phase 2 reduced-peak path, use
+		// DownloadStreamBitcoin which streams the bitcoin
+		// BitcoinBlobdata.Header off disk.
 		DownloadStream(ctx context.Context, blockFile *api.BlockFile, consumer StreamConsumer) error
+
+		// DownloadStreamBitcoin is the Phase 2 path for
+		// bitcoin-family blocks. It spools compressed bytes to disk,
+		// streams the decompressed bytes through a proto wire-walker
+		// that materializes everything except BitcoinBlobdata.Header,
+		// and invokes consumer with that partial *api.Block plus an
+		// OpenHeaderReader factory that seeks into the spooled
+		// decompressed file to deliver the header JSON bytes.
+		//
+		// Peak RAM drops from ~2× block size (DownloadStream) to
+		// ~1× block size (the input_transactions portion) plus the
+		// decompressed bytes as a file on disk.
+		//
+		// consumer sees block.Bitcoin.Header = nil. OpenHeaderReader
+		// may be called multiple times during the consumer's work
+		// (e.g. once for bitcoin.BlockStream.Transactions() and, if
+		// Header() is invoked before iteration, a second time for the
+		// header-only scan). Each returned ReadCloser is an
+		// independent handle on the spool file.
+		//
+		// Returns an error if the block is not bitcoin-shaped.
+		DownloadStreamBitcoin(ctx context.Context, blockFile *api.BlockFile, consumer BitcoinStreamConsumer) error
 	}
+
+	// BitcoinStreamConsumer receives a partial api.Block (with
+	// BitcoinBlobdata.Header = nil) plus a factory for opening a
+	// reader over the header bytes.
+	BitcoinStreamConsumer func(ctx context.Context, block *api.Block, openHeaderReader func() (io.ReadCloser, error)) error
 
 	BlockDownloaderParams struct {
 		fx.In
@@ -237,6 +263,120 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 
 	return consumer(ctx, block)
 }
+
+// DownloadStreamBitcoin is the Phase 2 streaming path. It spools the
+// compressed blob to disk, decompresses to a second temp file while
+// simultaneously walking the proto envelope, and hands the consumer a
+// partially-populated *api.Block plus a header reader factory that
+// seeks into the decompressed spool on demand.
+//
+// Peak RAM during this call is dominated by any materialized proto
+// fields (InputTransactions in particular), not by a duplicate []byte
+// copy of the decompressed block.
+func (d *blockDownloaderImpl) DownloadStreamBitcoin(ctx context.Context, blockFile *api.BlockFile, consumer BitcoinStreamConsumer) error {
+	if blockFile.Skipped {
+		return consumer(ctx, &api.Block{
+			Blockchain: d.config.Chain.Blockchain,
+			Network:    d.config.Chain.Network,
+			Metadata: &api.BlockMetadata{
+				Tag: blockFile.Tag, Height: blockFile.Height, Skipped: true,
+			},
+			Blobdata: nil,
+		}, func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		})
+	}
+
+	defer d.logDuration(time.Now())
+
+	// Spool #1: compressed body → tempfile1.
+	tmpCompressed, err := os.CreateTemp("", "chainstorage-block-compressed-*.bin")
+	if err != nil {
+		return xerrors.Errorf("create compressed spool: %w", err)
+	}
+	compressedPath := tmpCompressed.Name()
+	defer os.Remove(compressedPath)
+	if err := d.spoolToFile(ctx, blockFile, tmpCompressed); err != nil {
+		tmpCompressed.Close()
+		return err
+	}
+	if err := tmpCompressed.Close(); err != nil {
+		return xerrors.Errorf("close compressed spool: %w", err)
+	}
+
+	// Spool #2: decompressed bytes → tempfile2. We write via a tee so
+	// the walker can read them inline.
+	tmpDecompressed, err := os.CreateTemp("", "chainstorage-block-decompressed-*.bin")
+	if err != nil {
+		return xerrors.Errorf("create decompressed spool: %w", err)
+	}
+	decompressedPath := tmpDecompressed.Name()
+	defer os.Remove(decompressedPath)
+
+	compressedFile, err := os.Open(compressedPath)
+	if err != nil {
+		tmpDecompressed.Close()
+		return xerrors.Errorf("reopen compressed spool: %w", err)
+	}
+
+	dec, err := storage_utils.DecompressReader(compressedFile, blockFile.Compression)
+	if err != nil {
+		compressedFile.Close()
+		tmpDecompressed.Close()
+		return xerrors.Errorf("wrap decompressor: %w", err)
+	}
+
+	tee := io.TeeReader(dec, tmpDecompressed)
+	block, headerOffset, headerLength, walkErr := api.WalkBitcoinEnvelope(tee)
+
+	// Fully drain the tee so the remaining bytes (if any) land in the
+	// decompressed spool. WalkBitcoinEnvelope already consumes exactly
+	// up to the end of the Block message; if there are trailing bytes
+	// in the stream, we copy them through to keep tmpDecompressed faithful.
+	if walkErr == nil {
+		_, _ = io.Copy(io.Discard, tee)
+	}
+	dec.Close()
+	compressedFile.Close()
+	if err := tmpDecompressed.Sync(); err != nil {
+		tmpDecompressed.Close()
+		return xerrors.Errorf("sync decompressed spool: %w", err)
+	}
+	if err := tmpDecompressed.Close(); err != nil {
+		return xerrors.Errorf("close decompressed spool: %w", err)
+	}
+
+	if walkErr != nil {
+		return xerrors.Errorf("walk bitcoin envelope: %w", walkErr)
+	}
+	if headerOffset < 0 {
+		return xerrors.Errorf("block at (tag=%v, height=%v) has no bitcoin header", blockFile.Tag, blockFile.Height)
+	}
+
+	openHeaderReader := func() (io.ReadCloser, error) {
+		f, err := os.Open(decompressedPath)
+		if err != nil {
+			return nil, xerrors.Errorf("open decompressed spool for header read: %w", err)
+		}
+		if _, err := f.Seek(headerOffset, io.SeekStart); err != nil {
+			f.Close()
+			return nil, xerrors.Errorf("seek to header: %w", err)
+		}
+		return &seekedHeaderReader{f: f, limit: io.LimitReader(f, headerLength)}, nil
+	}
+
+	return consumer(ctx, block, openHeaderReader)
+}
+
+// seekedHeaderReader is an io.ReadCloser that reads up to `limit`
+// bytes from `f` and closes `f` on Close.
+type seekedHeaderReader struct {
+	f     *os.File
+	limit io.Reader
+}
+
+func (r *seekedHeaderReader) Read(p []byte) (int, error) { return r.limit.Read(p) }
+func (r *seekedHeaderReader) Close() error               { return r.f.Close() }
 
 // spoolToFile performs the (retryable) HTTP GET and streams the body to
 // dst. The file is truncated + rewound on every retry attempt.
