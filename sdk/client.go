@@ -101,21 +101,18 @@ type (
 		// This is useful if the caller needs a consistent snapshot of chain metadata during its current lifecycle.
 		GetStaticChainMetadata(ctx context.Context, req *api.GetChainMetadataRequest) (*api.GetChainMetadataResponse, error)
 
-		// StreamBlock downloads a block to a local disk spool, hands
-		// it to the configured chain-specific parser, and returns a
-		// StreamedBlock. Callers type-assert the result to a
-		// chain-specific extension (e.g. BitcoinStreamedBlock) to
-		// reach iterators and lazy accessors.
+		// StreamBitcoinBlock downloads a bitcoin-family block to a
+		// local disk spool and returns a BitcoinStreamedBlock. Errors
+		// if the configured chain is not bitcoin-family.
 		//
-		// The returned StreamedBlock owns a disk spool (for
-		// bitcoin-family chains). Callers MUST call Close() when done.
-		// A runtime cleanup is wired as a safety net but should not
-		// be relied on.
+		// The returned stream owns the disk spool. Callers MUST
+		// call Close() when done. A runtime cleanup is wired as a
+		// safety net but should not be relied on.
 		//
-		// For chains without a streaming parser, the returned
-		// StreamedBlock has metadata only; callers should fall back
-		// to GetBlock + ParseNativeBlock for chain-specific parsing.
-		StreamBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (StreamedBlock, error)
+		// Future chains will add typed counterparts
+		// (StreamEthereumBlock, StreamSolanaBlock, ...) as their
+		// parsers grow streaming support.
+		StreamBitcoinBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (BitcoinStreamedBlock, error)
 	}
 
 	ChainEventResult struct {
@@ -522,11 +519,11 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 	return block, nil
 }
 
-func (c *clientImpl) StreamBlock(
+func (c *clientImpl) StreamBitcoinBlock(
 	ctx context.Context,
 	tag uint32, height uint64, hash string,
 	opts ...ParseOption,
-) (StreamedBlock, error) {
+) (BitcoinStreamedBlock, error) {
 	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
 		Tag:    tag,
 		Height: height,
@@ -540,10 +537,10 @@ func (c *clientImpl) StreamBlock(
 	if err != nil {
 		return nil, err
 	}
-	stream, err := c.parser.StreamBlock(ctx, spooled, opts...)
+	stream, err := c.parser.StreamBitcoinBlock(ctx, spooled, opts...)
 	if err != nil {
 		spooled.Close()
-		return nil, xerrors.Errorf("failed to create block stream: %w", err)
+		return nil, xerrors.Errorf("failed to create bitcoin block stream: %w", err)
 	}
 	return stream, nil
 }

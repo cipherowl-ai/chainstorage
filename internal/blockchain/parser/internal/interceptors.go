@@ -152,10 +152,10 @@ func (i *instrumentInterceptor) ValidateRosettaBlock(ctx context.Context, req *a
 	)
 }
 
-// StreamBlock passes through to the wrapped parser. Streaming
+// StreamBitcoinBlock passes through to the wrapped parser. Streaming
 // instrumentation (per-tx counters, per-block duration) would require
 // hooking the iterator; for now the call is passed through unwrapped
 // so consumers see the real stream object.
-func (i *instrumentInterceptor) StreamBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (StreamedBlock, error) {
-	return i.parser.StreamBlock(ctx, spooled, opts...)
+func (i *instrumentInterceptor) StreamBitcoinBlock(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (BitcoinStreamedBlock, error) {
+	return i.parser.StreamBitcoinBlock(ctx, spooled, opts...)
 }
