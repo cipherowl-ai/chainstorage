@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/gateway"
@@ -82,53 +83,48 @@ func (s *streamBitcoinClientSuite) TestStreamBitcoinBlock_EndToEnd() {
 	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 
-	// For bitcoin-configured SDK, sdk.Client.StreamBlock uses the
-	// Phase 2 path: DownloadStreamBitcoin delivers an api.Block with
-	// Bitcoin.Header = nil plus an openHeaderReader factory.
+	// For bitcoin-configured SDK, sdk.Client.StreamBlock invokes
+	// DownloadStreamBitcoin which returns a BitcoinStream whose
+	// Block.Bitcoin has Header = nil and InputTransactions = nil,
+	// plus lazy loaders for both.
 	headerBytes := rawBlock.GetBitcoin().GetHeader()
-	blockForStream := *rawBlock
+	blockForStream := proto.Clone(rawBlock).(*api.Block)
 	blockForStream.Blobdata = &api.Block_Bitcoin{
 		Bitcoin: &api.BitcoinBlobdata{
 			Header:            nil, // walker would leave this empty
 			InputTransactions: nil, // walker now also leaves this empty
 		},
 	}
-	openHeaderReader := func() (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader(headerBytes)), nil
-	}
 	groups := rawBlock.GetBitcoin().GetInputTransactions()
-	loadGroup := func(i int) (*api.RepeatedBytes, error) {
-		if i < 0 || i >= len(groups) {
-			return nil, nil
-		}
-		return groups[i], nil
-	}
-	s.downloaderClient.EXPECT().DownloadStreamBitcoin(gomock.Any(), bf, gomock.Any()).DoAndReturn(
-		func(ctx context.Context, _ *api.BlockFile, consumer downloader.BitcoinStreamConsumer) error {
-			return consumer(ctx, &blockForStream, openHeaderReader, loadGroup)
+	stream := &downloader.BitcoinStream{
+		Block: blockForStream,
+		OpenHeaderReader: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(headerBytes)), nil
 		},
-	)
+		LoadInputTxGroup: func(i int) (*api.RepeatedBytes, error) {
+			if i < 0 || i >= len(groups) {
+				return nil, nil
+			}
+			return groups[i], nil
+		},
+	}
+	s.downloaderClient.EXPECT().DownloadStreamBitcoin(gomock.Any(), bf).Return(stream, nil)
+
+	view, err := s.client.StreamBlock(context.Background(), tag, height, hash)
+	s.require.NoError(err)
+	defer view.Close()
+	s.require.NotNil(view.GetMetadata())
+
+	bs := view.GetBitcoin()
+	s.require.NotNil(bs)
 
 	var txCount int
-	var header *api.BitcoinHeader
-	err := s.client.StreamBlock(context.Background(), tag, height, hash, func(view *StreamedBlock) error {
-		s.require.NotNil(view.GetMetadata())
-		bs := view.GetBitcoin()
-		s.require.NotNil(bs)
-		for tx, iterErr := range bs.Transactions() {
-			if iterErr != nil {
-				return iterErr
-			}
-			_ = tx
-			txCount++
-		}
-		h, herr := bs.Header()
-		if herr != nil {
-			return herr
-		}
-		header = h
-		return nil
-	})
+	for tx, iterErr := range bs.Transactions() {
+		s.require.NoError(iterErr)
+		_ = tx
+		txCount++
+	}
+	header, err := bs.Header()
 	s.require.NoError(err)
 	s.require.Greater(txCount, 0)
 	s.require.NotNil(header)
