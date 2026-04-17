@@ -61,7 +61,7 @@ func TestBlockStreamIter_IterateThenHeader(t *testing.T) {
 	require.NoError(err)
 
 	opener, calls := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin())
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()))
 
 	var count int
 	for tx, err := range stream.Transactions() {
@@ -103,7 +103,7 @@ func TestBlockStreamIter_HeaderBeforeIter(t *testing.T) {
 	require.NoError(err)
 
 	opener, calls := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin())
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()))
 
 	header, err := stream.Header()
 	require.NoError(err)
@@ -144,7 +144,7 @@ func TestBlockStreamIter_HeaderOnly(t *testing.T) {
 	require.NoError(err)
 
 	opener, calls := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin())
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()))
 
 	header, err := stream.Header()
 	require.NoError(err)
@@ -165,7 +165,7 @@ func TestBlockStreamIter_BreakEarly(t *testing.T) {
 	headerJSON := rawBlock.GetBitcoin().GetHeader()
 
 	opener, calls := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin())
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()))
 
 	var count int
 	for tx, iterErr := range stream.Transactions() {
@@ -201,7 +201,7 @@ func TestBlockStreamIter_ParityWithParseBlock(t *testing.T) {
 	require.NoError(err)
 
 	opener, _ := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin())
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()))
 
 	var streamed []*api.BitcoinTransaction
 	for tx, iterErr := range stream.Transactions() {
@@ -232,7 +232,7 @@ func TestBlockStreamIter_OptionsPassthrough(t *testing.T) {
 	headerJSON := rawBlock.GetBitcoin().GetHeader()
 
 	opener, _ := openerFor(headerJSON)
-	stream := parser.StreamBlockIter(context.Background(), opener, rawBlock.GetBitcoin(),
+	stream := parser.StreamBlockIter(context.Background(), opener, NewInMemoryInputTxGroupLoader(rawBlock.GetBitcoin().GetInputTransactions()),
 		internal.WithSkipScripts(), internal.WithSkipWitnesses())
 
 	for tx, iterErr := range stream.Transactions() {

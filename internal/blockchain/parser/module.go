@@ -25,6 +25,10 @@ type (
 
 	// BitcoinBlockStream is re-exported for SDK/mocks consumers.
 	BitcoinBlockStream = internal.BitcoinBlockStream
+
+	// BitcoinInputTxGroupLoader is re-exported so SDK callers can
+	// type their consumer lambdas without importing internal.
+	BitcoinInputTxGroupLoader = internal.BitcoinInputTxGroupLoader
 )
 
 var (

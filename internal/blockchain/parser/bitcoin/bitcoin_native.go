@@ -324,40 +324,69 @@ func (b *bitcoinNativeParserImpl) GetTransaction(ctx context.Context, nativeBloc
 // buildInputMetadataMap builds a lookup table from input transaction data in
 // blobdata. Each entry maps a transaction ID to its referenced outputs, which
 // are used later to resolve input values and compute fees.
+//
+// Used by the non-streaming ParseBlock path. Streaming callers prefer
+// buildMetadataForGroup which scopes the allocation to one tx's worth
+// of prev-outs.
 func (b *bitcoinNativeParserImpl) buildInputMetadataMap(
 	data *api.BitcoinBlobdata, optView internal.ParseOptionsView,
 ) (map[string][]*api.BitcoinTransactionOutput, error) {
 	metadataMap := make(map[string][]*api.BitcoinTransactionOutput)
 	for i, rawTransaction := range data.GetInputTransactions() {
-		for j, input := range rawTransaction.GetData() {
-			var inputTx BitcoinInputTransactionLit
-			if err := json.Unmarshal(input, &inputTx); err != nil {
-				return nil, xerrors.Errorf("failed to parse input transaction on [%d][%d]: %w", i, j, err)
-			}
-
-			if err := b.validateStruct(inputTx); err != nil {
-				return nil, xerrors.Errorf("failed to validate bitcoin input transaction %v: %w", inputTx.TxId, err)
-			}
-
-			if len(inputTx.Vout) != 1 {
-				return nil, xerrors.Errorf("unexpected length of input transaction's output (expected=1, len=%d)", len(inputTx.Vout))
-			}
-
-			inputTxId := inputTx.TxId.Value()
-			if _, ok := metadataMap[inputTxId]; !ok {
-				metadataMap[inputTxId] = make([]*api.BitcoinTransactionOutput, 0)
-			}
-
-			outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput(b.p2pkhVersionByte, optView)
-			if err != nil {
-				return nil, xerrors.Errorf("failed to convert to transaction output: %w", err)
-			}
-
-			metadataMap[inputTxId] = append(metadataMap[inputTxId], outputTx)
+		if err := b.appendGroupToMap(rawTransaction, optView, metadataMap); err != nil {
+			return nil, xerrors.Errorf("group [%d]: %w", i, err)
 		}
 	}
-
 	return metadataMap, nil
+}
+
+// buildMetadataForGroup builds a metadata lookup map for one tx's
+// prev-output transactions. Scoping the map to a single tx's worth
+// lets the streaming parser drop both the group bytes and the map
+// after each tx is yielded, keeping peak memory O(largest tx's
+// prev-outs) instead of O(all prev-outs).
+func (b *bitcoinNativeParserImpl) buildMetadataForGroup(
+	group *api.RepeatedBytes, optView internal.ParseOptionsView,
+) (map[string][]*api.BitcoinTransactionOutput, error) {
+	if group == nil {
+		return nil, nil
+	}
+	metadataMap := make(map[string][]*api.BitcoinTransactionOutput, len(group.GetData()))
+	if err := b.appendGroupToMap(group, optView, metadataMap); err != nil {
+		return nil, err
+	}
+	return metadataMap, nil
+}
+
+// appendGroupToMap decodes every prev-tx JSON in the group and appends
+// its single vout entry to metadataMap under the prev-tx's txid.
+func (b *bitcoinNativeParserImpl) appendGroupToMap(
+	group *api.RepeatedBytes,
+	optView internal.ParseOptionsView,
+	metadataMap map[string][]*api.BitcoinTransactionOutput,
+) error {
+	for j, input := range group.GetData() {
+		var inputTx BitcoinInputTransactionLit
+		if err := json.Unmarshal(input, &inputTx); err != nil {
+			return xerrors.Errorf("failed to parse input transaction [%d]: %w", j, err)
+		}
+
+		if err := b.validateStruct(inputTx); err != nil {
+			return xerrors.Errorf("failed to validate bitcoin input transaction %v: %w", inputTx.TxId, err)
+		}
+
+		if len(inputTx.Vout) != 1 {
+			return xerrors.Errorf("unexpected length of input transaction's output (expected=1, len=%d)", len(inputTx.Vout))
+		}
+
+		inputTxId := inputTx.TxId.Value()
+		outputTx, err := inputTx.Vout[0].ToApiBitcoinTransactionOutput(b.p2pkhVersionByte, optView)
+		if err != nil {
+			return xerrors.Errorf("failed to convert to transaction output: %w", err)
+		}
+		metadataMap[inputTxId] = append(metadataMap[inputTxId], outputTx)
+	}
+	return nil
 }
 
 func (b *bitcoinNativeParserImpl) parseTransactions(

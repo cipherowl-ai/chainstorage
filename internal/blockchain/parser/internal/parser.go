@@ -27,9 +27,12 @@ type (
 		ValidateRosettaBlock(ctx context.Context, req *api.ValidateRosettaBlockRequest, actualRosettaBlock *api.RosettaBlock) error
 		// StreamBitcoinBlock returns a BitcoinBlockStream for iterator-based
 		// traversal of a bitcoin-family block. Returns an error for chains
-		// that do not implement bitcoin streaming or for blocks whose
-		// Blobdata is not bitcoin-shaped.
-		StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error)
+		// that do not implement bitcoin streaming.
+		//
+		// loadGroup resolves prev-output transactions for each block tx
+		// on demand. If nil, tx fees and vin from-outputs are not
+		// populated (useful for callers that only need transaction ids).
+		StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error)
 	}
 
 	NativeParser interface {
@@ -198,14 +201,10 @@ func (p *parserImpl) ValidateRosettaBlock(ctx context.Context, req *api.Validate
 	return p.checker.ValidateRosettaBlock(ctx, req, actualRosettaBlock)
 }
 
-func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
+func (p *parserImpl) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
 	streamer, ok := p.nativeParser.(BitcoinStreamer)
 	if !ok {
 		return nil, xerrors.Errorf("native parser %T does not support bitcoin streaming", p.nativeParser)
 	}
-	blob := rawBlock.GetBitcoin()
-	if blob == nil {
-		return nil, xerrors.New("StreamBitcoinBlock requires bitcoin blobdata on rawBlock")
-	}
-	return streamer.StreamBlockIter(ctx, openReader, blob, opts...), nil
+	return streamer.StreamBlockIter(ctx, openReader, loadGroup, opts...), nil
 }

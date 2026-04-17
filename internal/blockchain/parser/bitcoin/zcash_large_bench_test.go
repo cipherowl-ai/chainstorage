@@ -137,7 +137,8 @@ func TestZcashLargeBlockBench(t *testing.T) {
 	})
 	r := bytes.NewReader(headerJSON)
 	streamStart := time.Now()
-	header, err := streamer.StreamBlock(ctx, r, blob, visitor, opts...)
+	loadGroup := NewInMemoryInputTxGroupLoader(blob.GetInputTransactions())
+	header, err := streamer.StreamBlock(ctx, r, loadGroup, visitor, opts...)
 	streamElapsed := time.Since(streamStart)
 	peak.stop()
 	if err != nil {

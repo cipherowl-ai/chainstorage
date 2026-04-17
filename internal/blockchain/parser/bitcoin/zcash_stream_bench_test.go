@@ -107,12 +107,8 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 		headerCost      time.Duration
 	)
 	start := time.Now()
-	err = dl.DownloadStreamBitcoin(ctx, bf, func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error)) error {
-		blob := rawBlock.GetBitcoin()
-		if blob == nil {
-			t.Fatalf("rawBlock has no bitcoin blobdata")
-		}
-		stream := bitcoinImpl.StreamBlockIter(ctx, openHeaderReader, blob, opts...)
+	err = dl.DownloadStreamBitcoin(ctx, bf, func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error), loadGroup func(int) (*api.RepeatedBytes, error)) error {
+		stream := bitcoinImpl.StreamBlockIter(ctx, openHeaderReader, loadGroup, opts...)
 
 		for tx, err := range stream.Transactions() {
 			if err != nil {

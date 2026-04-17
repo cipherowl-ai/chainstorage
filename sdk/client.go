@@ -552,8 +552,8 @@ func (c *clientImpl) StreamBlock(
 	// they're read on-demand from the decompressed spool file via
 	// openHeaderReader.
 	if isBitcoinFamilyChain(c.config.Chain.Blockchain) {
-		return c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error)) error {
-			stream, err := c.parser.StreamBitcoinBlock(ctx, openHeaderReader, rawBlock, opts...)
+		return c.blockDownloader.DownloadStreamBitcoin(ctx, blockFileResp.GetFile(), func(ctx context.Context, rawBlock *api.Block, openHeaderReader func() (io.ReadCloser, error), loadInputTxGroup func(int) (*api.RepeatedBytes, error)) error {
+			stream, err := c.parser.StreamBitcoinBlock(ctx, openHeaderReader, loadInputTxGroup, opts...)
 			if err != nil {
 				return xerrors.Errorf("failed to create bitcoin block stream: %w", err)
 			}

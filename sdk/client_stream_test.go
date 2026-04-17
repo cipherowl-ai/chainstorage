@@ -90,15 +90,22 @@ func (s *streamBitcoinClientSuite) TestStreamBitcoinBlock_EndToEnd() {
 	blockForStream.Blobdata = &api.Block_Bitcoin{
 		Bitcoin: &api.BitcoinBlobdata{
 			Header:            nil, // walker would leave this empty
-			InputTransactions: rawBlock.GetBitcoin().InputTransactions,
+			InputTransactions: nil, // walker now also leaves this empty
 		},
 	}
 	openHeaderReader := func() (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(headerBytes)), nil
 	}
+	groups := rawBlock.GetBitcoin().GetInputTransactions()
+	loadGroup := func(i int) (*api.RepeatedBytes, error) {
+		if i < 0 || i >= len(groups) {
+			return nil, nil
+		}
+		return groups[i], nil
+	}
 	s.downloaderClient.EXPECT().DownloadStreamBitcoin(gomock.Any(), bf, gomock.Any()).DoAndReturn(
 		func(ctx context.Context, _ *api.BlockFile, consumer downloader.BitcoinStreamConsumer) error {
-			return consumer(ctx, &blockForStream, openHeaderReader)
+			return consumer(ctx, &blockForStream, openHeaderReader, loadGroup)
 		},
 	)
 

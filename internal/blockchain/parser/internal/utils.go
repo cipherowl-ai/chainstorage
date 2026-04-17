@@ -56,7 +56,7 @@ func (p nopParser) ValidateRosettaBlock(ctx context.Context, req *api.ValidateRo
 	return nil
 }
 
-func (p nopParser) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), rawBlock *api.Block, opts ...ParseOption) (BitcoinBlockStream, error) {
+func (p nopParser) StreamBitcoinBlock(ctx context.Context, openReader func() (io.ReadCloser, error), loadGroup BitcoinInputTxGroupLoader, opts ...ParseOption) (BitcoinBlockStream, error) {
 	return nil, xerrors.New("nopParser does not support bitcoin streaming")
 }
 
