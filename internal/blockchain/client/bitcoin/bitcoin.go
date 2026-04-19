@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -382,12 +383,9 @@ func (b *bitcoinClient) getInputTransactions(
 
 	inputTransactionIDs := collectInputTransactionIDs(transactions)
 
-	inputTransactionsMap, err := b.fetchInputTransactions(ctx, inputTransactionIDs, blockHash)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	parsedCache, err := parseInputTransactions(inputTransactionsMap)
+	parsedCache, rawMap, err := b.fetchAndParseInputTransactions(
+		ctx, inputTransactionIDs, blockHash, b.preserveRawInputTransactions,
+	)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -397,7 +395,7 @@ func (b *bitcoinClient) getInputTransactions(
 		return nil, nil, err
 	}
 
-	return results, inputTransactionsMap, nil
+	return results, rawMap, nil
 }
 
 // collectInputTransactionIDs extracts deduplicated input transaction IDs
@@ -418,13 +416,23 @@ func collectInputTransactionIDs(transactions []*bitcoin.BitcoinTransactionLit) [
 	return ids
 }
 
-// fetchInputTransactions fetches raw transaction data for the given IDs via
-// concurrent batched getrawtransaction RPC calls. Returns a map of txid -> raw JSON.
-func (b *bitcoinClient) fetchInputTransactions(
+// fetchAndParseInputTransactions fetches raw transaction data for the given IDs
+// via concurrent batched getrawtransaction RPC calls and parses each batch
+// immediately rather than accumulating all raw responses. This collapses the
+// former three-stage pipeline (fetch all → merge → parse all) into one stage,
+// reducing peak memory from ~3× raw size to ~1× (parsed structs + at most one
+// batch of raw responses in flight per goroutine).
+//
+// When preserveRaw is true (Zcash, Dash), the raw response bytes are also
+// retained in rawMap alongside the parsed data. When false (Bitcoin mainnet),
+// rawMap is nil and the raw bytes are GC-eligible as soon as each batch's
+// parsing completes.
+func (b *bitcoinClient) fetchAndParseInputTransactions(
 	ctx context.Context,
 	inputTransactionIDs []string,
 	blockHash string,
-) (map[string][]byte, error) {
+	preserveRaw bool,
+) (map[string]*parsedInputTx, map[string][]byte, error) {
 	opts := internal.OptionsFromContext(ctx)
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 	numTransactions := len(inputTransactionIDs)
@@ -436,9 +444,14 @@ func (b *bitcoinClient) fetchInputTransactions(
 		zap.Int("txBatchSize", txBatchSize),
 	)
 
-	// Calculate number of batches and pre-allocate per-batch result slices.
 	numBatches := (numTransactions + txBatchSize - 1) / txBatchSize
-	batchResults := make([][]*jsonrpc.Response, numBatches)
+
+	var mu sync.Mutex
+	parsed := make(map[string]*parsedInputTx, numTransactions)
+	var rawMap map[string][]byte
+	if preserveRaw {
+		rawMap = make(map[string][]byte, numTransactions)
+	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(fetchInputTxConcurrency)
@@ -476,53 +489,61 @@ func (b *bitcoinClient) fetchInputTransactions(
 					err,
 				)
 			}
-			batchResults[idx] = responses
+
+			// Parse outside the lock — json.Unmarshal + voutMap building
+			// is CPU-intensive and should not serialize goroutines.
+			type batchEntry struct {
+				txID   string
+				parsed *parsedInputTx
+				raw    []byte
+			}
+			entries := make([]batchEntry, 0, len(responses))
+			for respIdx, resp := range responses {
+				txID := inputTransactionIDs[batchStart+respIdx]
+				var tx bitcoin.BitcoinInputTransactionLit
+				if err := json.Unmarshal(resp.Result, &tx); err != nil {
+					return xerrors.Errorf("failed to unmarshal input transaction %s: %w", txID, err)
+				}
+				if tx.TxId.Value() == "" {
+					return xerrors.Errorf("failed to validate input transaction %s: txid is required", txID)
+				}
+				if len(tx.Vout) == 0 {
+					return xerrors.Errorf("failed to validate input transaction %s: vout must have at least 1 element", txID)
+				}
+				vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(tx.Vout))
+				for _, o := range tx.Vout {
+					vm[o.N.Value()] = o
+				}
+				entry := batchEntry{
+					txID:   txID,
+					parsed: &parsedInputTx{tx: &tx, voutMap: vm},
+				}
+				if preserveRaw {
+					entry.raw = resp.Result
+				}
+				entries = append(entries, entry)
+			}
+
+			// Lock only for the map merge — fast O(n) pointer assignments.
+			mu.Lock()
+			for _, e := range entries {
+				parsed[e.txID] = e.parsed
+				if preserveRaw {
+					rawMap[e.txID] = e.raw
+				}
+			}
+			mu.Unlock()
 			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.done", idx)
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	opts.RecordHeartbeat(ctx, "fetchInputTx.done", numBatches)
 
-	// Merge batch results into a single map.
-	result := make(map[string][]byte, numTransactions)
-	for batchIdx, responses := range batchResults {
-		batchStart := batchIdx * txBatchSize
-		for respIdx, resp := range responses {
-			result[inputTransactionIDs[batchStart+respIdx]] = resp.Result
-		}
-	}
-
-	return result, nil
-}
-
-// parseInputTransactions unmarshals, validates, and indexes raw input
-// transactions. Each unique txid is parsed once and its vouts are indexed
-// by N for O(1) lookup. Replaces reflection-based validator.Struct with
-// direct checks to avoid per-call reflection overhead.
-func parseInputTransactions(rawMap map[string][]byte) (map[string]*parsedInputTx, error) {
-	parsed := make(map[string]*parsedInputTx, len(rawMap))
-	for txID, rawData := range rawMap {
-		var tx bitcoin.BitcoinInputTransactionLit
-		if err := json.Unmarshal(rawData, &tx); err != nil {
-			return nil, xerrors.Errorf("failed to unmarshal input transaction %s: %w", txID, err)
-		}
-		if tx.TxId.Value() == "" {
-			return nil, xerrors.Errorf("failed to validate input transaction %s: txid is required", txID)
-		}
-		if len(tx.Vout) == 0 {
-			return nil, xerrors.Errorf("failed to validate input transaction %s: vout must have at least 1 element", txID)
-		}
-		vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(tx.Vout))
-		for _, o := range tx.Vout {
-			vm[o.N.Value()] = o
-		}
-		parsed[txID] = &parsedInputTx{tx: &tx, voutMap: vm}
-	}
-	return parsed, nil
+	return parsed, rawMap, nil
 }
 
 // buildInputTransactionResults assembles per-vin filtered results with

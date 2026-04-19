@@ -78,6 +78,7 @@ require (
 )
 
 require (
+	github.com/KimMachineGun/automemlimit v0.7.5 // indirect
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.1 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.15.0 // indirect
@@ -104,6 +105,7 @@ require (
 	github.com/ferranbt/fastssz v0.1.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.5 // indirect
 	github.com/minio/sha256-simd v1.0.0 // indirect
+	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 )
 
 require (

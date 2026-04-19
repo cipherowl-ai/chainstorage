@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
@@ -27,6 +28,19 @@ type (
 	Client interface {
 		Call(ctx context.Context, method *RequestMethod, params Params, opts ...Option) (*Response, error)
 		BatchCall(ctx context.Context, method *RequestMethod, batchParams []Params, opts ...Option) ([]*Response, error)
+	}
+
+	// StreamingClient extends Client with a method that streams the JSON-RPC
+	// result directly to a caller-provided handler, avoiding the intermediate
+	// json.RawMessage buffer. Callers should type-assert to StreamingClient
+	// and fall back to Client.Call when the assertion fails (e.g., in unit
+	// tests using a mocked Client).
+	//
+	// The handler receives a *json.Decoder positioned at the start of the
+	// "result" value in the JSON-RPC response envelope. It must consume
+	// exactly one JSON value from the decoder before returning.
+	StreamingClient interface {
+		CallWithResultHandler(ctx context.Context, method *RequestMethod, params Params, handler func(dec *json.Decoder) error, opts ...Option) error
 	}
 
 	HTTPClient interface {
@@ -357,12 +371,13 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 	finalizer := finalizer.WithCloser(response.Body)
 	defer finalizer.Finalize()
 
-	responseBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
-	}
-
 	if response.StatusCode != http.StatusOK {
+		// Error path: read the full body for diagnostics (errors are small).
+		responseBody, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			return retry.Retryable(xerrors.Errorf("failed to read http response: %w", err))
+		}
+
 		errHTTP := xerrors.Errorf("received http error: %w", &HTTPError{
 			Code:     response.StatusCode,
 			Response: string(responseBody),
@@ -386,10 +401,17 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 		return errHTTP
 	}
 
-	if err := json.Unmarshal(responseBody, out); err != nil {
-		// Some upstream clients (e.g. Erigon client for ETH) return invalid JSON responses for otherwise retryable
-		// errors such as execution timeouts.
-		return retry.Retryable(xerrors.Errorf("failed to decode response %v: %w", string(responseBody), err))
+	// Success path: decode directly from the HTTP stream to avoid buffering
+	// the full response body. Eliminates one full copy of the response in
+	// memory (the intermediate []byte from ioutil.ReadAll).
+	//
+	// To preserve diagnostics for malformed 200 OK responses (e.g., Erigon
+	// returning invalid JSON on execution timeouts), capture up to 1KB of
+	// the stream alongside the decode so we can include it in the error.
+	var bodyPreview bytes.Buffer
+	tee := io.TeeReader(response.Body, &limitWriter{w: &bodyPreview, n: 1024})
+	if err := json.NewDecoder(tee).Decode(out); err != nil {
+		return retry.Retryable(xerrors.Errorf("failed to decode response %v: %w", bodyPreview.String(), err))
 	}
 
 	return finalizer.Close()
@@ -458,6 +480,26 @@ func IsNullOrEmpty(r json.RawMessage) bool {
 	return false
 }
 
+// limitWriter wraps a writer and silently stops writing after n bytes.
+// Used to capture a bounded preview of the response body for error diagnostics
+// without buffering the entire response.
+type limitWriter struct {
+	w io.Writer
+	n int
+}
+
+func (lw *limitWriter) Write(p []byte) (int, error) {
+	if lw.n <= 0 {
+		return len(p), nil // discard silently
+	}
+	if len(p) > lw.n {
+		p = p[:lw.n]
+	}
+	n, err := lw.w.Write(p)
+	lw.n -= n
+	return len(p), err // report full length to TeeReader
+}
+
 func (c *clientImpl) sanitizedError(err error) error {
 	var uerr *url.Error
 	if xerrors.As(err, &uerr) {
@@ -465,4 +507,160 @@ func (c *clientImpl) sanitizedError(err error) error {
 		err = uerr.Err
 	}
 	return err
+}
+
+// CallWithResultHandler implements StreamingClient. It makes an HTTP request
+// and walks the JSON-RPC response envelope on the wire, calling handler when
+// the "result" field is reached. The handler receives a json.Decoder
+// positioned at the start of the result value and must consume exactly one
+// JSON value from it before returning.
+//
+// This avoids buffering the entire result as json.RawMessage (which is what
+// the standard Call path does), eliminating one full copy of the result in
+// memory — critical for multi-MB responses like debug_traceBlockByHash.
+func (c *clientImpl) CallWithResultHandler(
+	ctx context.Context,
+	method *RequestMethod,
+	params Params,
+	handler func(dec *json.Decoder) error,
+	opts ...Option,
+) error {
+	var options options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	endpoint, err := c.endpointProvider.GetEndpoint(ctx)
+	if err != nil {
+		return xerrors.Errorf("failed to get endpoint for request: %w", err)
+	}
+
+	endpoint.IncRequestsCounter(1)
+
+	request := &Request{
+		JSONRPC: jsonrpcVersion,
+		Method:  method.Name,
+		Params:  params,
+		ID:      0,
+	}
+
+	attempt := 0
+	return c.wrap(ctx, method.Name, endpoint.Name, []Params{params}, func(ctx context.Context) error {
+		if options.onAttempt != nil {
+			options.onAttempt(ctx, attempt)
+		}
+		attempt++
+		return c.makeStreamingHTTPRequest(ctx, method.Timeout, endpoint, request, handler)
+	})
+}
+
+func (c *clientImpl) makeStreamingHTTPRequest(
+	ctx context.Context,
+	timeout time.Duration,
+	endpoint *endpoints.Endpoint,
+	data any,
+	handler func(dec *json.Decoder) error,
+) error {
+	url := endpoint.Config.Url
+	user := endpoint.Config.User
+	password := endpoint.Config.Password
+
+	requestBody, err := json.Marshal(data)
+	if err != nil {
+		return xerrors.Errorf("failed to marshal request: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(requestBody))
+	if err != nil {
+		err = c.sanitizedError(err)
+		return xerrors.Errorf("failed to create request: %w", err)
+	}
+
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json")
+
+	if user != "" && password != "" {
+		request.SetBasicAuth(user, password)
+	}
+
+	response, err := c.getHTTPClient(endpoint).Do(request)
+	if err != nil {
+		err = c.sanitizedError(err)
+		return retry.Retryable(xerrors.Errorf("failed to send http request: %w", err))
+	}
+
+	fin := finalizer.WithCloser(response.Body)
+	defer fin.Finalize()
+
+	if response.StatusCode != http.StatusOK {
+		responseBody, err := ioutil.ReadAll(response.Body)
+		if err != nil {
+			return retry.Retryable(xerrors.Errorf("failed to read error response: %w", err))
+		}
+		errHTTP := xerrors.Errorf("received http error: %w", &HTTPError{
+			Code:     response.StatusCode,
+			Response: string(responseBody),
+		})
+		if response.StatusCode == 429 {
+			return retry.RateLimit(errHTTP)
+		}
+		if response.StatusCode >= 500 {
+			return retry.Retryable(errHTTP)
+		}
+		return errHTTP
+	}
+
+	// Walk the JSON-RPC response envelope on the wire. When the "result"
+	// field is reached, hand the decoder to the caller's handler. If an
+	// "error" field is found, unmarshal it as RPCError.
+	dec := json.NewDecoder(response.Body)
+
+	t, err := dec.Token()
+	if err != nil {
+		return retry.Retryable(xerrors.Errorf("failed to read response start: %w", err))
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '{' {
+		return retry.Retryable(xerrors.Errorf("expected '{', got %v", t))
+	}
+
+	var rpcErr *RPCError
+	handlerCalled := false
+
+	for dec.More() {
+		keyToken, err := dec.Token()
+		if err != nil {
+			return retry.Retryable(xerrors.Errorf("failed to read key: %w", err))
+		}
+		key, _ := keyToken.(string)
+
+		switch key {
+		case "result":
+			if err := handler(dec); err != nil {
+				return err
+			}
+			handlerCalled = true
+		case "error":
+			rpcErr = new(RPCError)
+			if err := dec.Decode(rpcErr); err != nil {
+				return retry.Retryable(xerrors.Errorf("failed to decode rpc error: %w", err))
+			}
+		default:
+			// Skip "jsonrpc", "id", etc.
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return retry.Retryable(xerrors.Errorf("failed to skip field %q: %w", key, err))
+			}
+		}
+	}
+
+	if rpcErr != nil {
+		return rpcErr
+	}
+	if !handlerCalled {
+		return retry.Retryable(xerrors.Errorf("response missing 'result' field"))
+	}
+
+	return fin.Close()
 }

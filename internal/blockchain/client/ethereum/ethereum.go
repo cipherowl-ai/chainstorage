@@ -835,7 +835,8 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 			call = ethTraceBlockByHashOptimismMethod
 			timeout = ethTraceBlockByHashOptimismTimeout
 		}
-		if c.traceType.ErigonTraceEnabled() {
+		isErigon := c.traceType.ErigonTraceEnabled()
+		if isErigon {
 			call = erigonTraceBlockByHashMethod
 			timeout = erigonTraceBlockByHashTimeout
 		}
@@ -849,6 +850,77 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 
 		results := make([][]byte, c.getNumTraces(block.Transactions))
 
+		// Streaming path: decode trace elements one-by-one from the HTTP
+		// stream instead of buffering the entire result array. This avoids
+		// holding both the raw json.RawMessage AND the unmarshalled
+		// []ethereumResultHolder simultaneously.
+		//
+		// Not available for Erigon traces (which may need to re-read the
+		// full response for format detection) or when the client doesn't
+		// implement StreamingClient (e.g., unit-test mocks).
+		if sc, ok := c.client.(jsonrpc.StreamingClient); ok && !isErigon {
+			err := sc.CallWithResultHandler(ctx, call, params, func(dec *json.Decoder) error {
+				// Read opening '['
+				t, err := dec.Token()
+				if err != nil {
+					return xerrors.Errorf("failed to read trace array start: %w", err)
+				}
+				if delim, ok := t.(json.Delim); !ok || delim != '[' {
+					return xerrors.Errorf("expected '[' at trace array start, got %v", t)
+				}
+
+				i := 0
+				for dec.More() {
+					var holder ethereumResultHolder
+					if err := dec.Decode(&holder); err != nil {
+						return xerrors.Errorf("failed to decode trace element %d: %w", i, err)
+					}
+
+					if holder.Error != "" {
+						if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_OPTIMISM && holder.Error == optimismWhitelistError {
+							c.metrics.traceBlockFakeCounter.Inc(1)
+							fakeTrace := ethereum.EthereumTransactionTrace{
+								Error: optimismFakeTraceError,
+							}
+							byteTrace, err := json.Marshal(&fakeTrace)
+							if err != nil {
+								return xerrors.Errorf("failed to marshal fake trace for optimism block %v: %w", height, err)
+							}
+							holder.Result = byteTrace
+							c.logger.Warn("generate fake trace for block", zap.Uint64("height", height))
+						} else {
+							c.metrics.traceBlockExecutionTimeoutCounter.Inc(1)
+							return xerrors.Errorf("received partial result (height=%v, hash=%v, index=%v): %v", height, hash, i, holder.Error)
+						}
+					}
+
+					if i >= len(results) {
+						return xerrors.Errorf("unexpected number of results: expected=%v, got >%v", len(results), i)
+					}
+					results[i] = holder.Result
+					i++
+				}
+
+				// Read closing ']'
+				if _, err := dec.Token(); err != nil {
+					return xerrors.Errorf("failed to read trace array end: %w", err)
+				}
+
+				if i != len(results) {
+					return xerrors.Errorf("unexpected number of results: expected=%v actual=%v", len(results), i)
+				}
+				return nil
+			})
+			if err != nil {
+				c.metrics.traceBlockServerErrorCounter.Inc(1)
+				return nil, err
+			}
+			c.metrics.traceBlockSuccessCounter.Inc(1)
+			return results, nil
+		}
+
+		// Buffered fallback path: used by unit-test mocks (no StreamingClient)
+		// and Erigon traces (may need to re-read the response).
 		response, err := retry.WrapWithResult(ctx, func(ctx context.Context) (*jsonrpc.Response, error) {
 			response, err := c.client.Call(ctx, call, params)
 			if err != nil {
@@ -856,15 +928,10 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 				if xerrors.As(err, &rpcErr) {
 					if rpcErr.Code == -32000 &&
 						(blockNotFoundRegexp.MatchString(rpcErr.Message) || rpcErr.Message == unfinalizedDataError) {
-						// The nodes may be temporarily out of sync and the block may not be available in the node we just queried.
-						// Retry with a different node proactively.
-						// If all the retry attempts fail, return ErrBlockNotFound so that syncer may fall back to the master node.
 						return nil, retry.Retryable(xerrors.Errorf("block is not traceable: %v: %w", rpcErr, internal.ErrBlockNotFound))
 					}
 
 					if rpcErr.Code == -32000 && executionAbortedRegexp.MatchString(rpcErr.Message) {
-						// Retry "RPCError -32000: execution aborted (timeout = 15s)"
-						// Ref: https://github.com/ethereum/go-ethereum/blob/eed7983c7c0b0e76f1121368ace3e7e0efeb202b/internal/ethapi/api.go#L1070
 						return nil, retry.Retryable(xerrors.Errorf("execution aborted while tracing block: %w", rpcErr))
 					}
 
@@ -893,10 +960,7 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 		}
 
 		for i, result := range tmpResults {
-			// It is expected that, after https://github.com/ledgerwatch/erigon/issues/4935 is fixed, Erigon block trace
-			// format will fall back to the GETH format. When that happens is uncertain, but this check should maintain
-			// forward compatibility and can be removed once the change is complete.
-			if traceType.ErigonTraceEnabled() && jsonrpc.IsNullOrEmpty(result.Result) {
+			if isErigon && jsonrpc.IsNullOrEmpty(result.Result) {
 				var erigonResults []json.RawMessage
 				if err := json.Unmarshal(response.Result, &erigonResults); err != nil {
 					return nil, xerrors.Errorf("failed to unmarshal erigon results: %w", err)
@@ -916,12 +980,6 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 			}
 
 			if result.Error != "" {
-				// If an Optimism transaction is failed with the following error: "Fail with error
-				// 'deployer address not whitelisted:'", we need to create a fake trace
-				// because the debug_traceBlockByHash will return null trace for that transaction.
-				// e.g. For height=87673 (https://optimistic.etherscan.io/tx/87673), we get the following error from
-				// debug_traceBlockByHash: "TypeError: cannot read property 'toString' of undefined in server-side
-				// tracer function 'result'" (https://optimistic.etherscan.io/vmtrace?txhash=0xcf6e46a1f41e1678fba10590f9d092690c5e8fd2e85a3614715fb21caa74655d&type=gethtrace20)
 				if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_OPTIMISM && result.Error == optimismWhitelistError {
 					c.metrics.traceBlockFakeCounter.Inc(1)
 					fakeTrace := ethereum.EthereumTransactionTrace{
@@ -936,8 +994,6 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 						zap.Uint64("height", height),
 					)
 				} else {
-					// Calling tracer is expensive and occasionally it may return an error of "execution timeout".
-					// See https://github.com/ethereum/go-ethereum/blob/dd9c3225cf06dab0acf783fad671b4f601a4470e/eth/tracers/api.go#L808
 					c.metrics.traceBlockExecutionTimeoutCounter.Inc(1)
 					return nil, xerrors.Errorf("received partial result (height=%v, hash=%v, index=%v): %v", height, hash, i, result.Error)
 				}
