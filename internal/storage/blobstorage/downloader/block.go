@@ -197,10 +197,16 @@ func (c *blockDownloaderImpl) logDuration(start time.Time) {
 	)
 }
 
-// DownloadStream spools the compressed blob to disk, decompresses to a
-// second spool file, and returns a chain-agnostic SpooledBlock handle.
-// The decompressed spool persists until SpooledBlock.Close() is called —
-// callers MUST close it.
+// DownloadStream streams the compressed HTTP body through a
+// decompressor directly into a local spool file and returns a
+// chain-agnostic SpooledBlock handle over that file. The spool
+// persists until SpooledBlock.Close() is called — callers MUST
+// close it.
+//
+// There is only ONE tempfile per call (the decompressed spool). HTTP
+// retries truncate + rewind the spool and reissue the GET. This keeps
+// per-block I/O cost and tempfile churn minimal under concurrent
+// workloads.
 //
 // For skipped blocks, the returned SpooledBlock has an Open() that
 // returns an empty reader and a no-op Close; the parser detects
@@ -218,64 +224,29 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 
 	defer d.logDuration(time.Now())
 
-	// Spool #1: compressed body → tempfile1.
-	tmpCompressed, err := os.CreateTemp("", "chainstorage-block-compressed-*.bin")
-	if err != nil {
-		return nil, xerrors.Errorf("create compressed spool: %w", err)
-	}
-	compressedPath := tmpCompressed.Name()
-	// Compressed spool is scoped to this function — remove no matter what.
-	defer os.Remove(compressedPath)
-
-	if err := d.spoolToFile(ctx, blockFile, tmpCompressed); err != nil {
-		tmpCompressed.Close()
-		return nil, err
-	}
-	if err := tmpCompressed.Close(); err != nil {
-		return nil, xerrors.Errorf("close compressed spool: %w", err)
-	}
-
-	// Spool #2: decompressed bytes → tempfile2. This spool outlives
-	// the call — ownership passes to the returned SpooledBlock.
+	// Single tempfile: the decompressed spool. Ownership transfers
+	// to the returned SpooledBlock on success; removed here on any
+	// error path.
 	tmpDecompressed, err := os.CreateTemp("", "chainstorage-block-decompressed-*.bin")
 	if err != nil {
 		return nil, xerrors.Errorf("create decompressed spool: %w", err)
 	}
 	decompressedPath := tmpDecompressed.Name()
 
-	// If we fail before handing the spool over to the caller, remove it here.
 	transferred := false
 	defer func() {
 		if !transferred {
+			tmpDecompressed.Close()
 			os.Remove(decompressedPath)
 		}
 	}()
 
-	compressedFile, err := os.Open(compressedPath)
-	if err != nil {
-		tmpDecompressed.Close()
-		return nil, xerrors.Errorf("reopen compressed spool: %w", err)
+	if err := d.spoolDecompressedToFile(ctx, blockFile, tmpDecompressed); err != nil {
+		return nil, err
 	}
-
-	dec, err := storage_utils.DecompressReader(compressedFile, blockFile.Compression)
-	if err != nil {
-		compressedFile.Close()
-		tmpDecompressed.Close()
-		return nil, xerrors.Errorf("wrap decompressor: %w", err)
-	}
-
-	if _, err := io.Copy(tmpDecompressed, dec); err != nil {
-		dec.Close()
-		compressedFile.Close()
-		tmpDecompressed.Close()
-		return nil, xerrors.Errorf("decompress to spool: %v: %w", err, errors.ErrDownloadFailure)
-	}
-	dec.Close()
-	compressedFile.Close()
-	if err := tmpDecompressed.Sync(); err != nil {
-		tmpDecompressed.Close()
-		return nil, xerrors.Errorf("sync decompressed spool: %w", err)
-	}
+	// Intentionally skip Sync: the spool is read back through the
+	// OS page cache by the same process, so flushing to disk only
+	// adds fdatasync latency under concurrent load.
 	if err := tmpDecompressed.Close(); err != nil {
 		return nil, xerrors.Errorf("close decompressed spool: %w", err)
 	}
@@ -308,9 +279,14 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 	return stream, nil
 }
 
-// spoolToFile performs the (retryable) HTTP GET and streams the body to
-// dst. The file is truncated + rewound on every retry attempt.
-func (d *blockDownloaderImpl) spoolToFile(ctx context.Context, blockFile *api.BlockFile, dst *os.File) error {
+// spoolDecompressedToFile performs a (retryable) HTTP GET, wraps the
+// response body in the appropriate decompressor, and streams the
+// decompressed bytes to dst. The file is truncated + rewound on each
+// retry attempt. This combines download + decompression into a single
+// pass with only one tempfile, reducing per-block disk churn under
+// concurrent loads compared to separate compressed + decompressed
+// spools.
+func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, blockFile *api.BlockFile, dst *os.File) error {
 	_, err := d.retry.Retry(ctx, func(ctx context.Context) (*api.Block, error) {
 		if _, err := dst.Seek(0, io.SeekStart); err != nil {
 			return nil, err
@@ -338,8 +314,14 @@ func (d *blockDownloaderImpl) spoolToFile(ctx context.Context, blockFile *api.Bl
 			return nil, xerrors.Errorf("status %d: %w", sc, errors.ErrDownloadFailure)
 		}
 
-		if _, err := io.Copy(dst, resp.Body); err != nil {
-			return nil, retry.Retryable(xerrors.Errorf("spool body: %w", err))
+		dec, err := storage_utils.DecompressReader(resp.Body, blockFile.Compression)
+		if err != nil {
+			return nil, xerrors.Errorf("wrap decompressor: %w", err)
+		}
+		defer dec.Close()
+
+		if _, err := io.Copy(dst, dec); err != nil {
+			return nil, retry.Retryable(xerrors.Errorf("decompress to spool: %w", err))
 		}
 		return nil, closer.Close()
 	})

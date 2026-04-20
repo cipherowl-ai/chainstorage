@@ -261,14 +261,24 @@ func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.
 type nativeStreamedBlock struct {
 	metadata *api.BlockMetadata
 	spooled  *downloader.SpooledBlock
-	bitcoin  BitcoinNativeStream
+	// spoolHandle is a cached file handle over spooled used by the
+	// bitcoin loaders' ReadAt calls (so per-tx seek+read doesn't
+	// pay an Open syscall). Closed on Close() alongside the spool.
+	// Populated only for bitcoin-family streams.
+	spoolHandle io.Closer
+	bitcoin     BitcoinNativeStream
 	// ethereum is always nil today; added when the ethereum streaming
 	// walker lands.
 	ethereum EthereumNativeStream
 }
 
 func (n *nativeStreamedBlock) GetMetadata() *api.BlockMetadata { return n.metadata }
-func (n *nativeStreamedBlock) Close() error                    { return n.spooled.Close() }
+func (n *nativeStreamedBlock) Close() error {
+	if n.spoolHandle != nil {
+		n.spoolHandle.Close()
+	}
+	return n.spooled.Close()
+}
 func (n *nativeStreamedBlock) GetBitcoin() BitcoinNativeStream {
 	if n == nil {
 		return nil
@@ -312,20 +322,23 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		return nil, xerrors.Errorf("bitcoin block at height %d has no header", spooled.BlockFile.GetHeight())
 	}
 
+	// Cache a single *os.File handle over the spool so header and
+	// per-tx loaders use pread (ReadAt) instead of repeated
+	// Open+Seek+Read+Close. For a many-tx block this cuts ~4
+	// syscalls per tx × N txs into one open + N preads, making a
+	// meaningful difference under concurrent workloads.
+	handle, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool for loaders: %w", err)
+	}
+	readerAt, ok := handle.(io.ReaderAt)
+	if !ok {
+		handle.Close()
+		return nil, xerrors.Errorf("spool reader does not support ReadAt")
+	}
+
 	openHeader := func() (io.ReadCloser, error) {
-		f, err := spooled.Open()
-		if err != nil {
-			return nil, xerrors.Errorf("open spool for header: %w", err)
-		}
-		if seeker, ok := f.(io.Seeker); ok {
-			if _, err := seeker.Seek(chunks.Header.Offset, io.SeekStart); err != nil {
-				f.Close()
-				return nil, xerrors.Errorf("seek to header: %w", err)
-			}
-			return &seekedHeaderReader{f: f, limit: io.LimitReader(f, chunks.Header.Length)}, nil
-		}
-		f.Close()
-		return nil, xerrors.Errorf("spool reader does not support seek")
+		return io.NopCloser(io.NewSectionReader(readerAt, chunks.Header.Offset, chunks.Header.Length)), nil
 	}
 
 	groups := chunks.InputTransactionsGroups
@@ -334,20 +347,8 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 			return nil, nil
 		}
 		ref := groups[i]
-		f, err := spooled.Open()
-		if err != nil {
-			return nil, xerrors.Errorf("open spool for input tx group [%d]: %w", i, err)
-		}
-		defer f.Close()
-		seeker, ok := f.(io.Seeker)
-		if !ok {
-			return nil, xerrors.Errorf("spool reader does not support seek")
-		}
-		if _, err := seeker.Seek(ref.Offset, io.SeekStart); err != nil {
-			return nil, xerrors.Errorf("seek to input tx group [%d]: %w", i, err)
-		}
 		b := make([]byte, ref.Length)
-		if _, err := io.ReadFull(f, b); err != nil {
+		if _, err := readerAt.ReadAt(b, ref.Offset); err != nil && err != io.EOF {
 			return nil, xerrors.Errorf("read input tx group [%d]: %w", i, err)
 		}
 		rb := &api.RepeatedBytes{}
@@ -359,9 +360,10 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 
 	inner := streamer.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
 	return &nativeStreamedBlock{
-		metadata: block.GetMetadata(),
-		spooled:  spooled,
-		bitcoin:  inner,
+		metadata:     block.GetMetadata(),
+		spooled:      spooled,
+		spoolHandle:  handle,
+		bitcoin:      inner,
 	}, nil
 }
 

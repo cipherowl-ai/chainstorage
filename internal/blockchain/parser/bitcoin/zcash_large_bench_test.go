@@ -160,9 +160,16 @@ func newHeapPeak() *heapPeakTracker { return &heapPeakTracker{} }
 func (p *heapPeakTracker) start() {
 	p.stopCh = make(chan struct{})
 	p.doneCh = make(chan struct{})
+	// Capture an initial snapshot so short ops that finish before the
+	// first tick still record a baseline peak.
+	if h := heapAlloc(); h > p.peak {
+		p.peak = h
+	}
 	go func() {
 		defer close(p.doneCh)
-		tick := time.NewTicker(20 * time.Millisecond)
+		// 5ms tick catches ~10ms+ operations cleanly; sub-ms blocks
+		// may still read as baseline (fine — no peak to observe).
+		tick := time.NewTicker(5 * time.Millisecond)
 		defer tick.Stop()
 		for {
 			select {
@@ -180,4 +187,9 @@ func (p *heapPeakTracker) start() {
 func (p *heapPeakTracker) stop() {
 	close(p.stopCh)
 	<-p.doneCh
+	// Final snapshot so we don't miss a peak that hit between the
+	// last tick and the stop signal.
+	if h := heapAlloc(); h > p.peak {
+		p.peak = h
+	}
 }
