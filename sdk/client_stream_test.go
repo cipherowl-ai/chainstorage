@@ -165,4 +165,3 @@ func buildBitcoinFixtureBlock(t *testing.T) *api.Block {
 		},
 	}
 }
-

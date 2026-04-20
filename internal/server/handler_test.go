@@ -837,7 +837,7 @@ func (s *handlerTestSuite) TestGetNativeBlockByRange() {
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return testutil.MakeNativeBlock(rawBlock.Metadata.Height, tag), nil
 			},
 		),
@@ -896,7 +896,7 @@ func (s *handlerTestSuite) TestGetNativeBlocksByRange() {
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return testutil.MakeNativeBlock(rawBlock.Metadata.Height, tag), nil
 			},
 		),
@@ -2722,7 +2722,7 @@ func (s *handlerTestSuite) TestGetVerifiedAccountState() {
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return nativeBlock, nil
 			},
 		),
@@ -2842,7 +2842,7 @@ func (s *handlerTestSuite) TestGetVerifiedAccountState_GetAccountProof_Failure()
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return nativeBlock, nil
 			},
 		),
@@ -2917,7 +2917,7 @@ func (s *handlerTestSuite) TestGetVerifiedAccountState_ValidateAccountState_Fail
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return nativeBlock, nil
 			},
 		),
@@ -3029,7 +3029,7 @@ func (s *handlerTestSuite) TestGetVerifiedAccountState_Erc20() {
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(ctx context.Context, rawBlock *api.Block) (*api.NativeBlock, error) {
+			func(ctx context.Context, rawBlock *api.Block, opts ...parser.ParseOption) (*api.NativeBlock, error) {
 				return nativeBlock, nil
 			},
 		),

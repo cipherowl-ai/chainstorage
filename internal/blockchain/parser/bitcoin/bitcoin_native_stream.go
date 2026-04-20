@@ -136,7 +136,7 @@ func (s *bitcoinBlockStream) Transactions() iter.Seq2[*api.BitcoinTransaction, e
 			yield(nil, xerrors.Errorf("failed to open block reader: %w", err))
 			return
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 
 		emit := func(tx *api.BitcoinTransaction) error {
 			if !yield(tx, nil) {
@@ -180,7 +180,7 @@ func (s *bitcoinBlockStream) Header() (*api.BitcoinHeader, error) {
 		s.headerErr = xerrors.Errorf("failed to open block reader for header scan: %w", err)
 		return nil, s.headerErr
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 
 	hdr, err := parseBitcoinHeaderSkippingTx(r)
 

@@ -225,10 +225,10 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 	}
 	compressedPath := tmpCompressed.Name()
 	// Compressed spool is scoped to this function — remove no matter what.
-	defer os.Remove(compressedPath)
+	defer func() { _ = os.Remove(compressedPath) }()
 
 	if err := d.spoolToFile(ctx, blockFile, tmpCompressed); err != nil {
-		tmpCompressed.Close()
+		_ = tmpCompressed.Close()
 		return nil, err
 	}
 	if err := tmpCompressed.Close(); err != nil {
@@ -247,33 +247,33 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 	transferred := false
 	defer func() {
 		if !transferred {
-			os.Remove(decompressedPath)
+			_ = os.Remove(decompressedPath)
 		}
 	}()
 
 	compressedFile, err := os.Open(compressedPath)
 	if err != nil {
-		tmpDecompressed.Close()
+		_ = tmpDecompressed.Close()
 		return nil, xerrors.Errorf("reopen compressed spool: %w", err)
 	}
 
 	dec, err := storage_utils.DecompressReader(compressedFile, blockFile.Compression)
 	if err != nil {
-		compressedFile.Close()
-		tmpDecompressed.Close()
+		_ = compressedFile.Close()
+		_ = tmpDecompressed.Close()
 		return nil, xerrors.Errorf("wrap decompressor: %w", err)
 	}
 
 	if _, err := io.Copy(tmpDecompressed, dec); err != nil {
-		dec.Close()
-		compressedFile.Close()
-		tmpDecompressed.Close()
+		_ = dec.Close()
+		_ = compressedFile.Close()
+		_ = tmpDecompressed.Close()
 		return nil, xerrors.Errorf("decompress to spool: %v: %w", err, errors.ErrDownloadFailure)
 	}
-	dec.Close()
-	compressedFile.Close()
+	_ = dec.Close()
+	_ = compressedFile.Close()
 	if err := tmpDecompressed.Sync(); err != nil {
-		tmpDecompressed.Close()
+		_ = tmpDecompressed.Close()
 		return nil, xerrors.Errorf("sync decompressed spool: %w", err)
 	}
 	if err := tmpDecompressed.Close(); err != nil {

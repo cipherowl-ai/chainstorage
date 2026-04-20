@@ -243,7 +243,7 @@ func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.
 	if err != nil {
 		return nil, xerrors.Errorf("open spool for metadata walk: %w", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	block, err := api.WalkBlockEnvelope(r)
 	if err != nil {
 		return nil, xerrors.Errorf("walk block envelope: %w", err)
@@ -304,7 +304,7 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		return nil, xerrors.Errorf("open spool for walk: %w", err)
 	}
 	block, chunks, walkErr := api.WalkBitcoinEnvelope(r)
-	r.Close()
+	_ = r.Close()
 	if walkErr != nil {
 		return nil, xerrors.Errorf("walk bitcoin envelope: %w", walkErr)
 	}
@@ -319,12 +319,12 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		}
 		if seeker, ok := f.(io.Seeker); ok {
 			if _, err := seeker.Seek(chunks.Header.Offset, io.SeekStart); err != nil {
-				f.Close()
+				_ = f.Close()
 				return nil, xerrors.Errorf("seek to header: %w", err)
 			}
 			return &seekedHeaderReader{f: f, limit: io.LimitReader(f, chunks.Header.Length)}, nil
 		}
-		f.Close()
+		_ = f.Close()
 		return nil, xerrors.Errorf("spool reader does not support seek")
 	}
 
@@ -338,7 +338,7 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		if err != nil {
 			return nil, xerrors.Errorf("open spool for input tx group [%d]: %w", i, err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		seeker, ok := f.(io.Seeker)
 		if !ok {
 			return nil, xerrors.Errorf("spool reader does not support seek")

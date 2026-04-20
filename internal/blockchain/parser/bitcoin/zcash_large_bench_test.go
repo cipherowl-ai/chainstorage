@@ -61,8 +61,6 @@ func TestZcashLargeBlockBench(t *testing.T) {
 	if err := proto.Unmarshal(data, &rawBlock); err != nil {
 		t.Fatalf("proto.Unmarshal: %v", err)
 	}
-	data = nil
-	runtime.GC()
 	runtime.GC()
 	t.Logf("proto.Unmarshal api.Block envelope: %s", time.Since(t0))
 
