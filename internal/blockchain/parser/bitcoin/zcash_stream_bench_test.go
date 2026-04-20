@@ -41,13 +41,14 @@ func protoSize(m proto.Message) int { return proto.Size(m) }
 // (iter.Seq2 consumption).
 //
 // Gated by env var CHAINSTORAGE_BENCH_ZCASH_ZSTD. Optional:
-//   CHAINSTORAGE_BENCH_OPTS="skipScripts,skipWitnesses,skipShielded"
+//
+//	CHAINSTORAGE_BENCH_OPTS="skipScripts,skipWitnesses,skipShielded"
 //
 // Example:
 //
-//   CHAINSTORAGE_BENCH_ZCASH_ZSTD=/tmp/zcash_bench/block_322102.zstd \
-//   go test -v -run=TestZcashLargeBlockBench_Streaming -count=1 -timeout=30m \
-//       ./internal/blockchain/parser/bitcoin/
+//	CHAINSTORAGE_BENCH_ZCASH_ZSTD=/tmp/zcash_bench/block_322102.zstd \
+//	go test -v -run=TestZcashLargeBlockBench_Streaming -count=1 -timeout=30m \
+//	    ./internal/blockchain/parser/bitcoin/
 func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	zstdPath := os.Getenv("CHAINSTORAGE_BENCH_ZCASH_ZSTD")
 	if zstdPath == "" {
@@ -289,4 +290,3 @@ func TestZcashLargeBlockBench_Streaming(t *testing.T) {
 	t.Logf("Phase 2 generic (DownloadStream):      %s", humanBytes(subU(peak3.peak, before3)))
 	t.Logf("Phase 2 bitcoin (DownloadStream+iter): %s", humanBytes(subU(peak.peak, before)))
 }
-

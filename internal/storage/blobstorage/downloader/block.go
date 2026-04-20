@@ -236,8 +236,8 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 	transferred := false
 	defer func() {
 		if !transferred {
-			tmpDecompressed.Close()
-			os.Remove(decompressedPath)
+			_ = tmpDecompressed.Close()
+			_ = os.Remove(decompressedPath)
 		}
 	}()
 
@@ -318,7 +318,7 @@ func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, block
 		if err != nil {
 			return nil, xerrors.Errorf("wrap decompressor: %w", err)
 		}
-		defer dec.Close()
+		defer func() { _ = dec.Close() }()
 
 		if _, err := io.Copy(dst, dec); err != nil {
 			return nil, retry.Retryable(xerrors.Errorf("decompress to spool: %w", err))

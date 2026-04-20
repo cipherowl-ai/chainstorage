@@ -549,12 +549,12 @@ func (c *clientImpl) StreamNativeBlock(
 
 	sp, ok := c.parser.(streamingParser)
 	if !ok {
-		spooled.Close()
+		_ = spooled.Close()
 		return nil, xerrors.Errorf("parser %T does not support streaming", c.parser)
 	}
 	stream, err := sp.ParseStreamNative(ctx, spooled, opts...)
 	if err != nil {
-		spooled.Close()
+		_ = spooled.Close()
 		return nil, xerrors.Errorf("failed to create native stream: %w", err)
 	}
 	return stream, nil

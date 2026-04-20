@@ -243,7 +243,7 @@ func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.
 	if err != nil {
 		return nil, xerrors.Errorf("open spool for metadata walk: %w", err)
 	}
-	defer r.Close()
+	defer func() { _ = r.Close() }()
 	block, err := api.WalkBlockEnvelope(r)
 	if err != nil {
 		return nil, xerrors.Errorf("walk block envelope: %w", err)
@@ -275,7 +275,7 @@ type nativeStreamedBlock struct {
 func (n *nativeStreamedBlock) GetMetadata() *api.BlockMetadata { return n.metadata }
 func (n *nativeStreamedBlock) Close() error {
 	if n.spoolHandle != nil {
-		n.spoolHandle.Close()
+		_ = n.spoolHandle.Close()
 	}
 	return n.spooled.Close()
 }
@@ -314,7 +314,7 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		return nil, xerrors.Errorf("open spool for walk: %w", err)
 	}
 	block, chunks, walkErr := api.WalkBitcoinEnvelope(r)
-	r.Close()
+	_ = r.Close()
 	if walkErr != nil {
 		return nil, xerrors.Errorf("walk bitcoin envelope: %w", walkErr)
 	}
@@ -333,7 +333,7 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 	}
 	readerAt, ok := handle.(io.ReaderAt)
 	if !ok {
-		handle.Close()
+		_ = handle.Close()
 		return nil, xerrors.Errorf("spool reader does not support ReadAt")
 	}
 
@@ -360,10 +360,10 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 
 	inner := streamer.StreamBlockIter(ctx, openHeader, loadGroup, opts...)
 	return &nativeStreamedBlock{
-		metadata:     block.GetMetadata(),
-		spooled:      spooled,
-		spoolHandle:  handle,
-		bitcoin:      inner,
+		metadata:    block.GetMetadata(),
+		spooled:     spooled,
+		spoolHandle: handle,
+		bitcoin:     inner,
 	}, nil
 }
 

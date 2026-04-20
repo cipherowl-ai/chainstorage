@@ -13,10 +13,10 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
-	"github.com/coinbase/chainstorage/internal/config"
 	jsonrpcmocks "github.com/coinbase/chainstorage/internal/blockchain/jsonrpc/mocks"
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/blockchain/restapi"
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/dlq"
 	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
