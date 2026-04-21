@@ -49,22 +49,28 @@ func TestZcashLargeBlockBench(t *testing.T) {
 	defer app.Close()
 
 	t.Logf("loading %s", path)
-	t0 := time.Now()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	t.Logf("read: %.2f MB in %s", mbf(len(data)), time.Since(t0))
 
-	t0 = time.Now()
+	// Read + Unmarshal inside a closure so the compressed `data`
+	// slice (multi-GB) goes out of scope before the GC below —
+	// otherwise its reference stays live on the goroutine stack
+	// and inflates the subsequent measurements.
 	var rawBlock api.Block
-	if err := proto.Unmarshal(data, &rawBlock); err != nil {
-		t.Fatalf("proto.Unmarshal: %v", err)
-	}
-	data = nil
+	func() {
+		t0 := time.Now()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		t.Logf("read: %.2f MB in %s", mbf(len(data)), time.Since(t0))
+
+		t0 = time.Now()
+		if err := proto.Unmarshal(data, &rawBlock); err != nil {
+			t.Fatalf("proto.Unmarshal: %v", err)
+		}
+		t.Logf("proto.Unmarshal api.Block envelope: %s", time.Since(t0))
+	}()
 	runtime.GC()
 	runtime.GC()
-	t.Logf("proto.Unmarshal api.Block envelope: %s", time.Since(t0))
 
 	blob := rawBlock.GetBitcoin()
 	if blob == nil {

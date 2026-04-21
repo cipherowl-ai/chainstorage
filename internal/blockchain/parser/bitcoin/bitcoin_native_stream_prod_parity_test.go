@@ -440,32 +440,43 @@ func measureFullPipelineProfile(dl downloader.BlockDownloader, parser internal.N
 	sample := blockSample{height: height}
 
 	// --- Legacy pipeline ---
-	runtime.GC()
-	runtime.GC()
-	parseBaseline := heapAlloc()
-	parsePeak := newHeapPeak()
-	parsePeak.start()
-	legacyStart := time.Now()
-	rawBlock, err := dl.Download(ctx, bf)
-	if err != nil {
+	//
+	// Scoped inside a closure so rawBlock + baseline drop out of
+	// scope when it returns. Without the closure, local-var refs
+	// are still live on the goroutine stack when we call
+	// runtime.GC() below, which would prevent reclamation before
+	// the streaming measurement starts.
+	parseOK := func() bool {
+		runtime.GC()
+		runtime.GC()
+		parseBaseline := heapAlloc()
+		parsePeak := newHeapPeak()
+		parsePeak.start()
+		legacyStart := time.Now()
+		rawBlock, err := dl.Download(ctx, bf)
+		if err != nil {
+			parsePeak.stop()
+			return false
+		}
+		baseline, err := parser.ParseBlock(ctx, rawBlock)
+		sample.parseTime = time.Since(legacyStart)
 		parsePeak.stop()
+		sample.parsePeak = peakDelta(parsePeak.peak, parseBaseline)
+		if err != nil {
+			return false
+		}
+		sample.rawSize = proto.Size(rawBlock)
+		if bc := baseline.GetBitcoin(); bc != nil {
+			sample.txCount = len(bc.GetTransactions())
+		}
+		return true
+	}()
+	if !parseOK {
 		return sample
-	}
-	baseline, err := parser.ParseBlock(ctx, rawBlock)
-	sample.parseTime = time.Since(legacyStart)
-	parsePeak.stop()
-	sample.parsePeak = peakDelta(parsePeak.peak, parseBaseline)
-	if err != nil {
-		return sample
-	}
-	sample.rawSize = proto.Size(rawBlock)
-	if bc := baseline.GetBitcoin(); bc != nil {
-		sample.txCount = len(bc.GetTransactions())
 	}
 
-	// Drop everything and force GC so streaming measurement is clean.
-	rawBlock = nil
-	baseline = nil
+	// Force GC now that the closure's locals are out of scope, so
+	// streaming's peak measurement starts from a clean baseline.
 	runtime.GC()
 	runtime.GC()
 
@@ -483,7 +494,7 @@ func measureFullPipelineProfile(dl downloader.BlockDownloader, parser internal.N
 	sample.streamTime = time.Since(streamStart)
 	streamPeak.stop()
 	sample.streamPeak = peakDelta(streamPeak.peak, streamBaseline)
-	spooled.Close()
+	_ = spooled.Close()
 
 	return sample
 }
