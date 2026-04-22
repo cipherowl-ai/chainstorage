@@ -79,17 +79,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	respBody, err := post(*url, *user, *password, body, time.Duration(*timeoutSec)*time.Second)
+	n, err := postToFile(*url, *user, *password, body, *output, time.Duration(*timeoutSec)*time.Second)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "request failed: %v\n", err)
 		os.Exit(1)
 	}
-
-	if err := os.WriteFile(*output, respBody, 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "write output: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", len(respBody), *output)
+	fmt.Fprintf(os.Stderr, "wrote %d bytes to %s\n", n, *output)
 }
 
 func buildRequestBody(method, paramsJSON, batchParamsFile string) ([]byte, error) {
@@ -116,10 +111,14 @@ func buildRequestBody(method, paramsJSON, batchParamsFile string) ([]byte, error
 	return json.Marshal(batch)
 }
 
-func post(url, user, password string, body []byte, timeout time.Duration) ([]byte, error) {
+// postToFile issues the HTTP request and streams the response body directly
+// to the output file via io.Copy, avoiding io.ReadAll which would buffer the
+// entire response in memory — a hazard for this tool since its purpose is
+// capturing large-block payloads that may be hundreds of MB.
+func postToFile(url, user, password string, body []byte, outputPath string, timeout time.Duration) (int64, error) {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("new request: %w", err)
+		return 0, fmt.Errorf("new request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -130,18 +129,28 @@ func post(url, user, password string, body []byte, timeout time.Duration) ([]byt
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http do: %w", err)
+		return 0, fmt.Errorf("http do: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(respBody), 500))
+		// Error body is expected to be small; buffering up to 1 KB for the
+		// diagnostic message is fine.
+		preview, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return 0, fmt.Errorf("http %d: %s", resp.StatusCode, truncate(string(preview), 500))
 	}
-	return respBody, nil
+
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("create output: %w", err)
+	}
+	defer func() { _ = out.Close() }()
+
+	n, err := io.Copy(out, resp.Body)
+	if err != nil {
+		return n, fmt.Errorf("stream response to file: %w", err)
+	}
+	return n, nil
 }
 
 func truncate(s string, n int) string {

@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"runtime"
+	"runtime/metrics"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -329,12 +329,15 @@ func (c *fixtureHTTPClient) lookupResult(method string) []byte {
 // shared helpers
 // =============================================================================
 
+// runPipeline runs `fetch` then storage.Upload `b.N` times and reports B/op
+// plus peak heap-in-use (MB). The peak metric is scaled by b.N so that
+// benchstat's per-op division yields the actual high-water mark rather than
+// a per-iteration average.
 func runPipeline(b *testing.B, storage blobstorage.BlobStorage, fetch func() (*api.Block, error)) {
 	b.Helper()
 	if _, err := fetch(); err != nil {
 		b.Fatalf("warmup fetch: %v", err)
 	}
-	runtime.GC()
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -343,7 +346,11 @@ func runPipeline(b *testing.B, storage blobstorage.BlobStorage, fetch func() (*a
 	stop := startHeapSampler(&peakHeap)
 	defer func() {
 		stop()
-		b.ReportMetric(float64(peakHeap)/(1024*1024), "peak_heap_MB")
+		// Scale by b.N: b.ReportMetric is divided by b.N by the benchmark
+		// framework (and benchstat) before display. peak_heap_MB is a
+		// high-water mark for the whole run, not a per-op value — multiply
+		// so the final displayed number reflects the actual peak.
+		b.ReportMetric(float64(peakHeap)*float64(b.N)/(1024*1024), "peak_heap_MB")
 	}()
 
 	ctx := context.Background()
@@ -358,12 +365,18 @@ func runPipeline(b *testing.B, storage blobstorage.BlobStorage, fetch func() (*a
 	}
 }
 
+// startHeapSampler samples /memory/classes/heap/objects:bytes every
+// heapSampleInterval and tracks the max via atomic CAS. Uses the
+// runtime/metrics package (Go 1.16+) which reads lock-free from a ring
+// buffer, rather than runtime.ReadMemStats which stops the world to scan
+// the heap and would skew benchmark results.
 func startHeapSampler(peak *uint64) func() {
+	const metricName = "/memory/classes/heap/objects:bytes"
+	samples := []metrics.Sample{{Name: metricName}}
 	stop := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		var m runtime.MemStats
 		ticker := time.NewTicker(heapSampleInterval)
 		defer ticker.Stop()
 		for {
@@ -371,13 +384,14 @@ func startHeapSampler(peak *uint64) func() {
 			case <-stop:
 				return
 			case <-ticker.C:
-				runtime.ReadMemStats(&m)
+				metrics.Read(samples)
+				v := samples[0].Value.Uint64()
 				for {
 					cur := atomic.LoadUint64(peak)
-					if m.HeapInuse <= cur {
+					if v <= cur {
 						break
 					}
-					if atomic.CompareAndSwapUint64(peak, cur, m.HeapInuse) {
+					if atomic.CompareAndSwapUint64(peak, cur, v) {
 						break
 					}
 				}
@@ -427,7 +441,10 @@ func synthesizeEthereumTraces(b *testing.B, blockFixture []byte) []byte {
 func splitReceiptsArray(b *testing.B, arrayJSON []byte, fallback []byte) [][]byte {
 	b.Helper()
 	var raws []json.RawMessage
-	if err := json.Unmarshal(arrayJSON, &raws); err != nil {
+	if err := json.Unmarshal(arrayJSON, &raws); err != nil || len(raws) == 0 {
+		// Array fixture not present, malformed, or empty; serve the fallback
+		// receipt for every batch element. An empty slice would cause a
+		// division-by-zero when the Ethereum benchmark indexes into it.
 		return [][]byte{fallback}
 	}
 	out := make([][]byte, len(raws))
