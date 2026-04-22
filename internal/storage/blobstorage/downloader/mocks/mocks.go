@@ -13,6 +13,7 @@ import (
 	context "context"
 	reflect "reflect"
 
+	downloader "github.com/coinbase/chainstorage/internal/storage/blobstorage/downloader"
 	chainstorage "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 	gomock "go.uber.org/mock/gomock"
 )
@@ -53,4 +54,19 @@ func (m *MockBlockDownloader) Download(arg0 context.Context, arg1 *chainstorage.
 func (mr *MockBlockDownloaderMockRecorder) Download(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Download", reflect.TypeOf((*MockBlockDownloader)(nil).Download), arg0, arg1)
+}
+
+// DownloadStream mocks base method.
+func (m *MockBlockDownloader) DownloadStream(arg0 context.Context, arg1 *chainstorage.BlockFile) (*downloader.SpooledBlock, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DownloadStream", arg0, arg1)
+	ret0, _ := ret[0].(*downloader.SpooledBlock)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DownloadStream indicates an expected call of DownloadStream.
+func (mr *MockBlockDownloaderMockRecorder) DownloadStream(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStream", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStream), arg0, arg1)
 }

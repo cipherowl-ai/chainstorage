@@ -176,6 +176,13 @@ func (c *timeoutableClient) GetStaticChainMetadata(ctx context.Context, req *api
 	return c.client.GetStaticChainMetadata(ctx, req)
 }
 
+// StreamNativeBlock passes through to the wrapped client. No timeout
+// wrapping: the download + iterator lifetime is user-controlled and may
+// intentionally exceed short/medium/long defaults.
+func (c *timeoutableClient) StreamNativeBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (NativeStreamedBlock, error) {
+	return c.client.StreamNativeBlock(ctx, tag, height, hash, opts...)
+}
+
 func intercept[T any](ctx context.Context, logger *zap.Logger, operation retry.OperationWithResultFn[T]) (T, error) {
 	return retry.WrapWithResult(
 		ctx,

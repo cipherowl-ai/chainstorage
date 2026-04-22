@@ -100,6 +100,19 @@ type (
 		// GetStaticChainMetadata returns the static chain metadata, getting from the Config, instead of querying the ChainStorage server.
 		// This is useful if the caller needs a consistent snapshot of chain metadata during its current lifecycle.
 		GetStaticChainMetadata(ctx context.Context, req *api.GetChainMetadataRequest) (*api.GetChainMetadataResponse, error)
+
+		// StreamNativeBlock downloads a block to a local disk spool
+		// and returns a chain-agnostic NativeStreamedBlock. Callers
+		// pick the chain-matching accessor (GetBitcoin, GetEthereum,
+		// ...) to iterate. Accessors that don't match the configured
+		// chain — or that correspond to chains whose streaming walker
+		// hasn't landed yet — return nil; callers should fall back to
+		// GetBlock + ParseNativeBlock in that case.
+		//
+		// The returned stream owns the disk spool. Callers MUST call
+		// Close() when done. A runtime cleanup is wired as a safety
+		// net but should not be relied on.
+		StreamNativeBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (NativeStreamedBlock, error)
 	}
 
 	ChainEventResult struct {
@@ -504,6 +517,47 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 	}
 
 	return block, nil
+}
+
+// streamingParser is an unexported mirror of the internal parser's
+// streaming method. The injected c.parser always implements this (it
+// comes from the internal parser impl), but sdk.Parser is deliberately
+// trimmed to exclude it — consumers stream via Client.StreamNativeBlock
+// rather than holding a Parser + constructing a SpooledBlock themselves.
+type streamingParser interface {
+	ParseStreamNative(ctx context.Context, spooled *downloader.SpooledBlock, opts ...ParseOption) (NativeStreamedBlock, error)
+}
+
+func (c *clientImpl) StreamNativeBlock(
+	ctx context.Context,
+	tag uint32, height uint64, hash string,
+	opts ...ParseOption,
+) (NativeStreamedBlock, error) {
+	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
+		Tag:    tag,
+		Height: height,
+		Hash:   hash,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
+	}
+
+	spooled, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
+	if err != nil {
+		return nil, err
+	}
+
+	sp, ok := c.parser.(streamingParser)
+	if !ok {
+		_ = spooled.Close()
+		return nil, xerrors.Errorf("parser %T does not support streaming", c.parser)
+	}
+	stream, err := sp.ParseStreamNative(ctx, spooled, opts...)
+	if err != nil {
+		_ = spooled.Close()
+		return nil, xerrors.Errorf("failed to create native stream: %w", err)
+	}
+	return stream, nil
 }
 
 func (c *clientImpl) validateBlock(ctx context.Context, rawBlock *api.Block) error {

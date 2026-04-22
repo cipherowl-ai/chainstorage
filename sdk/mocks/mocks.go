@@ -299,6 +299,26 @@ func (mr *MockClientMockRecorder) StreamChainEvents(arg0, arg1 any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamChainEvents", reflect.TypeOf((*MockClient)(nil).StreamChainEvents), arg0, arg1)
 }
 
+// StreamNativeBlock mocks base method.
+func (m *MockClient) StreamNativeBlock(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string, arg4 ...sdk.ParseOption) (sdk.NativeStreamedBlock, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2, arg3}
+	for _, a := range arg4 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "StreamNativeBlock", varargs...)
+	ret0, _ := ret[0].(sdk.NativeStreamedBlock)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StreamNativeBlock indicates an expected call of StreamNativeBlock.
+func (mr *MockClientMockRecorder) StreamNativeBlock(arg0, arg1, arg2, arg3 any, arg4 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2, arg3}, arg4...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamNativeBlock", reflect.TypeOf((*MockClient)(nil).StreamNativeBlock), varargs...)
+}
+
 // MockParser is a mock of Parser interface.
 type MockParser struct {
 	ctrl     *gomock.Controller
@@ -338,18 +358,23 @@ func (mr *MockParserMockRecorder) GetNativeTransaction(arg0, arg1, arg2 any) *go
 }
 
 // ParseNativeBlock mocks base method.
-func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block) (*chainstorage.NativeBlock, error) {
+func (m *MockParser) ParseNativeBlock(arg0 context.Context, arg1 *chainstorage.Block, arg2 ...sdk.ParseOption) (*chainstorage.NativeBlock, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ParseNativeBlock", arg0, arg1)
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "ParseNativeBlock", varargs...)
 	ret0, _ := ret[0].(*chainstorage.NativeBlock)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
 // ParseNativeBlock indicates an expected call of ParseNativeBlock.
-func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any) *gomock.Call {
+func (mr *MockParserMockRecorder) ParseNativeBlock(arg0, arg1 any, arg2 ...any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), arg0, arg1)
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ParseNativeBlock", reflect.TypeOf((*MockParser)(nil).ParseNativeBlock), varargs...)
 }
 
 // ParseRosettaBlock mocks base method.
