@@ -238,23 +238,36 @@ type (
 		Output  EthereumHexString `json:"output"`
 	}
 
+	// receiptIndexMismatchTolerator decides whether a receipt/transaction TransactionIndex
+	// mismatch (when hash/blockHash/blockNumber already match) is acceptable for a given chain.
+	// The default parser has none (strict). Chains with known data quirks inject one via
+	// WithReceiptIndexMismatchTolerator to keep their special-case knowledge out of this file.
+	receiptIndexMismatchTolerator func(
+		transaction *api.EthereumTransaction,
+		receipt *api.EthereumTransactionReceipt,
+		transactions []*api.EthereumTransaction,
+		txHashCounts map[string]int,
+	) bool
+
 	ethereumNativeParserImpl struct {
-		Logger        *zap.Logger
-		validate      *validator.Validate
-		nodeType      types.EthereumNodeType
-		traceType     types.TraceType
-		config        *config.Config
-		metrics       *ethereumNativeParserMetrics
-		src20Parser   SRC20TokenTransferParser // Optional, only Seismic sets this
-		timestampInMs bool                     // If true, raw timestamps are in milliseconds and need to be converted to seconds
+		Logger                        *zap.Logger
+		validate                      *validator.Validate
+		nodeType                      types.EthereumNodeType
+		traceType                     types.TraceType
+		config                        *config.Config
+		metrics                       *ethereumNativeParserMetrics
+		src20Parser                   SRC20TokenTransferParser      // Optional, only Seismic sets this
+		timestampInMs                 bool                          // If true, raw timestamps are in milliseconds and need to be converted to seconds
+		receiptIndexMismatchTolerator receiptIndexMismatchTolerator // Optional, only chains with duplicate-tx quirks (e.g. MegaETH) set this
 	}
 
 	ethereumParserOptions struct {
-		nodeType        types.EthereumNodeType
-		traceType       types.TraceType
-		checksumAddress bool
-		src20Parser     SRC20TokenTransferParser
-		timestampInMs   bool
+		nodeType                      types.EthereumNodeType
+		traceType                     types.TraceType
+		checksumAddress               bool
+		src20Parser                   SRC20TokenTransferParser
+		timestampInMs                 bool
+		receiptIndexMismatchTolerator receiptIndexMismatchTolerator
 	}
 
 	nestedParityTrace struct {
@@ -462,6 +475,8 @@ func NewEthereumNativeParser(params internal.ParserParams, opts ...internal.Pars
 		metrics:       newEthereumNativeParserMetrics(params.Metrics),
 		src20Parser:   options.src20Parser,
 		timestampInMs: options.timestampInMs,
+
+		receiptIndexMismatchTolerator: options.receiptIndexMismatchTolerator,
 	}, nil
 }
 
@@ -518,6 +533,17 @@ func WithTimestampInMs() internal.ParserFactoryOption {
 	}
 }
 
+// WithReceiptIndexMismatchTolerator installs a chain-specific policy that decides whether a
+// receipt/transaction TransactionIndex mismatch is acceptable. Used by chains whose nodes can
+// return blocks that break positional receipt/tx index pairing (e.g. MegaETH duplicate tx hashes).
+func WithReceiptIndexMismatchTolerator(tolerator receiptIndexMismatchTolerator) internal.ParserFactoryOption {
+	return func(options any) {
+		if v, ok := options.(*ethereumParserOptions); ok {
+			v.receiptIndexMismatchTolerator = tolerator
+		}
+	}
+}
+
 func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api.Block, opts ...internal.ParseOption) (*api.NativeBlock, error) {
 	metadata := rawBlock.GetMetadata()
 	if metadata == nil {
@@ -549,13 +575,15 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 			return nil, xerrors.Errorf("unexpected number of transaction receipts: expected=%v actual=%v", numTransactions, len(transactionReceipts))
 		}
 
-		// MegaETH can list the same tx hash multiple times in one block; see
-		// isMegaethDuplicateReceiptIndex for why this breaks positional receipt/tx index matching.
-		txHashCounts := make(map[string]int, len(transactions))
-		for _, t := range transactions {
-			txHashCounts[t.Hash]++
+		// txHashCounts is only needed by a chain-specific tolerator (see
+		// WithReceiptIndexMismatchTolerator); the default strict path skips the allocation.
+		var txHashCounts map[string]int
+		if p.receiptIndexMismatchTolerator != nil {
+			txHashCounts = make(map[string]int, len(transactions))
+			for _, t := range transactions {
+				txHashCounts[t.Hash]++
+			}
 		}
-		isMegaeth := p.config.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_MEGAETH
 
 		for i, transactionReceipt := range transactionReceipts {
 			transaction := transactions[i]
@@ -565,8 +593,9 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 				transactionReceipt.BlockNumber != header.Number
 			indexMismatch := transactionReceipt.TransactionIndex != transaction.Index
 
-			tolerable := isMegaeth && indexMismatch && !hashOrBlockMismatch &&
-				isMegaethDuplicateReceiptIndex(transaction, transactionReceipt, transactions, txHashCounts)
+			tolerable := indexMismatch && !hashOrBlockMismatch &&
+				p.receiptIndexMismatchTolerator != nil &&
+				p.receiptIndexMismatchTolerator(transaction, transactionReceipt, transactions, txHashCounts)
 
 			if hashOrBlockMismatch || (indexMismatch && !tolerable) {
 				return nil, xerrors.Errorf("unexpected transaction receipt: transactionReceipt={%+v} transaction={%+v} block={%+v}", transactionReceipt, transaction, header)
@@ -577,7 +606,7 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 				if transactionReceipt.TransactionIndex < uint64(len(transactions)) {
 					receiptPointsToHash = transactions[transactionReceipt.TransactionIndex].Hash
 				}
-				p.Logger.Warn("megaeth: tolerating receipt/tx index mismatch caused by duplicate tx hash in block",
+				p.Logger.Warn("tolerating receipt/tx index mismatch by chain-specific policy",
 					zap.String("blockchain", p.config.Chain.Blockchain.String()),
 					zap.String("transaction_hash", transaction.Hash),
 					zap.Uint64("block_number", header.Number),
@@ -719,38 +748,6 @@ func (p *ethereumNativeParserImpl) toTimestamp(rawTimestamp int64) *timestamp.Ti
 		return utils.ToTimestampFromMs(rawTimestamp)
 	}
 	return utils.ToTimestamp(rawTimestamp)
-}
-
-// isMegaethDuplicateReceiptIndex reports whether a receipt/transaction TransactionIndex
-// mismatch is explained by the same tx hash appearing multiple times in the block. On
-// MegaETH a block can list one tx hash at several indices; eth_getTransactionReceipt then
-// returns the single canonical receipt (one index) for every occurrence, so positional
-// pairing disagrees on index even though the receipt is correct. Caller has already
-// confirmed hash/blockHash/blockNumber match.
-//
-// The receipt is intentionally NOT mutated: the node only has one receipt for the duplicated
-// hash, so the canonical index is the honest value. As a result, for the duplicated tx the
-// flattened transaction's TransactionIndex (its block position) may differ from the
-// receipt/event-log/token-transfer TransactionIndex (the node's canonical index).
-func isMegaethDuplicateReceiptIndex(
-	transaction *api.EthereumTransaction,
-	receipt *api.EthereumTransactionReceipt,
-	transactions []*api.EthereumTransaction,
-	txHashCounts map[string]int,
-) bool {
-	// (a) The hash must genuinely be duplicated in this block (position-independent).
-	if txHashCounts[transaction.Hash] <= 1 {
-		return false
-	}
-	// (b) The receipt's index must point at a real slot that holds the SAME hash —
-	//     i.e. the canonical occurrence — not an arbitrary/garbage index. Compare in
-	//     uint64 BEFORE converting to int to avoid a 64->int overflow producing a
-	//     negative/wrapped index.
-	if receipt.TransactionIndex >= uint64(len(transactions)) {
-		return false
-	}
-	idx := int(receipt.TransactionIndex)
-	return transactions[idx].Hash == transaction.Hash
 }
 
 func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader, []*api.EthereumTransaction, error) {
