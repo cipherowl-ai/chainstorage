@@ -549,14 +549,42 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 			return nil, xerrors.Errorf("unexpected number of transaction receipts: expected=%v actual=%v", numTransactions, len(transactionReceipts))
 		}
 
+		// MegaETH can list the same tx hash multiple times in one block; see
+		// isMegaethDuplicateReceiptIndex for why this breaks positional receipt/tx index matching.
+		txHashCounts := make(map[string]int, len(transactions))
+		for _, t := range transactions {
+			txHashCounts[t.Hash]++
+		}
+		isMegaeth := p.config.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_MEGAETH
+
 		for i, transactionReceipt := range transactionReceipts {
 			transaction := transactions[i]
 
-			if transactionReceipt.TransactionHash != transaction.Hash ||
-				transactionReceipt.TransactionIndex != transaction.Index ||
+			hashOrBlockMismatch := transactionReceipt.TransactionHash != transaction.Hash ||
 				transactionReceipt.BlockHash != header.Hash ||
-				transactionReceipt.BlockNumber != header.Number {
+				transactionReceipt.BlockNumber != header.Number
+			indexMismatch := transactionReceipt.TransactionIndex != transaction.Index
+
+			tolerable := isMegaeth && indexMismatch && !hashOrBlockMismatch &&
+				isMegaethDuplicateReceiptIndex(transaction, transactionReceipt, transactions, txHashCounts)
+
+			if hashOrBlockMismatch || (indexMismatch && !tolerable) {
 				return nil, xerrors.Errorf("unexpected transaction receipt: transactionReceipt={%+v} transaction={%+v} block={%+v}", transactionReceipt, transaction, header)
+			}
+
+			if tolerable {
+				receiptPointsToHash := ""
+				if transactionReceipt.TransactionIndex < uint64(len(transactions)) {
+					receiptPointsToHash = transactions[transactionReceipt.TransactionIndex].Hash
+				}
+				p.Logger.Warn("megaeth: tolerating receipt/tx index mismatch caused by duplicate tx hash in block",
+					zap.String("blockchain", p.config.Chain.Blockchain.String()),
+					zap.String("transaction_hash", transaction.Hash),
+					zap.Uint64("block_number", header.Number),
+					zap.Uint64("expected_transaction_index", transaction.Index),
+					zap.Uint64("receipt_transaction_index", transactionReceipt.TransactionIndex),
+					zap.String("receipt_points_to_transaction_hash", receiptPointsToHash),
+				)
 			}
 		}
 	} else {
@@ -691,6 +719,38 @@ func (p *ethereumNativeParserImpl) toTimestamp(rawTimestamp int64) *timestamp.Ti
 		return utils.ToTimestampFromMs(rawTimestamp)
 	}
 	return utils.ToTimestamp(rawTimestamp)
+}
+
+// isMegaethDuplicateReceiptIndex reports whether a receipt/transaction TransactionIndex
+// mismatch is explained by the same tx hash appearing multiple times in the block. On
+// MegaETH a block can list one tx hash at several indices; eth_getTransactionReceipt then
+// returns the single canonical receipt (one index) for every occurrence, so positional
+// pairing disagrees on index even though the receipt is correct. Caller has already
+// confirmed hash/blockHash/blockNumber match.
+//
+// The receipt is intentionally NOT mutated: the node only has one receipt for the duplicated
+// hash, so the canonical index is the honest value. As a result, for the duplicated tx the
+// flattened transaction's TransactionIndex (its block position) may differ from the
+// receipt/event-log/token-transfer TransactionIndex (the node's canonical index).
+func isMegaethDuplicateReceiptIndex(
+	transaction *api.EthereumTransaction,
+	receipt *api.EthereumTransactionReceipt,
+	transactions []*api.EthereumTransaction,
+	txHashCounts map[string]int,
+) bool {
+	// (a) The hash must genuinely be duplicated in this block (position-independent).
+	if txHashCounts[transaction.Hash] <= 1 {
+		return false
+	}
+	// (b) The receipt's index must point at a real slot that holds the SAME hash —
+	//     i.e. the canonical occurrence — not an arbitrary/garbage index. Compare in
+	//     uint64 BEFORE converting to int to avoid a 64->int overflow producing a
+	//     negative/wrapped index.
+	if receipt.TransactionIndex >= uint64(len(transactions)) {
+		return false
+	}
+	idx := int(receipt.TransactionIndex)
+	return transactions[idx].Hash == transaction.Hash
 }
 
 func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader, []*api.EthereumTransaction, error) {
