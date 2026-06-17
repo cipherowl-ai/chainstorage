@@ -850,6 +850,19 @@ func TestEndpointGroup_Error(t *testing.T) {
 	}
 }
 
+func TestConsolidationEnabledRejectsDynamoDB(t *testing.T) {
+	require := testutil.Require(t)
+
+	require.NoError(os.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true"))
+	require.NoError(os.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeShadowDualWrite)))
+	defer os.Unsetenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED")
+	defer os.Unsetenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE")
+
+	_, err := config.New()
+	require.Error(err)
+	require.Contains(err.Error(), "requires Postgres meta storage")
+}
+
 func TestParseConfigName(t *testing.T) {
 	tests := []struct {
 		configName string

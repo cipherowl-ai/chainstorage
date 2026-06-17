@@ -183,6 +183,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				query = blockMetadataRegularQuery
 			}
 
+			byteOffset, byteLength, uncompressedLength := blockObjectByteFields(block)
 			err = tx.QueryRowContext(txCtx, query,
 				block.Height,
 				block.Tag,
@@ -193,9 +194,9 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				unixTimestamp,
 				block.Skipped,
 				int32(block.GetObjectFormat()),
-				block.GetByteOffset(),
-				block.GetByteLength(),
-				block.GetUncompressedLength(),
+				byteOffset,
+				byteLength,
+				uncompressedLength,
 			).Scan(&blockId)
 			if err != nil {
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
@@ -542,4 +543,13 @@ func uint64Value(value sql.NullInt64) uint64 {
 		return 0
 	}
 	return uint64(value.Int64)
+}
+
+func blockObjectByteFields(block *api.BlockMetadata) (sql.NullInt64, sql.NullInt64, sql.NullInt64) {
+	if block.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(block.GetByteOffset()), Valid: true},
+		sql.NullInt64{Int64: int64(block.GetByteLength()), Valid: true},
+		sql.NullInt64{Int64: int64(block.GetUncompressedLength()), Valid: true}
 }

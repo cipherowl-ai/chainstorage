@@ -27,12 +27,7 @@ CREATE TABLE block_consolidation_shadow (
 CREATE INDEX idx_block_consolidation_shadow_tag_height
     ON block_consolidation_shadow (tag, height);
 
-CREATE INDEX idx_block_metadata_unconsolidated
-    ON block_metadata (tag, height)
-    WHERE object_format = 0;
-
 -- +goose Down
-DROP INDEX IF EXISTS idx_block_metadata_unconsolidated;
 DROP INDEX IF EXISTS idx_block_consolidation_shadow_tag_height;
 DROP TABLE IF EXISTS block_consolidation_shadow;
 

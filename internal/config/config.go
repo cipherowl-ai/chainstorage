@@ -759,10 +759,8 @@ func (c *Config) validateConsolidationConfig() error {
 	default:
 		return xerrors.Errorf("consolidation requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
 	}
-	switch c.StorageType.MetaStorageType {
-	case MetaStorageType_UNSPECIFIED, MetaStorageType_DYNAMODB, MetaStorageType_POSTGRES:
-	default:
-		return xerrors.Errorf("consolidation requires DynamoDB or Postgres meta storage, got %v", c.StorageType.MetaStorageType)
+	if c.StorageType.MetaStorageType != MetaStorageType_POSTGRES {
+		return xerrors.Errorf("consolidation requires Postgres meta storage until DynamoDB shadow placement and guarded promotion are implemented, got %v", c.StorageType.MetaStorageType)
 	}
 
 	if consolidation.CodecLevel <= 0 {
