@@ -39,6 +39,11 @@ message BlockIdentifier {
   google.protobuf.Timestamp timestamp = 5;
 }
 
+enum BlockObjectFormat {
+  BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK = 0;
+  BLOCK_OBJECT_FORMAT_CSCB_BATCH = 1;
+}
+
 message BlockMetadata {
   // Tag is a way to version the blockchain dataset. See http://go/cs-design for more details.
   uint32 tag = 1;
@@ -56,6 +61,14 @@ message BlockMetadata {
   bool skipped = 7;
   // Block timestamp. Note that this attribute is only available in recent blocks.
   google.protobuf.Timestamp timestamp = 8;
+  // Offset of this block's raw protobuf payload inside the decoded object payload.
+  uint64 byte_offset = 9;
+  // Length of this block's raw protobuf payload. Zero means legacy whole-object reads.
+  uint64 byte_length = 10;
+  // Length of the decoded payload region that contains this block.
+  uint64 uncompressed_length = 11;
+  // Object format for object_key_main. Zero value is the legacy whole-block object format.
+  BlockObjectFormat object_format = 12;
 }
 
 message TransactionMetadata {

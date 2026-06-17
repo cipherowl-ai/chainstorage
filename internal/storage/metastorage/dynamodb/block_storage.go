@@ -279,16 +279,20 @@ func (a *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 
 func makeBlockMetaDataDDBEntry(block *api.BlockMetadata) *model.BlockMetaDataDDBEntry {
 	blockMetaDataDDBEntry := model.BlockMetaDataDDBEntry{
-		BlockPid:      getBlockPidForHeight(block.Tag, block.Height),
-		BlockRid:      getBlockRidWithBlockHash(block.Hash),
-		Tag:           block.Tag,
-		Hash:          block.Hash,
-		ParentHash:    block.ParentHash,
-		Height:        block.Height,
-		ParentHeight:  block.ParentHeight,
-		ObjectKeyMain: block.ObjectKeyMain,
-		Skipped:       block.Skipped,
-		Timestamp:     block.GetTimestamp().GetSeconds(),
+		BlockPid:           getBlockPidForHeight(block.Tag, block.Height),
+		BlockRid:           getBlockRidWithBlockHash(block.Hash),
+		Tag:                block.Tag,
+		Hash:               block.Hash,
+		ParentHash:         block.ParentHash,
+		Height:             block.Height,
+		ParentHeight:       block.ParentHeight,
+		ObjectKeyMain:      block.ObjectKeyMain,
+		Skipped:            block.Skipped,
+		Timestamp:          block.GetTimestamp().GetSeconds(),
+		ObjectFormat:       int32(block.GetObjectFormat()),
+		ByteOffset:         block.GetByteOffset(),
+		ByteLength:         block.GetByteLength(),
+		UncompressedLength: block.GetUncompressedLength(),
 	}
 	return &blockMetaDataDDBEntry
 }

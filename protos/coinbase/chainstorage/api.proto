@@ -30,6 +30,10 @@ message BlockFile {
   bool skipped = 7;
   Compression compression = 8;
   google.protobuf.Timestamp block_timestamp = 9;
+  uint64 byte_offset = 10;
+  uint64 byte_length = 11;
+  uint64 uncompressed_length = 12;
+  BlockObjectFormat object_format = 13;
 }
 
 message BlockchainEvent {

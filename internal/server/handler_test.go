@@ -212,11 +212,15 @@ func (s *handlerTestSuite) TestGetBlockFile() {
 	require := testutil.Require(s.T())
 	tag := s.app.Config().Chain.BlockTag.Stable
 	expected := &api.BlockFile{
-		Tag:        tag,
-		Hash:       hash,
-		ParentHash: parentHash,
-		Height:     height,
-		FileUrl:    "http://endpoint/foo/bar",
+		Tag:                tag,
+		Hash:               hash,
+		ParentHash:         parentHash,
+		Height:             height,
+		FileUrl:            "http://endpoint/foo/bar",
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteOffset:         4096,
+		ByteLength:         8192,
+		UncompressedLength: 8192,
 	}
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
@@ -225,11 +229,15 @@ func (s *handlerTestSuite) TestGetBlockFile() {
 				require.Equal(height, height_)
 				require.Equal(hash, hash_)
 				return &api.BlockMetadata{
-					Tag:           tag,
-					Hash:          hash,
-					ParentHash:    parentHash,
-					Height:        height,
-					ObjectKeyMain: objectKeyMain,
+					Tag:                tag,
+					Hash:               hash,
+					ParentHash:         parentHash,
+					Height:             height,
+					ObjectKeyMain:      objectKeyMain,
+					ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+					ByteOffset:         4096,
+					ByteLength:         8192,
+					UncompressedLength: 8192,
 				}, nil
 			},
 		),

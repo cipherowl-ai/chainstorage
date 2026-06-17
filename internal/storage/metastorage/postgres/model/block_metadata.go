@@ -12,11 +12,14 @@ type Scanner interface {
 	Scan(dest ...interface{}) error
 }
 
-// scanBlockMetadata scans a single row into a BlockMetadata struct
-// Schema: id, height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped
+// scanBlockMetadata scans a single row into a BlockMetadata struct.
+// Schema: id, height, tag, hash, parent_hash, parent_height, object_key_main,
+// timestamp, skipped, object_format, byte_offset, byte_length, uncompressed_length
 func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
+	var objectFormat int32
+	var byteOffset, byteLength, uncompressedLength sql.NullInt64
 	var id int64 // We get this but don't need it in the result
 
 	err := scanner.Scan(
@@ -29,25 +32,39 @@ func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 		&block.ObjectKeyMain,
 		&timestamp,
 		&block.Skipped,
+		&objectFormat,
+		&byteOffset,
+		&byteLength,
+		&uncompressedLength,
 	)
 	if err != nil {
 		return nil, err
 	}
 
 	block.Timestamp = utils.ToTimestamp(timestamp)
+	block.ObjectFormat = api.BlockObjectFormat(objectFormat)
+	if byteOffset.Valid {
+		block.ByteOffset = uint64(byteOffset.Int64)
+	}
+	if byteLength.Valid {
+		block.ByteLength = uint64(byteLength.Int64)
+	}
+	if uncompressedLength.Valid {
+		block.UncompressedLength = uint64(uncompressedLength.Int64)
+	}
 	return &block, nil
 }
 
 // BlockMetadataFromRow converts a postgres row into a BlockMetadata proto
 // Used for direct block_metadata table queries
-// Schema: id, height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped
+// Schema: see scanBlockMetadata
 func BlockMetadataFromRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	return scanBlockMetadata(row)
 }
 
 // BlockMetadataFromCanonicalRow converts a postgres row from canonical join into a BlockMetadata proto
 // Used for queries that join canonical_blocks with block_metadata
-// Schema: bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, bm.timestamp, bm.skipped
+// Schema: see scanBlockMetadata
 func BlockMetadataFromCanonicalRow(db *sql.DB, row *sql.Row) (*api.BlockMetadata, error) {
 	return scanBlockMetadata(row)
 }
