@@ -461,7 +461,7 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 		for _, ref := range legacyRefs {
 			ref := ref
 			group.Go(func() error {
-				block, err := s.downloadLegacy(ctx, ref.metadata)
+				block, err := s.Download(ctx, ref.metadata)
 				if err != nil {
 					return xerrors.Errorf("failed to download legacy block (input={%+v}): %w", ref.metadata, err)
 				}
@@ -626,14 +626,9 @@ func (s *blobStorageImpl) downloadCSCBChunk(ctx context.Context, key string, cod
 	if uint64(len(compressed)) != chunk.CompressedLength {
 		return nil, xerrors.Errorf("CSCB compressed chunk length mismatch: got %d want %d", len(compressed), chunk.CompressedLength)
 	}
-	reader, err := storage_utils.DecompressReader(bytes.NewReader(compressed), codec)
+	decompressed, err := cscb.DecodeChunkFrame(bytes.NewReader(compressed), codec)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to create CSCB chunk decompressor: %w", err)
-	}
-	defer func() { _ = reader.Close() }()
-	decompressed, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to decompress CSCB chunk: %w", err)
+		return nil, err
 	}
 	return decompressed, nil
 }

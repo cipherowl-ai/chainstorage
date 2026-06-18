@@ -2,10 +2,13 @@ package cscb
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/binary"
 	"hash/crc32"
+	"io"
 
+	"github.com/klauspost/compress/zstd"
 	"golang.org/x/xerrors"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -283,6 +286,43 @@ func ValidateChunkPayload(chunkPayload []byte, chunk *ChunkDescriptor) error {
 	return nil
 }
 
+func DecodeChunkFrame(frame io.Reader, codec api.Compression) ([]byte, error) {
+	reader, err := NewChunkDecompressor(frame, codec)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = reader.Close() }()
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to decompress CSCB chunk: %w", err)
+	}
+	return decoded, nil
+}
+
+func NewChunkDecompressor(frame io.Reader, codec api.Compression) (io.ReadCloser, error) {
+	switch codec {
+	case api.Compression_GZIP:
+		reader, err := gzip.NewReader(frame)
+		if err != nil {
+			return nil, xerrors.Errorf("gzip reader: %w", err)
+		}
+		return reader, nil
+	case api.Compression_ZSTD:
+		reader, err := zstd.NewReader(
+			frame,
+			zstd.WithDecoderConcurrency(1),
+			zstd.WithDecoderLowmem(true),
+			zstd.WithDecoderMaxMemory(maxZstdDecoderMemoryBytes),
+		)
+		if err != nil {
+			return nil, xerrors.Errorf("zstd reader: %w", err)
+		}
+		return &zstdReadCloser{reader}, nil
+	default:
+		return nil, xerrors.Errorf("unsupported CSCB codec: %v", codec)
+	}
+}
+
 func ExtractBlockPayload(chunkPayload []byte, block *BlockDescriptor) ([]byte, error) {
 	if block == nil {
 		return nil, xerrors.New("CSCB block descriptor is required")
@@ -307,6 +347,15 @@ func ExtractBlockPayload(chunkPayload []byte, block *BlockDescriptor) ([]byte, e
 		return nil, xerrors.Errorf("CSCB block CRC mismatch: got %08x want %08x", crc, block.PayloadCRC32)
 	}
 	return payload, nil
+}
+
+type zstdReadCloser struct {
+	*zstd.Decoder
+}
+
+func (z *zstdReadCloser) Close() error {
+	z.Decoder.Close()
+	return nil
 }
 
 func parseBlockDescriptors(envelope []byte, offset uint64, count uint64) ([]BlockDescriptor, error) {
