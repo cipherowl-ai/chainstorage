@@ -43,6 +43,14 @@ const (
 		bm.timestamp, bm.skipped, bm.object_format, bm.byte_offset, bm.byte_length, bm.uncompressed_length`
 )
 
+func blockMetadataByHashQuery() string {
+	return fmt.Sprintf(`
+				SELECT %s
+				FROM block_metadata
+				WHERE tag = $1 AND height = $2 AND hash = $3 AND skipped = false
+				LIMIT 1`, blockMetadataColumns)
+}
+
 func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 	metrics := params.Metrics.SubScope("block_storage").Tagged(map[string]string{
 		"storage_type": "postgres",
@@ -301,12 +309,7 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 			row = b.db.QueryRowContext(ctx, query, tag, height)
 		} else {
 			// Query block_metadata directly for the specific hash
-			query := fmt.Sprintf(`
-				SELECT %s
-				FROM block_metadata
-				WHERE tag = $1 AND height = $2 AND hash = $3
-				LIMIT 1`, blockMetadataColumns)
-			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
+			row = b.db.QueryRowContext(ctx, blockMetadataByHashQuery(), tag, height, blockHash)
 		}
 
 		block, err := model.BlockMetadataFromRow(b.db, row)

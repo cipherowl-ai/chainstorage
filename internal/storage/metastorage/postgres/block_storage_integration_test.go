@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -274,6 +275,26 @@ func (s *blockStorageTestSuite) TestGetBlocksByHeightsBlockNotFound() {
 func (s *blockStorageTestSuite) TestGetBlockByHashInvalidHeight() {
 	_, err := s.accessor.GetBlockByHash(context.TODO(), tag, 0, "0x0")
 	assert.True(s.T(), xerrors.Is(err, errors.ErrInvalidHeight))
+}
+
+func (s *blockStorageTestSuite) TestGetBlockByHashQueryUsesPartialIndex() {
+	require := testutil.Require(s.T())
+
+	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN "+blockMetadataByHashQuery(), tag, s.config.Chain.BlockStartHeight, "0x0")
+	require.NoError(err)
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		require.NoError(rows.Scan(&line))
+		lines = append(lines, line)
+	}
+	require.NoError(rows.Err())
+
+	plan := strings.Join(lines, "\n")
+	assert.Contains(s.T(), plan, "unique_tag_hash_regular")
+	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 
 func (s *blockStorageTestSuite) TestGetBlocksByHeightRangeInvalidRange() {
