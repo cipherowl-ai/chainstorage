@@ -211,6 +211,10 @@ func (s *blobStorageImpl) Upload(ctx context.Context, block *api.Block, compress
 	})
 }
 
+func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []internal.ConsolidatedBlockPayload) (string, []internal.BlockPlacement, error) {
+	return "", nil, xerrors.New("consolidated block upload is not supported by GCS blob storage")
+}
+
 func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
 	return s.instrumentDownload.Instrument(ctx, func(ctx context.Context) (*api.Block, error) {
 		defer s.logDuration("download", time.Now())

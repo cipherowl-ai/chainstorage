@@ -86,6 +86,22 @@ func (mr *MockBlobStorageMockRecorder) Upload(arg0, arg1, arg2 any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Upload", reflect.TypeOf((*MockBlobStorage)(nil).Upload), arg0, arg1, arg2)
 }
 
+// UploadConsolidated mocks base method.
+func (m *MockBlobStorage) UploadConsolidated(arg0 context.Context, arg1 []internal.ConsolidatedBlockPayload) (string, []internal.BlockPlacement, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UploadConsolidated", arg0, arg1)
+	ret0, _ := ret[0].(string)
+	ret1, _ := ret[1].([]internal.BlockPlacement)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// UploadConsolidated indicates an expected call of UploadConsolidated.
+func (mr *MockBlobStorageMockRecorder) UploadConsolidated(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UploadConsolidated", reflect.TypeOf((*MockBlobStorage)(nil).UploadConsolidated), arg0, arg1)
+}
+
 // UploadRaw mocks base method.
 func (m *MockBlobStorage) UploadRaw(arg0 context.Context, arg1 *internal.RawBlockData) (string, error) {
 	m.ctrl.T.Helper()

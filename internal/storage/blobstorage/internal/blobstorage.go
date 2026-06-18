@@ -1,7 +1,9 @@
 package internal
 
 import (
+	"bytes"
 	"context"
+	"io"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -22,9 +24,35 @@ type (
 		BlockDataCompression api.Compression
 	}
 
+	PayloadSource interface {
+		Open(ctx context.Context) (io.ReadCloser, error)
+		Length() uint64
+	}
+
+	BytesPayloadSource []byte
+
+	ConsolidatedBlockPayload struct {
+		Metadata           *api.BlockMetadata
+		MetadataID         int64
+		RawBlockPayload    PayloadSource
+		UncompressedLength uint64
+	}
+
+	BlockPlacement struct {
+		MetadataID         int64
+		Height             uint64
+		Hash               string
+		ObjectKey          string
+		ObjectFormat       api.BlockObjectFormat
+		ByteOffset         uint64
+		ByteLength         uint64
+		UncompressedLength uint64
+	}
+
 	BlobStorage interface {
 		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
 		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
+		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}
@@ -40,6 +68,14 @@ type (
 		GCS BlobStorageFactory `name:"blobstorage/gcs"`
 	}
 )
+
+func (s BytesPayloadSource) Open(ctx context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(s)), nil
+}
+
+func (s BytesPayloadSource) Length() uint64 {
+	return uint64(len(s))
+}
 
 func WithBlobStorageFactory(params BlobStorageFactoryParams) (BlobStorage, error) {
 	var factory BlobStorageFactory

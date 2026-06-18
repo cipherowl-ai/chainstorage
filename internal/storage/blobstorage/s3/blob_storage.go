@@ -7,12 +7,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
 	storageerrors "github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
@@ -67,6 +70,14 @@ const (
 	blobUploaderScopeName   = "uploader"
 	blobDownloaderScopeName = "downloader"
 	blobSizeMetricName      = "blob_size"
+
+	cscbMetadataFormat             = "chainstorage-format"
+	cscbMetadataCompressionScope   = "chainstorage-compression-scope"
+	cscbMetadataSHA256             = "chainstorage-sha256"
+	cscbMetadataCodec              = "chainstorage-codec"
+	cscbMetadataUncompressedLength = "chainstorage-uncompressed-length"
+
+	maxSinglePutObjectSize = 5 * 1024 * 1024 * 1024
 )
 
 var _ internal.BlobStorage = (*blobStorageImpl)(nil)
@@ -196,6 +207,196 @@ func (s *blobStorageImpl) Upload(ctx context.Context, block *api.Block, compress
 			BlockDataCompression: compression,
 		})
 	})
+}
+
+func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []internal.ConsolidatedBlockPayload) (string, []internal.BlockPlacement, error) {
+	defer s.logDuration("upload_consolidated", time.Now())
+
+	consolidation := s.config.AWS.Storage.Consolidation
+	object, err := cscb.Encode(ctx, cscb.EncodeConfig{
+		Blockchain:                s.config.Chain.Blockchain,
+		Network:                   s.config.Chain.Network,
+		SideChain:                 s.config.Chain.Sidechain,
+		Codec:                     consolidation.Codec,
+		CodecLevel:                consolidation.CodecLevel,
+		ZstdLongDistanceWindowLog: consolidation.ZstdLongDistanceWindowLog,
+		MaxBlocks:                 consolidation.MaxBlocks,
+		CompressionChunkBlocks:    consolidation.CompressionChunkBlocks,
+		MaxChunkCompressedBytes:   consolidation.MaxChunkCompressedBytes,
+		MaxChunkUncompressedBytes: consolidation.MaxChunkUncompressedBytes,
+		MaxCompressedBytes:        consolidation.MaxCompressedBytes,
+		MaxUncompressedBytes:      consolidation.MaxUncompressedBytes,
+		ShardSize:                 consolidation.ShardSize,
+		MemoryBudgetBytes:         consolidation.MemoryBudgetBytes,
+		LocalSpillDir:             consolidation.LocalSpillDir,
+		LocalSpillMaxBytes:        consolidation.LocalSpillMaxBytes,
+	}, blocks)
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() { _ = object.Close() }()
+
+	found, err := s.validateExistingConsolidatedObject(ctx, object)
+	if err != nil {
+		return "", nil, err
+	}
+	if !found {
+		uploaded, err := s.uploadConsolidatedObject(ctx, object, consolidation.Codec)
+		if err != nil {
+			return "", nil, err
+		}
+		if uploaded {
+			if err := s.validateUploadedConsolidatedObject(ctx, object); err != nil {
+				return "", nil, err
+			}
+			s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(object.Length) * time.Millisecond)
+		}
+	}
+	return object.Key, object.Placements, nil
+}
+
+func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *cscb.Object, compression api.Compression) (bool, error) {
+	if object.Length > maxSinglePutObjectSize {
+		return false, xerrors.Errorf("CSCB object length %d exceeds v1 single-put limit %d", object.Length, maxSinglePutObjectSize)
+	}
+	reader, err := object.Open()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = reader.Close() }()
+
+	contentMD5, err := computeContentMD5(object)
+	if err != nil {
+		return false, err
+	}
+	metadata := map[string]string{
+		cscbMetadataFormat:             "cscb",
+		cscbMetadataCompressionScope:   "batch-chunked",
+		cscbMetadataSHA256:             object.SHA256,
+		cscbMetadataCodec:              codecName(compression),
+		cscbMetadataUncompressedLength: fmt.Sprintf("%d", object.PayloadUncompressedLength),
+	}
+	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(object.Key),
+		Body:        reader,
+		ContentMD5:  aws.String(contentMD5),
+		ACL:         awss3types.ObjectCannedACLBucketOwnerFullControl,
+		IfNoneMatch: aws.String("*"),
+		Metadata:    metadata,
+	}); err != nil {
+		if isObjectPreconditionFailed(err) {
+			found, validateErr := s.validateExistingConsolidatedObject(ctx, object)
+			if validateErr != nil {
+				return false, validateErr
+			}
+			if found {
+				return false, nil
+			}
+		}
+		return false, xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
+	}
+	return true, nil
+}
+
+func computeContentMD5(object *cscb.Object) (string, error) {
+	reader, err := object.Open()
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = reader.Close() }()
+
+	// #nosec G401 -- S3 Content-MD5 is a transport integrity header, not a cryptographic trust boundary.
+	h := md5.New()
+	if _, err := io.Copy(h, reader); err != nil {
+		return "", xerrors.Errorf("failed to compute CSCB content md5: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
+}
+
+func (s *blobStorageImpl) validateExistingConsolidatedObject(ctx context.Context, object *cscb.Object) (bool, error) {
+	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(object.Key),
+	})
+	if err != nil {
+		if isObjectNotFound(err) {
+			return false, nil
+		}
+		return false, xerrors.Errorf("failed to head CSCB object (bucket=%s, key=%s): %w", s.bucket, object.Key, err)
+	}
+	if err := validateConsolidatedHead(out, object); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *blobStorageImpl) validateUploadedConsolidatedObject(ctx context.Context, object *cscb.Object) error {
+	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(object.Key),
+	})
+	if err != nil {
+		return xerrors.Errorf("failed to validate uploaded CSCB object (bucket=%s, key=%s): %w", s.bucket, object.Key, err)
+	}
+	return validateConsolidatedHead(out, object)
+}
+
+func validateConsolidatedHead(out *awss3.HeadObjectOutput, object *cscb.Object) error {
+	if out == nil {
+		return xerrors.New("empty CSCB HeadObject response")
+	}
+	if out.ContentLength == nil {
+		return xerrors.Errorf("CSCB object %s has no content length", object.Key)
+	}
+	if uint64(*out.ContentLength) != object.Length {
+		return xerrors.Errorf("CSCB object %s length mismatch: got %d want %d", object.Key, *out.ContentLength, object.Length)
+	}
+	if metadataSHA := out.Metadata[cscbMetadataSHA256]; metadataSHA != object.SHA256 {
+		return xerrors.Errorf("CSCB object %s sha256 metadata mismatch: got %q want %q", object.Key, metadataSHA, object.SHA256)
+	}
+	return nil
+}
+
+func isObjectNotFound(err error) bool {
+	var notFound *awss3types.NotFound
+	if errors.As(err, &notFound) {
+		return true
+	}
+	var noSuchKey *awss3types.NoSuchKey
+	if errors.As(err, &noSuchKey) {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "NotFound", "NoSuchKey", "404":
+			return true
+		}
+	}
+	return false
+}
+
+func isObjectPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed", "412":
+			return true
+		}
+	}
+	return false
+}
+
+func codecName(compression api.Compression) string {
+	switch compression {
+	case api.Compression_GZIP:
+		return "gzip"
+	case api.Compression_ZSTD:
+		return "zstd"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
