@@ -209,7 +209,7 @@ func (s *blobStorageImpl) Upload(ctx context.Context, block *api.Block, compress
 	})
 }
 
-func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []internal.ConsolidatedBlockPayload, compression api.Compression) (string, []internal.BlockPlacement, error) {
+func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []internal.ConsolidatedBlockPayload) (string, []internal.BlockPlacement, error) {
 	defer s.logDuration("upload_consolidated", time.Now())
 
 	consolidation := s.config.AWS.Storage.Consolidation
@@ -217,7 +217,7 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		Blockchain:                s.config.Chain.Blockchain,
 		Network:                   s.config.Chain.Network,
 		SideChain:                 s.config.Chain.Sidechain,
-		Codec:                     compression,
+		Codec:                     consolidation.Codec,
 		CodecLevel:                consolidation.CodecLevel,
 		ZstdLongDistanceWindowLog: consolidation.ZstdLongDistanceWindowLog,
 		MaxBlocks:                 consolidation.MaxBlocks,
@@ -240,30 +240,33 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		return "", nil, err
 	}
 	if !found {
-		if err := s.uploadConsolidatedObject(ctx, object, compression); err != nil {
+		uploaded, err := s.uploadConsolidatedObject(ctx, object, consolidation.Codec)
+		if err != nil {
 			return "", nil, err
 		}
-		if err := s.validateUploadedConsolidatedObject(ctx, object); err != nil {
-			return "", nil, err
+		if uploaded {
+			if err := s.validateUploadedConsolidatedObject(ctx, object); err != nil {
+				return "", nil, err
+			}
+			s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(object.Length) * time.Millisecond)
 		}
-		s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(object.Length) * time.Millisecond)
 	}
 	return object.Key, object.Placements, nil
 }
 
-func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *cscb.Object, compression api.Compression) error {
+func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *cscb.Object, compression api.Compression) (bool, error) {
 	if object.Length > maxSinglePutObjectSize {
-		return xerrors.Errorf("CSCB object length %d exceeds v1 single-put limit %d", object.Length, maxSinglePutObjectSize)
+		return false, xerrors.Errorf("CSCB object length %d exceeds v1 single-put limit %d", object.Length, maxSinglePutObjectSize)
 	}
 	reader, err := object.Open()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer func() { _ = reader.Close() }()
 
 	contentMD5, err := computeContentMD5(object)
 	if err != nil {
-		return err
+		return false, err
 	}
 	metadata := map[string]string{
 		cscbMetadataFormat:             "cscb",
@@ -272,27 +275,27 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		cscbMetadataCodec:              codecName(compression),
 		cscbMetadataUncompressedLength: fmt.Sprintf("%d", object.PayloadUncompressedLength),
 	}
-	if _, err := s.uploader.Upload(ctx, &awss3.PutObjectInput{
-		Bucket:     aws.String(s.bucket),
-		Key:        aws.String(object.Key),
-		Body:       reader,
-		ContentMD5: aws.String(contentMD5),
-		ACL:        awss3types.ObjectCannedACLBucketOwnerFullControl,
-		Metadata:   metadata,
-	}, singlePutUploadOption(object.Length)); err != nil {
-		return xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
-	}
-	return nil
-}
-
-func singlePutUploadOption(objectLength uint64) func(*manager.Uploader) {
-	return func(u *manager.Uploader) {
-		partSize := int64(objectLength + 1)
-		if partSize < manager.MinUploadPartSize {
-			partSize = manager.MinUploadPartSize
+	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(object.Key),
+		Body:        reader,
+		ContentMD5:  aws.String(contentMD5),
+		ACL:         awss3types.ObjectCannedACLBucketOwnerFullControl,
+		IfNoneMatch: aws.String("*"),
+		Metadata:    metadata,
+	}); err != nil {
+		if isObjectPreconditionFailed(err) {
+			found, validateErr := s.validateExistingConsolidatedObject(ctx, object)
+			if validateErr != nil {
+				return false, validateErr
+			}
+			if found {
+				return false, nil
+			}
 		}
-		u.PartSize = partSize
+		return false, xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
 	}
+	return true, nil
 }
 
 func computeContentMD5(object *cscb.Object) (string, error) {
@@ -367,6 +370,17 @@ func isObjectNotFound(err error) bool {
 	if errors.As(err, &apiErr) {
 		switch apiErr.ErrorCode() {
 		case "NotFound", "NoSuchKey", "404":
+			return true
+		}
+	}
+	return false
+}
+
+func isObjectPreconditionFailed(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "PreconditionFailed", "412":
 			return true
 		}
 	}

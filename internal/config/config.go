@@ -674,6 +674,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.flush_interval", "1m")
 	v.SetDefault("aws.storage.consolidation.shadow_timeout", "30s")
 	v.SetDefault("aws.storage.consolidation.max_inflight_raw_blocks", 4)
+	v.SetDefault("aws.storage.consolidation.memory_budget_bytes", 268435456)
 	v.SetDefault("aws.storage.consolidation.local_spill_dir", "/tmp/chainstorage-cscb")
 	v.SetDefault("aws.storage.consolidation.shard_size", 10000)
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
@@ -786,6 +787,9 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.MaxInflightRawBlocks == 0 {
 		return xerrors.New("consolidation max_inflight_raw_blocks must be positive")
+	}
+	if consolidation.MemoryBudgetBytes != nil && *consolidation.MemoryBudgetBytes == 0 {
+		return xerrors.New("consolidation memory_budget_bytes must be positive when set")
 	}
 	if consolidation.FlushInterval <= 0 {
 		return xerrors.New("consolidation flush_interval must be positive")

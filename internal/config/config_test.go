@@ -951,6 +951,7 @@ func getDataCompressionType(cfg *config.Config) api.Compression {
 }
 
 func defaultConsolidationConfig() config.ConsolidationConfig {
+	memoryBudgetBytes := uint64(268435456)
 	return config.ConsolidationConfig{
 		Enabled:                false,
 		Mode:                   config.ConsolidationModeLegacyOnly,
@@ -963,6 +964,7 @@ func defaultConsolidationConfig() config.ConsolidationConfig {
 		FlushInterval:          time.Minute,
 		ShadowTimeout:          30 * time.Second,
 		MaxInflightRawBlocks:   4,
+		MemoryBudgetBytes:      &memoryBudgetBytes,
 		LocalSpillDir:          "/tmp/chainstorage-cscb",
 		ShardSize:              10000,
 		MultipartThreshold:     134217728,

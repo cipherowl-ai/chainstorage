@@ -35,6 +35,8 @@ const (
 
 	fileSuffixGzip = ".cscb.gzip"
 	fileSuffixZstd = ".cscb.zstd"
+
+	defaultMemoryBudgetBytes = 256 * 1024 * 1024
 )
 
 var (
@@ -97,12 +99,15 @@ type (
 	}
 
 	chunkBuilder struct {
-		index              uint32
-		startHeight        uint64
-		endHeight          uint64
-		uncompressedOffset uint64
-		blockCount         uint32
-		raw                bytes.Buffer
+		index                   uint32
+		startHeight             uint64
+		endHeight               uint64
+		compressedPayloadOffset uint64
+		uncompressedOffset      uint64
+		uncompressedLength      uint64
+		blockCount              uint32
+		chunkCRC                hash.Hash32
+		writer                  io.WriteCloser
 	}
 )
 
@@ -141,32 +146,34 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 		prevHeight        uint64
 		totalUncompressed uint64
 	)
+	defer func() {
+		if currentChunk != nil && currentChunk.writer != nil {
+			_ = currentChunk.writer.Close()
+		}
+	}()
 
 	flushChunk := func() error {
 		if currentChunk == nil || currentChunk.blockCount == 0 {
 			return nil
 		}
-		rawChunk := currentChunk.raw.Bytes()
-		compressed, err := compressChunk(rawChunk, cfg.Codec, cfg.CodecLevel, cfg.ZstdLongDistanceWindowLog)
-		if err != nil {
-			return err
+		if err := currentChunk.writer.Close(); err != nil {
+			return xerrors.Errorf("failed to close CSCB chunk compressor: %w", err)
 		}
-		if cfg.MaxChunkCompressedBytes != nil && uint64(len(compressed)) > *cfg.MaxChunkCompressedBytes && currentChunk.blockCount > 1 {
-			return xerrors.Errorf("CSCB compressed chunk length %d exceeds max_chunk_compressed_bytes %d", len(compressed), *cfg.MaxChunkCompressedBytes)
+		currentChunk.writer = nil
+		compressedLength := payloadSink.size - currentChunk.compressedPayloadOffset
+		if cfg.MaxChunkCompressedBytes != nil && compressedLength > *cfg.MaxChunkCompressedBytes && currentChunk.blockCount > 1 {
+			return xerrors.Errorf("CSCB compressed chunk length %d exceeds max_chunk_compressed_bytes %d", compressedLength, *cfg.MaxChunkCompressedBytes)
 		}
 		record := chunkRecord{
 			index:                   currentChunk.index,
 			startHeight:             currentChunk.startHeight,
 			endHeight:               currentChunk.endHeight,
-			compressedPayloadOffset: payloadSink.size,
-			compressedLength:        uint64(len(compressed)),
+			compressedPayloadOffset: currentChunk.compressedPayloadOffset,
+			compressedLength:        compressedLength,
 			uncompressedOffset:      currentChunk.uncompressedOffset,
-			uncompressedLength:      uint64(len(rawChunk)),
-			chunkCRC32:              crc32.ChecksumIEEE(rawChunk),
+			uncompressedLength:      currentChunk.uncompressedLength,
+			chunkCRC32:              currentChunk.chunkCRC.Sum32(),
 			blockCount:              currentChunk.blockCount,
-		}
-		if _, err := payloadSink.Write(compressed); err != nil {
-			return xerrors.Errorf("failed to write compressed CSCB chunk: %w", err)
 		}
 		chunkRecords = append(chunkRecords, record)
 		currentChunk = nil
@@ -198,43 +205,45 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 		}
 		prevHeight = metadata.Height
 
-		raw, err := readPayload(ctx, payload)
+		payloadLength, err := validatePayloadSource(payload)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to read CSCB payload at height %d: %w", metadata.Height, err)
+			return nil, xerrors.Errorf("invalid CSCB payload at height %d: %w", metadata.Height, err)
 		}
-		if len(raw) == 0 {
-			return nil, xerrors.Errorf("CSCB payload cannot be empty (height=%d)", metadata.Height)
-		}
-		if err := validateAdd(totalUncompressed, uint64(len(raw)), uint64(len(blocks)), cfg.MaxUncompressedBytes); err != nil {
+		if err := validateAdd(totalUncompressed, payloadLength, uint64(len(blocks)), cfg.MaxUncompressedBytes); err != nil {
 			return nil, err
 		}
 
-		if currentChunk != nil && shouldFlushChunk(currentChunk, uint64(len(raw)), cfg) {
+		if currentChunk != nil && shouldFlushChunk(currentChunk, payloadLength, cfg) {
 			if err := flushChunk(); err != nil {
 				return nil, err
 			}
 		}
 		if currentChunk == nil {
-			currentChunk = &chunkBuilder{
-				index:              uint32(len(chunkRecords)),
-				startHeight:        metadata.Height,
-				uncompressedOffset: logicalOffset,
+			var err error
+			currentChunk, err = newChunkBuilder(
+				uint32(len(chunkRecords)),
+				metadata.Height,
+				logicalOffset,
+				payloadSink.size,
+				payloadSink,
+				cfg,
+			)
+			if err != nil {
+				return nil, err
 			}
 		}
 
-		chunkRelativeOffset := uint64(currentChunk.raw.Len())
-		if _, err := currentChunk.raw.Write(raw); err != nil {
-			return nil, xerrors.Errorf("failed to buffer CSCB chunk: %w", err)
-		}
-		if _, err := payloadCRC.Write(raw); err != nil {
-			return nil, xerrors.Errorf("failed to compute CSCB payload crc: %w", err)
+		chunkRelativeOffset := currentChunk.uncompressedLength
+		blockCRC := crc32.NewIEEE()
+		if err := writePayload(ctx, payload, payloadLength, currentChunk.writer, payloadCRC, currentChunk.chunkCRC, blockCRC); err != nil {
+			return nil, xerrors.Errorf("failed to write CSCB payload at height %d: %w", metadata.Height, err)
 		}
 		hashDigest := sha256.Sum256([]byte(metadata.Hash))
 		blockRecords = append(blockRecords, blockRecord{
 			height:               metadata.Height,
 			logicalPayloadOffset: logicalOffset,
-			payloadLength:        uint64(len(raw)),
-			payloadCRC32:         crc32.ChecksumIEEE(raw),
+			payloadLength:        payloadLength,
+			payloadCRC32:         blockCRC.Sum32(),
 			chunkIndex:           currentChunk.index,
 			chunkRelativeOffset:  chunkRelativeOffset,
 			hashSHA256:           hashDigest,
@@ -246,11 +255,12 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 			Hash:               metadata.Hash,
 			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			ByteOffset:         logicalOffset,
-			ByteLength:         uint64(len(raw)),
-			UncompressedLength: uint64(len(raw)),
+			ByteLength:         payloadLength,
+			UncompressedLength: payloadLength,
 		})
-		logicalOffset += uint64(len(raw))
-		totalUncompressed += uint64(len(raw))
+		logicalOffset += payloadLength
+		totalUncompressed += payloadLength
+		currentChunk.uncompressedLength += payloadLength
 		currentChunk.blockCount++
 		currentChunk.endHeight = metadata.Height + 1
 	}
@@ -334,30 +344,40 @@ func validateConfig(cfg EncodeConfig) error {
 	if cfg.ShardSize == 0 {
 		return xerrors.New("CSCB shard_size must be positive")
 	}
+	if cfg.MemoryBudgetBytes != nil && *cfg.MemoryBudgetBytes == 0 {
+		return xerrors.New("CSCB memory_budget_bytes must be positive when set")
+	}
 	return nil
 }
 
-func readPayload(ctx context.Context, payload internal.ConsolidatedBlockPayload) ([]byte, error) {
+func validatePayloadSource(payload internal.ConsolidatedBlockPayload) (uint64, error) {
 	if payload.RawBlockPayload == nil {
-		return nil, xerrors.New("raw block payload source is required")
-	}
-	reader, err := payload.RawBlockPayload.Open(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = reader.Close() }()
-	raw, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
+		return 0, xerrors.New("raw block payload source is required")
 	}
 	expected := payload.RawBlockPayload.Length()
-	if expected != uint64(len(raw)) {
-		return nil, xerrors.Errorf("payload length mismatch: read %d want %d", len(raw), expected)
+	if expected == 0 {
+		return 0, xerrors.New("raw block payload source cannot be empty")
 	}
-	if payload.UncompressedLength != 0 && payload.UncompressedLength != uint64(len(raw)) {
-		return nil, xerrors.Errorf("uncompressed length mismatch: payload=%d source=%d", payload.UncompressedLength, len(raw))
+	if payload.UncompressedLength != 0 && payload.UncompressedLength != expected {
+		return 0, xerrors.Errorf("uncompressed length mismatch: payload=%d source=%d", payload.UncompressedLength, expected)
 	}
-	return raw, nil
+	return expected, nil
+}
+
+func writePayload(ctx context.Context, payload internal.ConsolidatedBlockPayload, expected uint64, writers ...io.Writer) error {
+	reader, err := payload.RawBlockPayload.Open(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = reader.Close() }()
+	copied, err := io.Copy(io.MultiWriter(writers...), reader)
+	if err != nil {
+		return err
+	}
+	if uint64(copied) != expected {
+		return xerrors.Errorf("payload length mismatch: read %d want %d", copied, expected)
+	}
+	return nil
 }
 
 func validateAdd(current uint64, next uint64, blockCount uint64, limit uint64) error {
@@ -377,7 +397,7 @@ func shouldFlushChunk(chunk *chunkBuilder, nextPayloadLength uint64, cfg EncodeC
 	if uint64(chunk.blockCount) >= cfg.CompressionChunkBlocks {
 		return true
 	}
-	if cfg.MemoryBudgetBytes != nil && chunk.blockCount > 0 && uint64(chunk.raw.Len())+nextPayloadLength > *cfg.MemoryBudgetBytes {
+	if chunk.blockCount > 0 && chunk.uncompressedLength+nextPayloadLength > effectiveMemoryBudget(cfg.MemoryBudgetBytes) {
 		return true
 	}
 	if cfg.MaxChunkUncompressedBytes == nil {
@@ -386,24 +406,32 @@ func shouldFlushChunk(chunk *chunkBuilder, nextPayloadLength uint64, cfg EncodeC
 	if chunk.blockCount == 0 {
 		return false
 	}
-	return uint64(chunk.raw.Len())+nextPayloadLength > *cfg.MaxChunkUncompressedBytes
+	return chunk.uncompressedLength+nextPayloadLength > *cfg.MaxChunkUncompressedBytes
 }
 
-func compressChunk(raw []byte, codec api.Compression, level int, windowLog *int) ([]byte, error) {
+func newChunkBuilder(index uint32, startHeight uint64, uncompressedOffset uint64, compressedPayloadOffset uint64, dst io.Writer, cfg EncodeConfig) (*chunkBuilder, error) {
+	writer, err := newChunkCompressor(dst, cfg.Codec, cfg.CodecLevel, cfg.ZstdLongDistanceWindowLog)
+	if err != nil {
+		return nil, err
+	}
+	return &chunkBuilder{
+		index:                   index,
+		startHeight:             startHeight,
+		compressedPayloadOffset: compressedPayloadOffset,
+		uncompressedOffset:      uncompressedOffset,
+		chunkCRC:                crc32.NewIEEE(),
+		writer:                  writer,
+	}, nil
+}
+
+func newChunkCompressor(dst io.Writer, codec api.Compression, level int, windowLog *int) (io.WriteCloser, error) {
 	switch codec {
 	case api.Compression_GZIP:
-		var buf bytes.Buffer
-		writer, err := gzip.NewWriterLevel(&buf, level)
+		writer, err := gzip.NewWriterLevel(dst, level)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to create gzip writer: %w", err)
 		}
-		if _, err := writer.Write(raw); err != nil {
-			return nil, xerrors.Errorf("failed to write gzip CSCB chunk: %w", err)
-		}
-		if err := writer.Close(); err != nil {
-			return nil, xerrors.Errorf("failed to close gzip CSCB chunk: %w", err)
-		}
-		return buf.Bytes(), nil
+		return writer, nil
 	case api.Compression_ZSTD:
 		opts := []zstd.EOption{
 			zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
@@ -413,12 +441,11 @@ func compressChunk(raw []byte, codec api.Compression, level int, windowLog *int)
 		if windowLog != nil {
 			opts = append(opts, zstd.WithWindowSize(1<<uint(*windowLog)))
 		}
-		writer, err := zstd.NewWriter(nil, opts...)
+		writer, err := zstd.NewWriter(dst, opts...)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to create zstd writer: %w", err)
 		}
-		defer func() { _ = writer.Close() }()
-		return writer.EncodeAll(raw, nil), nil
+		return writer, nil
 	default:
 		return nil, xerrors.Errorf("unsupported CSCB codec: %v", codec)
 	}
@@ -532,7 +559,7 @@ func codecSuffix(codec api.Compression) string {
 
 func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope []byte, payload *spillBuffer) (*Object, error) {
 	length := uint64(len(header)+len(envelope)) + payload.size
-	if payload.inMemory() && (memoryBudget == nil || length <= *memoryBudget) {
+	if payload.inMemory() && length <= effectiveMemoryBudget(memoryBudget) {
 		data := make([]byte, 0, length)
 		data = append(data, header...)
 		data = append(data, envelope...)
@@ -612,7 +639,7 @@ func shardBounds(height uint64, shardSize uint64) (uint64, uint64) {
 
 type spillBuffer struct {
 	dir   string
-	limit *uint64
+	limit uint64
 	buf   bytes.Buffer
 	file  *os.File
 	size  uint64
@@ -621,12 +648,12 @@ type spillBuffer struct {
 func newSpillBuffer(dir string, limit *uint64) (*spillBuffer, error) {
 	return &spillBuffer{
 		dir:   dir,
-		limit: limit,
+		limit: effectiveMemoryBudget(limit),
 	}, nil
 }
 
 func (b *spillBuffer) Write(p []byte) (int, error) {
-	if b.file == nil && b.limit != nil && uint64(b.buf.Len()+len(p)) > *b.limit {
+	if b.file == nil && uint64(b.buf.Len()+len(p)) > b.limit {
 		file, err := createTemp(b.dir, "chainstorage-cscb-payload-*.tmp")
 		if err != nil {
 			return 0, xerrors.Errorf("failed to create CSCB payload temp file: %w", err)
@@ -671,6 +698,13 @@ func (b *spillBuffer) cleanup() {
 	name := b.file.Name()
 	_ = b.file.Close()
 	_ = os.Remove(name)
+}
+
+func effectiveMemoryBudget(limit *uint64) uint64 {
+	if limit == nil {
+		return defaultMemoryBudgetBytes
+	}
+	return *limit
 }
 
 func spillDir(dir string) string {

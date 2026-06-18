@@ -52,7 +52,7 @@ type (
 	BlobStorage interface {
 		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
 		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
-		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload, compression api.Compression) (string, []BlockPlacement, error)
+		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}

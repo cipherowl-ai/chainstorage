@@ -11,9 +11,9 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
 
@@ -49,13 +49,15 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 				require.True(strings.HasPrefix(*input.Key, "BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/consolidated/v=7/shard=00000000000000000000-00000000000000010000/00000000000000000100-00000000000000000102-"))
 				return nil, &awss3types.NotFound{}
 			}),
-		uploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
-			DoAndReturn(func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*manager.Uploader)) (*manager.UploadOutput, error) {
+		client.EXPECT().PutObject(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*awss3.Options)) (*awss3.PutObjectOutput, error) {
 				require.NotNil(input.Bucket)
 				require.NotEmpty(*input.Bucket)
 				require.NotNil(input.Key)
 				require.NotNil(input.Body)
 				require.NotNil(input.ContentMD5)
+				require.NotNil(input.IfNoneMatch)
+				require.Equal("*", *input.IfNoneMatch)
 				require.Equal(awss3types.ObjectCannedACLBucketOwnerFullControl, input.ACL)
 				require.Equal("cscb", input.Metadata[cscbMetadataFormat])
 				require.Equal("batch-chunked", input.Metadata[cscbMetadataCompressionScope])
@@ -64,11 +66,6 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 
 				body, err := io.ReadAll(input.Body)
 				require.NoError(err)
-				var mgr manager.Uploader
-				for _, opt := range opts {
-					opt(&mgr)
-				}
-				require.Greater(mgr.PartSize, int64(len(body)))
 				sum := sha256.Sum256(body)
 				md5Sum := md5.Sum(body)
 				uploadedKey = *input.Key
@@ -77,7 +74,7 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 				require.Equal(uploadedSHA, input.Metadata[cscbMetadataSHA256])
 				require.Contains(uploadedKey, uploadedSHA)
 				require.Equal(base64.StdEncoding.EncodeToString(md5Sum[:]), *input.ContentMD5)
-				return &manager.UploadOutput{}, nil
+				return &awss3.PutObjectOutput{}, nil
 			}),
 		client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
 			DoAndReturn(func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
@@ -103,7 +100,7 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	)
 	defer app.Close()
 
-	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads(), api.Compression_ZSTD)
+	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
 	require.NoError(err)
 	require.Equal(uploadedKey, objectKey)
 	require.Len(placements, 2)
@@ -128,6 +125,7 @@ func TestBlobStorage_UploadConsolidated_AcceptsExistingExactObject(t *testing.T)
 	uploader := s3mocks.NewMockUploader(ctrl)
 	client := s3mocks.NewMockClient(ctrl)
 	uploader.EXPECT().Upload(gomock.Any(), gomock.Any()).Times(0)
+	client.EXPECT().PutObject(gomock.Any(), gomock.Any()).Times(0)
 	client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
 			require.Equal(expected.Key, *input.Key)
@@ -151,7 +149,7 @@ func TestBlobStorage_UploadConsolidated_AcceptsExistingExactObject(t *testing.T)
 	)
 	defer app.Close()
 
-	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads(), api.Compression_ZSTD)
+	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
 	require.NoError(err)
 	require.Equal(expected.Key, objectKey)
 	require.Len(placements, 2)
@@ -168,6 +166,7 @@ func TestBlobStorage_UploadConsolidated_RejectsExistingDifferentObject(t *testin
 	uploader := s3mocks.NewMockUploader(ctrl)
 	client := s3mocks.NewMockClient(ctrl)
 	uploader.EXPECT().Upload(gomock.Any(), gomock.Any()).Times(0)
+	client.EXPECT().PutObject(gomock.Any(), gomock.Any()).Times(0)
 	client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
 		DoAndReturn(func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
 			return &awss3.HeadObjectOutput{
@@ -190,9 +189,57 @@ func TestBlobStorage_UploadConsolidated_RejectsExistingDifferentObject(t *testin
 	)
 	defer app.Close()
 
-	_, _, err := storage.UploadConsolidated(context.Background(), testS3Payloads(), api.Compression_ZSTD)
+	_, _, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
 	require.Error(err)
 	require.Contains(err.Error(), "length mismatch")
+}
+
+func TestBlobStorage_UploadConsolidated_AcceptsConcurrentExactObject(t *testing.T) {
+	require := testutil.Require(t)
+
+	expected, err := cscb.Encode(context.Background(), testS3EncodeConfig(), testS3Payloads())
+	require.NoError(err)
+	defer expected.Close()
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	gomock.InOrder(
+		client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
+			Return(nil, &awss3types.NotFound{}),
+		client.EXPECT().PutObject(gomock.Any(), gomock.Any()).
+			Return(nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "object already exists"}),
+		client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
+			DoAndReturn(func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
+				require.Equal(expected.Key, *input.Key)
+				return &awss3.HeadObjectOutput{
+					ContentLength: aws.Int64(int64(expected.Length)),
+					Metadata: map[string]string{
+						cscbMetadataSHA256: expected.SHA256,
+					},
+				}, nil
+			}),
+	)
+
+	var storage internal.BlobStorage
+	app := testapp.New(
+		t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
+		fx.Provide(New),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
+	require.NoError(err)
+	require.Equal(expected.Key, objectKey)
+	require.Len(placements, 2)
 }
 
 func testS3EncodeConfig() cscb.EncodeConfig {
