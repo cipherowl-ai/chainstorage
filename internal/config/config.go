@@ -791,6 +791,9 @@ func (c *Config) validateConsolidationConfig() error {
 	if consolidation.MemoryBudgetBytes != nil && *consolidation.MemoryBudgetBytes == 0 {
 		return xerrors.New("consolidation memory_budget_bytes must be positive when set")
 	}
+	if consolidation.LocalSpillMaxBytes != nil && *consolidation.LocalSpillMaxBytes == 0 {
+		return xerrors.New("consolidation local_spill_max_bytes must be positive when set")
+	}
 	if consolidation.FlushInterval <= 0 {
 		return xerrors.New("consolidation flush_interval must be positive")
 	}

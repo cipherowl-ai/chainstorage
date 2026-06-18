@@ -143,6 +143,21 @@ func TestEncodeCSCB_SpillsWhenMemoryBudgetExceeded(t *testing.T) {
 	require.True(os.IsNotExist(err))
 }
 
+func TestEncodeCSCB_EnforcesLocalSpillMaxBytes(t *testing.T) {
+	require := testutil.Require(t)
+
+	memoryBudget := uint64(1)
+	localSpillMaxBytes := uint64(1)
+	cfg := testEncodeConfig(api.Compression_GZIP)
+	cfg.MemoryBudgetBytes = &memoryBudget
+	cfg.LocalSpillMaxBytes = &localSpillMaxBytes
+	cfg.LocalSpillDir = t.TempDir()
+
+	_, err := Encode(context.Background(), cfg, testPayloads())
+	require.Error(err)
+	require.Contains(err.Error(), "local_spill_max_bytes")
+}
+
 func testEncodeConfig(codec api.Compression) EncodeConfig {
 	return EncodeConfig{
 		Blockchain:             common.Blockchain_BLOCKCHAIN_SOLANA,

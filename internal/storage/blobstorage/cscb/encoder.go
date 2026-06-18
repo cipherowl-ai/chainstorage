@@ -61,6 +61,7 @@ type (
 		ShardSize                 uint64
 		MemoryBudgetBytes         *uint64
 		LocalSpillDir             string
+		LocalSpillMaxBytes        *uint64
 	}
 
 	Object struct {
@@ -73,6 +74,8 @@ type (
 
 		data     []byte
 		tempFile string
+		limiter  *spillLimiter
+		diskSize uint64
 	}
 
 	blockRecord struct {
@@ -130,7 +133,8 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 	startHeight := first.Height
 	shardStart, shardEnd := shardBounds(startHeight, cfg.ShardSize)
 
-	payloadSink, err := newSpillBuffer(cfg.LocalSpillDir, cfg.MemoryBudgetBytes)
+	limiter := newSpillLimiter(cfg.LocalSpillMaxBytes)
+	payloadSink, err := newSpillBuffer(cfg.LocalSpillDir, cfg.MemoryBudgetBytes, limiter)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +285,7 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 	payloadOffset := uint64(HeaderSize + len(envelope))
 	applyAbsoluteChunkOffsets(envelope, len(blockRecords), payloadOffset)
 	header := buildHeader(cfg.Codec, uint64(len(blockRecords)), uint64(len(chunkRecords)), startHeight, endHeight, envelope, payloadCompressedLength, totalUncompressed, payloadCRC)
-	object, err := materializeObject(cfg.LocalSpillDir, cfg.MemoryBudgetBytes, header, envelope, payloadSink)
+	object, err := materializeObject(cfg.LocalSpillDir, cfg.MemoryBudgetBytes, header, envelope, payloadSink, limiter)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +321,10 @@ func (o *Object) Close() error {
 	}
 	err := os.Remove(o.tempFile)
 	o.tempFile = ""
+	if o.limiter != nil {
+		o.limiter.release(o.diskSize)
+		o.diskSize = 0
+	}
 	return err
 }
 
@@ -346,6 +354,9 @@ func validateConfig(cfg EncodeConfig) error {
 	}
 	if cfg.MemoryBudgetBytes != nil && *cfg.MemoryBudgetBytes == 0 {
 		return xerrors.New("CSCB memory_budget_bytes must be positive when set")
+	}
+	if cfg.LocalSpillMaxBytes != nil && *cfg.LocalSpillMaxBytes == 0 {
+		return xerrors.New("CSCB local_spill_max_bytes must be positive when set")
 	}
 	return nil
 }
@@ -557,7 +568,7 @@ func codecSuffix(codec api.Compression) string {
 	}
 }
 
-func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope []byte, payload *spillBuffer) (*Object, error) {
+func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope []byte, payload *spillBuffer, limiter *spillLimiter) (*Object, error) {
 	length := uint64(len(header)+len(envelope)) + payload.size
 	if payload.inMemory() && length <= effectiveMemoryBudget(memoryBudget) {
 		data := make([]byte, 0, length)
@@ -572,8 +583,12 @@ func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope
 		}, nil
 	}
 
+	if err := limiter.reserve(length); err != nil {
+		return nil, err
+	}
 	file, err := createTemp(dir, "chainstorage-cscb-object-*.tmp")
 	if err != nil {
+		limiter.release(length)
 		return nil, xerrors.Errorf("failed to create CSCB object temp file: %w", err)
 	}
 	var success bool
@@ -581,6 +596,7 @@ func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope
 		if !success {
 			_ = file.Close()
 			_ = os.Remove(file.Name())
+			limiter.release(length)
 		}
 	}()
 
@@ -611,6 +627,8 @@ func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope
 		SHA256:   hex.EncodeToString(sha.Sum(nil)),
 		Length:   length,
 		tempFile: file.Name(),
+		limiter:  limiter,
+		diskSize: length,
 	}, nil
 }
 
@@ -638,29 +656,37 @@ func shardBounds(height uint64, shardSize uint64) (uint64, uint64) {
 }
 
 type spillBuffer struct {
-	dir   string
-	limit uint64
-	buf   bytes.Buffer
-	file  *os.File
-	size  uint64
+	dir      string
+	limit    uint64
+	limiter  *spillLimiter
+	buf      bytes.Buffer
+	file     *os.File
+	size     uint64
+	diskSize uint64
 }
 
-func newSpillBuffer(dir string, limit *uint64) (*spillBuffer, error) {
+func newSpillBuffer(dir string, limit *uint64, limiter *spillLimiter) (*spillBuffer, error) {
 	return &spillBuffer{
-		dir:   dir,
-		limit: effectiveMemoryBudget(limit),
+		dir:     dir,
+		limit:   effectiveMemoryBudget(limit),
+		limiter: limiter,
 	}, nil
 }
 
 func (b *spillBuffer) Write(p []byte) (int, error) {
 	if b.file == nil && uint64(b.buf.Len()+len(p)) > b.limit {
+		if err := b.reserveDisk(uint64(b.buf.Len())); err != nil {
+			return 0, err
+		}
 		file, err := createTemp(b.dir, "chainstorage-cscb-payload-*.tmp")
 		if err != nil {
+			b.releaseDisk()
 			return 0, xerrors.Errorf("failed to create CSCB payload temp file: %w", err)
 		}
 		if _, err := file.Write(b.buf.Bytes()); err != nil {
 			_ = file.Close()
 			_ = os.Remove(file.Name())
+			b.releaseDisk()
 			return 0, xerrors.Errorf("failed to spill CSCB payload buffer: %w", err)
 		}
 		b.buf.Reset()
@@ -669,7 +695,14 @@ func (b *spillBuffer) Write(p []byte) (int, error) {
 	var n int
 	var err error
 	if b.file != nil {
+		if err := b.reserveDisk(uint64(len(p))); err != nil {
+			return 0, err
+		}
 		n, err = b.file.Write(p)
+		if n < len(p) {
+			b.limiter.release(uint64(len(p) - n))
+			b.diskSize -= uint64(len(p) - n)
+		}
 	} else {
 		n, err = b.buf.Write(p)
 	}
@@ -698,6 +731,7 @@ func (b *spillBuffer) cleanup() {
 	name := b.file.Name()
 	_ = b.file.Close()
 	_ = os.Remove(name)
+	b.releaseDisk()
 }
 
 func effectiveMemoryBudget(limit *uint64) uint64 {
@@ -705,6 +739,50 @@ func effectiveMemoryBudget(limit *uint64) uint64 {
 		return defaultMemoryBudgetBytes
 	}
 	return *limit
+}
+
+type spillLimiter struct {
+	limit *uint64
+	used  uint64
+}
+
+func newSpillLimiter(limit *uint64) *spillLimiter {
+	return &spillLimiter{limit: limit}
+}
+
+func (l *spillLimiter) reserve(n uint64) error {
+	if l == nil || l.limit == nil || n == 0 {
+		return nil
+	}
+	if n > *l.limit || l.used > *l.limit-n {
+		return xerrors.Errorf("CSCB local spill bytes would exceed local_spill_max_bytes %d", *l.limit)
+	}
+	l.used += n
+	return nil
+}
+
+func (l *spillLimiter) release(n uint64) {
+	if l == nil || l.limit == nil || n == 0 {
+		return
+	}
+	if n >= l.used {
+		l.used = 0
+		return
+	}
+	l.used -= n
+}
+
+func (b *spillBuffer) reserveDisk(n uint64) error {
+	if err := b.limiter.reserve(n); err != nil {
+		return err
+	}
+	b.diskSize += n
+	return nil
+}
+
+func (b *spillBuffer) releaseDisk() {
+	b.limiter.release(b.diskSize)
+	b.diskSize = 0
 }
 
 func spillDir(dir string) string {

@@ -229,6 +229,7 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		ShardSize:                 consolidation.ShardSize,
 		MemoryBudgetBytes:         consolidation.MemoryBudgetBytes,
 		LocalSpillDir:             consolidation.LocalSpillDir,
+		LocalSpillMaxBytes:        consolidation.LocalSpillMaxBytes,
 	}, blocks)
 	if err != nil {
 		return "", nil, err
