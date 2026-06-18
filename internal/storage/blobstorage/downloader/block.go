@@ -270,11 +270,13 @@ func (c *blockDownloaderImpl) logDuration(start time.Time) {
 	)
 }
 
-// DownloadStream streams the compressed HTTP body through a
-// decompressor directly into a local spool file and returns a
-// chain-agnostic SpooledBlock handle over that file. The spool
-// persists until SpooledBlock.Close() is called — callers MUST
-// close it.
+// DownloadStream spools decompressed block bytes to a local file and
+// returns a chain-agnostic SpooledBlock handle over that file. Legacy
+// block objects stream the compressed HTTP body through a decompressor
+// directly into the spool. CSCB objects range-read the target
+// compressed chunk, decode and validate that one chunk in memory, and
+// spool only the requested block payload. The spool persists until
+// SpooledBlock.Close() is called — callers MUST close it.
 //
 // There is only ONE tempfile per call (the decompressed spool). HTTP
 // retries truncate + rewind the spool and reissue the GET. This keeps
@@ -353,12 +355,14 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 }
 
 // spoolDecompressedToFile performs a (retryable) HTTP GET, wraps the
-// response body in the appropriate decompressor, and streams the
-// decompressed bytes to dst. The file is truncated + rewound on each
-// retry attempt. This combines download + decompression into a single
-// pass with only one tempfile, reducing per-block disk churn under
-// concurrent loads compared to separate compressed + decompressed
-// spools.
+// response body in the appropriate decompressor, and writes the
+// decompressed block payload to dst. Legacy objects are streamed into
+// dst. CSCB objects buffer one decompressed chunk in memory for chunk
+// CRC validation, then write only the requested block payload to dst.
+// The file is truncated + rewound on each retry attempt. This combines
+// download + decompression into a single pass with only one tempfile,
+// reducing per-block I/O cost under concurrent workloads compared to
+// separate compressed + decompressed spools.
 func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, blockFile *api.BlockFile, dst *os.File) error {
 	if isCSCBBlockFile(blockFile) {
 		payload, err := d.downloadCSCBBlockPayload(ctx, blockFile)
@@ -457,27 +461,34 @@ func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, fileURL stri
 	}
 	sort.Ints(chunkIndexes)
 
+	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(d.downloadWorkerLimit()))
 	for _, chunkIndex := range chunkIndexes {
 		downloads := downloadsByChunk[uint32(chunkIndex)]
-		chunk := downloads[0].chunk
-		chunkPayload, err := d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
-		if err != nil {
-			return err
-		}
-		if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
-			return err
-		}
-		for _, download := range downloads {
-			blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
+		group.Go(func() error {
+			chunk := downloads[0].chunk
+			chunkPayload, err := d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
 			if err != nil {
 				return err
 			}
-			block, err := unmarshalCSCBBlock(download.ref.blockFile, blockPayload)
-			if err != nil {
+			if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
 				return err
 			}
-			result[download.ref.index] = block
-		}
+			for _, download := range downloads {
+				blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
+				if err != nil {
+					return err
+				}
+				block, err := unmarshalCSCBBlock(download.ref.blockFile, blockPayload)
+				if err != nil {
+					return err
+				}
+				result[download.ref.index] = block
+			}
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return err
 	}
 	return nil
 }

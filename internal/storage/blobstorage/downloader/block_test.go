@@ -84,7 +84,9 @@ func (s *blockDownloaderTestSuite) SetupTest() {
 }
 
 func (s *blockDownloaderTestSuite) TearDownTest() {
-	s.httpServer.Close()
+	if s.httpServer != nil {
+		s.httpServer.Close()
+	}
 	s.app.Close()
 }
 
@@ -346,7 +348,7 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBGroupsByChunk() {
 	}
 
 	ranges := recorder.rangesSnapshot()
-	require.Equal([]string{
+	require.ElementsMatch([]string{
 		"bytes=0-65535",
 		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
 		rangeHeader(fixture.index.Chunks[1].CompressedPayloadOffset, fixture.index.Chunks[1].CompressedLength),
