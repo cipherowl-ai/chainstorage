@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/suite"
@@ -16,6 +17,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
 	blobstorageinternal "github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
@@ -355,6 +357,46 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBGroupsByChunk() {
 	}, ranges)
 }
 
+func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBLimitsConcurrencyAcrossFiles() {
+	require := testutil.Require(s.T())
+	const workerLimit = 2
+
+	fixtureA := newCSCBDownloaderFixture(s.T(), 4, 1)
+	defer fixtureA.close()
+	fixtureB := newCSCBDownloaderFixture(s.T(), 4, 1)
+	defer fixtureB.close()
+	tracker := &rangeConcurrencyTracker{}
+
+	serverA, _ := newRangeHTTPServerWithTracker(fixtureA.data, tracker, 20*time.Millisecond)
+	defer serverA.Close()
+	serverB, _ := newRangeHTTPServerWithTracker(fixtureB.data, tracker, 20*time.Millisecond)
+	defer serverB.Close()
+	for _, file := range fixtureA.blockFiles {
+		file.FileUrl = serverA.URL
+	}
+	for _, file := range fixtureB.blockFiles {
+		file.FileUrl = serverB.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Invoke(func(cfg *config.Config) {
+			cfg.SDK.NumWorkers = workerLimit
+			cfg.Api.NumWorkers = workerLimit
+		}),
+		fx.Provide(func() HTTPClient { return serverA.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	blockFiles := append([]*api.BlockFile{}, fixtureA.blockFiles...)
+	blockFiles = append(blockFiles, fixtureB.blockFiles...)
+	rawBlocks, err := s.downloader.DownloadMany(context.Background(), blockFiles)
+	require.NoError(err)
+	require.Len(rawBlocks, len(blockFiles))
+	require.LessOrEqual(tracker.peakActive(), workerLimit)
+}
+
 func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesOrder() {
 	require := testutil.Require(s.T())
 	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
@@ -560,12 +602,27 @@ func (f *cscbDownloaderFixture) close() {
 }
 
 type rangeRequestRecorder struct {
+	mu      sync.Mutex
+	ranges  []string
+	tracker *rangeConcurrencyTracker
+	delay   time.Duration
+}
+
+type rangeConcurrencyTracker struct {
 	mu     sync.Mutex
-	ranges []string
+	active int
+	peak   int
 }
 
 func newRangeHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
-	recorder := &rangeRequestRecorder{}
+	return newRangeHTTPServerWithTracker(data, nil, 0)
+}
+
+func newRangeHTTPServerWithTracker(data []byte, tracker *rangeConcurrencyTracker, delay time.Duration) (*httptest.Server, *rangeRequestRecorder) {
+	recorder := &rangeRequestRecorder{
+		tracker: tracker,
+		delay:   delay,
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
@@ -573,7 +630,11 @@ func newRangeHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
 		}
 
 		rangeValue := request.Header.Get("Range")
-		recorder.record(rangeValue)
+		done := recorder.record(rangeValue)
+		defer done()
+		if recorder.delay > 0 {
+			time.Sleep(recorder.delay)
+		}
 		if rangeValue == "" {
 			_, _ = writer.Write(data)
 			return
@@ -598,16 +659,40 @@ func newRangeHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
 	return server, recorder
 }
 
-func (r *rangeRequestRecorder) record(rangeValue string) {
+func (r *rangeRequestRecorder) record(rangeValue string) func() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.ranges = append(r.ranges, rangeValue)
+	r.mu.Unlock()
+	if r.tracker == nil {
+		return func() {}
+	}
+	return r.tracker.begin()
 }
 
 func (r *rangeRequestRecorder) rangesSnapshot() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.ranges...)
+}
+
+func (t *rangeConcurrencyTracker) begin() func() {
+	t.mu.Lock()
+	t.active++
+	if t.active > t.peak {
+		t.peak = t.active
+	}
+	t.mu.Unlock()
+	return func() {
+		t.mu.Lock()
+		t.active--
+		t.mu.Unlock()
+	}
+}
+
+func (t *rangeConcurrencyTracker) peakActive() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.peak
 }
 
 func rangeHeader(offset uint64, length uint64) string {

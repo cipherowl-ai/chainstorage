@@ -108,6 +108,8 @@ type (
 		block *cscb.BlockDescriptor
 		chunk *cscb.ChunkDescriptor
 	}
+
+	downloadLimiter chan struct{}
 )
 
 // Close releases the locally-spooled decompressed file. Safe to call
@@ -236,11 +238,17 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 		cscbRefsByURL[fileURL] = append(cscbRefsByURL[fileURL], ref)
 	}
 
-	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(d.downloadWorkerLimit()))
+	limiter := newDownloadLimiter(d.downloadWorkerLimit())
+	group, ctx := syncgroup.New(ctx)
 	for _, ref := range legacyRefs {
 		ref := ref
 		group.Go(func() error {
-			block, err := d.Download(ctx, ref.blockFile)
+			var block *api.Block
+			err := limiter.Do(ctx, func() error {
+				var err error
+				block, err = d.Download(ctx, ref.blockFile)
+				return err
+			})
 			if err != nil {
 				return xerrors.Errorf("failed to download legacy block file (height=%d): %w", ref.blockFile.GetHeight(), err)
 			}
@@ -251,7 +259,7 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 	for fileURL, refs := range cscbRefsByURL {
 		fileURL, refs := fileURL, refs
 		group.Go(func() error {
-			if err := d.downloadCSCBFile(ctx, fileURL, refs, result); err != nil {
+			if err := d.downloadCSCBFile(ctx, limiter, fileURL, refs, result); err != nil {
 				return xerrors.Errorf("failed to download CSCB block file %s: %w", fileURL, err)
 			}
 			return nil
@@ -417,7 +425,7 @@ func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, block
 }
 
 func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, blockFile *api.BlockFile) ([]byte, error) {
-	index, err := d.readCSCBIndex(ctx, blockFile.GetFileUrl())
+	index, err := d.readCSCBIndex(ctx, nil, blockFile.GetFileUrl())
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +433,7 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 	if err != nil {
 		return nil, err
 	}
-	chunkPayload, err := d.downloadCSCBChunk(ctx, blockFile.GetFileUrl(), index.Header.Codec, chunk)
+	chunkPayload, err := d.downloadCSCBChunk(ctx, nil, blockFile.GetFileUrl(), index.Header.Codec, chunk)
 	if err != nil {
 		return nil, err
 	}
@@ -435,8 +443,8 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 	return cscb.ExtractBlockPayload(chunkPayload, block)
 }
 
-func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, fileURL string, refs []downloadRef, result []*api.Block) error {
-	index, err := d.readCSCBIndex(ctx, fileURL)
+func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, limiter downloadLimiter, fileURL string, refs []downloadRef, result []*api.Block) error {
+	index, err := d.readCSCBIndex(ctx, limiter, fileURL)
 	if err != nil {
 		return err
 	}
@@ -461,12 +469,12 @@ func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, fileURL stri
 	}
 	sort.Ints(chunkIndexes)
 
-	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(d.downloadWorkerLimit()))
+	group, ctx := syncgroup.New(ctx)
 	for _, chunkIndex := range chunkIndexes {
 		downloads := downloadsByChunk[uint32(chunkIndex)]
 		group.Go(func() error {
 			chunk := downloads[0].chunk
-			chunkPayload, err := d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
+			chunkPayload, err := d.downloadCSCBChunk(ctx, limiter, fileURL, index.Header.Codec, chunk)
 			if err != nil {
 				return err
 			}
@@ -493,8 +501,8 @@ func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, fileURL stri
 	return nil
 }
 
-func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, fileURL string) (*cscb.Index, error) {
-	first, err := d.readHTTPRange(ctx, fileURL, 0, cscbInitialIndexReadSize-1)
+func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, limiter downloadLimiter, fileURL string) (*cscb.Index, error) {
+	first, err := d.readHTTPRange(ctx, limiter, fileURL, 0, cscbInitialIndexReadSize-1)
 	if err != nil {
 		return nil, err
 	}
@@ -505,7 +513,7 @@ func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, fileURL string)
 	if required <= uint64(len(first)) {
 		return cscb.ParseIndex(first)
 	}
-	remaining, err := d.readHTTPRange(ctx, fileURL, uint64(len(first)), required-1)
+	remaining, err := d.readHTTPRange(ctx, limiter, fileURL, uint64(len(first)), required-1)
 	if err != nil {
 		return nil, err
 	}
@@ -515,8 +523,8 @@ func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, fileURL string)
 	return cscb.ParseIndex(indexData)
 }
 
-func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, fileURL string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
-	compressed, err := d.readHTTPRangeByLength(ctx, fileURL, chunk.CompressedPayloadOffset, chunk.CompressedLength)
+func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, limiter downloadLimiter, fileURL string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+	compressed, err := d.readHTTPRangeByLength(ctx, limiter, fileURL, chunk.CompressedPayloadOffset, chunk.CompressedLength)
 	if err != nil {
 		return nil, err
 	}
@@ -530,7 +538,7 @@ func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, fileURL str
 	return decompressed, nil
 }
 
-func (d *blockDownloaderImpl) readHTTPRangeByLength(ctx context.Context, fileURL string, offset uint64, length uint64) ([]byte, error) {
+func (d *blockDownloaderImpl) readHTTPRangeByLength(ctx context.Context, limiter downloadLimiter, fileURL string, offset uint64, length uint64) ([]byte, error) {
 	if length == 0 {
 		return nil, xerrors.Errorf("empty range read for %s at offset %d", fileURL, offset)
 	}
@@ -538,13 +546,23 @@ func (d *blockDownloaderImpl) readHTTPRangeByLength(ctx context.Context, fileURL
 	if err != nil {
 		return nil, err
 	}
-	return d.readHTTPRange(ctx, fileURL, offset, end)
+	return d.readHTTPRange(ctx, limiter, fileURL, offset, end)
 }
 
-func (d *blockDownloaderImpl) readHTTPRange(ctx context.Context, fileURL string, start uint64, end uint64) ([]byte, error) {
+func (d *blockDownloaderImpl) readHTTPRange(ctx context.Context, limiter downloadLimiter, fileURL string, start uint64, end uint64) ([]byte, error) {
 	if end < start {
 		return nil, xerrors.Errorf("invalid range for %s: start=%d end=%d", fileURL, start, end)
 	}
+	var body []byte
+	err := limiter.Do(ctx, func() error {
+		var err error
+		body, err = d.readHTTPRangeUnthrottled(ctx, fileURL, start, end)
+		return err
+	})
+	return body, err
+}
+
+func (d *blockDownloaderImpl) readHTTPRangeUnthrottled(ctx context.Context, fileURL string, start uint64, end uint64) ([]byte, error) {
 	return d.retryBytes.Retry(ctx, func(ctx context.Context) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 		if err != nil {
@@ -581,6 +599,26 @@ func (d *blockDownloaderImpl) readHTTPRange(ctx context.Context, fileURL string,
 		}
 		return bodyBytes, finalizer.Close()
 	})
+}
+
+func newDownloadLimiter(limit int) downloadLimiter {
+	if limit <= 0 {
+		return nil
+	}
+	return make(downloadLimiter, limit)
+}
+
+func (l downloadLimiter) Do(ctx context.Context, fn func() error) error {
+	if l == nil {
+		return fn()
+	}
+	select {
+	case l <- struct{}{}:
+		defer func() { <-l }()
+		return fn()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func isCSCBBlockFile(blockFile *api.BlockFile) bool {
