@@ -40,7 +40,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/consts"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/log"
-	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
 	"github.com/coinbase/chainstorage/internal/utils/utils"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 	"github.com/coinbase/chainstorage/sdk/services"
@@ -853,27 +852,11 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 }
 
 func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.Block, error) {
-	result := make([]*api.Block, len(blocks))
-	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(int(s.config.Api.NumWorkers)))
-	for i := range blocks {
-		i := i
-		group.Go(func() error {
-			input := blocks[i]
-			output, err := s.blobStorage.Download(ctx, input)
-			if err != nil {
-				return xerrors.Errorf("failed to download from blob storage (input={%+v}): %w", input, err)
-			}
-
-			result[i] = output
-			return nil
-		})
-	}
-
-	if err := group.Wait(); err != nil {
+	output, err := s.blobStorage.DownloadMany(ctx, blocks)
+	if err != nil {
 		return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
 	}
-
-	return result, nil
+	return output, nil
 }
 
 func (s *Server) newAuthContext(ctx context.Context) context.Context {

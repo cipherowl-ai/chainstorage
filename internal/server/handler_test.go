@@ -642,11 +642,16 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_StableTag() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				return block, nil
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				require.Len(metadatas, numBlocks)
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					output[i] = block
+				}
+				return output, nil
 			},
 		),
 	)
@@ -694,11 +699,16 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_LatestTag() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				return block, nil
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				require.Len(metadatas, numBlocks)
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					output[i] = block
+				}
+				return output, nil
 			},
 		),
 	)
@@ -748,14 +758,18 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_DownloadError() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				if block.Metadata.Height == failedHeight {
-					return nil, fmt.Errorf("mock download error")
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					if block.Metadata.Height == failedHeight {
+						return nil, fmt.Errorf("mock download error")
+					}
+					output[i] = block
 				}
-				return block, nil
+				return output, nil
 			},
 		),
 	)
@@ -793,8 +807,8 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_DownloadCancelError() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(
-			func(_ context.Context, _ *api.BlockMetadata) (*api.Block, error) {
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(_ context.Context, _ []*api.BlockMetadata) ([]*api.Block, error) {
 				return nil, storage.ErrRequestCanceled
 			},
 		),
@@ -896,11 +910,16 @@ func (s *handlerTestSuite) TestGetNativeBlocksByRange() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				return block, nil
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				require.Len(metadatas, numBlocks)
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					output[i] = block
+				}
+				return output, nil
 			},
 		),
 		s.parser.EXPECT().ParseNativeBlock(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
@@ -1053,11 +1072,16 @@ func (s *handlerTestSuite) TestGetRosettaBlocksByRange() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				return block, nil
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				require.Len(metadatas, numBlocks)
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					output[i] = block
+				}
+				return output, nil
 			},
 		),
 		s.parser.EXPECT().ParseRosettaBlock(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
@@ -1132,11 +1156,16 @@ func (s *handlerTestSuite) TestGetRosettaBlocksByRange_NotImplemented() {
 				return testutil.MakeBlockMetadata(10000, tag), nil
 			},
 		),
-		s.blobStorage.EXPECT().Download(gomock.Any(), gomock.Any()).Times(numBlocks).DoAndReturn(
-			func(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-				block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
-				require.True(ok)
-				return block, nil
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+				require.Len(metadatas, numBlocks)
+				output := make([]*api.Block, len(metadatas))
+				for i, metadata := range metadatas {
+					block, ok := blocksByObjectKey[metadata.ObjectKeyMain]
+					require.True(ok)
+					output[i] = block
+				}
+				return output, nil
 			},
 		),
 	)
@@ -2643,8 +2672,8 @@ func (s *handlerTestSuite) TestGetNativeTransaction() {
 			GetBlocksByHeights(gomock.Any(), stableTag, gomock.Any()).
 			Return([]*api.BlockMetadata{blockMetadata}, nil),
 		s.blobStorage.EXPECT().
-			Download(gomock.Any(), gomock.Any()).
-			Return(rawBlock, nil),
+			DownloadMany(gomock.Any(), []*api.BlockMetadata{blockMetadata}).
+			Return([]*api.Block{rawBlock}, nil),
 		s.parser.EXPECT().
 			ParseNativeBlock(gomock.Any(), rawBlock).
 			Return(nativeBlock, nil),

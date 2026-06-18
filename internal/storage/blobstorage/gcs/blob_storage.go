@@ -267,6 +267,18 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 	})
 }
 
+func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+	blocks := make([]*api.Block, len(metadatas))
+	for i, metadata := range metadatas {
+		block, err := s.Download(ctx, metadata)
+		if err != nil {
+			return nil, err
+		}
+		blocks[i] = block
+	}
+	return blocks, nil
+}
+
 // PreSign implements internal.BlobStorage.
 func (s *blobStorageImpl) PreSign(ctx context.Context, objectKey string) (string, error) {
 	fileUrl, err := s.client.Bucket(s.bucket).SignedURL(objectKey, &storage.SignedURLOptions{
