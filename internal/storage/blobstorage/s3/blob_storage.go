@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -30,6 +31,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -48,21 +50,33 @@ type (
 	}
 
 	blobStorageImpl struct {
-		logger              *zap.Logger
-		config              *config.Config
-		bucket              string
-		client              s3.Client
-		downloader          s3.Downloader
-		uploader            s3.Uploader
-		blobStorageMetrics  *blobStorageMetrics
-		instrumentUpload    instrument.InstrumentWithResult[string]
-		instrumentUploadRaw instrument.InstrumentWithResult[string]
-		instrumentDownload  instrument.InstrumentWithResult[*api.Block]
+		logger                 *zap.Logger
+		config                 *config.Config
+		bucket                 string
+		client                 s3.Client
+		downloader             s3.Downloader
+		uploader               s3.Uploader
+		blobStorageMetrics     *blobStorageMetrics
+		instrumentUpload       instrument.InstrumentWithResult[string]
+		instrumentUploadRaw    instrument.InstrumentWithResult[string]
+		instrumentDownload     instrument.InstrumentWithResult[*api.Block]
+		instrumentDownloadMany instrument.InstrumentWithResult[[]*api.Block]
 	}
 
 	blobStorageMetrics struct {
 		blobDownloadedSize tally.Timer
 		blobUploadedSize   tally.Timer
+	}
+
+	downloadRef struct {
+		index    int
+		metadata *api.BlockMetadata
+	}
+
+	cscbBlockDownload struct {
+		ref   downloadRef
+		block *cscb.BlockDescriptor
+		chunk *cscb.ChunkDescriptor
 	}
 )
 
@@ -78,6 +92,8 @@ const (
 	cscbMetadataUncompressedLength = "chainstorage-uncompressed-length"
 
 	maxSinglePutObjectSize = 5 * 1024 * 1024 * 1024
+
+	cscbInitialIndexReadSize = 64 * 1024
 )
 
 var _ internal.BlobStorage = (*blobStorageImpl)(nil)
@@ -96,16 +112,17 @@ func New(params BlobStorageParams) (internal.BlobStorage, error) {
 		"storage_type": "s3",
 	})
 	return &blobStorageImpl{
-		logger:              log.WithPackage(params.Logger),
-		config:              params.Config,
-		bucket:              params.Config.AWS.Bucket,
-		client:              params.Client,
-		downloader:          params.Downloader,
-		uploader:            params.Uploader,
-		blobStorageMetrics:  newBlobStorageMetrics(metrics),
-		instrumentUpload:    instrument.NewWithResult[string](metrics, "upload"),
-		instrumentUploadRaw: instrument.NewWithResult[string](metrics, "upload_raw"),
-		instrumentDownload:  instrument.NewWithResult[*api.Block](metrics, "download"),
+		logger:                 log.WithPackage(params.Logger),
+		config:                 params.Config,
+		bucket:                 params.Config.AWS.Bucket,
+		client:                 params.Client,
+		downloader:             params.Downloader,
+		uploader:               params.Uploader,
+		blobStorageMetrics:     newBlobStorageMetrics(metrics),
+		instrumentUpload:       instrument.NewWithResult[string](metrics, "upload"),
+		instrumentUploadRaw:    instrument.NewWithResult[string](metrics, "upload_raw"),
+		instrumentDownload:     instrument.NewWithResult[*api.Block](metrics, "download"),
+		instrumentDownloadMany: instrument.NewWithResult[[]*api.Block](metrics, "download_many"),
 	}, nil
 }
 
@@ -404,51 +421,281 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 		defer s.logDuration("download", time.Now())
 
 		if metadata.Skipped {
-			// No blob data is available when the block is skipped.
-			return &api.Block{
-				Blockchain: s.config.Chain.Blockchain,
-				Network:    s.config.Chain.Network,
-				SideChain:  s.config.Chain.Sidechain,
-				Metadata:   metadata,
-				Blobdata:   nil,
-			}, nil
+			return s.skippedBlock(metadata), nil
 		}
-
-		key := metadata.ObjectKeyMain
-		buf := manager.NewWriteAtBuffer([]byte{})
-
-		size, err := s.downloader.Download(ctx, buf, &awss3.GetObjectInput{
-			Bucket: aws.String(s.bucket),
-			Key:    aws.String(key),
-		})
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return nil, storageerrors.ErrRequestCanceled
-			}
-			return nil, xerrors.Errorf("failed to download from s3 (bucket=%s, key=%s): %w", s.bucket, key, err)
+		if isLegacyBlockObject(metadata) {
+			return s.downloadLegacy(ctx, metadata)
 		}
-
-		// a workaround to use timer
-		s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(size) * time.Millisecond)
-
-		compression := storage_utils.GetCompressionType(key)
-		blockData, err := storage_utils.Decompress(buf.Bytes(), compression)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", compression.String(), err)
-		}
-
-		var block api.Block
-		err = proto.Unmarshal(blockData, &block)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to unmarshal data downloaded from s3 bucket %s key %s: %w", s.bucket, key, err)
-		}
-
-		// When metadata is loaded from meta storage,
-		// the new fields, e.g. ParentHeight, may be populated with default values.
-		// Overwrite metadata using the one loaded from meta storage.
-		block.Metadata = metadata
-		return &block, nil
+		return s.downloadCSCBBlock(ctx, metadata)
 	})
+}
+
+func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+	return s.instrumentDownloadMany.Instrument(ctx, func(ctx context.Context) ([]*api.Block, error) {
+		defer s.logDuration("download_many", time.Now())
+
+		result := make([]*api.Block, len(metadatas))
+		legacyRefs := make([]downloadRef, 0, len(metadatas))
+		cscbRefsByObject := make(map[string][]downloadRef)
+		for i, metadata := range metadatas {
+			if metadata.GetSkipped() {
+				result[i] = s.skippedBlock(metadata)
+				continue
+			}
+			ref := downloadRef{
+				index:    i,
+				metadata: metadata,
+			}
+			if isLegacyBlockObject(metadata) {
+				legacyRefs = append(legacyRefs, ref)
+				continue
+			}
+			key := metadata.GetObjectKeyMain()
+			if key == "" {
+				return nil, xerrors.Errorf("missing CSCB object key for height %d", metadata.GetHeight())
+			}
+			cscbRefsByObject[key] = append(cscbRefsByObject[key], ref)
+		}
+
+		group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(s.downloadWorkerLimit()))
+		for _, ref := range legacyRefs {
+			ref := ref
+			group.Go(func() error {
+				block, err := s.Download(ctx, ref.metadata)
+				if err != nil {
+					return xerrors.Errorf("failed to download legacy block (input={%+v}): %w", ref.metadata, err)
+				}
+				result[ref.index] = block
+				return nil
+			})
+		}
+		for key, refs := range cscbRefsByObject {
+			key, refs := key, refs
+			group.Go(func() error {
+				if err := s.downloadCSCBObject(ctx, key, refs, result); err != nil {
+					return xerrors.Errorf("failed to download CSCB object %s: %w", key, err)
+				}
+				return nil
+			})
+		}
+		if err := group.Wait(); err != nil {
+			return nil, err
+		}
+		return result, nil
+	})
+}
+
+func (s *blobStorageImpl) skippedBlock(metadata *api.BlockMetadata) *api.Block {
+	return &api.Block{
+		Blockchain: s.config.Chain.Blockchain,
+		Network:    s.config.Chain.Network,
+		SideChain:  s.config.Chain.Sidechain,
+		Metadata:   metadata,
+		Blobdata:   nil,
+	}
+}
+
+func isLegacyBlockObject(metadata *api.BlockMetadata) bool {
+	return metadata.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH || metadata.GetByteLength() == 0
+}
+
+func (s *blobStorageImpl) downloadWorkerLimit() int {
+	limit := int(s.config.Api.NumWorkers)
+	if limit <= 0 {
+		return 1
+	}
+	return limit
+}
+
+func (s *blobStorageImpl) downloadLegacy(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+	key := metadata.ObjectKeyMain
+	buf := manager.NewWriteAtBuffer([]byte{})
+
+	size, err := s.downloader.Download(ctx, buf, &awss3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, storageerrors.ErrRequestCanceled
+		}
+		return nil, xerrors.Errorf("failed to download from s3 (bucket=%s, key=%s): %w", s.bucket, key, err)
+	}
+
+	// a workaround to use timer
+	s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(size) * time.Millisecond)
+
+	compression := storage_utils.GetCompressionType(key)
+	blockData, err := storage_utils.Decompress(buf.Bytes(), compression)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", compression.String(), err)
+	}
+
+	return unmarshalBlockData(s.bucket, key, metadata, blockData)
+}
+
+func (s *blobStorageImpl) downloadCSCBBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+	result := make([]*api.Block, 1)
+	ref := downloadRef{
+		index:    0,
+		metadata: metadata,
+	}
+	if err := s.downloadCSCBObject(ctx, metadata.GetObjectKeyMain(), []downloadRef{ref}, result); err != nil {
+		return nil, err
+	}
+	return result[0], nil
+}
+
+func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, key string, refs []downloadRef, result []*api.Block) error {
+	index, err := s.readCSCBIndex(ctx, key)
+	if err != nil {
+		return err
+	}
+
+	downloadsByChunk := make(map[uint32][]cscbBlockDownload)
+	for _, ref := range refs {
+		block, chunk, err := index.LookupBlock(ref.metadata)
+		if err != nil {
+			return err
+		}
+		downloadsByChunk[chunk.Index] = append(downloadsByChunk[chunk.Index], cscbBlockDownload{
+			ref:   ref,
+			block: block,
+			chunk: chunk,
+		})
+	}
+
+	chunkIndexes := make([]int, 0, len(downloadsByChunk))
+	for chunkIndex := range downloadsByChunk {
+		chunkIndexes = append(chunkIndexes, int(chunkIndex))
+	}
+	sort.Ints(chunkIndexes)
+
+	for _, chunkIndex := range chunkIndexes {
+		downloads := downloadsByChunk[uint32(chunkIndex)]
+		chunk := downloads[0].chunk
+		chunkPayload, err := s.downloadCSCBChunk(ctx, key, index.Header.Codec, chunk)
+		if err != nil {
+			return err
+		}
+		if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
+			return err
+		}
+		for _, download := range downloads {
+			blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
+			if err != nil {
+				return err
+			}
+			block, err := unmarshalBlockData(s.bucket, key, download.ref.metadata, blockPayload)
+			if err != nil {
+				return err
+			}
+			result[download.ref.index] = block
+		}
+	}
+	return nil
+}
+
+func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, key string) (*cscb.Index, error) {
+	first, err := s.readObjectRange(ctx, key, 0, cscbInitialIndexReadSize-1)
+	if err != nil {
+		return nil, err
+	}
+	required, err := cscb.HeaderEnvelopeLength(first)
+	if err != nil {
+		return nil, err
+	}
+	if required <= uint64(len(first)) {
+		return cscb.ParseIndex(first)
+	}
+	remaining, err := s.readObjectRange(ctx, key, uint64(len(first)), required-1)
+	if err != nil {
+		return nil, err
+	}
+	indexData := make([]byte, 0, required)
+	indexData = append(indexData, first...)
+	indexData = append(indexData, remaining...)
+	return cscb.ParseIndex(indexData)
+}
+
+func (s *blobStorageImpl) downloadCSCBChunk(ctx context.Context, key string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+	compressed, err := s.readObjectRangeByLength(ctx, key, chunk.CompressedPayloadOffset, chunk.CompressedLength)
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(compressed)) != chunk.CompressedLength {
+		return nil, xerrors.Errorf("CSCB compressed chunk length mismatch: got %d want %d", len(compressed), chunk.CompressedLength)
+	}
+	decompressed, err := cscb.DecodeChunkFrame(bytes.NewReader(compressed), codec)
+	if err != nil {
+		return nil, err
+	}
+	return decompressed, nil
+}
+
+func (s *blobStorageImpl) readObjectRangeByLength(ctx context.Context, key string, offset uint64, length uint64) ([]byte, error) {
+	if length == 0 {
+		return nil, xerrors.Errorf("empty range read for key %s at offset %d", key, offset)
+	}
+	end, err := inclusiveRangeEnd(offset, length)
+	if err != nil {
+		return nil, err
+	}
+	return s.readObjectRange(ctx, key, offset, end)
+}
+
+func (s *blobStorageImpl) readObjectRange(ctx context.Context, key string, start uint64, end uint64) ([]byte, error) {
+	if end < start {
+		return nil, xerrors.Errorf("invalid range for key %s: start=%d end=%d", key, start, end)
+	}
+	output, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, storageerrors.ErrRequestCanceled
+		}
+		return nil, xerrors.Errorf("failed to range download from s3 (bucket=%s, key=%s, range=bytes=%d-%d): %w", s.bucket, key, start, end, err)
+	}
+	if output.Body == nil {
+		return nil, xerrors.Errorf("empty s3 body (bucket=%s, key=%s, range=bytes=%d-%d)", s.bucket, key, start, end)
+	}
+	defer func() { _ = output.Body.Close() }()
+	data, err := io.ReadAll(output.Body)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return nil, storageerrors.ErrRequestCanceled
+		}
+		return nil, xerrors.Errorf("failed to read s3 range body (bucket=%s, key=%s, range=bytes=%d-%d): %w", s.bucket, key, start, end, err)
+	}
+	s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(len(data)) * time.Millisecond)
+	return data, nil
+}
+
+func inclusiveRangeEnd(offset uint64, length uint64) (uint64, error) {
+	if length == 0 {
+		return 0, xerrors.New("range length must be positive")
+	}
+	if offset > ^uint64(0)-(length-1) {
+		return 0, xerrors.Errorf("range overflow: offset=%d length=%d", offset, length)
+	}
+	return offset + length - 1, nil
+}
+
+func unmarshalBlockData(bucket string, key string, metadata *api.BlockMetadata, blockData []byte) (*api.Block, error) {
+	var block api.Block
+	err := proto.Unmarshal(blockData, &block)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to unmarshal data downloaded from s3 bucket %s key %s: %w", bucket, key, err)
+	}
+
+	// When metadata is loaded from meta storage,
+	// the new fields, e.g. ParentHeight, may be populated with default values.
+	// Overwrite metadata using the one loaded from meta storage.
+	block.Metadata = metadata
+	return &block, nil
 }
 
 func (s *blobStorageImpl) PreSign(ctx context.Context, objectKey string) (string, error) {

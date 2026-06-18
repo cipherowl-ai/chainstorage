@@ -54,6 +54,7 @@ type (
 		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
 		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
+		DownloadMany(ctx context.Context, metadata []*api.BlockMetadata) ([]*api.Block, error)
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}
 

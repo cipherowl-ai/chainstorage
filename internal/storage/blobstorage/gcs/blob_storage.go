@@ -22,6 +22,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -265,6 +266,35 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 		block.Metadata = metadata
 		return &block, finalizer.Close()
 	})
+}
+
+func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.BlockMetadata) ([]*api.Block, error) {
+	blocks := make([]*api.Block, len(metadatas))
+	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(s.downloadWorkerLimit()))
+	for i := range metadatas {
+		i := i
+		group.Go(func() error {
+			metadata := metadatas[i]
+			block, err := s.Download(ctx, metadata)
+			if err != nil {
+				return xerrors.Errorf("failed to download from GCS blob storage (input={%+v}): %w", metadata, err)
+			}
+			blocks[i] = block
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	return blocks, nil
+}
+
+func (s *blobStorageImpl) downloadWorkerLimit() int {
+	limit := int(s.config.Api.NumWorkers)
+	if limit <= 0 {
+		return 1
+	}
+	return limit
 }
 
 // PreSign implements internal.BlobStorage.

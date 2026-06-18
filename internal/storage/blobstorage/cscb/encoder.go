@@ -36,7 +36,10 @@ const (
 	fileSuffixGzip = ".cscb.gzip"
 	fileSuffixZstd = ".cscb.zstd"
 
-	defaultMemoryBudgetBytes = 256 * 1024 * 1024
+	MaxZstdLongDistanceWindowLog = 29
+
+	defaultMemoryBudgetBytes  = 256 * 1024 * 1024
+	maxZstdDecoderMemoryBytes = 1 << MaxZstdLongDistanceWindowLog
 )
 
 var (
@@ -342,8 +345,8 @@ func validateConfig(cfg EncodeConfig) error {
 	}
 	if cfg.Codec == api.Compression_ZSTD && cfg.ZstdLongDistanceWindowLog != nil {
 		windowLog := *cfg.ZstdLongDistanceWindowLog
-		if windowLog < 10 || windowLog > 29 {
-			return xerrors.Errorf("zstd_long_distance_window_log must be between 10 and 29, got %d", windowLog)
+		if windowLog < 10 || windowLog > MaxZstdLongDistanceWindowLog {
+			return xerrors.Errorf("zstd_long_distance_window_log must be between 10 and %d, got %d", MaxZstdLongDistanceWindowLog, windowLog)
 		}
 	}
 	if cfg.CompressionChunkBlocks == 0 {

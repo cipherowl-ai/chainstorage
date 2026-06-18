@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5" // #nosec G501
 	"crypto/sha256"
@@ -11,11 +12,13 @@ import (
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/s3"
 	s3mocks "github.com/coinbase/chainstorage/internal/s3/mocks"
@@ -242,6 +245,143 @@ func TestBlobStorage_UploadConsolidated_AcceptsConcurrentExactObject(t *testing.
 	require.Len(placements, 2)
 }
 
+func TestBlobStorage_DownloadConsolidatedBlock_RangeReadsChunk(t *testing.T) {
+	require := testutil.Require(t)
+	object, metadatas, expectedBlocks, objectData, index := testS3CSCBProtoObject(t)
+	defer object.Close()
+
+	targetMetadata := metadatas[1]
+	_, targetChunk, err := index.LookupBlock(targetMetadata)
+	require.NoError(err)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	expectedRanges := map[string]int{
+		"bytes=0-65535":          1,
+		rangeHeader(targetChunk): 1,
+	}
+	expectRangeReads(t, client, objectData, expectedRanges)
+
+	var storage internal.BlobStorage
+	app := testapp.New(
+		t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
+		fx.Provide(New),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	actual, err := storage.Download(context.Background(), targetMetadata)
+	require.NoError(err)
+	require.True(proto.Equal(expectedBlocks[1], actual))
+	assertRangeReadsConsumed(t, expectedRanges)
+}
+
+func TestBlobStorage_DownloadManyConsolidatedBlocks_GroupsByObjectAndChunk(t *testing.T) {
+	require := testutil.Require(t)
+	object, metadatas, expectedBlocks, objectData, index := testS3CSCBProtoObject(t)
+	defer object.Close()
+
+	_, chunk0, err := index.LookupBlock(metadatas[0])
+	require.NoError(err)
+	_, chunk1, err := index.LookupBlock(metadatas[2])
+	require.NoError(err)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	expectedRanges := map[string]int{
+		"bytes=0-65535":     1,
+		rangeHeader(chunk0): 1,
+		rangeHeader(chunk1): 1,
+	}
+	expectRangeReads(t, client, objectData, expectedRanges)
+
+	var storage internal.BlobStorage
+	app := testapp.New(
+		t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
+		fx.Provide(New),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	actual, err := storage.DownloadMany(context.Background(), []*api.BlockMetadata{
+		metadatas[2],
+		metadatas[0],
+		metadatas[1],
+	})
+	require.NoError(err)
+	require.Len(actual, 3)
+	require.True(proto.Equal(expectedBlocks[2], actual[0]))
+	require.True(proto.Equal(expectedBlocks[0], actual[1]))
+	require.True(proto.Equal(expectedBlocks[1], actual[2]))
+	assertRangeReadsConsumed(t, expectedRanges)
+}
+
+func TestBlobStorage_DownloadConsolidatedMetadataWithZeroLengthUsesLegacy(t *testing.T) {
+	require := testutil.Require(t)
+
+	metadata := &api.BlockMetadata{
+		Tag:           7,
+		Height:        100,
+		Hash:          "hash-100",
+		ObjectKeyMain: "legacy/object",
+		ObjectFormat:  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteLength:    0,
+	}
+	expectedBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+		Network:    common.Network_NETWORK_SOLANA_MAINNET,
+		Metadata:   metadata,
+	}
+	payload, err := proto.Marshal(expectedBlock)
+	require.NoError(err)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...func(*manager.Downloader)) (int64, error) {
+			require.Equal(metadata.ObjectKeyMain, aws.ToString(input.Key))
+			written, err := writer.WriteAt(payload, 0)
+			return int64(written), err
+		})
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).Times(0)
+
+	var storage internal.BlobStorage
+	app := testapp.New(
+		t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
+		fx.Provide(New),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	actual, err := storage.Download(context.Background(), metadata)
+	require.NoError(err)
+	require.True(proto.Equal(expectedBlock, actual))
+}
+
 func testS3EncodeConfig() cscb.EncodeConfig {
 	return cscb.EncodeConfig{
 		Blockchain:             common.Blockchain_BLOCKCHAIN_SOLANA,
@@ -279,4 +419,117 @@ func testS3Payloads() []internal.ConsolidatedBlockPayload {
 			UncompressedLength: 6,
 		},
 	}
+}
+
+func testS3CSCBProtoObject(t *testing.T) (*cscb.Object, []*api.BlockMetadata, []*api.Block, []byte, *cscb.Index) {
+	t.Helper()
+	require := testutil.Require(t)
+
+	blocks := []*api.Block{
+		{
+			Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+			Network:    common.Network_NETWORK_SOLANA_MAINNET,
+			Metadata: &api.BlockMetadata{
+				Tag:    7,
+				Height: 100,
+				Hash:   "hash-100",
+			},
+		},
+		{
+			Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+			Network:    common.Network_NETWORK_SOLANA_MAINNET,
+			Metadata: &api.BlockMetadata{
+				Tag:    7,
+				Height: 101,
+				Hash:   "hash-101",
+			},
+		},
+		{
+			Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+			Network:    common.Network_NETWORK_SOLANA_MAINNET,
+			Metadata: &api.BlockMetadata{
+				Tag:    7,
+				Height: 102,
+				Hash:   "hash-102",
+			},
+		},
+	}
+	payloads := make([]internal.ConsolidatedBlockPayload, len(blocks))
+	for i, block := range blocks {
+		raw, err := proto.Marshal(block)
+		require.NoError(err)
+		payloads[i] = internal.ConsolidatedBlockPayload{
+			Metadata:           block.Metadata,
+			MetadataID:         int64(1000 + i),
+			RawBlockPayload:    internal.BytesPayloadSource(raw),
+			UncompressedLength: uint64(len(raw)),
+		}
+	}
+
+	cfg := testS3EncodeConfig()
+	cfg.CompressionChunkBlocks = 2
+	object, err := cscb.Encode(context.Background(), cfg, payloads)
+	require.NoError(err)
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := cscb.ParseIndex(data)
+	require.NoError(err)
+
+	metadatas := make([]*api.BlockMetadata, len(blocks))
+	expectedBlocks := make([]*api.Block, len(blocks))
+	for i, placement := range object.Placements {
+		metadata := proto.Clone(blocks[i].Metadata).(*api.BlockMetadata)
+		metadata.ObjectKeyMain = object.Key
+		metadata.ObjectFormat = placement.ObjectFormat
+		metadata.ByteOffset = placement.ByteOffset
+		metadata.ByteLength = placement.ByteLength
+		metadata.UncompressedLength = placement.UncompressedLength
+		metadatas[i] = metadata
+
+		expected := proto.Clone(blocks[i]).(*api.Block)
+		expected.Metadata = metadata
+		expectedBlocks[i] = expected
+	}
+	return object, metadatas, expectedBlocks, data, index
+}
+
+func expectRangeReads(t *testing.T, client *s3mocks.MockClient, objectData []byte, expectedRanges map[string]int) {
+	t.Helper()
+	require := testutil.Require(t)
+
+	totalReads := 0
+	for _, count := range expectedRanges {
+		totalReads += count
+	}
+	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).Times(totalReads).
+		DoAndReturn(func(ctx context.Context, input *awss3.GetObjectInput, opts ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
+			rangeValue := aws.ToString(input.Range)
+			require.Positive(expectedRanges[rangeValue], "unexpected range read %s", rangeValue)
+			expectedRanges[rangeValue]--
+
+			var start uint64
+			var end uint64
+			_, err := fmt.Sscanf(rangeValue, "bytes=%d-%d", &start, &end)
+			require.NoError(err)
+			require.Less(start, uint64(len(objectData)))
+			if end >= uint64(len(objectData)) {
+				end = uint64(len(objectData)) - 1
+			}
+			return &awss3.GetObjectOutput{
+				Body: io.NopCloser(bytes.NewReader(objectData[start : end+1])),
+			}, nil
+		})
+}
+
+func assertRangeReadsConsumed(t *testing.T, expectedRanges map[string]int) {
+	t.Helper()
+	require := testutil.Require(t)
+	for rangeValue, count := range expectedRanges {
+		require.Zero(count, "range %s was not read expected number of times", rangeValue)
+	}
+}
+
+func rangeHeader(chunk *cscb.ChunkDescriptor) string {
+	return fmt.Sprintf("bytes=%d-%d", chunk.CompressedPayloadOffset, chunk.CompressedPayloadOffset+chunk.CompressedLength-1)
 }
