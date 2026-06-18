@@ -52,9 +52,10 @@ type (
 		DLQType         DLQType         `mapstructure:"dlq"`
 	}
 
-	BlobStorageType int32
-	MetaStorageType int32
-	DLQType         int32
+	BlobStorageType   int32
+	MetaStorageType   int32
+	DLQType           int32
+	ConsolidationMode string
 
 	ChainConfig struct {
 		Blockchain       common.Blockchain `mapstructure:"blockchain" validate:"required"`
@@ -406,7 +407,34 @@ type (
 	}
 
 	StorageConfig struct {
-		DataCompression api.Compression `mapstructure:"data_compression"`
+		DataCompression api.Compression     `mapstructure:"data_compression"`
+		Consolidation   ConsolidationConfig `mapstructure:"consolidation"`
+	}
+
+	ConsolidationConfig struct {
+		Enabled                             bool              `mapstructure:"enabled"`
+		Mode                                ConsolidationMode `mapstructure:"mode"`
+		Codec                               api.Compression   `mapstructure:"codec"`
+		CodecLevel                          int               `mapstructure:"codec_level"`
+		ZstdLongDistanceWindowLog           *int              `mapstructure:"zstd_long_distance_window_log"`
+		MaxCompressedBytes                  uint64            `mapstructure:"max_compressed_bytes"`
+		MaxUncompressedBytes                uint64            `mapstructure:"max_uncompressed_bytes"`
+		MaxBlocks                           uint64            `mapstructure:"max_blocks"`
+		CompressionChunkBlocks              uint64            `mapstructure:"compression_chunk_blocks"`
+		MaxChunkCompressedBytes             *uint64           `mapstructure:"max_chunk_compressed_bytes"`
+		MaxChunkUncompressedBytes           *uint64           `mapstructure:"max_chunk_uncompressed_bytes"`
+		FlushInterval                       time.Duration     `mapstructure:"flush_interval"`
+		ShadowTimeout                       time.Duration     `mapstructure:"shadow_timeout"`
+		MaxInflightRawBlocks                uint64            `mapstructure:"max_inflight_raw_blocks"`
+		MemoryBudgetBytes                   *uint64           `mapstructure:"memory_budget_bytes"`
+		LocalSpillDir                       string            `mapstructure:"local_spill_dir"`
+		LocalSpillMaxBytes                  *uint64           `mapstructure:"local_spill_max_bytes"`
+		ShardSize                           uint64            `mapstructure:"shard_size"`
+		MultipartThreshold                  uint64            `mapstructure:"multipart_threshold"`
+		ReadShadowFirst                     bool              `mapstructure:"read_shadow_first"`
+		PromotionGateHeight                 *uint64           `mapstructure:"promotion_gate_height"`
+		SafePromotionLag                    *uint64           `mapstructure:"safe_promotion_lag"`
+		LegacyShadowWriteAfterSyncerCutover bool              `mapstructure:"legacy_shadow_write_after_syncer_cutover"`
 	}
 
 	SLAConfig struct {
@@ -570,6 +598,11 @@ const (
 	DLQType_SQS         DLQType = 1
 	DLQType_FIRESTORE   DLQType = 2
 
+	ConsolidationModeLegacyOnly                ConsolidationMode = "legacy_only"
+	ConsolidationModeShadowDualWrite           ConsolidationMode = "shadow_dual_write"
+	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
+	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
+
 	AWSAccountDevelopment AWSAccount = "development"
 	AWSAccountProduction  AWSAccount = "production"
 
@@ -630,6 +663,21 @@ func New(opts ...ConfigOption) (*Config, error) {
 		v.SetDefault("aws.reset_local", true)
 	}
 	v.SetDefault("chain.client.tx_batch_size", 100)
+	v.SetDefault("aws.storage.consolidation.enabled", false)
+	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeLegacyOnly))
+	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
+	v.SetDefault("aws.storage.consolidation.codec_level", 6)
+	v.SetDefault("aws.storage.consolidation.max_compressed_bytes", 2147483648)
+	v.SetDefault("aws.storage.consolidation.max_uncompressed_bytes", 137438953472)
+	v.SetDefault("aws.storage.consolidation.max_blocks", 1000)
+	v.SetDefault("aws.storage.consolidation.compression_chunk_blocks", 10)
+	v.SetDefault("aws.storage.consolidation.flush_interval", "1m")
+	v.SetDefault("aws.storage.consolidation.shadow_timeout", "30s")
+	v.SetDefault("aws.storage.consolidation.max_inflight_raw_blocks", 4)
+	v.SetDefault("aws.storage.consolidation.local_spill_dir", "/tmp/chainstorage-cscb")
+	v.SetDefault("aws.storage.consolidation.shard_size", 10000)
+	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
+	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
 
 	// Read the data in base.yml
 	if err := v.ReadConfig(configReader); err != nil {
@@ -666,6 +714,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	if err := validate.Struct(&cfg); err != nil {
 		return nil, xerrors.Errorf("failed to validate config: %w", err)
 	}
+	if err := cfg.validateConsolidationConfig(); err != nil {
+		return nil, xerrors.Errorf("failed to validate consolidation config: %w", err)
+	}
 
 	if cfg.Chain.Blockchain != common.Blockchain_BLOCKCHAIN_ETHEREUM || cfg.Chain.Network != common.Network_NETWORK_ETHEREUM_MAINNET {
 		// Zero-value blockTag is reserved as an alias of the stable blockTag.
@@ -680,6 +731,79 @@ func New(opts ...ConfigOption) (*Config, error) {
 	}
 
 	return &cfg, nil
+}
+
+func (c *Config) validateConsolidationConfig() error {
+	consolidation := c.AWS.Storage.Consolidation
+	switch consolidation.Mode {
+	case ConsolidationModeLegacyOnly,
+		ConsolidationModeShadowDualWrite,
+		ConsolidationModePromoteFinalized,
+		ConsolidationModeSyncerConsolidatedPrimary:
+	default:
+		return xerrors.Errorf("invalid consolidation mode %q", consolidation.Mode)
+	}
+
+	switch consolidation.Codec {
+	case api.Compression_GZIP, api.Compression_ZSTD:
+	default:
+		return xerrors.Errorf("invalid consolidation codec %v", consolidation.Codec)
+	}
+
+	if !consolidation.Enabled {
+		return nil
+	}
+
+	switch c.StorageType.BlobStorageType {
+	case BlobStorageType_UNSPECIFIED, BlobStorageType_S3:
+	default:
+		return xerrors.Errorf("consolidation requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
+	}
+	if c.StorageType.MetaStorageType != MetaStorageType_POSTGRES {
+		return xerrors.Errorf("consolidation requires Postgres meta storage until DynamoDB shadow placement and guarded promotion are implemented, got %v", c.StorageType.MetaStorageType)
+	}
+
+	if consolidation.CodecLevel <= 0 {
+		return xerrors.New("consolidation codec_level must be positive")
+	}
+	if consolidation.MaxCompressedBytes == 0 {
+		return xerrors.New("consolidation max_compressed_bytes must be positive")
+	}
+	if consolidation.MaxUncompressedBytes == 0 {
+		return xerrors.New("consolidation max_uncompressed_bytes must be positive")
+	}
+	if consolidation.MaxBlocks == 0 {
+		return xerrors.New("consolidation max_blocks must be positive")
+	}
+	if consolidation.CompressionChunkBlocks == 0 {
+		return xerrors.New("consolidation compression_chunk_blocks must be positive")
+	}
+	if consolidation.ShardSize == 0 {
+		return xerrors.New("consolidation shard_size must be positive")
+	}
+	if consolidation.MultipartThreshold == 0 {
+		return xerrors.New("consolidation multipart_threshold must be positive")
+	}
+	if consolidation.MaxInflightRawBlocks == 0 {
+		return xerrors.New("consolidation max_inflight_raw_blocks must be positive")
+	}
+	if consolidation.FlushInterval <= 0 {
+		return xerrors.New("consolidation flush_interval must be positive")
+	}
+	if consolidation.ShadowTimeout <= 0 {
+		return xerrors.New("consolidation shadow_timeout must be positive")
+	}
+	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.PromotionGateHeight == nil {
+		return xerrors.New("consolidation promote_finalized requires promotion_gate_height")
+	}
+	if consolidation.SafePromotionLag != nil && *consolidation.SafePromotionLag < c.Chain.IrreversibleDistance {
+		return xerrors.Errorf(
+			"consolidation safe_promotion_lag(%d) must be at least irreversible_distance(%d)",
+			*consolidation.SafePromotionLag,
+			c.Chain.IrreversibleDistance,
+		)
+	}
+	return nil
 }
 
 func GetEnv() Env {
@@ -1106,7 +1230,11 @@ func stringToCompressionHookFunc() mapstructure.DecodeHookFunc {
 			return data, nil
 		}
 
-		return api.Compression_value[data.(string)], nil
+		v, ok := api.Compression_value[strings.ToUpper(data.(string))]
+		if !ok {
+			return nil, xerrors.Errorf("invalid compression type: %v", data)
+		}
+		return v, nil
 	}
 }
 

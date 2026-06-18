@@ -78,7 +78,7 @@ func (s *blockStorageTestSuite) TearDownTest() {
 		ctx := context.Background()
 		s.T().Log("Clearing database tables after test")
 		// Clear all tables in reverse order due to foreign key constraints
-		tables := []string{"block_events", "canonical_blocks", "block_metadata"}
+		tables := []string{"block_events", "block_consolidation_shadow", "canonical_blocks", "block_metadata"}
 		for _, table := range tables {
 			_, err := s.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
 			if err != nil {

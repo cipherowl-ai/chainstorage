@@ -125,6 +125,7 @@ func TestValidateConfigs(t *testing.T) {
 
 		require.GreaterOrEqual(cfg.Chain.EventTag.Latest, cfg.Chain.EventTag.Stable)
 		require.Equal(api.Compression_GZIP, cfg.AWS.Storage.DataCompression)
+		require.Equal(defaultConsolidationConfig(), cfg.AWS.Storage.Consolidation)
 
 		require.Equal(fmt.Sprintf("chainstorage-%v", normalizedConfigName), cfg.Cadence.Domain)
 
@@ -199,6 +200,7 @@ func TestDerivedConfigValues(t *testing.T) {
 			},
 			Storage: config.StorageConfig{
 				DataCompression: getDataCompressionType(cfg),
+				Consolidation:   defaultConsolidationConfig(),
 			},
 			// Skip AWS account verification
 			AWSAccount: cfg.AWS.AWSAccount,
@@ -848,6 +850,19 @@ func TestEndpointGroup_Error(t *testing.T) {
 	}
 }
 
+func TestConsolidationEnabledRejectsDynamoDB(t *testing.T) {
+	require := testutil.Require(t)
+
+	require.NoError(os.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true"))
+	require.NoError(os.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeShadowDualWrite)))
+	defer os.Unsetenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED")
+	defer os.Unsetenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE")
+
+	_, err := config.New()
+	require.Error(err)
+	require.Contains(err.Error(), "requires Postgres meta storage")
+}
+
 func TestParseConfigName(t *testing.T) {
 	tests := []struct {
 		configName string
@@ -933,6 +948,26 @@ func getDataCompressionType(cfg *config.Config) api.Compression {
 	}
 
 	return api.Compression_GZIP
+}
+
+func defaultConsolidationConfig() config.ConsolidationConfig {
+	return config.ConsolidationConfig{
+		Enabled:                false,
+		Mode:                   config.ConsolidationModeLegacyOnly,
+		Codec:                  api.Compression_ZSTD,
+		CodecLevel:             6,
+		MaxCompressedBytes:     2147483648,
+		MaxUncompressedBytes:   137438953472,
+		MaxBlocks:              1000,
+		CompressionChunkBlocks: 10,
+		FlushInterval:          time.Minute,
+		ShadowTimeout:          30 * time.Second,
+		MaxInflightRawBlocks:   4,
+		LocalSpillDir:          "/tmp/chainstorage-cscb",
+		ShardSize:              10000,
+		MultipartThreshold:     134217728,
+		ReadShadowFirst:        false,
+	}
 }
 
 func TestUseFailoverEndpoints(t *testing.T) {

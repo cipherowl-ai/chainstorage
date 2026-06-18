@@ -34,6 +34,15 @@ type (
 	}
 )
 
+const (
+	blockMetadataColumns = `
+		id, height, tag, hash, parent_hash, parent_height, object_key_main,
+		timestamp, skipped, object_format, byte_offset, byte_length, uncompressed_length`
+	canonicalBlockMetadataColumns = `
+		bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main,
+		bm.timestamp, bm.skipped, bm.object_format, bm.byte_offset, bm.byte_length, bm.uncompressed_length`
+)
+
 func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 	metrics := params.Metrics.SubScope("block_storage").Tagged(map[string]string{
 		"storage_type": "postgres",
@@ -104,26 +113,40 @@ func (b *blockStorageImpl) PersistBlockMetas(
 
 		// Different queries for skipped vs non-skipped blocks due to different conflict resolution
 		blockMetadataSkippedQuery := `
-			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
 				hash = EXCLUDED.hash,
 				parent_hash = EXCLUDED.parent_hash,
 				parent_height = EXCLUDED.parent_height,
 				object_key_main = EXCLUDED.object_key_main,
 				timestamp = EXCLUDED.timestamp,
-				skipped = EXCLUDED.skipped
+				skipped = EXCLUDED.skipped,
+				object_format = EXCLUDED.object_format,
+				byte_offset = EXCLUDED.byte_offset,
+				byte_length = EXCLUDED.byte_length,
+				uncompressed_length = EXCLUDED.uncompressed_length
 			RETURNING id`
 
 		blockMetadataRegularQuery := `
-			INSERT INTO block_metadata (height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped) 
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 			ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
 				parent_hash = EXCLUDED.parent_hash,
 				parent_height = EXCLUDED.parent_height,
 				object_key_main = EXCLUDED.object_key_main,
 				timestamp = EXCLUDED.timestamp,
-				skipped = EXCLUDED.skipped
+				skipped = EXCLUDED.skipped,
+				object_format = EXCLUDED.object_format,
+				byte_offset = EXCLUDED.byte_offset,
+				byte_length = EXCLUDED.byte_length,
+				uncompressed_length = EXCLUDED.uncompressed_length
 			RETURNING id`
 
 		// Simply insert or update canonical blocks like DynamoDB does
@@ -160,6 +183,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				query = blockMetadataRegularQuery
 			}
 
+			byteOffset, byteLength, uncompressedLength := blockObjectByteFields(block)
 			err = tx.QueryRowContext(txCtx, query,
 				block.Height,
 				block.Tag,
@@ -169,6 +193,10 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				block.ObjectKeyMain,
 				unixTimestamp,
 				block.Skipped,
+				int32(block.GetObjectFormat()),
+				byteOffset,
+				byteLength,
+				uncompressedLength,
 			).Scan(&blockId)
 			if err != nil {
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
@@ -237,14 +265,13 @@ func (b *blockStorageImpl) GetLatestBlock(ctx context.Context, tag uint32) (*api
 		// Get the latest canonical block by highest height
 		// Only return blocks that have been validated (is_watermark=TRUE)
 		// This prevents canonical chain leakage to streamer before validation
-		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main,
-			       bm.timestamp, bm.skipped
+		query := fmt.Sprintf(`
+			SELECT %s
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.is_watermark = TRUE
 			ORDER BY cb.height DESC
-			LIMIT 1`
+			LIMIT 1`, canonicalBlockMetadataColumns)
 		row := b.db.QueryRowContext(ctx, query, tag)
 		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
@@ -265,22 +292,20 @@ func (b *blockStorageImpl) GetBlockByHash(ctx context.Context, tag uint32, heigh
 		var row *sql.Row
 		if blockHash == "" {
 			// Get the canonical block at this height (could be regular or skipped)
-			query := `
-				SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       bm.timestamp, bm.skipped
+			query := fmt.Sprintf(`
+				SELECT %s
 				FROM canonical_blocks cb
 				JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 				WHERE cb.tag = $1 AND cb.height = $2
-				LIMIT 1`
+				LIMIT 1`, canonicalBlockMetadataColumns)
 			row = b.db.QueryRowContext(ctx, query, tag, height)
 		} else {
 			// Query block_metadata directly for the specific hash
-			query := `
-				SELECT id, height, tag, hash, parent_hash, parent_height, object_key_main, 
-					   timestamp, skipped
+			query := fmt.Sprintf(`
+				SELECT %s
 				FROM block_metadata
 				WHERE tag = $1 AND height = $2 AND hash = $3
-				LIMIT 1`
+				LIMIT 1`, blockMetadataColumns)
 			row = b.db.QueryRowContext(ctx, query, tag, height, blockHash)
 		}
 
@@ -301,13 +326,12 @@ func (b *blockStorageImpl) GetBlockByHeight(ctx context.Context, tag uint32, hei
 			return nil, err
 		}
 		// Get block from canonical_blocks table (includes both regular and skipped blocks)
-		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       bm.timestamp, bm.skipped
+		query := fmt.Sprintf(`
+			SELECT %s
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height = $2
-			LIMIT 1`
+			LIMIT 1`, canonicalBlockMetadataColumns)
 		row := b.db.QueryRowContext(ctx, query, tag, height)
 		block, err := model.BlockMetadataFromCanonicalRow(b.db, row)
 		if err != nil {
@@ -330,13 +354,12 @@ func (b *blockStorageImpl) GetBlocksByHeightRange(ctx context.Context, tag uint3
 		}
 
 		// Get all blocks (canonical and skipped) from canonical_blocks table
-		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       bm.timestamp, bm.skipped
+		query := fmt.Sprintf(`
+			SELECT %s
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height >= $2 AND cb.height < $3
-			ORDER BY cb.height ASC`
+			ORDER BY cb.height ASC`, canonicalBlockMetadataColumns)
 		rows, err := b.db.QueryContext(ctx, query, tag, startHeight, endHeight)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to query blocks by height range: %w", err)
@@ -397,12 +420,12 @@ func (b *blockStorageImpl) GetBlocksByHeights(ctx context.Context, tag uint32, h
 			args[i+1] = height
 		}
 		query := fmt.Sprintf(`
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       bm.timestamp, bm.skipped
+			SELECT %s
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND cb.height IN (%s)
 			ORDER BY cb.height ASC`,
+			canonicalBlockMetadataColumns,
 			strings.Join(placeholders, ", "))
 
 		rows, err := b.db.QueryContext(ctx, query, args...)
@@ -462,15 +485,14 @@ func (b *blockStorageImpl) GetWatermarkCount(ctx context.Context, tag uint32) (i
 func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error) {
 	return b.instrumentGetBlockByTimestamp.Instrument(ctx, func(ctx context.Context) (*api.BlockMetadata, error) {
 		// Query to get the latest block before or at the given timestamp
-		query := `
-			SELECT bm.id, bm.height, bm.tag, bm.hash, bm.parent_hash, bm.parent_height, bm.object_key_main, 
-			       bm.timestamp, bm.skipped
+		query := fmt.Sprintf(`
+			SELECT %s
 			FROM canonical_blocks cb
 			JOIN block_metadata bm ON cb.block_metadata_id = bm.id
 			WHERE cb.tag = $1 AND bm.timestamp <= $2
 			ORDER BY bm.timestamp DESC, bm.height DESC
 			LIMIT 1
-		`
+		`, canonicalBlockMetadataColumns)
 
 		var blockId int64
 		var height uint64
@@ -479,9 +501,12 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		var parentHeight uint64
 		var blockTimestamp int64
 		var skipped bool
+		var objectFormat int32
+		var byteOffset, byteLength, uncompressedLength sql.NullInt64
 
 		err := b.db.QueryRowContext(ctx, query, tag, timestamp).Scan(
-			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTimestamp, &skipped)
+			&blockId, &height, &blockTag, &hash, &parentHash, &parentHeight, &objectKeyMain, &blockTimestamp, &skipped,
+			&objectFormat, &byteOffset, &byteLength, &uncompressedLength)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				fmt.Printf("[DEBUG] No block found for tag=%d, timestamp=%d\n", tag, timestamp)
@@ -497,14 +522,34 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		}
 
 		return &api.BlockMetadata{
-			Tag:           blockTag,
-			Hash:          hash.String,
-			ParentHash:    parentHash.String,
-			Height:        height,
-			ParentHeight:  parentHeight,
-			ObjectKeyMain: objectKeyMain.String,
-			Timestamp:     utils.ToTimestamp(blockTimestamp),
-			Skipped:       skipped,
+			Tag:                blockTag,
+			Hash:               hash.String,
+			ParentHash:         parentHash.String,
+			Height:             height,
+			ParentHeight:       parentHeight,
+			ObjectKeyMain:      objectKeyMain.String,
+			Timestamp:          utils.ToTimestamp(blockTimestamp),
+			Skipped:            skipped,
+			ObjectFormat:       api.BlockObjectFormat(objectFormat),
+			ByteOffset:         uint64Value(byteOffset),
+			ByteLength:         uint64Value(byteLength),
+			UncompressedLength: uint64Value(uncompressedLength),
 		}, nil
 	})
+}
+
+func uint64Value(value sql.NullInt64) uint64 {
+	if !value.Valid {
+		return 0
+	}
+	return uint64(value.Int64)
+}
+
+func blockObjectByteFields(block *api.BlockMetadata) (sql.NullInt64, sql.NullInt64, sql.NullInt64) {
+	if block.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH {
+		return sql.NullInt64{}, sql.NullInt64{}, sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: int64(block.GetByteOffset()), Valid: true},
+		sql.NullInt64{Int64: int64(block.GetByteLength()), Valid: true},
+		sql.NullInt64{Int64: int64(block.GetUncompressedLength()), Valid: true}
 }
