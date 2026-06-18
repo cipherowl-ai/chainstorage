@@ -433,7 +433,7 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 	if err != nil {
 		return nil, err
 	}
-	chunkPayload, err := d.downloadCSCBChunk(ctx, nil, blockFile.GetFileUrl(), index.Header.Codec, chunk)
+	chunkPayload, err := d.downloadCSCBChunk(ctx, blockFile.GetFileUrl(), index.Header.Codec, chunk)
 	if err != nil {
 		return nil, err
 	}
@@ -473,26 +473,28 @@ func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, limiter down
 	for _, chunkIndex := range chunkIndexes {
 		downloads := downloadsByChunk[uint32(chunkIndex)]
 		group.Go(func() error {
-			chunk := downloads[0].chunk
-			chunkPayload, err := d.downloadCSCBChunk(ctx, limiter, fileURL, index.Header.Codec, chunk)
-			if err != nil {
-				return err
-			}
-			if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
-				return err
-			}
-			for _, download := range downloads {
-				blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
+			return limiter.Do(ctx, func() error {
+				chunk := downloads[0].chunk
+				chunkPayload, err := d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
 				if err != nil {
 					return err
 				}
-				block, err := unmarshalCSCBBlock(download.ref.blockFile, blockPayload)
-				if err != nil {
+				if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
 					return err
 				}
-				result[download.ref.index] = block
-			}
-			return nil
+				for _, download := range downloads {
+					blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
+					if err != nil {
+						return err
+					}
+					block, err := unmarshalCSCBBlock(download.ref.blockFile, blockPayload)
+					if err != nil {
+						return err
+					}
+					result[download.ref.index] = block
+				}
+				return nil
+			})
 		})
 	}
 	if err := group.Wait(); err != nil {
@@ -523,8 +525,8 @@ func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, limiter downloa
 	return cscb.ParseIndex(indexData)
 }
 
-func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, limiter downloadLimiter, fileURL string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
-	compressed, err := d.readHTTPRangeByLength(ctx, limiter, fileURL, chunk.CompressedPayloadOffset, chunk.CompressedLength)
+func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, fileURL string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+	compressed, err := d.readHTTPRangeByLength(ctx, nil, fileURL, chunk.CompressedPayloadOffset, chunk.CompressedLength)
 	if err != nil {
 		return nil, err
 	}
