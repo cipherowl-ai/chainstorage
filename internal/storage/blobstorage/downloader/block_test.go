@@ -2,10 +2,13 @@ package downloader
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/suite"
@@ -14,6 +17,9 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
+	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
+	blobstorageinternal "github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
@@ -80,7 +86,9 @@ func (s *blockDownloaderTestSuite) SetupTest() {
 }
 
 func (s *blockDownloaderTestSuite) TearDownTest() {
-	s.httpServer.Close()
+	if s.httpServer != nil {
+		s.httpServer.Close()
+	}
 	s.app.Close()
 }
 
@@ -272,6 +280,220 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_CloseRemovesSpool() {
 	require.Error(err)
 }
 
+func (s *blockDownloaderTestSuite) TestDownload_CSCB() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 3, 2)
+	defer fixture.close()
+
+	server, recorder := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	rawBlock, err := s.downloader.Download(context.Background(), fixture.blockFiles[1])
+	require.NoError(err)
+	expected := proto.Clone(fixture.blocks[1]).(*api.Block)
+	expected.Metadata = blockFileToMetadata(fixture.blockFiles[1])
+	if diff := cmp.Diff(expected, rawBlock, protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+
+	ranges := recorder.rangesSnapshot()
+	require.Equal([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
+	}, ranges)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBGroupsByChunk() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 4, 2)
+	defer fixture.close()
+
+	server, recorder := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	blockFiles := []*api.BlockFile{
+		fixture.blockFiles[1],
+		fixture.blockFiles[0],
+		fixture.blockFiles[3],
+	}
+	rawBlocks, err := s.downloader.DownloadMany(context.Background(), blockFiles)
+	require.NoError(err)
+	require.Len(rawBlocks, len(blockFiles))
+
+	for i, blockFile := range blockFiles {
+		sourceIndex := int(blockFile.GetHeight() - 100)
+		expected := proto.Clone(fixture.blocks[sourceIndex]).(*api.Block)
+		expected.Metadata = blockFileToMetadata(blockFile)
+		if diff := cmp.Diff(expected, rawBlocks[i], protocmp.Transform()); diff != "" {
+			require.FailNow(diff)
+		}
+	}
+
+	ranges := recorder.rangesSnapshot()
+	require.ElementsMatch([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
+		rangeHeader(fixture.index.Chunks[1].CompressedPayloadOffset, fixture.index.Chunks[1].CompressedLength),
+	}, ranges)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBLimitsConcurrencyAcrossFiles() {
+	require := testutil.Require(s.T())
+	const workerLimit = 2
+
+	fixtureA := newCSCBDownloaderFixture(s.T(), 4, 1)
+	defer fixtureA.close()
+	fixtureB := newCSCBDownloaderFixture(s.T(), 4, 1)
+	defer fixtureB.close()
+	tracker := &rangeConcurrencyTracker{}
+
+	serverA, _ := newRangeHTTPServerWithTracker(fixtureA.data, tracker, 20*time.Millisecond)
+	defer serverA.Close()
+	serverB, _ := newRangeHTTPServerWithTracker(fixtureB.data, tracker, 20*time.Millisecond)
+	defer serverB.Close()
+	for _, file := range fixtureA.blockFiles {
+		file.FileUrl = serverA.URL
+	}
+	for _, file := range fixtureB.blockFiles {
+		file.FileUrl = serverB.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Invoke(func(cfg *config.Config) {
+			cfg.SDK.NumWorkers = workerLimit
+			cfg.Api.NumWorkers = workerLimit
+		}),
+		fx.Provide(func() HTTPClient { return serverA.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	blockFiles := append([]*api.BlockFile{}, fixtureA.blockFiles...)
+	blockFiles = append(blockFiles, fixtureB.blockFiles...)
+	rawBlocks, err := s.downloader.DownloadMany(context.Background(), blockFiles)
+	require.NoError(err)
+	require.Len(rawBlocks, len(blockFiles))
+	require.LessOrEqual(tracker.peakActive(), workerLimit)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesOrder() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
+	defer fixture.close()
+
+	cscbServer, _ := newRangeHTTPServer(fixture.data)
+	defer cscbServer.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = cscbServer.URL
+	}
+
+	legacyBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
+		Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 900, Hash: "legacy-hash"},
+	}
+	legacyPayload, err := proto.Marshal(legacyBlock)
+	require.NoError(err)
+	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(http.MethodGet, r.Method)
+		_, _ = w.Write(legacyPayload)
+	}))
+	defer legacyServer.Close()
+
+	legacyFile := &api.BlockFile{
+		Tag:     1,
+		Height:  900,
+		Hash:    "legacy-hash",
+		FileUrl: legacyServer.URL,
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return cscbServer.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	rawBlocks, err := s.downloader.DownloadMany(context.Background(), []*api.BlockFile{
+		fixture.blockFiles[1],
+		legacyFile,
+		fixture.blockFiles[0],
+	})
+	require.NoError(err)
+	require.Len(rawBlocks, 3)
+
+	expectedFirst := proto.Clone(fixture.blocks[1]).(*api.Block)
+	expectedFirst.Metadata = blockFileToMetadata(fixture.blockFiles[1])
+	expectedThird := proto.Clone(fixture.blocks[0]).(*api.Block)
+	expectedThird.Metadata = blockFileToMetadata(fixture.blockFiles[0])
+	if diff := cmp.Diff(expectedFirst, rawBlocks[0], protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+	if diff := cmp.Diff(legacyBlock, rawBlocks[1], protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+	if diff := cmp.Diff(expectedThird, rawBlocks[2], protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadStream_CSCB() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
+	defer fixture.close()
+
+	server, _ := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	spooled, err := s.downloader.DownloadStream(context.Background(), fixture.blockFiles[1])
+	require.NoError(err)
+	defer spooled.Close()
+
+	rc, err := spooled.Open()
+	require.NoError(err)
+	defer rc.Close()
+	gotBytes, err := io.ReadAll(rc)
+	require.NoError(err)
+
+	var rawBlock api.Block
+	require.NoError(proto.Unmarshal(gotBytes, &rawBlock))
+	expected := proto.Clone(fixture.blocks[1]).(*api.Block)
+	if diff := cmp.Diff(expected, &rawBlock, protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+}
+
 func (s *blockDownloaderTestSuite) newHttpClientFunc() httpClientFunc {
 	return func() HTTPClient {
 		return s.httpServer.Client()
@@ -292,4 +514,187 @@ func (s *blockDownloaderTestSuite) newHttpServerFunc(httpMethod string, respStat
 		s.blockFile.FileUrl = server.URL
 		return server
 	}
+}
+
+type cscbDownloaderFixture struct {
+	object     *cscb.Object
+	data       []byte
+	index      *cscb.Index
+	blocks     []*api.Block
+	blockFiles []*api.BlockFile
+}
+
+func newCSCBDownloaderFixture(t *testing.T, blockCount int, chunkBlocks uint64) *cscbDownloaderFixture {
+	t.Helper()
+	require := testutil.Require(t)
+
+	blocks := make([]*api.Block, blockCount)
+	payloads := make([]blobstorageinternal.ConsolidatedBlockPayload, blockCount)
+	for i := 0; i < blockCount; i++ {
+		height := uint64(100 + i)
+		block := &api.Block{
+			Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
+			Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
+			Metadata: &api.BlockMetadata{
+				Tag:          1,
+				Hash:         fmt.Sprintf("hash-%d", height),
+				ParentHash:   fmt.Sprintf("hash-%d", height-1),
+				Height:       height,
+				ParentHeight: height - 1,
+			},
+		}
+		blockBytes, err := proto.Marshal(block)
+		require.NoError(err)
+		blocks[i] = block
+		payloads[i] = blobstorageinternal.ConsolidatedBlockPayload{
+			Metadata:           block.Metadata,
+			MetadataID:         int64(i + 1),
+			RawBlockPayload:    blobstorageinternal.BytesPayloadSource(blockBytes),
+			UncompressedLength: uint64(len(blockBytes)),
+		}
+	}
+
+	object, err := cscb.Encode(context.Background(), cscb.EncodeConfig{
+		Blockchain:             common.Blockchain_BLOCKCHAIN_ETHEREUM,
+		Network:                common.Network_NETWORK_ETHEREUM_MAINNET,
+		Codec:                  api.Compression_ZSTD,
+		CodecLevel:             1,
+		MaxBlocks:              uint64(blockCount),
+		CompressionChunkBlocks: chunkBlocks,
+		ShardSize:              10_000,
+	}, payloads)
+	require.NoError(err)
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := cscb.ParseIndex(data)
+	require.NoError(err)
+
+	blockFiles := make([]*api.BlockFile, blockCount)
+	for i, placement := range object.Placements {
+		source := blocks[i].GetMetadata()
+		blockFiles[i] = &api.BlockFile{
+			Tag:                source.GetTag(),
+			Hash:               source.GetHash(),
+			ParentHash:         source.GetParentHash(),
+			Height:             source.GetHeight(),
+			ParentHeight:       source.GetParentHeight(),
+			Compression:        api.Compression_ZSTD,
+			ObjectFormat:       placement.ObjectFormat,
+			ByteOffset:         placement.ByteOffset,
+			ByteLength:         placement.ByteLength,
+			UncompressedLength: placement.UncompressedLength,
+		}
+	}
+
+	return &cscbDownloaderFixture{
+		object:     object,
+		data:       data,
+		index:      index,
+		blocks:     blocks,
+		blockFiles: blockFiles,
+	}
+}
+
+func (f *cscbDownloaderFixture) close() {
+	if f != nil && f.object != nil {
+		_ = f.object.Close()
+	}
+}
+
+type rangeRequestRecorder struct {
+	mu      sync.Mutex
+	ranges  []string
+	tracker *rangeConcurrencyTracker
+	delay   time.Duration
+}
+
+type rangeConcurrencyTracker struct {
+	mu     sync.Mutex
+	active int
+	peak   int
+}
+
+func newRangeHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
+	return newRangeHTTPServerWithTracker(data, nil, 0)
+}
+
+func newRangeHTTPServerWithTracker(data []byte, tracker *rangeConcurrencyTracker, delay time.Duration) (*httptest.Server, *rangeRequestRecorder) {
+	recorder := &rangeRequestRecorder{
+		tracker: tracker,
+		delay:   delay,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		rangeValue := request.Header.Get("Range")
+		done := recorder.record(rangeValue)
+		defer done()
+		if recorder.delay > 0 {
+			time.Sleep(recorder.delay)
+		}
+		if rangeValue == "" {
+			_, _ = writer.Write(data)
+			return
+		}
+
+		var start, end uint64
+		if _, err := fmt.Sscanf(rangeValue, "bytes=%d-%d", &start, &end); err != nil {
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if start >= uint64(len(data)) || end < start {
+			writer.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= uint64(len(data)) {
+			end = uint64(len(data)) - 1
+		}
+		writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		writer.WriteHeader(http.StatusPartialContent)
+		_, _ = writer.Write(data[start : end+1])
+	}))
+	return server, recorder
+}
+
+func (r *rangeRequestRecorder) record(rangeValue string) func() {
+	r.mu.Lock()
+	r.ranges = append(r.ranges, rangeValue)
+	r.mu.Unlock()
+	if r.tracker == nil {
+		return func() {}
+	}
+	return r.tracker.begin()
+}
+
+func (r *rangeRequestRecorder) rangesSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ranges...)
+}
+
+func (t *rangeConcurrencyTracker) begin() func() {
+	t.mu.Lock()
+	t.active++
+	if t.active > t.peak {
+		t.peak = t.active
+	}
+	t.mu.Unlock()
+	return func() {
+		t.mu.Lock()
+		t.active--
+		t.mu.Unlock()
+	}
+}
+
+func (t *rangeConcurrencyTracker) peakActive() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.peak
+}
+
+func rangeHeader(offset uint64, length uint64) string {
+	return fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
 }

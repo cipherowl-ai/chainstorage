@@ -505,6 +505,72 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange() {
 	require.NoError(err)
 }
 
+func (s *handlerTestSuite) TestGetBlockFilesByRange_ReusesPresignedURLForSameObject() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().Chain.BlockTag.Stable
+	const objectKey = "BLOCKCHAIN_ETHEREUM/NETWORK_ETHEREUM_MAINNET/consolidated/v=0/shard=000000000000-000000010000/000000009000-000000009002-sha.cscb.zstd"
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32, startHeight, endHeight uint64) ([]*api.BlockMetadata, error) {
+				require.Equal(stableTag, tag)
+				require.Equal(uint64(9000), startHeight)
+				require.Equal(uint64(9002), endHeight)
+				return []*api.BlockMetadata{
+					{
+						Hash:               "hash1",
+						ParentHash:         "hash0",
+						Height:             9000,
+						ParentHeight:       8999,
+						ObjectKeyMain:      objectKey,
+						ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+						ByteOffset:         0,
+						ByteLength:         100,
+						UncompressedLength: 100,
+					},
+					{
+						Hash:               "hash2",
+						ParentHash:         "hash1",
+						Height:             9001,
+						ParentHeight:       9000,
+						ObjectKeyMain:      objectKey,
+						ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+						ByteOffset:         100,
+						ByteLength:         120,
+						UncompressedLength: 120,
+					},
+				}, nil
+			},
+		),
+		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+			func(ctx context.Context, tag uint32) (*api.BlockMetadata, error) {
+				require.Equal(stableTag, tag)
+				return &api.BlockMetadata{
+					Tag:           0,
+					Hash:          "hash3",
+					ParentHash:    "hash2",
+					Height:        100000,
+					ObjectKeyMain: "key",
+				}, nil
+			},
+		),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("http://endpoint/consolidated", nil),
+	)
+
+	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
+		StartHeight: 9000,
+		EndHeight:   9002,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetFiles(), 2)
+	require.Equal("http://endpoint/consolidated", resp.GetFiles()[0].GetFileUrl())
+	require.Equal(resp.GetFiles()[0].GetFileUrl(), resp.GetFiles()[1].GetFileUrl())
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, resp.GetFiles()[0].GetObjectFormat())
+	require.Equal(uint64(100), resp.GetFiles()[1].GetByteOffset())
+	require.Equal(uint64(120), resp.GetFiles()[1].GetByteLength())
+}
+
 func (s *handlerTestSuite) TestGetBlockFilesByRange_ExceededLatest() {
 	require := testutil.Require(s.T())
 	latest := uint64(99)

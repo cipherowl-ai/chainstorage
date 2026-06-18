@@ -18,7 +18,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/downloader"
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/internal/utils/retry"
-	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -226,37 +225,31 @@ func (c *clientImpl) GetBlocksByRangeWithTag(ctx context.Context, tag uint32, st
 	}
 	blockFiles := resp.GetFiles()
 
-	blocks := make([]*api.Block, endHeight-startHeight)
-	group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(int(c.config.SDK.NumWorkers)))
-	for i := range blockFiles {
-		i := i
-		group.Go(func() error {
-			blockFile := blockFiles[i]
-			c.logger.Debug(
-				"downloading block",
-				zap.Uint32("tag", blockFile.Tag),
-				zap.Uint64("height", blockFile.Height),
-				zap.String("hash", blockFile.Hash),
-			)
-			rawBlock, err := c.blockDownloader.Download(ctx, blockFile)
-			if err != nil {
-				return xerrors.Errorf("failed download blockFile from %s: %w", blockFile.GetFileUrl(), err)
-			}
-
-			if c.blockValidation {
-				err := c.validateBlock(ctx, rawBlock)
-				if err != nil {
-					return xerrors.Errorf("failed to validate block (blockHeight=%v, blockHash=%v): %w", blockFile.Height, blockFile.Hash, err)
-				}
-			}
-
-			blocks[i] = rawBlock
-			return nil
-		})
+	for _, blockFile := range blockFiles {
+		c.logger.Debug(
+			"downloading block",
+			zap.Uint32("tag", blockFile.Tag),
+			zap.Uint64("height", blockFile.Height),
+			zap.String("hash", blockFile.Hash),
+		)
 	}
 
-	if err := group.Wait(); err != nil {
+	blocks, err := c.blockDownloader.DownloadMany(ctx, blockFiles)
+	if err != nil {
 		return nil, xerrors.Errorf("failed to download block files: %w", err)
+	}
+	if len(blocks) != len(blockFiles) {
+		return nil, xerrors.Errorf("downloaded block count mismatch: got %d want %d", len(blocks), len(blockFiles))
+	}
+
+	for i := range blockFiles {
+		if c.blockValidation {
+			blockFile := blockFiles[i]
+			err := c.validateBlock(ctx, blocks[i])
+			if err != nil {
+				return nil, xerrors.Errorf("failed to validate block (blockHeight=%v, blockHash=%v): %w", blockFile.Height, blockFile.Hash, err)
+			}
+		}
 	}
 
 	return blocks, nil
