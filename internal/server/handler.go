@@ -407,8 +407,9 @@ func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFile
 	}
 
 	blockFiles := make([]*api.BlockFile, len(blocks))
+	presignedURLs := make(map[string]string)
 	for i := 0; i < len(blocks); i++ {
-		blockFile, err := s.newBlockFile(blocks[i])
+		blockFile, err := s.newBlockFileWithPresignCache(blocks[i], presignedURLs)
 		if err != nil {
 			return nil, xerrors.Errorf("newBlockFile error: %w", err)
 		}
@@ -735,6 +736,10 @@ func (s *Server) getBlocksFromTransactionStorage(ctx context.Context, tag uint32
 }
 
 func (s *Server) newBlockFile(block *api.BlockMetadata) (*api.BlockFile, error) {
+	return s.newBlockFileWithPresignCache(block, nil)
+}
+
+func (s *Server) newBlockFileWithPresignCache(block *api.BlockMetadata, presignedURLs map[string]string) (*api.BlockFile, error) {
 	if block.Skipped {
 		return &api.BlockFile{
 			Tag:     block.Tag,
@@ -745,9 +750,16 @@ func (s *Server) newBlockFile(block *api.BlockMetadata) (*api.BlockFile, error) 
 
 	key := block.GetObjectKeyMain()
 	compression := storage_utils.GetCompressionType(key)
-	fileUrl, err := s.blobStorage.PreSign(context.Background(), key)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to generate presigned url: %w", err)
+	fileUrl, ok := presignedURLs[key]
+	if !ok {
+		var err error
+		fileUrl, err = s.blobStorage.PreSign(context.Background(), key)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to generate presigned url: %w", err)
+		}
+		if presignedURLs != nil {
+			presignedURLs[key] = fileUrl
+		}
 	}
 
 	return &api.BlockFile{

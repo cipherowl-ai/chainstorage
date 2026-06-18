@@ -131,8 +131,8 @@ func (s *clientTestSuite) TestGetBlocksByRange() {
 			Height: metadata.Height,
 		}
 		blockFiles[i] = blockFile
-		s.downloaderClient.EXPECT().Download(gomock.Any(), blockFile).Return(blocks[i], nil)
 	}
+	s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), blockFiles).Return(blocks, nil)
 	s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
@@ -163,8 +163,8 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTag() {
 			Height: metadata.Height,
 		}
 		blockFiles[i] = blockFile
-		s.downloaderClient.EXPECT().Download(gomock.Any(), blockFile).Return(blocks[i], nil)
 	}
+	s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), blockFiles).Return(blocks, nil)
 	s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
 		Tag:         tag,
 		StartHeight: startHeight,

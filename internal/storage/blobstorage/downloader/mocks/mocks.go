@@ -56,6 +56,21 @@ func (mr *MockBlockDownloaderMockRecorder) Download(arg0, arg1 any) *gomock.Call
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Download", reflect.TypeOf((*MockBlockDownloader)(nil).Download), arg0, arg1)
 }
 
+// DownloadMany mocks base method.
+func (m *MockBlockDownloader) DownloadMany(arg0 context.Context, arg1 []*chainstorage.BlockFile) ([]*chainstorage.Block, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "DownloadMany", arg0, arg1)
+	ret0, _ := ret[0].([]*chainstorage.Block)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// DownloadMany indicates an expected call of DownloadMany.
+func (mr *MockBlockDownloaderMockRecorder) DownloadMany(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadMany", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadMany), arg0, arg1)
+}
+
 // DownloadStream mocks base method.
 func (m *MockBlockDownloader) DownloadStream(arg0 context.Context, arg1 *chainstorage.BlockFile) (*downloader.SpooledBlock, error) {
 	m.ctrl.T.Helper()
