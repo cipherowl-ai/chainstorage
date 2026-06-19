@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -103,6 +104,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		MaxBlocks:   100,
 	}
 	objectKey := "consolidated/v=000000000001/shard=000000001000-000000001999/000000001000-000000001002-sha.zstd"
+	capturedPayloadPaths := make([]string, 0, len(records))
 	placements := []blobstorage.BlockPlacement{
 		{
 			MetadataID:         records[0].ID,
@@ -149,6 +151,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 			UncompressedLength:        110,
 		},
 	}
+	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -157,7 +160,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		s.blobStorage.EXPECT().Download(gomock.Any(), record.Metadata).Return(blocks[i], nil)
 	}
 	s.blobStorage.EXPECT().
-		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID, records[1].ID})).
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatchAndCapturePaths(blocks, []int64{records[0].ID, records[1].ID}, &capturedPayloadPaths)).
 		Return(objectKey, placements, nil)
 	s.metaStorage.EXPECT().
 		PersistBlockConsolidationShadows(gomock.Any(), expectedShadows).
@@ -172,6 +175,11 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		ConsolidatedBlocks: 2,
 		ObjectKey:          objectKey,
 	}, response)
+	require.Len(capturedPayloadPaths, len(records))
+	for _, path := range capturedPayloadPaths {
+		_, statErr := os.Stat(path)
+		require.ErrorIs(statErr, os.ErrNotExist)
+	}
 }
 
 func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBeforeUpload() {
@@ -195,14 +203,20 @@ func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBef
 }
 
 type consolidatedPayloadsMatcher struct {
-	blocks      []*api.Block
-	metadataIDs []int64
+	blocks        []*api.Block
+	metadataIDs   []int64
+	capturedPaths *[]string
 }
 
 func consolidatedPayloadsMatch(blocks []*api.Block, metadataIDs []int64) gomock.Matcher {
+	return consolidatedPayloadsMatchAndCapturePaths(blocks, metadataIDs, nil)
+}
+
+func consolidatedPayloadsMatchAndCapturePaths(blocks []*api.Block, metadataIDs []int64, capturedPaths *[]string) gomock.Matcher {
 	return &consolidatedPayloadsMatcher{
-		blocks:      blocks,
-		metadataIDs: metadataIDs,
+		blocks:        blocks,
+		metadataIDs:   metadataIDs,
+		capturedPaths: capturedPaths,
 	}
 }
 
@@ -211,12 +225,23 @@ func (m *consolidatedPayloadsMatcher) Matches(x any) bool {
 	if !ok || len(payloads) != len(m.blocks) || len(payloads) != len(m.metadataIDs) {
 		return false
 	}
+	paths := make([]string, 0, len(payloads))
 	for i, payload := range payloads {
 		if payload.MetadataID != m.metadataIDs[i] {
 			return false
 		}
 		if !proto.Equal(payload.Metadata, m.blocks[i].GetMetadata()) {
 			return false
+		}
+		if m.capturedPaths != nil {
+			fileSource, ok := payload.RawBlockPayload.(blobstorage.FilePayloadSource)
+			if !ok {
+				return false
+			}
+			if _, err := os.Stat(fileSource.Path()); err != nil {
+				return false
+			}
+			paths = append(paths, fileSource.Path())
 		}
 		reader, err := payload.RawBlockPayload.Open(context.Background())
 		if err != nil {
@@ -234,6 +259,9 @@ func (m *consolidatedPayloadsMatcher) Matches(x any) bool {
 		if !proto.Equal(&block, m.blocks[i]) {
 			return false
 		}
+	}
+	if m.capturedPaths != nil {
+		*m.capturedPaths = paths
 	}
 	return true
 }

@@ -120,7 +120,7 @@ workflows:
     workflow_identity: workflow.backfiller
     workflow_run_timeout: 24h
   batch_consolidator:
-    activity_heartbeat_timeout: 2m
+    activity_heartbeat_timeout: 30m
     activity_retry:
       backoff_coefficient: 2
       initial_interval: 10s

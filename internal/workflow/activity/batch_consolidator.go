@@ -2,6 +2,8 @@ package activity
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -88,10 +90,11 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 		}, nil
 	}
 
-	payloads, recordsByID, err := a.buildPayloads(ctx, records)
+	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, records)
 	if err != nil {
 		return nil, err
 	}
+	defer cleanup()
 
 	objectKey, placements, err := a.blobStorage.UploadConsolidated(ctx, payloads)
 	if err != nil {
@@ -135,16 +138,25 @@ func (a *BatchConsolidator) validateConsolidationMode() error {
 func (a *BatchConsolidator) buildPayloads(
 	ctx context.Context,
 	records []*metastorage.BlockMetadataRecord,
-) ([]blobstorage.ConsolidatedBlockPayload, map[int64]*api.BlockMetadata, error) {
+) ([]blobstorage.ConsolidatedBlockPayload, map[int64]*api.BlockMetadata, func(), error) {
 	payloads := make([]blobstorage.ConsolidatedBlockPayload, len(records))
 	recordsByID := make(map[int64]*api.BlockMetadata, len(records))
 	for i, record := range records {
 		if record == nil || record.Metadata == nil {
-			return nil, nil, xerrors.New("missing block metadata record")
+			return nil, nil, nil, xerrors.New("missing block metadata record")
 		}
 		recordsByID[record.ID] = record.Metadata
 		payloads[i].MetadataID = record.ID
 		payloads[i].Metadata = record.Metadata
+	}
+
+	tempFiles := make([]string, len(records))
+	cleanup := func() {
+		for _, path := range tempFiles {
+			if path != "" {
+				_ = os.Remove(path)
+			}
+		}
 	}
 
 	parallelism := int(a.config.AWS.Storage.Consolidation.MaxInflightRawBlocks)
@@ -169,21 +181,67 @@ func (a *BatchConsolidator) buildPayloads(
 			if err != nil {
 				return xerrors.Errorf("failed to marshal block (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
-			payloads[i].RawBlockPayload = blobstorage.BytesPayloadSource(rawBlockPayload)
-			payloads[i].UncompressedLength = uint64(len(rawBlockPayload))
+			source, path, length, err := writeRawBlockPayloadTempFile(rawBlockPayload, a.config.AWS.Storage.Consolidation.LocalSpillDir)
+			if err != nil {
+				return xerrors.Errorf("failed to stage raw block payload (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
+			}
+			rawBlockPayload = nil
+			tempFiles[i] = path
+			payloads[i].RawBlockPayload = source
+			payloads[i].UncompressedLength = length
 			sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.block_downloaded", metadata.GetHeight())
 			return nil
 		})
 	}
 	if err := group.Wait(); err != nil {
-		return nil, nil, err
+		cleanup()
+		return nil, nil, nil, err
 	}
 	for _, payload := range payloads {
 		if payload.RawBlockPayload == nil {
-			return nil, nil, xerrors.Errorf("missing consolidated payload for metadata_id=%d", payload.MetadataID)
+			cleanup()
+			return nil, nil, nil, xerrors.Errorf("missing consolidated payload for metadata_id=%d", payload.MetadataID)
 		}
 	}
-	return payloads, recordsByID, nil
+	return payloads, recordsByID, cleanup, nil
+}
+
+func writeRawBlockPayloadTempFile(raw []byte, dir string) (blobstorage.PayloadSource, string, uint64, error) {
+	if len(raw) == 0 {
+		return nil, "", 0, xerrors.New("raw block payload cannot be empty")
+	}
+	spillDir := os.TempDir()
+	if dir != "" {
+		spillDir = filepath.Clean(dir)
+	}
+	if err := os.MkdirAll(spillDir, 0o700); err != nil {
+		return nil, "", 0, err
+	}
+	file, err := os.CreateTemp(spillDir, "chainstorage-cscb-raw-block-*.pb")
+	if err != nil {
+		return nil, "", 0, err
+	}
+	path := file.Name()
+	success := false
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+		if !success {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(raw); err != nil {
+		return nil, "", 0, err
+	}
+	if err := file.Close(); err != nil {
+		return nil, "", 0, err
+	}
+	closed = true
+	success = true
+	length := uint64(len(raw))
+	return blobstorage.NewFilePayloadSource(path, length), path, length, nil
 }
 
 func validateDownloadedBlock(expected *api.BlockMetadata, block *api.Block) error {

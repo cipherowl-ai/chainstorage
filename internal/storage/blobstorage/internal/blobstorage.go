@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -30,6 +31,11 @@ type (
 	}
 
 	BytesPayloadSource []byte
+
+	FilePayloadSource struct {
+		path   string
+		length uint64
+	}
 
 	ConsolidatedBlockPayload struct {
 		Metadata           *api.BlockMetadata
@@ -76,6 +82,28 @@ func (s BytesPayloadSource) Open(ctx context.Context) (io.ReadCloser, error) {
 
 func (s BytesPayloadSource) Length() uint64 {
 	return uint64(len(s))
+}
+
+func NewFilePayloadSource(path string, length uint64) FilePayloadSource {
+	return FilePayloadSource{
+		path:   path,
+		length: length,
+	}
+}
+
+func (s FilePayloadSource) Open(ctx context.Context) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return os.Open(s.path)
+}
+
+func (s FilePayloadSource) Length() uint64 {
+	return s.length
+}
+
+func (s FilePayloadSource) Path() string {
+	return s.path
 }
 
 func WithBlobStorageFactory(params BlobStorageFactoryParams) (BlobStorage, error) {
