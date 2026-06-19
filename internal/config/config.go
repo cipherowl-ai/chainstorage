@@ -751,7 +751,7 @@ func (c *Config) validateConsolidationConfig() error {
 		return xerrors.Errorf("invalid consolidation codec %v", consolidation.Codec)
 	}
 
-	if !consolidation.Enabled {
+	if !consolidation.Enabled && !consolidation.ReadShadowFirst {
 		return nil
 	}
 
@@ -762,6 +762,10 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if c.StorageType.MetaStorageType != MetaStorageType_POSTGRES {
 		return xerrors.Errorf("consolidation requires Postgres meta storage until DynamoDB shadow placement and guarded promotion are implemented, got %v", c.StorageType.MetaStorageType)
+	}
+
+	if !consolidation.Enabled {
+		return nil
 	}
 
 	if consolidation.CodecLevel <= 0 {

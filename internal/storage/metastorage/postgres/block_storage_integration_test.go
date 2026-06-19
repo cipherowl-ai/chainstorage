@@ -311,6 +311,134 @@ func (s *blockStorageTestSuite) equalProto(x, y any) {
 	}
 }
 
+func (s *blockStorageTestSuite) getBlockMetadataID(ctx context.Context, block *api.BlockMetadata) int64 {
+	require := testutil.Require(s.T())
+	var blockMetadataID int64
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT id FROM block_metadata WHERE tag = $1 AND height = $2 AND hash = $3 AND object_key_main = $4`,
+		block.GetTag(),
+		block.GetHeight(),
+		block.GetHash(),
+		block.GetObjectKeyMain(),
+	).Scan(&blockMetadataID)
+	require.NoError(err)
+	return blockMetadataID
+}
+
+func (s *blockStorageTestSuite) insertConsolidationShadow(
+	ctx context.Context,
+	block *api.BlockMetadata,
+	consolidatedObjectKey string,
+	byteOffset uint64,
+	byteLength uint64,
+	uncompressedLength uint64,
+	validated bool,
+	legacyObjectKeyMain string,
+) {
+	require := testutil.Require(s.T())
+	if legacyObjectKeyMain == "" {
+		legacyObjectKeyMain = block.GetObjectKeyMain()
+	}
+	var validatedAt any
+	if validated {
+		validatedAt = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			object_format, byte_offset, byte_length, uncompressed_length, validated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		s.getBlockMetadataID(ctx, block),
+		block.GetTag(),
+		block.GetHeight(),
+		block.GetHash(),
+		legacyObjectKeyMain,
+		consolidatedObjectKey,
+		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
+		byteOffset,
+		byteLength,
+		uncompressedLength,
+		validatedAt,
+	)
+	require.NoError(err)
+}
+
+func expectedConsolidationShadow(
+	block *api.BlockMetadata,
+	consolidatedObjectKey string,
+	byteOffset uint64,
+	byteLength uint64,
+	uncompressedLength uint64,
+) *api.BlockMetadata {
+	shadow := proto.Clone(block).(*api.BlockMetadata)
+	shadow.ObjectKeyMain = consolidatedObjectKey
+	shadow.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
+	shadow.ByteOffset = byteOffset
+	shadow.ByteLength = byteLength
+	shadow.UncompressedLength = uncompressedLength
+	return shadow
+}
+
+func (s *blockStorageTestSuite) TestGetConsolidationShadowPredicates() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 4, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/validated.cscb.zstd", 10, 20, 20, true, "")
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/unvalidated.cscb.zstd", 30, 40, 40, false, "")
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/wrong-legacy-key.cscb.zstd", 50, 60, 60, true, "legacy/key/does/not/match")
+
+	expected := expectedConsolidationShadow(blocks[0], "consolidated/validated.cscb.zstd", 10, 20, 20)
+	actual, err := s.accessor.GetBlockConsolidationShadow(ctx, blocks[0])
+	require.NoError(err)
+	s.equalProto(expected, actual)
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[1])
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[2])
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[3])
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+
+	skipped := &api.BlockMetadata{Tag: tag, Height: startHeight + 10, Skipped: true}
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, skipped)
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
+func (s *blockStorageTestSuite) TestGetBlocksConsolidationShadowPreservesOrderAndMisses() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 100, 200, 200, true, "")
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/third.cscb.zstd", 300, 400, 400, true, "")
+	skipped := &api.BlockMetadata{Tag: tag, Height: startHeight + 99, Skipped: true}
+
+	actual, err := s.accessor.GetBlocksConsolidationShadow(ctx, []*api.BlockMetadata{blocks[2], blocks[1], skipped, blocks[0]})
+	require.NoError(err)
+	require.Len(actual, 4)
+	s.equalProto(expectedConsolidationShadow(blocks[2], "consolidated/third.cscb.zstd", 300, 400, 400), actual[0])
+	require.Nil(actual[1])
+	require.Nil(actual[2])
+	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/first.cscb.zstd", 100, 200, 200), actual[3])
+}
+
 func (s *blockStorageTestSuite) TestWatermarkVisibilityControl() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
