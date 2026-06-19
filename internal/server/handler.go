@@ -170,19 +170,19 @@ const (
 
 	accountStateServedCounter = "account_state_served"
 
-	shadowReadCounter            = "shadow_read"
-	shadowReadBytesCounter       = "shadow_read_bytes"
-	shadowReadLatencyTimer       = "shadow_read_latency"
-	shadowPathTag                = "path"
-	shadowOutcomeTag             = "outcome"
-	shadowPathConsolidated       = "consolidated"
-	shadowPathLegacy             = "legacy"
-	shadowOutcomeMiss            = "miss"
-	shadowOutcomeError           = "error"
-	shadowOutcomeValidation      = "validation_mismatch"
-	shadowOutcomeSuccess         = "success"
-	shadowOutcomeFallbackSuccess = "fallback_success"
-	shadowOutcomeFallbackFailure = "fallback_failure"
+	shadowReadCounter             = "shadow_read"
+	shadowReadLogicalBytesCounter = "shadow_read_logical_bytes"
+	shadowReadLatencyTimer        = "shadow_read_latency"
+	shadowPathTag                 = "path"
+	shadowOutcomeTag              = "outcome"
+	shadowPathConsolidated        = "consolidated"
+	shadowPathLegacy              = "legacy"
+	shadowOutcomeMiss             = "miss"
+	shadowOutcomeError            = "error"
+	shadowOutcomeValidation       = "validation_mismatch"
+	shadowOutcomeSuccess          = "success"
+	shadowOutcomeFallbackSuccess  = "fallback_success"
+	shadowOutcomeFallbackFailure  = "fallback_failure"
 
 	errorCounter = "error"
 	serviceTag   = "service"
@@ -380,11 +380,11 @@ func (s *Server) emitShadowReadMetric(outcome string, count int64) {
 	s.metrics.scope.Tagged(map[string]string{shadowOutcomeTag: outcome}).Counter(shadowReadCounter).Inc(count)
 }
 
-func (s *Server) emitShadowReadBytes(path string, count int64) {
+func (s *Server) emitShadowReadLogicalBytes(path string, count int64) {
 	if count <= 0 {
 		return
 	}
-	s.metrics.scope.Tagged(map[string]string{shadowPathTag: path}).Counter(shadowReadBytesCounter).Inc(count)
+	s.metrics.scope.Tagged(map[string]string{shadowPathTag: path}).Counter(shadowReadLogicalBytesCounter).Inc(count)
 }
 
 func (s *Server) emitShadowReadLatency(path string, duration time.Duration) {
@@ -990,7 +990,7 @@ func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMet
 		)
 		return nil, false
 	}
-	if shadow.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH || shadow.GetByteLength() == 0 {
+	if !isConsolidatedBlockMetadata(shadow) {
 		s.emitShadowReadMetric(shadowOutcomeValidation, 1)
 		s.logger.Warn(
 			"shadow consolidated metadata is invalid; falling back to legacy",
@@ -1010,13 +1010,51 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 	selected := make([]*api.BlockMetadata, len(blocks))
 	var shadowCount int
 	var fallbackCount int
+	shadows, err := s.metaStorage.GetBlocksConsolidationShadow(ctx, blocks)
+	if err != nil {
+		s.emitShadowReadMetric(shadowOutcomeError, int64(len(blocks)))
+		s.logger.Warn(
+			"shadow consolidated metadata batch lookup failed; falling back to legacy",
+			zap.Int("num_blocks", len(blocks)),
+			zap.Error(err),
+		)
+		copy(selected, blocks)
+		return selected, 0, len(blocks)
+	}
+	if len(shadows) != len(blocks) {
+		s.emitShadowReadMetric(shadowOutcomeError, int64(len(blocks)))
+		s.logger.Warn(
+			"shadow consolidated metadata batch lookup returned invalid result count; falling back to legacy",
+			zap.Int("num_blocks", len(blocks)),
+			zap.Int("num_shadows", len(shadows)),
+		)
+		copy(selected, blocks)
+		return selected, 0, len(blocks)
+	}
+
 	for i, block := range blocks {
-		shadow, ok := s.getShadowBlockMetadata(ctx, block)
-		if ok {
+		shadow := shadows[i]
+		if shadow == nil {
+			s.emitShadowReadMetric(shadowOutcomeMiss, 1)
+			selected[i] = block
+			fallbackCount++
+			continue
+		}
+		if isConsolidatedBlockMetadata(shadow) {
 			selected[i] = shadow
 			shadowCount++
 			continue
 		}
+		s.emitShadowReadMetric(shadowOutcomeValidation, 1)
+		s.logger.Warn(
+			"shadow consolidated metadata is invalid; falling back to legacy",
+			zap.Uint32("tag", block.GetTag()),
+			zap.Uint64("height", block.GetHeight()),
+			zap.String("hash", block.GetHash()),
+			zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+			zap.Int32("object_format", int32(shadow.GetObjectFormat())),
+			zap.Uint64("byte_length", shadow.GetByteLength()),
+		)
 		selected[i] = block
 		fallbackCount++
 	}
@@ -1030,7 +1068,7 @@ func (s *Server) downloadBlockWithShadowMetrics(ctx context.Context, block *api.
 	if err != nil {
 		return nil, xerrors.Errorf("failed to download from blob storage (input={%+v}): %w", block, err)
 	}
-	s.emitShadowReadBytes(path, blockReadBytes(block, output))
+	s.emitShadowReadLogicalBytes(path, blockReadLogicalBytes(block, output))
 	return output, nil
 }
 
@@ -1056,12 +1094,12 @@ func (s *Server) downloadBlocksWithShadowMetrics(ctx context.Context, blocks []*
 		if i < len(output) {
 			downloaded = output[i]
 		}
-		s.emitShadowReadBytes(path, blockReadBytes(block, downloaded))
+		s.emitShadowReadLogicalBytes(path, blockReadLogicalBytes(block, downloaded))
 	}
 	return output, nil
 }
 
-func blockReadBytes(metadata *api.BlockMetadata, block *api.Block) int64 {
+func blockReadLogicalBytes(metadata *api.BlockMetadata, block *api.Block) int64 {
 	if isConsolidatedBlockMetadata(metadata) {
 		return int64(metadata.GetByteLength())
 	}
@@ -1087,8 +1125,20 @@ func isShadowValidationError(err error) bool {
 		return false
 	}
 	errText := err.Error()
-	return strings.Contains(errText, "CSCB block hash mismatch") ||
+	return strings.Contains(errText, "invalid CSCB magic") ||
+		strings.Contains(errText, "invalid CSCB envelope magic") ||
+		strings.Contains(errText, "unsupported CSCB format version") ||
+		strings.Contains(errText, "unsupported CSCB compression scope") ||
+		strings.Contains(errText, "unexpected CSCB") ||
+		strings.Contains(errText, "CSCB block offset mismatch") ||
+		strings.Contains(errText, "CSCB block length mismatch") ||
+		strings.Contains(errText, "CSCB block uncompressed length mismatch") ||
+		strings.Contains(errText, "CSCB block hash mismatch") ||
 		strings.Contains(errText, "CSCB block CRC mismatch") ||
+		strings.Contains(errText, "CSCB block count mismatch") ||
+		strings.Contains(errText, "CSCB block height") ||
+		strings.Contains(errText, "CSCB chunk count mismatch") ||
+		strings.Contains(errText, "CSCB chunk index") ||
 		strings.Contains(errText, "CSCB chunk CRC mismatch") ||
 		strings.Contains(errText, "CSCB envelope CRC mismatch") ||
 		strings.Contains(errText, "CSCB compressed chunk length mismatch") ||

@@ -136,6 +136,41 @@ func makeShadowBlockMetadata(block *api.BlockMetadata) *api.BlockMetadata {
 	return shadow
 }
 
+func TestIsShadowValidationError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "block offset mismatch",
+			err:  xerrors.New("CSCB block offset mismatch at height 100: index=1 metadata=2"),
+			want: true,
+		},
+		{
+			name: "unsupported header",
+			err:  xerrors.New("unsupported CSCB format version: 99"),
+			want: true,
+		},
+		{
+			name: "hash mismatch",
+			err:  xerrors.New("CSCB block hash mismatch at height 100"),
+			want: true,
+		},
+		{
+			name: "generic storage error",
+			err:  xerrors.New("s3 timeout"),
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := testutil.Require(t)
+			require.Equal(test.want, isShadowValidationError(test.err))
+		})
+	}
+}
+
 func (s *handlerTestSuite) TearDownTest() {
 	s.app.Close()
 	s.ctrl.Finish()
@@ -767,7 +802,7 @@ func (s *handlerTestSuite) TestGetRawBlock_ReadShadowFirstUsesShadow() {
 
 	snapshot := scope.Snapshot()
 	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=success"].Value())
-	require.Equal(int64(shadowMetadata.ByteLength), snapshot.Counters()["server.shadow_read_bytes+path=consolidated"].Value())
+	require.Equal(int64(shadowMetadata.ByteLength), snapshot.Counters()["server.shadow_read_logical_bytes+path=consolidated"].Value())
 }
 
 func (s *handlerTestSuite) TestGetRawBlock_ReadShadowFirstFallsBackOnMiss() {
@@ -1073,9 +1108,7 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_ReadShadowFirstFallsBackOnSha
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), tag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
 		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Times(1).Return(testutil.MakeBlockMetadata(10000, tag), nil),
-		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadatas[0]).Times(1).Return(shadowMetadatas[0], nil),
-		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadatas[1]).Times(1).Return(shadowMetadatas[1], nil),
-		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadatas[2]).Times(1).Return(shadowMetadatas[2], nil),
+		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
 		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), shadowMetadatas).Times(1).Return(nil, xerrors.New("mock consolidated download error")),
 		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), blockMetadatas).Times(1).Return(blocks, nil),
 	)
@@ -1092,6 +1125,48 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_ReadShadowFirstFallsBackOnSha
 	snapshot := scope.Snapshot()
 	require.Equal(int64(numBlocks), snapshot.Counters()["server.shadow_read+outcome=error"].Value())
 	require.Equal(int64(numBlocks), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
+}
+
+func (s *handlerTestSuite) TestGetRawBlocksByRange_ReadShadowFirstUsesBatchLookupWithMiss() {
+	const (
+		startHeight uint64 = 9000
+		endHeight   uint64 = 9003
+		numBlocks          = int(endHeight - startHeight)
+	)
+
+	require := testutil.Require(s.T())
+	scope := tally.NewTestScope("", nil)
+	s.server.metrics = newServerMetrics(scope)
+	s.server.config.AWS.Storage.Consolidation.ReadShadowFirst = true
+
+	tag := s.app.Config().GetLatestBlockTag()
+	blockMetadatas := testutil.MakeBlockMetadatasFromStartHeight(startHeight, numBlocks, tag)
+	shadowMetadatas := make([]*api.BlockMetadata, len(blockMetadatas))
+	shadowMetadatas[0] = makeShadowBlockMetadata(blockMetadatas[0])
+	shadowMetadatas[2] = makeShadowBlockMetadata(blockMetadatas[2])
+	selectedMetadatas := []*api.BlockMetadata{shadowMetadatas[0], blockMetadatas[1], shadowMetadatas[2]}
+	blocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), tag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
+		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Times(1).Return(testutil.MakeBlockMetadata(10000, tag), nil),
+		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), selectedMetadatas).Times(1).Return(blocks, nil),
+	)
+
+	resp, err := s.server.GetRawBlocksByRange(context.Background(), &api.GetRawBlocksByRangeRequest{
+		Tag:         tag,
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(blocks, resp.Blocks)
+
+	snapshot := scope.Snapshot()
+	require.Equal(int64(2), snapshot.Counters()["server.shadow_read+outcome=success"].Value())
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=miss"].Value())
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
 }
 
 func (s *handlerTestSuite) TestGetRawBlocksByRange_MaxRangeExceeded() {

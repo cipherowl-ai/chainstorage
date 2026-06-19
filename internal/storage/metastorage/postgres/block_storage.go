@@ -543,45 +543,124 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 }
 
 func (b *blockStorageImpl) GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error) {
-	if block.GetSkipped() {
-		return nil, xerrors.Errorf("skipped block has no consolidation shadow: %w", errors.ErrItemNotFound)
-	}
-
-	var objectKey string
-	var objectFormat int32
-	var byteOffset, byteLength int64
-	var uncompressedLength sql.NullInt64
-	query := `
-		SELECT consolidated_object_key_main, object_format, byte_offset, byte_length, uncompressed_length
-		FROM block_consolidation_shadow
-		WHERE tag = $1
-			AND height = $2
-			AND hash = $3
-			AND legacy_object_key_main = $4
-			AND validated_at IS NOT NULL
-		ORDER BY created_at DESC
-		LIMIT 1`
-	err := b.db.QueryRowContext(ctx, query, block.GetTag(), block.GetHeight(), block.GetHash(), block.GetObjectKeyMain()).Scan(
-		&objectKey,
-		&objectFormat,
-		&byteOffset,
-		&byteLength,
-		&uncompressedLength,
-	)
+	shadows, err := b.GetBlocksConsolidationShadow(ctx, []*api.BlockMetadata{block})
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, xerrors.Errorf("consolidation shadow not found: %w", errors.ErrItemNotFound)
+		return nil, err
+	}
+	if len(shadows) == 0 || shadows[0] == nil {
+		return nil, xerrors.Errorf("consolidation shadow not found: %w", errors.ErrItemNotFound)
+	}
+	return shadows[0], nil
+}
+
+func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error) {
+	shadows := make([]*api.BlockMetadata, len(blocks))
+	placeholders := make([]string, 0, len(blocks))
+	args := make([]interface{}, 0, len(blocks)*5)
+	nextArg := 1
+	for i, block := range blocks {
+		if block.GetSkipped() {
+			continue
 		}
-		return nil, xerrors.Errorf("failed to get consolidation shadow: %w", err)
+		placeholders = append(placeholders, fmt.Sprintf(
+			"($%d::int, $%d::int, $%d::bigint, $%d::varchar, $%d::text)",
+			nextArg,
+			nextArg+1,
+			nextArg+2,
+			nextArg+3,
+			nextArg+4,
+		))
+		args = append(args, i, block.GetTag(), block.GetHeight(), block.GetHash(), block.GetObjectKeyMain())
+		nextArg += 5
+	}
+	if len(placeholders) == 0 {
+		return shadows, nil
 	}
 
+	query := fmt.Sprintf(`
+		WITH input(ord, tag, height, hash, legacy_object_key_main) AS (
+			VALUES %s
+		)
+		SELECT
+			input.ord,
+			shadow.consolidated_object_key_main,
+			shadow.object_format,
+			shadow.byte_offset,
+			shadow.byte_length,
+			shadow.uncompressed_length
+		FROM input
+		LEFT JOIN LATERAL (
+			SELECT consolidated_object_key_main, object_format, byte_offset, byte_length, uncompressed_length
+			FROM block_consolidation_shadow
+			WHERE tag = input.tag
+				AND height = input.height
+				AND hash = input.hash
+				AND legacy_object_key_main = input.legacy_object_key_main
+				AND validated_at IS NOT NULL
+			ORDER BY created_at DESC
+			LIMIT 1
+		) shadow ON true
+		ORDER BY input.ord ASC`, strings.Join(placeholders, ", "))
+	rows, err := b.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get consolidation shadows: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	for rows.Next() {
+		var ord int
+		var objectKey sql.NullString
+		var objectFormat sql.NullInt64
+		var byteOffset, byteLength sql.NullInt64
+		var uncompressedLength sql.NullInt64
+		if err := rows.Scan(
+			&ord,
+			&objectKey,
+			&objectFormat,
+			&byteOffset,
+			&byteLength,
+			&uncompressedLength,
+		); err != nil {
+			return nil, xerrors.Errorf("failed to scan consolidation shadow: %w", err)
+		}
+		if !objectKey.Valid {
+			continue
+		}
+		if ord < 0 || ord >= len(blocks) {
+			return nil, xerrors.Errorf("consolidation shadow input order out of range: %d", ord)
+		}
+		shadows[ord] = makeConsolidationShadowBlockMetadata(
+			blocks[ord],
+			objectKey.String,
+			api.BlockObjectFormat(objectFormat.Int64),
+			uint64Value(byteOffset),
+			uint64Value(byteLength),
+			uint64Value(uncompressedLength),
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, xerrors.Errorf("failed to iterate consolidation shadows: %w", err)
+	}
+	return shadows, nil
+}
+
+func makeConsolidationShadowBlockMetadata(
+	block *api.BlockMetadata,
+	objectKey string,
+	objectFormat api.BlockObjectFormat,
+	byteOffset uint64,
+	byteLength uint64,
+	uncompressedLength uint64,
+) *api.BlockMetadata {
 	shadow := proto.Clone(block).(*api.BlockMetadata)
 	shadow.ObjectKeyMain = objectKey
-	shadow.ObjectFormat = api.BlockObjectFormat(objectFormat)
-	shadow.ByteOffset = uint64(byteOffset)
-	shadow.ByteLength = uint64(byteLength)
-	shadow.UncompressedLength = uint64Value(uncompressedLength)
-	return shadow, nil
+	shadow.ObjectFormat = objectFormat
+	shadow.ByteOffset = byteOffset
+	shadow.ByteLength = byteLength
+	shadow.UncompressedLength = uncompressedLength
+	return shadow
 }
 
 func uint64Value(value sql.NullInt64) uint64 {

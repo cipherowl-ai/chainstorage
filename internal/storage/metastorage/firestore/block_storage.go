@@ -254,6 +254,10 @@ func (b *blockStorageImpl) GetBlockConsolidationShadow(ctx context.Context, bloc
 	return nil, xerrors.New("GetBlockConsolidationShadow not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blocks []*chainstorage.BlockMetadata) ([]*chainstorage.BlockMetadata, error) {
+	return nil, xerrors.New("GetBlocksConsolidationShadow not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) getLatestBlockDocRef(tag uint32) *firestore.DocumentRef {
 	return b.client.Doc(fmt.Sprintf("env/%s/blocks/%d-latest", b.env, tag))
 }
