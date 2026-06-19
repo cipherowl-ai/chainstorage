@@ -1,0 +1,211 @@
+package workflow
+
+import (
+	"context"
+	"strconv"
+
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/workflow"
+	"go.uber.org/fx"
+	"go.uber.org/zap"
+	"golang.org/x/xerrors"
+
+	"github.com/coinbase/chainstorage/internal/cadence"
+	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/utils/fxparams"
+	"github.com/coinbase/chainstorage/internal/workflow/activity"
+)
+
+type (
+	BatchConsolidator struct {
+		baseWorkflow
+		batchConsolidator *activity.BatchConsolidator
+	}
+
+	BatchConsolidatorParams struct {
+		fx.In
+		fxparams.Params
+		Runtime           cadence.Runtime
+		BatchConsolidator *activity.BatchConsolidator
+	}
+
+	BatchConsolidatorRequest struct {
+		Tag            uint32
+		StartHeight    uint64
+		EndHeight      uint64 `validate:"gtfield=StartHeight"`
+		BatchSize      uint64
+		CheckpointSize uint64
+		MaxBlocks      uint64
+	}
+)
+
+var (
+	_ InstrumentedRequest = (*BatchConsolidatorRequest)(nil)
+)
+
+const (
+	batchConsolidatorHeightGauge              = "workflow.batch_consolidator.height"
+	batchConsolidatorObjectCounter            = "workflow.batch_consolidator.object"
+	batchConsolidatorConsolidatedBlockCounter = "workflow.batch_consolidator.consolidated_block"
+	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
+)
+
+func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
+	w := &BatchConsolidator{
+		baseWorkflow:      newBaseWorkflow(&params.Config.Workflows.BatchConsolidator, params.Runtime),
+		batchConsolidator: params.BatchConsolidator,
+	}
+	w.registerWorkflow(w.execute)
+	return w
+}
+
+func (w *BatchConsolidator) Execute(ctx context.Context, request *BatchConsolidatorRequest) (client.WorkflowRun, error) {
+	workflowID := w.name
+	if v, ok := ctx.Value("workflowId").(string); ok && v != "" {
+		workflowID = v
+	}
+	return w.startWorkflow(ctx, workflowID, request)
+}
+
+func (r *BatchConsolidatorRequest) GetTags() map[string]string {
+	return map[string]string{
+		tagBlockTag: strconv.Itoa(int(r.Tag)),
+	}
+}
+
+func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolidatorRequest) error {
+	return w.executeWorkflow(ctx, request, func() error {
+		var cfg config.BatchConsolidatorWorkflowConfig
+		if err := w.readConfig(ctx, &cfg); err != nil {
+			return xerrors.Errorf("failed to read config: %w", err)
+		}
+
+		batchSize := cfg.BatchSize
+		if request.BatchSize > 0 {
+			batchSize = request.BatchSize
+		}
+		checkpointSize := cfg.CheckpointSize
+		if request.CheckpointSize > 0 {
+			checkpointSize = request.CheckpointSize
+		}
+		maxBlocks := cfg.MaxBlocks
+		if request.MaxBlocks > 0 {
+			maxBlocks = request.MaxBlocks
+		}
+		storageMaxBlocks := cfg.Storage.Consolidation.MaxBlocks
+		if storageMaxBlocks == 0 {
+			return xerrors.New("batch_consolidator storage consolidation max_blocks must be positive")
+		}
+		if maxBlocks == 0 || maxBlocks > storageMaxBlocks {
+			maxBlocks = storageMaxBlocks
+		}
+		shardSize := cfg.Storage.Consolidation.ShardSize
+		if batchSize == 0 {
+			return xerrors.New("batch_consolidator batch_size must be positive")
+		}
+		if checkpointSize <= batchSize {
+			return xerrors.Errorf("batch_consolidator checkpoint_size(%d) must be greater than batch_size(%d)", checkpointSize, batchSize)
+		}
+		if maxBlocks == 0 {
+			return xerrors.New("batch_consolidator max_blocks must be positive")
+		}
+		if shardSize == 0 {
+			return xerrors.New("batch_consolidator storage consolidation shard_size must be positive")
+		}
+
+		tag := cfg.GetEffectiveBlockTag(request.Tag)
+		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
+			tagBlockTag: strconv.Itoa(int(tag)),
+		})
+		logger := w.getLogger(ctx).With(
+			zap.Reflect("request", request),
+			zap.Reflect("config", cfg),
+			zap.Uint32("effective_tag", tag),
+			zap.Uint64("batch_size", batchSize),
+			zap.Uint64("checkpoint_size", checkpointSize),
+			zap.Uint64("max_blocks", maxBlocks),
+			zap.Uint64("storage_max_blocks", storageMaxBlocks),
+			zap.Uint64("shard_size", shardSize),
+		)
+		logger.Info("workflow started")
+		ctx = w.withActivityOptions(ctx)
+
+		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
+			if batchStart-request.StartHeight >= checkpointSize {
+				newRequest := *request
+				newRequest.StartHeight = batchStart
+				logger.Info("checkpoint reached", zap.Reflect("newRequest", newRequest))
+				return w.continueAsNew(ctx, &newRequest)
+			}
+
+			batchEnd := batchConsolidatorWindowEnd(batchStart, request.EndHeight, batchSize, shardSize)
+			if batchEnd <= batchStart {
+				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
+			}
+
+			objectsInBatch := uint64(0)
+			blocksInBatch := uint64(0)
+			for {
+				response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
+					Tag:         tag,
+					StartHeight: batchStart,
+					EndHeight:   batchEnd,
+					MaxBlocks:   maxBlocks,
+				})
+				if err != nil {
+					return xerrors.Errorf("failed to consolidate shadow batch [%d, %d): %w", batchStart, batchEnd, err)
+				}
+				if response.ScannedBlocks == 0 {
+					metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
+					break
+				}
+				if response.ConsolidatedBlocks == 0 {
+					return xerrors.Errorf("batch_consolidator made no progress for non-empty shadow scan [%d, %d)", batchStart, batchEnd)
+				}
+				objectsInBatch++
+				blocksInBatch += response.ConsolidatedBlocks
+				metrics.Counter(batchConsolidatorObjectCounter).Inc(1)
+				metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(response.ConsolidatedBlocks))
+				logger.Info(
+					"processed shadow object",
+					zap.Uint64("batch_start", batchStart),
+					zap.Uint64("batch_end", batchEnd),
+					zap.Uint64("scanned_blocks", response.ScannedBlocks),
+					zap.Uint64("consolidated_blocks", response.ConsolidatedBlocks),
+					zap.String("object_key", response.ObjectKey),
+				)
+				if response.ScannedBlocks < maxBlocks {
+					break
+				}
+			}
+			metrics.Gauge(batchConsolidatorHeightGauge).Update(float64(batchEnd - 1))
+			logger.Info(
+				"processed shadow batch",
+				zap.Uint64("batch_start", batchStart),
+				zap.Uint64("batch_end", batchEnd),
+				zap.Uint64("objects", objectsInBatch),
+				zap.Uint64("consolidated_blocks", blocksInBatch),
+			)
+			batchStart = batchEnd
+		}
+
+		logger.Info("workflow finished")
+		return nil
+	})
+}
+
+func batchConsolidatorWindowEnd(startHeight uint64, requestedEndHeight uint64, batchSize uint64, shardSize uint64) uint64 {
+	batchEnd := startHeight + batchSize
+	if batchEnd < startHeight || batchEnd > requestedEndHeight {
+		batchEnd = requestedEndHeight
+	}
+	shardEnd := batchConsolidatorShardEnd(startHeight, shardSize)
+	if shardEnd < batchEnd {
+		return shardEnd
+	}
+	return batchEnd
+}
+
+func batchConsolidatorShardEnd(height uint64, shardSize uint64) uint64 {
+	return (height/shardSize + 1) * shardSize
+}

@@ -13,10 +13,19 @@ type (
 	BlobStorageFactory       = internal.BlobStorageFactory
 	BlobStorageFactoryParams = internal.BlobStorageFactoryParams
 	RawBlockData             = internal.RawBlockData
+	PayloadSource            = internal.PayloadSource
+	BytesPayloadSource       = internal.BytesPayloadSource
+	FilePayloadSource        = internal.FilePayloadSource
+	ConsolidatedBlockPayload = internal.ConsolidatedBlockPayload
+	BlockPlacement           = internal.BlockPlacement
 )
 
-var Module = fx.Options(
-	fx.Provide(internal.WithBlobStorageFactory),
-	s3.Module,
-	gcs.Module,
+var (
+	NewFilePayloadSource = internal.NewFilePayloadSource
+
+	Module = fx.Options(
+		fx.Provide(internal.WithBlobStorageFactory),
+		s3.Module,
+		gcs.Module,
+	)
 )

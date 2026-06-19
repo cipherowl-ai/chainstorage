@@ -21,6 +21,7 @@ var Module = fx.Options(
 	fx.Provide(NewLatestBlock),
 	fx.Provide(NewUpdateWatermark),
 	fx.Provide(NewMigrator),
+	fx.Provide(NewBatchConsolidator),
 	fx.Provide(NewGetLatestBlockHeightActivity),
 	fx.Provide(NewGetLatestBlockFromPostgresActivity),
 	fx.Provide(NewGetLatestEventFromPostgresActivity),

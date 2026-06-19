@@ -18,6 +18,7 @@ var Module = fx.Options(
 	fx.Provide(NewEventBackfiller),
 	fx.Provide(NewReplicator),
 	fx.Provide(NewMigrator),
+	fx.Provide(NewBatchConsolidator),
 )
 
 const (

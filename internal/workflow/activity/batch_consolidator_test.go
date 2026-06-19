@@ -1,0 +1,297 @@
+package activity
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"testing"
+
+	"github.com/stretchr/testify/suite"
+	"go.temporal.io/sdk/testsuite"
+	"go.uber.org/fx"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/coinbase/chainstorage/internal/cadence"
+	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/dlq"
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
+	blobstoragemocks "github.com/coinbase/chainstorage/internal/storage/blobstorage/mocks"
+	"github.com/coinbase/chainstorage/internal/storage/metastorage"
+	metastoragemocks "github.com/coinbase/chainstorage/internal/storage/metastorage/mocks"
+	"github.com/coinbase/chainstorage/internal/utils/testapp"
+	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
+)
+
+type BatchConsolidatorTestSuite struct {
+	suite.Suite
+	testsuite.WorkflowTestSuite
+	env               *cadence.TestEnv
+	ctrl              *gomock.Controller
+	metaStorage       *metastoragemocks.MockMetaStorage
+	blobStorage       *blobstoragemocks.MockBlobStorage
+	app               testapp.TestApp
+	batchConsolidator *BatchConsolidator
+}
+
+func TestBatchConsolidatorTestSuite(t *testing.T) {
+	suite.Run(t, new(BatchConsolidatorTestSuite))
+}
+
+func (s *BatchConsolidatorTestSuite) SetupTest() {
+	require := testutil.Require(s.T())
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.Storage.Consolidation.Enabled = true
+	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModeShadowDualWrite
+
+	s.env = cadence.NewTestActivityEnv(s)
+	s.ctrl = gomock.NewController(s.T())
+	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
+	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.app = testapp.New(
+		s.T(),
+		Module,
+		testapp.WithConfig(cfg),
+		cadence.WithTestEnv(s.env),
+		fx.Provide(func() metastorage.MetaStorage {
+			return s.metaStorage
+		}),
+		fx.Provide(func() blobstorage.BlobStorage {
+			return s.blobStorage
+		}),
+		fx.Provide(dlq.NewNop),
+		fx.Populate(&s.batchConsolidator),
+	)
+}
+
+func (s *BatchConsolidatorTestSuite) TearDownTest() {
+	s.app.Close()
+	s.ctrl.Finish()
+	s.env.AssertExpectations(s.T())
+}
+
+func (s *BatchConsolidatorTestSuite) TestEmptyScanNoOps() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   100,
+	}
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(nil, nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight: request.StartHeight,
+		EndHeight:   request.EndHeight,
+	}, response)
+}
+
+func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements() {
+	require := testutil.Require(s.T())
+	records, blocks := makeConsolidatorFixture(2, 1000)
+	request := &BatchConsolidatorRequest{
+		Tag:         records[0].Metadata.GetTag(),
+		StartHeight: 1000,
+		EndHeight:   1002,
+		MaxBlocks:   100,
+	}
+	objectKey := "consolidated/v=000000000001/shard=000000001000-000000001999/000000001000-000000001002-sha.zstd"
+	capturedPayloadPaths := make([]string, 0, len(records))
+	placements := []blobstorage.BlockPlacement{
+		{
+			MetadataID:         records[0].ID,
+			Height:             records[0].Metadata.GetHeight(),
+			Hash:               records[0].Metadata.GetHash(),
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         0,
+			ByteLength:         100,
+			UncompressedLength: 100,
+		},
+		{
+			MetadataID:         records[1].ID,
+			Height:             records[1].Metadata.GetHeight(),
+			Hash:               records[1].Metadata.GetHash(),
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         100,
+			ByteLength:         110,
+			UncompressedLength: 110,
+		},
+	}
+	expectedShadows := []*metastorage.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           records[0].ID,
+			Tag:                       records[0].Metadata.GetTag(),
+			Height:                    records[0].Metadata.GetHeight(),
+			Hash:                      records[0].Metadata.GetHash(),
+			LegacyObjectKeyMain:       records[0].Metadata.GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: objectKey,
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                0,
+			ByteLength:                100,
+			UncompressedLength:        100,
+		},
+		{
+			BlockMetadataID:           records[1].ID,
+			Tag:                       records[1].Metadata.GetTag(),
+			Height:                    records[1].Metadata.GetHeight(),
+			Hash:                      records[1].Metadata.GetHash(),
+			LegacyObjectKeyMain:       records[1].Metadata.GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: objectKey,
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                100,
+			ByteLength:                110,
+			UncompressedLength:        110,
+		},
+	}
+	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
+
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(records, nil)
+	for i, record := range records {
+		s.blobStorage.EXPECT().Download(gomock.Any(), record.Metadata).Return(blocks[i], nil)
+	}
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatchAndCapturePaths(blocks, []int64{records[0].ID, records[1].ID}, &capturedPayloadPaths)).
+		Return(objectKey, placements, nil)
+	s.metaStorage.EXPECT().
+		PersistBlockConsolidationShadows(gomock.Any(), expectedShadows).
+		Return(nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          request.EndHeight,
+		ScannedBlocks:      2,
+		ConsolidatedBlocks: 2,
+		ObjectKey:          objectKey,
+	}, response)
+	require.Len(capturedPayloadPaths, len(records))
+	for _, path := range capturedPayloadPaths {
+		_, statErr := os.Stat(path)
+		require.ErrorIs(statErr, os.ErrNotExist)
+	}
+}
+
+func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBeforeUpload() {
+	require := testutil.Require(s.T())
+	records, blocks := makeConsolidatorFixture(1, 1000)
+	blocks[0].Metadata.Hash = "wrong-hash"
+	request := &BatchConsolidatorRequest{
+		Tag:         records[0].Metadata.GetTag(),
+		StartHeight: 1000,
+		EndHeight:   1001,
+		MaxBlocks:   100,
+	}
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(records, nil)
+	s.blobStorage.EXPECT().Download(gomock.Any(), records[0].Metadata).Return(blocks[0], nil)
+
+	_, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.Contains(err.Error(), "downloaded block metadata mismatch")
+}
+
+type consolidatedPayloadsMatcher struct {
+	blocks        []*api.Block
+	metadataIDs   []int64
+	capturedPaths *[]string
+}
+
+func consolidatedPayloadsMatch(blocks []*api.Block, metadataIDs []int64) gomock.Matcher {
+	return consolidatedPayloadsMatchAndCapturePaths(blocks, metadataIDs, nil)
+}
+
+func consolidatedPayloadsMatchAndCapturePaths(blocks []*api.Block, metadataIDs []int64, capturedPaths *[]string) gomock.Matcher {
+	return &consolidatedPayloadsMatcher{
+		blocks:        blocks,
+		metadataIDs:   metadataIDs,
+		capturedPaths: capturedPaths,
+	}
+}
+
+func (m *consolidatedPayloadsMatcher) Matches(x any) bool {
+	payloads, ok := x.([]blobstorage.ConsolidatedBlockPayload)
+	if !ok || len(payloads) != len(m.blocks) || len(payloads) != len(m.metadataIDs) {
+		return false
+	}
+	paths := make([]string, 0, len(payloads))
+	for i, payload := range payloads {
+		if payload.MetadataID != m.metadataIDs[i] {
+			return false
+		}
+		if !proto.Equal(payload.Metadata, m.blocks[i].GetMetadata()) {
+			return false
+		}
+		if m.capturedPaths != nil {
+			fileSource, ok := payload.RawBlockPayload.(blobstorage.FilePayloadSource)
+			if !ok {
+				return false
+			}
+			if _, err := os.Stat(fileSource.Path()); err != nil {
+				return false
+			}
+			paths = append(paths, fileSource.Path())
+		}
+		reader, err := payload.RawBlockPayload.Open(context.Background())
+		if err != nil {
+			return false
+		}
+		raw, err := io.ReadAll(reader)
+		_ = reader.Close()
+		if err != nil || uint64(len(raw)) != payload.UncompressedLength {
+			return false
+		}
+		var block api.Block
+		if err := proto.Unmarshal(raw, &block); err != nil {
+			return false
+		}
+		if !proto.Equal(&block, m.blocks[i]) {
+			return false
+		}
+	}
+	if m.capturedPaths != nil {
+		*m.capturedPaths = paths
+	}
+	return true
+}
+
+func (m *consolidatedPayloadsMatcher) String() string {
+	return fmt.Sprintf("matches %d consolidated block payloads", len(m.blocks))
+}
+
+func makeConsolidatorFixture(count int, startHeight uint64) ([]*metastorage.BlockMetadataRecord, []*api.Block) {
+	records := make([]*metastorage.BlockMetadataRecord, count)
+	blocks := make([]*api.Block, count)
+	for i := 0; i < count; i++ {
+		height := startHeight + uint64(i)
+		metadata := &api.BlockMetadata{
+			Tag:           2,
+			Height:        height,
+			Hash:          fmt.Sprintf("hash-%d", height),
+			ParentHash:    fmt.Sprintf("hash-%d", height-1),
+			ParentHeight:  height - 1,
+			ObjectKeyMain: fmt.Sprintf("legacy/%d.gzip", height),
+		}
+		records[i] = &metastorage.BlockMetadataRecord{
+			ID:       int64(10 + i),
+			Metadata: metadata,
+		}
+		blocks[i] = &api.Block{
+			Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
+			Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
+			Metadata:   proto.Clone(metadata).(*api.BlockMetadata),
+		}
+	}
+	return records, blocks
+}

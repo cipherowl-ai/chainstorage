@@ -26,6 +26,8 @@ type (
 		GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error)
 		GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error)
 		GetBlocksConsolidationShadow(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error)
+		GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*BlockMetadataRecord, error)
+		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
 	}
 
 	EventStorage interface {
@@ -65,6 +67,24 @@ type (
 		EventStorage       EventStorage
 		MetaStorage        MetaStorage
 		TransactionStorage TransactionStorage
+	}
+
+	BlockMetadataRecord struct {
+		ID       int64
+		Metadata *api.BlockMetadata
+	}
+
+	ConsolidationShadowPlacement struct {
+		BlockMetadataID           int64
+		Tag                       uint32
+		Height                    uint64
+		Hash                      string
+		LegacyObjectKeyMain       string
+		ConsolidatedObjectKeyMain string
+		ObjectFormat              api.BlockObjectFormat
+		ByteOffset                uint64
+		ByteLength                uint64
+		UncompressedLength        uint64
 	}
 
 	MetaStorageFactory interface {
