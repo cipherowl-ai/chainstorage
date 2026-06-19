@@ -168,6 +168,16 @@ func TestIsShadowValidationError(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "wrapped cscb object timeout",
+			err:  xerrors.Errorf("failed to download CSCB object (key=consolidated): %w", xerrors.New("s3 timeout")),
+			want: false,
+		},
+		{
+			name: "wrapped metadata context timeout",
+			err:  xerrors.Errorf("failed to download from blob storage (input={ObjectFormat:BLOCK_OBJECT_FORMAT_CSCB_BATCH}): %w", xerrors.New("s3 timeout")),
+			want: false,
+		},
+		{
 			name: "hash mismatch",
 			err:  xerrors.New("CSCB block hash mismatch at height 100"),
 			want: true,
@@ -1159,7 +1169,7 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_ReadShadowFirstFallsBackOnSha
 		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), tag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
 		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Times(1).Return(testutil.MakeBlockMetadata(10000, tag), nil),
 		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
-		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), shadowMetadatas).Times(1).Return(nil, xerrors.New("mock consolidated download error")),
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), shadowMetadatas).Times(1).Return(nil, xerrors.Errorf("failed to download CSCB object (key=consolidated): %w", xerrors.New("s3 timeout"))),
 		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), blockMetadatas).Times(1).Return(blocks, nil),
 	)
 

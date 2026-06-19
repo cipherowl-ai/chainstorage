@@ -914,7 +914,7 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		return blockWithPrimaryMetadata(output, block), nil
 	}
 
-	s.emitShadowReadMetric(shadowReadErrorOutcome(errors.Unwrap(err)), 1)
+	s.emitShadowReadMetric(shadowReadErrorOutcome(err), 1)
 	s.logger.Warn(
 		"shadow consolidated block read failed; falling back to legacy",
 		zap.Uint32("tag", block.GetTag()),
@@ -954,7 +954,7 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 		return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
 	}
 
-	s.emitShadowReadMetric(shadowReadErrorOutcome(errors.Unwrap(err)), int64(shadowCount))
+	s.emitShadowReadMetric(shadowReadErrorOutcome(err), int64(shadowCount))
 	s.logger.Warn(
 		"shadow consolidated range read failed; falling back to legacy",
 		zap.Int("num_blocks", len(blocks)),
@@ -1143,7 +1143,25 @@ func isShadowValidationError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(err.Error(), "CSCB")
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		if isCSCBValidationMessage(current.Error()) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCSCBValidationMessage(errText string) bool {
+	return strings.Contains(errText, "invalid CSCB") ||
+		strings.Contains(errText, "unsupported CSCB") ||
+		strings.Contains(errText, "unexpected CSCB") ||
+		strings.Contains(errText, "duplicate CSCB") ||
+		strings.Contains(errText, "failed to decompress CSCB chunk") ||
+		strings.Contains(errText, "CSCB header") ||
+		strings.Contains(errText, "CSCB index") ||
+		strings.Contains(errText, "CSCB envelope") ||
+		strings.Contains(errText, "CSCB block") ||
+		strings.Contains(errText, "CSCB chunk")
 }
 
 func (s *Server) newAuthContext(ctx context.Context) context.Context {
