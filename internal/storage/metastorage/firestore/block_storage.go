@@ -250,6 +250,10 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 	return nil, xerrors.New("GetBlockByTimestamp not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationShadow(ctx context.Context, block *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	return nil, xerrors.New("GetBlockConsolidationShadow not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) getLatestBlockDocRef(tag uint32) *firestore.DocumentRef {
 	return b.client.Doc(fmt.Sprintf("env/%s/blocks/%d-latest", b.env, tag))
 }

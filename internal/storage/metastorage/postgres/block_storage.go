@@ -541,6 +541,48 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 	})
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error) {
+	if block.GetSkipped() {
+		return nil, xerrors.Errorf("skipped block has no consolidation shadow: %w", errors.ErrItemNotFound)
+	}
+
+	var objectKey string
+	var objectFormat int32
+	var byteOffset, byteLength int64
+	var uncompressedLength sql.NullInt64
+	query := `
+		SELECT consolidated_object_key_main, object_format, byte_offset, byte_length, uncompressed_length
+		FROM block_consolidation_shadow
+		WHERE tag = $1
+			AND height = $2
+			AND hash = $3
+			AND legacy_object_key_main = $4
+			AND validated_at IS NOT NULL
+		ORDER BY created_at DESC
+		LIMIT 1`
+	err := b.db.QueryRowContext(ctx, query, block.GetTag(), block.GetHeight(), block.GetHash(), block.GetObjectKeyMain()).Scan(
+		&objectKey,
+		&objectFormat,
+		&byteOffset,
+		&byteLength,
+		&uncompressedLength,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, xerrors.Errorf("consolidation shadow not found: %w", errors.ErrItemNotFound)
+		}
+		return nil, xerrors.Errorf("failed to get consolidation shadow: %w", err)
+	}
+
+	shadow := *block
+	shadow.ObjectKeyMain = objectKey
+	shadow.ObjectFormat = api.BlockObjectFormat(objectFormat)
+	shadow.ByteOffset = uint64(byteOffset)
+	shadow.ByteLength = uint64(byteLength)
+	shadow.UncompressedLength = uint64Value(uncompressedLength)
+	return &shadow, nil
+}
+
 func uint64Value(value sql.NullInt64) uint64 {
 	if !value.Valid {
 		return 0

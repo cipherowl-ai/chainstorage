@@ -24,6 +24,7 @@ type (
 		GetBlocksByHeights(ctx context.Context, tag uint32, heights []uint64) ([]*api.BlockMetadata, error)
 		// GetBlockByTimestamp gets the latest block before or at the given timestamp
 		GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error)
+		GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error)
 	}
 
 	EventStorage interface {

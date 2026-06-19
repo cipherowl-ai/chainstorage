@@ -113,6 +113,21 @@ func (mr *MockMetaStorageMockRecorder) GetBlockByHeight(arg0, arg1, arg2 any) *g
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByHeight", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockByHeight), arg0, arg1, arg2)
 }
 
+// GetBlockConsolidationShadow mocks base method.
+func (m *MockMetaStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationShadow", arg0, arg1)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationShadow indicates an expected call of GetBlockConsolidationShadow.
+func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationShadow(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadow", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationShadow), arg0, arg1)
+}
+
 // GetBlockByTimestamp mocks base method.
 func (m *MockMetaStorage) GetBlockByTimestamp(arg0 context.Context, arg1 uint32, arg2 uint64) (*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -512,6 +527,21 @@ func (m *MockBlockStorage) GetBlockByHeight(arg0 context.Context, arg1 uint32, a
 func (mr *MockBlockStorageMockRecorder) GetBlockByHeight(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByHeight", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockByHeight), arg0, arg1, arg2)
+}
+
+// GetBlockConsolidationShadow mocks base method.
+func (m *MockBlockStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationShadow", arg0, arg1)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationShadow indicates an expected call of GetBlockConsolidationShadow.
+func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationShadow(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadow", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationShadow), arg0, arg1)
 }
 
 // GetBlockByTimestamp mocks base method.
