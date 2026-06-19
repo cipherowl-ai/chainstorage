@@ -910,7 +910,7 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 	output, err := s.downloadBlockWithShadowMetrics(ctx, shadow, shadowPathConsolidated)
 	if err == nil {
 		s.emitShadowReadMetric(shadowOutcomeSuccess, 1)
-		return output, nil
+		return blockWithPrimaryMetadata(output, block), nil
 	}
 
 	s.emitShadowReadMetric(shadowReadErrorOutcome(err), 1)
@@ -945,10 +945,11 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 	if err == nil {
 		s.emitShadowReadMetric(shadowOutcomeSuccess, int64(shadowCount))
 		s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, int64(fallbackCount))
-		return output, nil
+		return blocksWithPrimaryMetadata(output, blocks), nil
 	}
 
 	if shadowCount == 0 {
+		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, int64(fallbackCount))
 		return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
 	}
 
@@ -965,7 +966,7 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 		return nil, xerrors.Errorf("failed to download fallback legacy blocks from blob storage: %w", fallbackErr)
 	}
 	s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, int64(len(blocks)))
-	return fallback, nil
+	return blocksWithPrimaryMetadata(fallback, blocks), nil
 }
 
 func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
@@ -1109,6 +1110,23 @@ func blockReadLogicalBytes(metadata *api.BlockMetadata, block *api.Block) int64 
 	return 0
 }
 
+func blockWithPrimaryMetadata(block *api.Block, metadata *api.BlockMetadata) *api.Block {
+	if block != nil {
+		block.Metadata = metadata
+	}
+	return block
+}
+
+func blocksWithPrimaryMetadata(blocks []*api.Block, metadatas []*api.BlockMetadata) []*api.Block {
+	for i, block := range blocks {
+		if i >= len(metadatas) {
+			break
+		}
+		blockWithPrimaryMetadata(block, metadatas[i])
+	}
+	return blocks
+}
+
 func isConsolidatedBlockMetadata(metadata *api.BlockMetadata) bool {
 	return metadata.GetObjectFormat() == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH && metadata.GetByteLength() > 0
 }
@@ -1139,10 +1157,14 @@ func isShadowValidationError(err error) bool {
 		strings.Contains(errText, "CSCB block height") ||
 		strings.Contains(errText, "CSCB chunk count mismatch") ||
 		strings.Contains(errText, "CSCB chunk index") ||
+		strings.Contains(errText, "CSCB chunk length mismatch") ||
 		strings.Contains(errText, "CSCB chunk CRC mismatch") ||
 		strings.Contains(errText, "CSCB envelope CRC mismatch") ||
 		strings.Contains(errText, "CSCB compressed chunk length mismatch") ||
-		strings.Contains(errText, "CSCB block payload length mismatch")
+		strings.Contains(errText, "CSCB block payload length mismatch") ||
+		strings.Contains(errText, "CSCB block payload exceeds chunk bounds") ||
+		strings.Contains(errText, "unsupported CSCB codec") ||
+		strings.Contains(errText, "failed to decompress CSCB chunk")
 }
 
 func (s *Server) newAuthContext(ctx context.Context) context.Context {
