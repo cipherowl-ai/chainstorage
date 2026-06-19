@@ -646,6 +646,171 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 	return shadows, nil
 }
 
+func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*internal.BlockMetadataRecord, error) {
+	if endHeight <= startHeight {
+		return nil, nil
+	}
+	if limit == 0 {
+		return nil, xerrors.New("consolidation shadow scan limit must be positive")
+	}
+	query := fmt.Sprintf(`
+		SELECT %s
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
+			AND bm.skipped = false
+			AND bm.byte_length IS NULL
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+			AND NOT EXISTS (
+				SELECT 1
+				FROM block_consolidation_shadow shadow
+				WHERE shadow.block_metadata_id = bm.id
+					AND shadow.legacy_object_key_main = bm.object_key_main
+					AND shadow.validated_at IS NOT NULL
+			)
+		ORDER BY cb.height ASC
+		LIMIT $4`, canonicalBlockMetadataColumns)
+
+	rows, err := b.db.QueryContext(ctx, query, tag, startHeight, endHeight, limit)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to scan unconsolidated blocks: %w", err)
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	records := make([]*internal.BlockMetadataRecord, 0)
+	for rows.Next() {
+		var id int64
+		var height uint64
+		var blockTag uint32
+		var hash, parentHash, objectKeyMain sql.NullString
+		var parentHeight uint64
+		var blockTimestamp int64
+		var skipped bool
+		var objectFormat int32
+		var byteOffset, byteLength, uncompressedLength sql.NullInt64
+		if err := rows.Scan(
+			&id,
+			&height,
+			&blockTag,
+			&hash,
+			&parentHash,
+			&parentHeight,
+			&objectKeyMain,
+			&blockTimestamp,
+			&skipped,
+			&objectFormat,
+			&byteOffset,
+			&byteLength,
+			&uncompressedLength,
+		); err != nil {
+			return nil, xerrors.Errorf("failed to scan unconsolidated block: %w", err)
+		}
+		records = append(records, &internal.BlockMetadataRecord{
+			ID: id,
+			Metadata: &api.BlockMetadata{
+				Tag:                blockTag,
+				Hash:               hash.String,
+				ParentHash:         parentHash.String,
+				Height:             height,
+				ParentHeight:       parentHeight,
+				ObjectKeyMain:      objectKeyMain.String,
+				Timestamp:          utils.ToTimestamp(blockTimestamp),
+				Skipped:            skipped,
+				ObjectFormat:       api.BlockObjectFormat(objectFormat),
+				ByteOffset:         uint64Value(byteOffset),
+				ByteLength:         uint64Value(byteLength),
+				UncompressedLength: uint64Value(uncompressedLength),
+			},
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, xerrors.Errorf("failed to iterate unconsolidated blocks: %w", err)
+	}
+	return records, nil
+}
+
+func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
+	if len(placements) == 0 {
+		return nil
+	}
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return xerrors.Errorf("failed to begin consolidation shadow transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	const query = `
+		INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			object_format, byte_offset, byte_length, uncompressed_length, validated_at
+		)
+		SELECT
+			bm.id, bm.tag, bm.height, bm.hash, bm.object_key_main, $6,
+			$7, $8, $9, $10, NOW()
+		FROM block_metadata bm
+		WHERE bm.id = $1
+			AND bm.tag = $2
+			AND bm.height = $3
+			AND bm.hash = $4
+			AND bm.object_key_main = $5
+			AND bm.skipped = false
+		ON CONFLICT (block_metadata_id) DO UPDATE SET
+			tag = EXCLUDED.tag,
+			height = EXCLUDED.height,
+			hash = EXCLUDED.hash,
+			legacy_object_key_main = EXCLUDED.legacy_object_key_main,
+			consolidated_object_key_main = EXCLUDED.consolidated_object_key_main,
+			object_format = EXCLUDED.object_format,
+			byte_offset = EXCLUDED.byte_offset,
+			byte_length = EXCLUDED.byte_length,
+			uncompressed_length = EXCLUDED.uncompressed_length,
+			validated_at = EXCLUDED.validated_at
+		WHERE block_consolidation_shadow.legacy_object_key_main = EXCLUDED.legacy_object_key_main
+		RETURNING block_metadata_id`
+
+	for _, placement := range placements {
+		if placement == nil {
+			continue
+		}
+		var id int64
+		err := tx.QueryRowContext(
+			ctx,
+			query,
+			placement.BlockMetadataID,
+			placement.Tag,
+			placement.Height,
+			placement.Hash,
+			placement.LegacyObjectKeyMain,
+			placement.ConsolidatedObjectKeyMain,
+			int32(placement.ObjectFormat),
+			placement.ByteOffset,
+			placement.ByteLength,
+			placement.UncompressedLength,
+		).Scan(&id)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: primary metadata identity mismatch", placement.BlockMetadataID, placement.Height)
+			}
+			return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: %w", placement.BlockMetadataID, placement.Height, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return xerrors.Errorf("failed to commit consolidation shadows: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 func makeConsolidationShadowBlockMetadata(
 	block *api.BlockMetadata,
 	objectKey string,

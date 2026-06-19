@@ -20,30 +20,33 @@ const (
 	EventBackfillerIdentity
 	ReplicatorIdentity
 	MigratorIdentity
+	BatchConsolidatorIdentity
 )
 
 var workflowIdentityToString = map[WorkflowIdentity]string{
-	BackfillerIdentity:      "workflow.backfiller",
-	BenchmarkerIdentity:     "workflow.benchmarker",
-	MonitorIdentity:         "workflow.monitor",
-	PollerIdentity:          "workflow.poller",
-	StreamerIdentity:        "workflow.streamer",
-	CrossValidatorIdentity:  "workflow.cross_validator",
-	EventBackfillerIdentity: "workflow.event_backfiller",
-	ReplicatorIdentity:      "workflow.replicator",
-	MigratorIdentity:        "workflow.migrator",
+	BackfillerIdentity:        "workflow.backfiller",
+	BenchmarkerIdentity:       "workflow.benchmarker",
+	MonitorIdentity:           "workflow.monitor",
+	PollerIdentity:            "workflow.poller",
+	StreamerIdentity:          "workflow.streamer",
+	CrossValidatorIdentity:    "workflow.cross_validator",
+	EventBackfillerIdentity:   "workflow.event_backfiller",
+	ReplicatorIdentity:        "workflow.replicator",
+	MigratorIdentity:          "workflow.migrator",
+	BatchConsolidatorIdentity: "workflow.batch_consolidator",
 }
 
 var workflowIdentities = map[string]WorkflowIdentity{
-	"backfiller":       BackfillerIdentity,
-	"benchmarker":      BenchmarkerIdentity,
-	"monitor":          MonitorIdentity,
-	"poller":           PollerIdentity,
-	"streamer":         StreamerIdentity,
-	"cross_validator":  CrossValidatorIdentity,
-	"event_backfiller": EventBackfillerIdentity,
-	"replicator":       ReplicatorIdentity,
-	"migrator":         MigratorIdentity,
+	"backfiller":         BackfillerIdentity,
+	"benchmarker":        BenchmarkerIdentity,
+	"monitor":            MonitorIdentity,
+	"poller":             PollerIdentity,
+	"streamer":           StreamerIdentity,
+	"cross_validator":    CrossValidatorIdentity,
+	"event_backfiller":   EventBackfillerIdentity,
+	"replicator":         ReplicatorIdentity,
+	"migrator":           MigratorIdentity,
+	"batch_consolidator": BatchConsolidatorIdentity,
 }
 
 func GetWorkflowIdentify(name string) WorkflowIdentity {
@@ -110,6 +113,11 @@ func (w WorkflowIdentity) UnmarshalJsonStringToRequest(str string) (any, error) 
 		}
 	case MigratorIdentity:
 		var req MigratorRequest
+		if err = decoder.Decode(&req); err == nil {
+			return req, nil
+		}
+	case BatchConsolidatorIdentity:
+		var req BatchConsolidatorRequest
 		if err = decoder.Decode(&req); err == nil {
 			return req, nil
 		}

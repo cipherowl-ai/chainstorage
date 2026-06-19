@@ -192,16 +192,17 @@ type (
 	}
 
 	WorkflowsConfig struct {
-		Workers         []WorkerConfig                `mapstructure:"workers"`
-		Backfiller      BackfillerWorkflowConfig      `mapstructure:"backfiller"`
-		Poller          PollerWorkflowConfig          `mapstructure:"poller"`
-		Benchmarker     BenchmarkerWorkflowConfig     `mapstructure:"benchmarker"`
-		Monitor         MonitorWorkflowConfig         `mapstructure:"monitor"`
-		Streamer        StreamerWorkflowConfig        `mapstructure:"streamer"`
-		CrossValidator  CrossValidatorWorkflowConfig  `mapstructure:"cross_validator"`
-		EventBackfiller EventBackfillerWorkflowConfig `mapstructure:"event_backfiller"`
-		Replicator      ReplicatorWorkflowConfig      `mapstructure:"replicator"`
-		Migrator        MigratorWorkflowConfig        `mapstructure:"migrator"`
+		Workers           []WorkerConfig                  `mapstructure:"workers"`
+		Backfiller        BackfillerWorkflowConfig        `mapstructure:"backfiller"`
+		Poller            PollerWorkflowConfig            `mapstructure:"poller"`
+		Benchmarker       BenchmarkerWorkflowConfig       `mapstructure:"benchmarker"`
+		Monitor           MonitorWorkflowConfig           `mapstructure:"monitor"`
+		Streamer          StreamerWorkflowConfig          `mapstructure:"streamer"`
+		CrossValidator    CrossValidatorWorkflowConfig    `mapstructure:"cross_validator"`
+		EventBackfiller   EventBackfillerWorkflowConfig   `mapstructure:"event_backfiller"`
+		Replicator        ReplicatorWorkflowConfig        `mapstructure:"replicator"`
+		Migrator          MigratorWorkflowConfig          `mapstructure:"migrator"`
+		BatchConsolidator BatchConsolidatorWorkflowConfig `mapstructure:"batch_consolidator"`
 	}
 
 	WorkerConfig struct {
@@ -320,6 +321,13 @@ type (
 		ContinuousSync  bool          `mapstructure:"continuous_sync"`
 		SyncInterval    time.Duration `mapstructure:"sync_interval"`
 		AutoResume      bool          `mapstructure:"auto_resume"`
+	}
+
+	BatchConsolidatorWorkflowConfig struct {
+		WorkflowConfig `mapstructure:",squash"`
+		BatchSize      uint64 `mapstructure:"batch_size" validate:"required"`
+		CheckpointSize uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
+		MaxBlocks      uint64 `mapstructure:"max_blocks"`
 	}
 
 	RosettaConfig struct {

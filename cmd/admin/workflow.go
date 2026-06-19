@@ -40,16 +40,17 @@ var (
 
 type executors struct {
 	fx.In
-	Backfiller      *workflow.Backfiller
-	Monitor         *workflow.Monitor
-	Poller          *workflow.Poller
-	Streamer        *workflow.Streamer
-	Benchmarker     *workflow.Benchmarker
-	CrossValidator  *workflow.CrossValidator
-	EventBackfiller *workflow.EventBackfiller
-	Replicator      *workflow.Replicator
-	Migrator        *workflow.Migrator
-	Runtime         cadence.Runtime
+	Backfiller        *workflow.Backfiller
+	Monitor           *workflow.Monitor
+	Poller            *workflow.Poller
+	Streamer          *workflow.Streamer
+	Benchmarker       *workflow.Benchmarker
+	CrossValidator    *workflow.CrossValidator
+	EventBackfiller   *workflow.EventBackfiller
+	Replicator        *workflow.Replicator
+	Migrator          *workflow.Migrator
+	BatchConsolidator *workflow.BatchConsolidator
+	Runtime           cadence.Runtime
 }
 
 var (
@@ -208,6 +209,12 @@ func startWorkflow() error {
 			return xerrors.Errorf("error converting to request type")
 		}
 		run, err = executors.Migrator.Execute(ctx, &request)
+	case workflow.BatchConsolidatorIdentity:
+		request, ok := req.(workflow.BatchConsolidatorRequest)
+		if !ok {
+			return xerrors.Errorf("error converting to request type")
+		}
+		run, err = executors.BatchConsolidator.Execute(ctx, &request)
 	default:
 		return xerrors.Errorf("unsupported workflow identity: %v", workflowIdentity)
 	}
@@ -280,6 +287,8 @@ func stopWorkflow() error {
 		err = executors.Replicator.StopWorkflow(ctx, workflowIdentityString, reason)
 	case workflow.MigratorIdentity:
 		err = executors.Migrator.StopWorkflow(ctx, workflowIdentityString, reason)
+	case workflow.BatchConsolidatorIdentity:
+		err = executors.BatchConsolidator.StopWorkflow(ctx, workflowIdentityString, reason)
 	default:
 		return xerrors.Errorf("unsupported workflow identity: %v", workflowIdentity)
 	}

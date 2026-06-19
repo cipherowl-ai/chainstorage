@@ -439,6 +439,85 @@ func (s *blockStorageTestSuite) TestGetBlocksConsolidationShadowPreservesOrderAn
 	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/first.cscb.zstd", 100, 200, 200), actual[3])
 }
 
+func (s *blockStorageTestSuite) TestGetBlocksMissingConsolidationShadowFiltersAndLimits() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+	blocks[2].ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
+	blocks[2].ByteOffset = 10
+	blocks[2].ByteLength = 20
+	blocks[2].UncompressedLength = 20
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/validated.cscb.zstd", 10, 20, 20, true, "")
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/unvalidated.cscb.zstd", 30, 40, 40, false, "")
+
+	actual, err := s.accessor.GetBlocksMissingConsolidationShadow(ctx, tag, startHeight, startHeight+5, 2)
+	require.NoError(err)
+	require.Len(actual, 2)
+	require.Equal(s.getBlockMetadataID(ctx, blocks[1]), actual[0].ID)
+	s.equalProto(blocks[1], actual[0].Metadata)
+	require.Equal(s.getBlockMetadataID(ctx, blocks[3]), actual[1].ID)
+	s.equalProto(blocks[3], actual[1].Metadata)
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimaryIdentity() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 2, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	err = s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           s.getBlockMetadataID(ctx, blocks[0]),
+			Tag:                       blocks[0].GetTag(),
+			Height:                    blocks[0].GetHeight(),
+			Hash:                      blocks[0].GetHash(),
+			LegacyObjectKeyMain:       blocks[0].GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: "consolidated/first.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                100,
+			ByteLength:                200,
+			UncompressedLength:        200,
+		},
+	})
+	require.NoError(err)
+
+	shadow, err := s.accessor.GetBlockConsolidationShadow(ctx, blocks[0])
+	require.NoError(err)
+	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/first.cscb.zstd", 100, 200, 200), shadow)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, blocks[0].GetTag(), blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[0], primary)
+
+	err = s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           s.getBlockMetadataID(ctx, blocks[1]),
+			Tag:                       blocks[1].GetTag(),
+			Height:                    blocks[1].GetHeight(),
+			Hash:                      blocks[1].GetHash(),
+			LegacyObjectKeyMain:       "legacy/key/does/not/match",
+			ConsolidatedObjectKeyMain: "consolidated/wrong.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                300,
+			ByteLength:                400,
+			UncompressedLength:        400,
+		},
+	})
+	require.Error(err)
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[1])
+	require.Error(err)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
 func (s *blockStorageTestSuite) TestWatermarkVisibilityControl() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
