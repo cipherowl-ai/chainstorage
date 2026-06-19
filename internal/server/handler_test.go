@@ -888,6 +888,41 @@ func (s *handlerTestSuite) TestGetRawBlock_ReadShadowFirstFallsBackOnValidationE
 	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
 }
 
+func (s *handlerTestSuite) TestGetRawBlock_ReadShadowFirstFallsBackOnDownloadError() {
+	const (
+		height uint64 = 13193825
+	)
+
+	require := testutil.Require(s.T())
+	scope := tally.NewTestScope("", nil)
+	s.server.metrics = newServerMetrics(scope)
+	s.server.config.AWS.Storage.Consolidation.ReadShadowFirst = true
+
+	tag := s.app.Config().Chain.BlockTag.Stable
+	blockMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	shadowMetadata := makeShadowBlockMetadata(blockMetadata)
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(1).Return(blockMetadata, nil),
+		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
+		s.blobStorage.EXPECT().Download(gomock.Any(), shadowMetadata).Times(1).Return(nil, xerrors.New("s3 timeout")),
+		s.blobStorage.EXPECT().Download(gomock.Any(), blockMetadata).Times(1).Return(block, nil),
+	)
+
+	resp, err := s.server.GetRawBlock(context.Background(), &api.GetRawBlockRequest{
+		Height: blockMetadata.Height,
+		Hash:   blockMetadata.Hash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(block, resp.Block)
+
+	snapshot := scope.Snapshot()
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=error"].Value())
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
+}
+
 func (s *handlerTestSuite) TestGetRawBlocksByRange_StableTag() {
 	const (
 		startHeight uint64 = 9000

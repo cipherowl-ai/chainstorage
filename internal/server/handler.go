@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -913,7 +914,7 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		return blockWithPrimaryMetadata(output, block), nil
 	}
 
-	s.emitShadowReadMetric(shadowReadErrorOutcome(err), 1)
+	s.emitShadowReadMetric(shadowReadErrorOutcome(errors.Unwrap(err)), 1)
 	s.logger.Warn(
 		"shadow consolidated block read failed; falling back to legacy",
 		zap.Uint32("tag", block.GetTag()),
@@ -953,7 +954,7 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 		return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
 	}
 
-	s.emitShadowReadMetric(shadowReadErrorOutcome(err), int64(shadowCount))
+	s.emitShadowReadMetric(shadowReadErrorOutcome(errors.Unwrap(err)), int64(shadowCount))
 	s.logger.Warn(
 		"shadow consolidated range read failed; falling back to legacy",
 		zap.Int("num_blocks", len(blocks)),
