@@ -1142,29 +1142,7 @@ func isShadowValidationError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errText := err.Error()
-	return strings.Contains(errText, "invalid CSCB magic") ||
-		strings.Contains(errText, "invalid CSCB envelope magic") ||
-		strings.Contains(errText, "unsupported CSCB format version") ||
-		strings.Contains(errText, "unsupported CSCB compression scope") ||
-		strings.Contains(errText, "unexpected CSCB") ||
-		strings.Contains(errText, "CSCB block offset mismatch") ||
-		strings.Contains(errText, "CSCB block length mismatch") ||
-		strings.Contains(errText, "CSCB block uncompressed length mismatch") ||
-		strings.Contains(errText, "CSCB block hash mismatch") ||
-		strings.Contains(errText, "CSCB block CRC mismatch") ||
-		strings.Contains(errText, "CSCB block count mismatch") ||
-		strings.Contains(errText, "CSCB block height") ||
-		strings.Contains(errText, "CSCB chunk count mismatch") ||
-		strings.Contains(errText, "CSCB chunk index") ||
-		strings.Contains(errText, "CSCB chunk length mismatch") ||
-		strings.Contains(errText, "CSCB chunk CRC mismatch") ||
-		strings.Contains(errText, "CSCB envelope CRC mismatch") ||
-		strings.Contains(errText, "CSCB compressed chunk length mismatch") ||
-		strings.Contains(errText, "CSCB block payload length mismatch") ||
-		strings.Contains(errText, "CSCB block payload exceeds chunk bounds") ||
-		strings.Contains(errText, "unsupported CSCB codec") ||
-		strings.Contains(errText, "failed to decompress CSCB chunk")
+	return strings.Contains(err.Error(), "CSCB")
 }
 
 func (s *Server) newAuthContext(ctx context.Context) context.Context {

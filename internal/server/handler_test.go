@@ -163,6 +163,11 @@ func TestIsShadowValidationError(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "block index envelope bounds",
+			err:  xerrors.New("CSCB block index record 3 exceeds envelope length"),
+			want: true,
+		},
+		{
 			name: "hash mismatch",
 			err:  xerrors.New("CSCB block hash mismatch at height 100"),
 			want: true,
