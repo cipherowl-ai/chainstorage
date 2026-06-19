@@ -19,6 +19,7 @@ import (
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/client"
@@ -126,13 +127,13 @@ func (s *handlerTestSuite) SetupTest() {
 }
 
 func makeShadowBlockMetadata(block *api.BlockMetadata) *api.BlockMetadata {
-	shadow := *block
+	shadow := proto.Clone(block).(*api.BlockMetadata)
 	shadow.ObjectKeyMain = fmt.Sprintf("consolidated/v=1/shard=000000000000-000000010000/%012d-%012d-deadbeef.cscb.zstd", block.Height, block.Height)
 	shadow.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
 	shadow.ByteOffset = 4096
 	shadow.ByteLength = 8192
 	shadow.UncompressedLength = 16384
-	return &shadow
+	return shadow
 }
 
 func (s *handlerTestSuite) TearDownTest() {

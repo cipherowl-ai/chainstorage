@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
@@ -574,13 +575,13 @@ func (b *blockStorageImpl) GetBlockConsolidationShadow(ctx context.Context, bloc
 		return nil, xerrors.Errorf("failed to get consolidation shadow: %w", err)
 	}
 
-	shadow := *block
+	shadow := proto.Clone(block).(*api.BlockMetadata)
 	shadow.ObjectKeyMain = objectKey
 	shadow.ObjectFormat = api.BlockObjectFormat(objectFormat)
 	shadow.ByteOffset = uint64(byteOffset)
 	shadow.ByteLength = uint64(byteLength)
 	shadow.UncompressedLength = uint64Value(uncompressedLength)
-	return &shadow, nil
+	return shadow, nil
 }
 
 func uint64Value(value sql.NullInt64) uint64 {
