@@ -185,7 +185,6 @@ func (a *BatchConsolidator) buildPayloads(
 			if err != nil {
 				return xerrors.Errorf("failed to stage raw block payload (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
-			rawBlockPayload = nil
 			tempFiles[i] = path
 			payloads[i].RawBlockPayload = source
 			payloads[i].UncompressedLength = length
