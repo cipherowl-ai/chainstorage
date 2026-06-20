@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"io"
+	"sort"
 
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/xerrors"
@@ -299,6 +300,101 @@ func DecodeChunkFrame(frame io.Reader, codec api.Compression) ([]byte, error) {
 	return decoded, nil
 }
 
+type blockPayloadRead struct {
+	originalIndex int
+	block         *BlockDescriptor
+	start         uint64
+	end           uint64
+}
+
+// ExtractBlockPayloadsFromChunkFrame streams a compressed chunk and returns
+// only the requested block payloads in the same order as blocks. It validates
+// each requested block CRC without materializing the full decompressed chunk.
+func ExtractBlockPayloadsFromChunkFrame(frame io.Reader, codec api.Compression, chunk *ChunkDescriptor, blocks []*BlockDescriptor) ([][]byte, error) {
+	if chunk == nil {
+		return nil, xerrors.New("CSCB chunk descriptor is required")
+	}
+	if len(blocks) == 0 {
+		return nil, nil
+	}
+
+	reads := make([]blockPayloadRead, len(blocks))
+	for i, block := range blocks {
+		if block == nil {
+			return nil, xerrors.New("CSCB block descriptor is required")
+		}
+		if block.ChunkIndex != chunk.Index {
+			return nil, xerrors.Errorf("CSCB block chunk mismatch at height %d: block=%d chunk=%d", block.Height, block.ChunkIndex, chunk.Index)
+		}
+		end, err := checkedAdd(block.ChunkRelativeOffset, block.PayloadLength)
+		if err != nil {
+			return nil, err
+		}
+		if end > chunk.UncompressedLength {
+			return nil, xerrors.Errorf("CSCB block payload exceeds chunk bounds: end=%d chunk_length=%d", end, chunk.UncompressedLength)
+		}
+		reads[i] = blockPayloadRead{
+			originalIndex: i,
+			block:         block,
+			start:         block.ChunkRelativeOffset,
+			end:           end,
+		}
+	}
+	sort.SliceStable(reads, func(i, j int) bool {
+		return reads[i].start < reads[j].start
+	})
+
+	reader, err := NewChunkDecompressor(frame, codec)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = reader.Close() }()
+
+	payloads := make([][]byte, len(blocks))
+	var offset uint64
+	var hasPrevious bool
+	var previousStart uint64
+	var previousEnd uint64
+	var previousPayload []byte
+	var previousCRC uint32
+	for _, read := range reads {
+		if read.start < offset {
+			if hasPrevious && read.start == previousStart && read.end == previousEnd {
+				if previousCRC != read.block.PayloadCRC32 {
+					return nil, xerrors.Errorf("CSCB duplicate block CRC mismatch at height %d: got %08x want %08x", read.block.Height, previousCRC, read.block.PayloadCRC32)
+				}
+				payloads[read.originalIndex] = append([]byte(nil), previousPayload...)
+				continue
+			}
+			return nil, xerrors.Errorf("CSCB block payload overlaps previous read at height %d: start=%d offset=%d", read.block.Height, read.start, offset)
+		}
+		if err := discardExactly(reader, read.start-offset); err != nil {
+			return nil, err
+		}
+
+		length, err := toInt(read.block.PayloadLength)
+		if err != nil {
+			return nil, err
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			return nil, xerrors.Errorf("failed to read CSCB block payload at height %d: %w", read.block.Height, err)
+		}
+		offset = read.end
+		if crc := crc32.ChecksumIEEE(payload); crc != read.block.PayloadCRC32 {
+			return nil, xerrors.Errorf("CSCB block CRC mismatch at height %d: got %08x want %08x", read.block.Height, crc, read.block.PayloadCRC32)
+		} else {
+			previousCRC = crc
+		}
+		payloads[read.originalIndex] = payload
+		hasPrevious = true
+		previousStart = read.start
+		previousEnd = read.end
+		previousPayload = payload
+	}
+	return payloads, nil
+}
+
 func NewChunkDecompressor(frame io.Reader, codec api.Compression) (io.ReadCloser, error) {
 	switch codec {
 	case api.Compression_GZIP:
@@ -347,6 +443,20 @@ func ExtractBlockPayload(chunkPayload []byte, block *BlockDescriptor) ([]byte, e
 		return nil, xerrors.Errorf("CSCB block CRC mismatch: got %08x want %08x", crc, block.PayloadCRC32)
 	}
 	return payload, nil
+}
+
+func discardExactly(reader io.Reader, n uint64) error {
+	if n == 0 {
+		return nil
+	}
+	const maxInt64 = uint64(1<<63 - 1)
+	if n >= maxInt64 {
+		return xerrors.Errorf("discard length %d is too large", n)
+	}
+	if _, err := io.CopyN(io.Discard, reader, int64(n)); err != nil {
+		return xerrors.Errorf("failed to skip CSCB chunk bytes: %w", err)
+	}
+	return nil
 }
 
 type zstdReadCloser struct {

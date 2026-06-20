@@ -1,6 +1,7 @@
 package downloader
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -64,6 +65,38 @@ type (
 
 func TestBlockDownloaderSuite(t *testing.T) {
 	suite.Run(t, new(blockDownloaderTestSuite))
+}
+
+func TestReadExpectedRangeBodyAllowsShortInitialRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	actual, err := readExpectedRangeBody(bytes.NewReader([]byte("short")), 64*1024, true)
+	require.NoError(err)
+	require.Equal([]byte("short"), actual)
+}
+
+func TestReadExpectedRangeBodyRejectsShortNonInitialRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	_, err := readExpectedRangeBody(bytes.NewReader([]byte("short")), 10, false)
+	require.Error(err)
+	require.Contains(err.Error(), "range body length mismatch")
+}
+
+func TestReadExpectedRangeBodyRejectsOversizedRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	_, err := readExpectedRangeBody(bytes.NewReader([]byte("too-long")), 3, true)
+	require.Error(err)
+	require.Contains(err.Error(), "range body length mismatch")
+}
+
+func TestReadRangePrefixBodyTruncatesOversizedRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	actual, err := readRangePrefixBody(bytes.NewReader([]byte("too-long")), 3)
+	require.NoError(err)
+	require.Equal([]byte("too"), actual)
 }
 
 func (s *blockDownloaderTestSuite) SetupTest() {
@@ -313,6 +346,43 @@ func (s *blockDownloaderTestSuite) TestDownload_CSCB() {
 	}, ranges)
 }
 
+func (s *blockDownloaderTestSuite) TestDownload_CSCBInitialIndexIgnoresRangeWithBoundedPrefix() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 3, 2)
+	defer fixture.close()
+
+	data := append([]byte{}, fixture.data...)
+	if len(data) <= 64*1024 {
+		data = append(data, bytes.Repeat([]byte{0}, 64*1024-len(data)+1)...)
+	}
+	server, recorder := newInitialRangeIgnoringHTTPServer(data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	rawBlock, err := s.downloader.Download(context.Background(), fixture.blockFiles[1])
+	require.NoError(err)
+	expected := proto.Clone(fixture.blocks[1]).(*api.Block)
+	expected.Metadata = blockFileToMetadata(fixture.blockFiles[1])
+	if diff := cmp.Diff(expected, rawBlock, protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+
+	ranges := recorder.rangesSnapshot()
+	require.Equal([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
+	}, ranges)
+}
+
 func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBGroupsByChunk() {
 	require := testutil.Require(s.T())
 	fixture := newCSCBDownloaderFixture(s.T(), 4, 2)
@@ -354,6 +424,47 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBGroupsByChunk() {
 		"bytes=0-65535",
 		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
 		rangeHeader(fixture.index.Chunks[1].CompressedPayloadOffset, fixture.index.Chunks[1].CompressedLength),
+	}, ranges)
+}
+
+func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBAllowsDuplicateInputs() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 4, 2)
+	defer fixture.close()
+
+	server, recorder := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	blockFiles := []*api.BlockFile{
+		fixture.blockFiles[1],
+		fixture.blockFiles[1],
+	}
+	rawBlocks, err := s.downloader.DownloadMany(context.Background(), blockFiles)
+	require.NoError(err)
+	require.Len(rawBlocks, len(blockFiles))
+
+	for i, blockFile := range blockFiles {
+		expected := proto.Clone(fixture.blocks[1]).(*api.Block)
+		expected.Metadata = blockFileToMetadata(blockFile)
+		if diff := cmp.Diff(expected, rawBlocks[i], protocmp.Transform()); diff != "" {
+			require.FailNow(diff)
+		}
+	}
+
+	ranges := recorder.rangesSnapshot()
+	require.Equal([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
 	}, ranges)
 }
 
@@ -618,6 +729,27 @@ func newRangeHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
 	return newRangeHTTPServerWithTracker(data, nil, 0)
 }
 
+func newInitialRangeIgnoringHTTPServer(data []byte) (*httptest.Server, *rangeRequestRecorder) {
+	recorder := &rangeRequestRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodGet {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		rangeValue := request.Header.Get("Range")
+		done := recorder.record(rangeValue)
+		defer done()
+		if rangeValue == "bytes=0-65535" {
+			_, _ = writer.Write(data)
+			return
+		}
+
+		writeRangeResponse(writer, rangeValue, data)
+	}))
+	return server, recorder
+}
+
 func newRangeHTTPServerWithTracker(data []byte, tracker *rangeConcurrencyTracker, delay time.Duration) (*httptest.Server, *rangeRequestRecorder) {
 	recorder := &rangeRequestRecorder{
 		tracker: tracker,
@@ -640,23 +772,27 @@ func newRangeHTTPServerWithTracker(data []byte, tracker *rangeConcurrencyTracker
 			return
 		}
 
-		var start, end uint64
-		if _, err := fmt.Sscanf(rangeValue, "bytes=%d-%d", &start, &end); err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		if start >= uint64(len(data)) || end < start {
-			writer.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-		if end >= uint64(len(data)) {
-			end = uint64(len(data)) - 1
-		}
-		writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-		writer.WriteHeader(http.StatusPartialContent)
-		_, _ = writer.Write(data[start : end+1])
+		writeRangeResponse(writer, rangeValue, data)
 	}))
 	return server, recorder
+}
+
+func writeRangeResponse(writer http.ResponseWriter, rangeValue string, data []byte) {
+	var start, end uint64
+	if _, err := fmt.Sscanf(rangeValue, "bytes=%d-%d", &start, &end); err != nil {
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if start >= uint64(len(data)) || end < start {
+		writer.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if end >= uint64(len(data)) {
+		end = uint64(len(data)) - 1
+	}
+	writer.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	writer.WriteHeader(http.StatusPartialContent)
+	_, _ = writer.Write(data[start : end+1])
 }
 
 func (r *rangeRequestRecorder) record(rangeValue string) func() {

@@ -332,6 +332,73 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_GroupsByObjectAndChunk(t *te
 	assertRangeReadsConsumed(t, expectedRanges)
 }
 
+func TestBlobStorage_DownloadManyConsolidatedBlocks_AllowsDuplicateInputs(t *testing.T) {
+	require := testutil.Require(t)
+	object, metadatas, expectedBlocks, objectData, index := testS3CSCBProtoObject(t)
+	defer object.Close()
+
+	_, chunk, err := index.LookupBlock(metadatas[1])
+	require.NoError(err)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	expectedRanges := map[string]int{
+		"bytes=0-65535":    1,
+		rangeHeader(chunk): 1,
+	}
+	expectRangeReads(t, client, objectData, expectedRanges)
+
+	var storage internal.BlobStorage
+	app := testapp.New(
+		t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
+		fx.Provide(New),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	actual, err := storage.DownloadMany(context.Background(), []*api.BlockMetadata{
+		metadatas[1],
+		metadatas[1],
+	})
+	require.NoError(err)
+	require.Len(actual, 2)
+	require.True(proto.Equal(expectedBlocks[1], actual[0]))
+	require.True(proto.Equal(expectedBlocks[1], actual[1]))
+	assertRangeReadsConsumed(t, expectedRanges)
+}
+
+func TestReadExpectedRangeBodyAllowsShortInitialRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	actual, err := readExpectedRangeBody(bytes.NewReader([]byte("short")), 64*1024, true)
+	require.NoError(err)
+	require.Equal([]byte("short"), actual)
+}
+
+func TestReadExpectedRangeBodyRejectsShortNonInitialRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	_, err := readExpectedRangeBody(bytes.NewReader([]byte("short")), 10, false)
+	require.Error(err)
+	require.Contains(err.Error(), "range body length mismatch")
+}
+
+func TestReadExpectedRangeBodyRejectsOversizedRead(t *testing.T) {
+	require := testutil.Require(t)
+
+	_, err := readExpectedRangeBody(bytes.NewReader([]byte("too-long")), 3, true)
+	require.Error(err)
+	require.Contains(err.Error(), "range body length mismatch")
+}
+
 func TestBlobStorage_DownloadConsolidatedMetadataWithZeroLengthUsesLegacy(t *testing.T) {
 	require := testutil.Require(t)
 
