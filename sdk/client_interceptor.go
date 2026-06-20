@@ -106,6 +106,37 @@ func (c *timeoutableClient) GetBlockWithTag(ctx context.Context, tag uint32, hei
 	})
 }
 
+func (c *timeoutableClient) GetBlockWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error) {
+	readSourceClient, ok := c.client.(ReadSourceClient)
+	if !ok {
+		return nil, xerrors.Errorf("client %T does not support read source override", c.client)
+	}
+	if readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return c.getBlockWithTagAndReadSource(ctx, readSourceClient, tag, height, hash, readSource)
+	}
+
+	block, err := c.getBlockWithTagAndReadSource(ctx, readSourceClient, tag, height, hash, readSource)
+	if err == nil {
+		return block, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+
+	c.logger.Warn(
+		"consolidated block read timed out or failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("height", height),
+		zap.String("hash", hash),
+		zap.Error(err),
+	)
+	block, fallbackErr := c.getBlockWithTagAndReadSource(ctx, readSourceClient, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to read consolidated block and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return block, nil
+}
+
 func (c *timeoutableClient) GetBlocksByRange(ctx context.Context, startHeight uint64, endHeight uint64) ([]*api.Block, error) {
 	// No retry needed because this is a wrapper on GetBlocksByRangeWithTag
 	return c.client.GetBlocksByRange(ctx, startHeight, endHeight)
@@ -113,15 +144,87 @@ func (c *timeoutableClient) GetBlocksByRange(ctx context.Context, startHeight ui
 
 func (c *timeoutableClient) GetBlocksByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) ([]*api.Block, error) {
 	return intercept(ctx, c.logger, func(ctx context.Context) ([]*api.Block, error) {
-		timeout := c.mediumTimeout
-		if endHeight-startHeight > 2 {
-			timeout = c.longTimeout
-		}
+		timeout := c.rangeReadTimeout(startHeight, endHeight)
 
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
 		return c.client.GetBlocksByRangeWithTag(ctx, tag, startHeight, endHeight)
+	})
+}
+
+func (c *timeoutableClient) GetBlocksByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) ([]*api.Block, error) {
+	readSourceClient, ok := c.client.(ReadSourceClient)
+	if !ok {
+		return nil, xerrors.Errorf("client %T does not support read source override", c.client)
+	}
+	if readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return c.getBlocksByRangeWithTagAndReadSource(ctx, readSourceClient, tag, startHeight, endHeight, readSource)
+	}
+
+	blocks, err := c.getBlocksByRangeWithTagAndReadSource(ctx, readSourceClient, tag, startHeight, endHeight, readSource)
+	if err == nil {
+		return blocks, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+
+	c.logger.Warn(
+		"consolidated block range read timed out or failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("start_height", startHeight),
+		zap.Uint64("end_height", endHeight),
+		zap.Error(err),
+	)
+	blocks, fallbackErr := c.getBlocksByRangeWithTagAndReadSource(ctx, readSourceClient, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to read consolidated block range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return blocks, nil
+}
+
+func (c *timeoutableClient) rangeReadTimeout(startHeight uint64, endHeight uint64) time.Duration {
+	effectiveEndHeight := endHeight
+	if effectiveEndHeight == 0 {
+		effectiveEndHeight = startHeight + 1
+	}
+
+	if effectiveEndHeight > startHeight && effectiveEndHeight-startHeight > 2 {
+		return c.longTimeout
+	}
+	return c.mediumTimeout
+}
+
+func (c *timeoutableClient) getBlockWithTagAndReadSource(
+	ctx context.Context,
+	readSourceClient ReadSourceClient,
+	tag uint32,
+	height uint64,
+	hash string,
+	readSource api.BlockReadSource,
+) (*api.Block, error) {
+	return intercept(ctx, c.logger, func(ctx context.Context) (*api.Block, error) {
+		ctx, cancel := context.WithTimeout(ctx, c.mediumTimeout)
+		defer cancel()
+
+		return readSourceClient.GetBlockWithTagAndReadSource(ctx, tag, height, hash, readSource)
+	})
+}
+
+func (c *timeoutableClient) getBlocksByRangeWithTagAndReadSource(
+	ctx context.Context,
+	readSourceClient ReadSourceClient,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	readSource api.BlockReadSource,
+) ([]*api.Block, error) {
+	return intercept(ctx, c.logger, func(ctx context.Context) ([]*api.Block, error) {
+		ctx, cancel := context.WithTimeout(ctx, c.rangeReadTimeout(startHeight, endHeight))
+		defer cancel()
+
+		return readSourceClient.GetBlocksByRangeWithTagAndReadSource(ctx, tag, startHeight, endHeight, readSource)
 	})
 }
 
