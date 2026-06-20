@@ -47,6 +47,65 @@ func TestParseIndexAndExtractBlockPayload(t *testing.T) {
 	payload, err := ExtractBlockPayload(chunkPayload, block)
 	require.NoError(err)
 	require.Equal([]byte("bravo-bravo"), payload)
+
+	streamedPayloads, err := ExtractBlockPayloadsFromChunkFrame(bytes.NewReader(frame), index.Header.Codec, chunk, []*BlockDescriptor{block})
+	require.NoError(err)
+	require.Len(streamedPayloads, 1)
+	require.Equal([]byte("bravo-bravo"), streamedPayloads[0])
+}
+
+func TestExtractBlockPayloadsFromChunkFramePreservesInputOrder(t *testing.T) {
+	require := testutil.Require(t)
+
+	object, err := Encode(context.Background(), testEncodeConfig(api.Compression_ZSTD), testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := ParseIndex(data)
+	require.NoError(err)
+	require.Len(index.Chunks, 2)
+
+	metadata0 := &api.BlockMetadata{
+		Tag:                7,
+		Height:             100,
+		Hash:               "hash-100",
+		ObjectKeyMain:      object.Key,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteOffset:         object.Placements[0].ByteOffset,
+		ByteLength:         object.Placements[0].ByteLength,
+		UncompressedLength: object.Placements[0].UncompressedLength,
+	}
+	metadata1 := &api.BlockMetadata{
+		Tag:                7,
+		Height:             101,
+		Hash:               "hash-101",
+		ObjectKeyMain:      object.Key,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteOffset:         object.Placements[1].ByteOffset,
+		ByteLength:         object.Placements[1].ByteLength,
+		UncompressedLength: object.Placements[1].UncompressedLength,
+	}
+	block0, chunk0, err := index.LookupBlock(metadata0)
+	require.NoError(err)
+	block1, chunk1, err := index.LookupBlock(metadata1)
+	require.NoError(err)
+	require.Equal(chunk0.Index, chunk1.Index)
+
+	frame := data[chunk0.CompressedPayloadOffset : chunk0.CompressedPayloadOffset+chunk0.CompressedLength]
+	payloads, err := ExtractBlockPayloadsFromChunkFrame(bytes.NewReader(frame), index.Header.Codec, chunk0, []*BlockDescriptor{block1, block0})
+	require.NoError(err)
+	require.Len(payloads, 2)
+	require.Equal([]byte("bravo-bravo"), payloads[0])
+	require.Equal([]byte("alpha"), payloads[1])
+
+	duplicatePayloads, err := ExtractBlockPayloadsFromChunkFrame(bytes.NewReader(frame), index.Header.Codec, chunk0, []*BlockDescriptor{block1, block0, block1})
+	require.NoError(err)
+	require.Len(duplicatePayloads, 3)
+	require.Equal([]byte("bravo-bravo"), duplicatePayloads[0])
+	require.Equal([]byte("alpha"), duplicatePayloads[1])
+	require.Equal([]byte("bravo-bravo"), duplicatePayloads[2])
 }
 
 func TestLookupBlockRejectsMismatchedMetadata(t *testing.T) {

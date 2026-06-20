@@ -574,18 +574,16 @@ func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, key string, re
 	for _, chunkIndex := range chunkIndexes {
 		downloads := downloadsByChunk[uint32(chunkIndex)]
 		chunk := downloads[0].chunk
-		chunkPayload, err := s.downloadCSCBChunk(ctx, key, index.Header.Codec, chunk)
+		blocks := make([]*cscb.BlockDescriptor, len(downloads))
+		for i, download := range downloads {
+			blocks[i] = download.block
+		}
+		blockPayloads, err := s.downloadCSCBChunkPayloads(ctx, key, index.Header.Codec, chunk, blocks)
 		if err != nil {
 			return err
 		}
-		if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
-			return err
-		}
-		for _, download := range downloads {
-			blockPayload, err := cscb.ExtractBlockPayload(chunkPayload, download.block)
-			if err != nil {
-				return err
-			}
+		for i, download := range downloads {
+			blockPayload := blockPayloads[i]
 			block, err := unmarshalBlockData(s.bucket, key, download.ref.metadata, blockPayload)
 			if err != nil {
 				return err
@@ -618,7 +616,7 @@ func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, key string) (*cscb.
 	return cscb.ParseIndex(indexData)
 }
 
-func (s *blobStorageImpl) downloadCSCBChunk(ctx context.Context, key string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+func (s *blobStorageImpl) downloadCSCBChunkPayloads(ctx context.Context, key string, codec api.Compression, chunk *cscb.ChunkDescriptor, blocks []*cscb.BlockDescriptor) ([][]byte, error) {
 	compressed, err := s.readObjectRangeByLength(ctx, key, chunk.CompressedPayloadOffset, chunk.CompressedLength)
 	if err != nil {
 		return nil, err
@@ -626,11 +624,7 @@ func (s *blobStorageImpl) downloadCSCBChunk(ctx context.Context, key string, cod
 	if uint64(len(compressed)) != chunk.CompressedLength {
 		return nil, xerrors.Errorf("CSCB compressed chunk length mismatch: got %d want %d", len(compressed), chunk.CompressedLength)
 	}
-	decompressed, err := cscb.DecodeChunkFrame(bytes.NewReader(compressed), codec)
-	if err != nil {
-		return nil, err
-	}
-	return decompressed, nil
+	return cscb.ExtractBlockPayloadsFromChunkFrame(bytes.NewReader(compressed), codec, chunk, blocks)
 }
 
 func (s *blobStorageImpl) readObjectRangeByLength(ctx context.Context, key string, offset uint64, length uint64) ([]byte, error) {
@@ -663,7 +657,8 @@ func (s *blobStorageImpl) readObjectRange(ctx context.Context, key string, start
 		return nil, xerrors.Errorf("empty s3 body (bucket=%s, key=%s, range=bytes=%d-%d)", s.bucket, key, start, end)
 	}
 	defer func() { _ = output.Body.Close() }()
-	data, err := io.ReadAll(output.Body)
+	expectedLength := end - start + 1
+	data, err := readExpectedRangeBody(output.Body, expectedLength, start == 0)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return nil, storageerrors.ErrRequestCanceled
@@ -671,6 +666,21 @@ func (s *blobStorageImpl) readObjectRange(ctx context.Context, key string, start
 		return nil, xerrors.Errorf("failed to read s3 range body (bucket=%s, key=%s, range=bytes=%d-%d): %w", s.bucket, key, start, end, err)
 	}
 	s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(len(data)) * time.Millisecond)
+	return data, nil
+}
+
+func readExpectedRangeBody(body io.Reader, expectedLength uint64, allowShort bool) ([]byte, error) {
+	const maxInt64 = uint64(1<<63 - 1)
+	if expectedLength >= maxInt64 {
+		return nil, xerrors.Errorf("range body length %d is too large", expectedLength)
+	}
+	data, err := io.ReadAll(io.LimitReader(body, int64(expectedLength)+1))
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(data)) > expectedLength || (!allowShort && uint64(len(data)) != expectedLength) {
+		return nil, xerrors.Errorf("range body length mismatch: got %d want %d", len(data), expectedLength)
+	}
 	return data, nil
 }
 
