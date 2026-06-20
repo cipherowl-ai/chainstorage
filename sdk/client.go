@@ -114,6 +114,14 @@ type (
 		StreamNativeBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (NativeStreamedBlock, error)
 	}
 
+	ReadSourceClient interface {
+		// GetBlockWithTagAndReadSource returns the raw block using the requested blob read source.
+		GetBlockWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error)
+
+		// GetBlocksByRangeWithTagAndReadSource returns raw blocks using the requested blob read source.
+		GetBlocksByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) ([]*api.Block, error)
+	}
+
 	ChainEventResult struct {
 		BlockchainEvent *api.BlockchainEvent
 		Block           *api.Block
@@ -203,18 +211,63 @@ func (c *clientImpl) GetBlock(ctx context.Context, height uint64, hash string) (
 }
 
 func (c *clientImpl) GetBlockWithTag(ctx context.Context, tag uint32, height uint64, hash string) (*api.Block, error) {
-	return c.downloadBlock(ctx, tag, height, hash)
+	return c.GetBlockWithTagAndReadSource(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+}
+
+func (c *clientImpl) GetBlockWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error) {
+	block, err := c.downloadBlock(ctx, tag, height, hash, readSource)
+	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return block, err
+	}
+
+	c.logger.Warn(
+		"consolidated block download failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("height", height),
+		zap.String("hash", hash),
+		zap.Error(err),
+	)
+	block, fallbackErr := c.downloadBlock(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to download consolidated block and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return block, nil
 }
 
 func (c *clientImpl) GetBlocksByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) ([]*api.Block, error) {
+	return c.GetBlocksByRangeWithTagAndReadSource(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+}
+
+func (c *clientImpl) GetBlocksByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) ([]*api.Block, error) {
 	if endHeight == 0 {
 		endHeight = startHeight + 1
 	}
 
+	blocks, err := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, readSource)
+	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return blocks, err
+	}
+
+	c.logger.Warn(
+		"consolidated block range download failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("start_height", startHeight),
+		zap.Uint64("end_height", endHeight),
+		zap.Error(err),
+	)
+	blocks, fallbackErr := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to download consolidated block range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return blocks, nil
+}
+
+func (c *clientImpl) downloadBlocksByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) ([]*api.Block, error) {
 	resp, err := c.client.GetBlockFilesByRange(ctx, &api.GetBlockFilesByRangeRequest{
 		Tag:         tag,
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
+		ReadSource:  readSource,
 	})
 
 	if err != nil {
@@ -355,7 +408,7 @@ func (c *clientImpl) streamBlocks(
 		if !cfg.EventOnly {
 			var err error
 			blockID := event.GetBlock()
-			block, err = c.downloadBlock(ctx, blockID.GetTag(), blockID.GetHeight(), blockID.GetHash())
+			block, err = c.downloadBlock(ctx, blockID.GetTag(), blockID.GetHeight(), blockID.GetHash(), api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 			if err != nil {
 				c.sendBlockResult(ctx, ch, &ChainEventResult{
 					Error: xerrors.Errorf("failed to download block (cfg={%+v}, request={%+v}, event={%+v}): %w", cfg, request, event, err),
@@ -391,7 +444,7 @@ func (c *clientImpl) sendBlockResult(
 	}
 }
 
-func (c *clientImpl) downloadBlock(ctx context.Context, tag uint32, height uint64, hash string) (*api.Block, error) {
+func (c *clientImpl) downloadBlock(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error) {
 	c.logger.Debug(
 		"downloading block",
 		zap.Uint32("tag", tag),
@@ -399,9 +452,10 @@ func (c *clientImpl) downloadBlock(ctx context.Context, tag uint32, height uint6
 		zap.String("hash", hash),
 	)
 	blockFile, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
-		Tag:    tag,
-		Height: height,
-		Hash:   hash,
+		Tag:        tag,
+		Height:     height,
+		Hash:       hash,
+		ReadSource: readSource,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
@@ -483,7 +537,7 @@ func (c *clientImpl) GetBlockByTransaction(ctx context.Context, tag uint32, tran
 	// because a transaction belongs to a single block in most cases.
 	blocks := make([]*api.Block, len(blockIds))
 	for i, blockId := range blockIds {
-		block, err := c.downloadBlock(ctx, blockId.Tag, blockId.Height, blockId.Hash)
+		block, err := c.downloadBlock(ctx, blockId.Tag, blockId.Height, blockId.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to download block data: %w", err)
 		}
@@ -504,7 +558,7 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 	}
 
 	// Download the block data using the metadata from the response
-	block, err := c.downloadBlock(ctx, resp.Tag, resp.Height, resp.Hash)
+	block, err := c.downloadBlock(ctx, resp.Tag, resp.Height, resp.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to download block data: %w", err)
 	}

@@ -20,6 +20,12 @@ enum InitialPosition {
   LATEST = 1;
 }
 
+enum BlockReadSource {
+  BLOCK_READ_SOURCE_DEFAULT = 0;
+  BLOCK_READ_SOURCE_LEGACY = 1;
+  BLOCK_READ_SOURCE_CONSOLIDATED = 2;
+}
+
 message BlockFile {
   uint32 tag = 1;
   string hash = 2;
@@ -80,6 +86,7 @@ message GetBlockFileRequest {
   uint32 tag = 1;
   uint64 height = 2;
   string hash = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetBlockFileResponse {
@@ -90,6 +97,7 @@ message GetBlockFilesByRangeRequest {
   uint32 tag = 1;
   uint64 start_height = 2;
   uint64 end_height = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetBlockFilesByRangeResponse {
@@ -100,6 +108,7 @@ message GetRawBlockRequest {
   uint32 tag = 1;
   uint64 height = 2;
   string hash = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetRawBlockResponse {
@@ -110,6 +119,7 @@ message GetRawBlocksByRangeRequest {
   uint32 tag = 1;
   uint64 start_height = 2;
   uint64 end_height = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetRawBlocksByRangeResponse {
@@ -120,6 +130,7 @@ message GetNativeBlockRequest {
   uint32 tag = 1;
   uint64 height = 2;
   string hash = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetNativeBlockResponse {
@@ -130,6 +141,7 @@ message GetNativeBlocksByRangeRequest {
   uint32 tag = 1;
   uint64 start_height = 2;
   uint64 end_height = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetNativeBlocksByRangeResponse {
@@ -140,6 +152,7 @@ message GetRosettaBlockRequest {
   uint32 tag = 1;
   uint64 height = 2;
   string hash = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetRosettaBlockResponse {
@@ -150,6 +163,7 @@ message GetRosettaBlocksByRangeRequest {
   uint32 tag = 1;
   uint64 start_height = 2;
   uint64 end_height = 3;
+  BlockReadSource read_source = 4;
 }
 
 message GetRosettaBlocksByRangeResponse {

@@ -414,10 +414,32 @@ func (s *Server) GetLatestBlock(ctx context.Context, req *api.GetLatestBlockRequ
 
 func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest) (*api.GetBlockFileResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	block, err := s.getBlockFromMetaStorage(ctx, req)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
+	}
+
+	if shouldReadFromConsolidated(req.GetReadSource(), false) {
+		if shadow, ok := s.getShadowBlockMetadata(ctx, block); ok {
+			blockFile, err := s.newBlockFile(shadow)
+			if err == nil {
+				s.emitBlocksMetric(formatFile, clientID, 1)
+				return &api.GetBlockFileResponse{File: blockFile}, nil
+			}
+			s.emitShadowReadMetric(shadowOutcomeError, 1)
+			s.logger.Warn(
+				"failed to prepare consolidated block file; falling back to legacy",
+				zap.Uint32("tag", block.GetTag()),
+				zap.Uint64("height", block.GetHeight()),
+				zap.String("hash", block.GetHash()),
+				zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+				zap.Error(err),
+			)
+		}
 	}
 
 	blockFile, err := s.newBlockFile(block)
@@ -434,21 +456,34 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 
 func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFilesByRangeRequest) (*api.GetBlockFilesByRangeResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	blocks, err := s.getBlocksFromMetaStorage(ctx, req, s.config.Api.MaxNumBlockFiles)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get blocks from meta storage: %w", err)
 	}
 
-	blockFiles := make([]*api.BlockFile, len(blocks))
-	presignedURLs := make(map[string]string)
-	for i := 0; i < len(blocks); i++ {
-		blockFile, err := s.newBlockFileWithPresignCache(blocks[i], presignedURLs)
-		if err != nil {
-			return nil, xerrors.Errorf("newBlockFile error: %w", err)
-		}
+	selectedBlocks := blocks
+	shadowCount := 0
+	if shouldReadFromConsolidated(req.GetReadSource(), false) {
+		selectedBlocks, shadowCount, _, _ = s.selectShadowBlockMetadata(ctx, blocks)
+	}
 
-		blockFiles[i] = blockFile
+	blockFiles, err := s.newBlockFiles(selectedBlocks)
+	if err != nil && shadowCount > 0 {
+		s.emitShadowReadMetric(shadowOutcomeError, int64(shadowCount))
+		s.logger.Warn(
+			"failed to prepare consolidated block files; falling back to legacy",
+			zap.Int("num_blocks", len(blocks)),
+			zap.Int("shadow_blocks", shadowCount),
+			zap.Error(err),
+		)
+		blockFiles, err = s.newBlockFiles(blocks)
+	}
+	if err != nil {
+		return nil, xerrors.Errorf("newBlockFile error: %w", err)
 	}
 
 	s.emitBlocksMetric(formatFile, clientID, int64(len(blockFiles)))
@@ -458,13 +493,16 @@ func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFile
 
 func (s *Server) GetRawBlock(ctx context.Context, req *api.GetRawBlockRequest) (*api.GetRawBlockResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	block, err := s.getBlockFromMetaStorage(ctx, req)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
 	}
 
-	rawBlock, err := s.getBlockFromBlobStorage(ctx, block)
+	rawBlock, err := s.getBlockFromBlobStorage(ctx, block, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -478,13 +516,16 @@ func (s *Server) GetRawBlock(ctx context.Context, req *api.GetRawBlockRequest) (
 
 func (s *Server) GetRawBlocksByRange(ctx context.Context, req *api.GetRawBlocksByRangeRequest) (*api.GetRawBlocksByRangeResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	blocks, err := s.getBlocksFromMetaStorage(ctx, req, s.config.Api.MaxNumBlocks)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get blocks from meta storage: %w", err)
 	}
 
-	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks)
+	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -498,13 +539,16 @@ func (s *Server) GetRawBlocksByRange(ctx context.Context, req *api.GetRawBlocksB
 
 func (s *Server) GetNativeBlock(ctx context.Context, req *api.GetNativeBlockRequest) (*api.GetNativeBlockResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	block, err := s.getBlockFromMetaStorage(ctx, req)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
 	}
 
-	rawBlock, err := s.getBlockFromBlobStorage(ctx, block)
+	rawBlock, err := s.getBlockFromBlobStorage(ctx, block, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -523,13 +567,16 @@ func (s *Server) GetNativeBlock(ctx context.Context, req *api.GetNativeBlockRequ
 
 func (s *Server) GetNativeBlocksByRange(ctx context.Context, req *api.GetNativeBlocksByRangeRequest) (*api.GetNativeBlocksByRangeResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	blocks, err := s.getBlocksFromMetaStorage(ctx, req, s.config.Api.MaxNumBlocks)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get blocks from meta storage: %w", err)
 	}
 
-	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks)
+	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -554,13 +601,16 @@ func (s *Server) GetNativeBlocksByRange(ctx context.Context, req *api.GetNativeB
 func (s *Server) GetRosettaBlock(ctx context.Context, req *api.GetRosettaBlockRequest) (*api.GetRosettaBlockResponse, error) {
 	// TODO: short-circuit fetching block from blob-storage if RosettaParser is not implemented for chain
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	block, err := s.getBlockFromMetaStorage(ctx, req)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
 	}
 
-	rawBlock, err := s.getBlockFromBlobStorage(ctx, block)
+	rawBlock, err := s.getBlockFromBlobStorage(ctx, block, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -579,13 +629,16 @@ func (s *Server) GetRosettaBlock(ctx context.Context, req *api.GetRosettaBlockRe
 
 func (s *Server) GetRosettaBlocksByRange(ctx context.Context, req *api.GetRosettaBlocksByRangeRequest) (*api.GetRosettaBlocksByRangeResponse, error) {
 	clientID := getClientID(ctx)
+	if err := validateBlockReadSource(req.GetReadSource()); err != nil {
+		return nil, err
+	}
 
 	blocks, err := s.getBlocksFromMetaStorage(ctx, req, s.config.Api.MaxNumBlocks)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get blocks from meta storage: %w", err)
 	}
 
-	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks)
+	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks, req.GetReadSource())
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -646,7 +699,7 @@ func (s *Server) GetNativeTransaction(ctx context.Context, req *api.GetNativeTra
 		return nil, xerrors.Errorf("failed to get blocks from transaction storage: %w", err)
 	}
 
-	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks)
+	rawBlocks, err := s.getBlocksFromBlobStorage(ctx, blocks, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -685,7 +738,7 @@ func (s *Server) GetVerifiedAccountState(ctx context.Context, req *api.GetVerifi
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
 	}
 
-	rawBlock, err := s.getBlockFromBlobStorage(ctx, block)
+	rawBlock, err := s.getBlockFromBlobStorage(ctx, block, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get raw blocks: %w", err)
 	}
@@ -771,6 +824,19 @@ func (s *Server) getBlocksFromTransactionStorage(ctx context.Context, tag uint32
 
 func (s *Server) newBlockFile(block *api.BlockMetadata) (*api.BlockFile, error) {
 	return s.newBlockFileWithPresignCache(block, nil)
+}
+
+func (s *Server) newBlockFiles(blocks []*api.BlockMetadata) ([]*api.BlockFile, error) {
+	blockFiles := make([]*api.BlockFile, len(blocks))
+	presignedURLs := make(map[string]string)
+	for i := 0; i < len(blocks); i++ {
+		blockFile, err := s.newBlockFileWithPresignCache(blocks[i], presignedURLs)
+		if err != nil {
+			return nil, err
+		}
+		blockFiles[i] = blockFile
+	}
+	return blockFiles, nil
 }
 
 func (s *Server) newBlockFileWithPresignCache(block *api.BlockMetadata, presignedURLs map[string]string) (*api.BlockFile, error) {
@@ -888,8 +954,8 @@ func (s *Server) getBlocksFromMetaStorage(ctx context.Context, req requestByRang
 	return blocks, nil
 }
 
-func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMetadata) (*api.Block, error) {
-	if !s.config.AWS.Storage.Consolidation.ReadShadowFirst {
+func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMetadata, readSource api.BlockReadSource) (*api.Block, error) {
+	if !shouldReadFromConsolidated(readSource, s.config.AWS.Storage.Consolidation.ReadShadowFirst) {
 		output, err := s.blobStorage.Download(ctx, block)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to download from blob storage (input={%+v}): %w", block, err)
@@ -932,8 +998,8 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 	return fallback, nil
 }
 
-func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.Block, error) {
-	if !s.config.AWS.Storage.Consolidation.ReadShadowFirst {
+func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.BlockMetadata, readSource api.BlockReadSource) ([]*api.Block, error) {
+	if !shouldReadFromConsolidated(readSource, s.config.AWS.Storage.Consolidation.ReadShadowFirst) {
 		output, err := s.blobStorage.DownloadMany(ctx, blocks)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
@@ -941,7 +1007,7 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 		return output, nil
 	}
 
-	selectedBlocks, shadowCount, fallbackCount := s.selectShadowBlockMetadata(ctx, blocks)
+	selectedBlocks, shadowCount, fallbackCount, _ := s.selectShadowBlockMetadata(ctx, blocks)
 	output, err := s.downloadBlocksWithShadowMetrics(ctx, selectedBlocks)
 	if err == nil {
 		s.emitShadowReadMetric(shadowOutcomeSuccess, int64(shadowCount))
@@ -968,6 +1034,28 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 	}
 	s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, int64(len(blocks)))
 	return blocksWithPrimaryMetadata(fallback, blocks), nil
+}
+
+func validateBlockReadSource(readSource api.BlockReadSource) error {
+	switch readSource {
+	case api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED:
+		return nil
+	default:
+		return status.Errorf(codes.InvalidArgument, "invalid read_source: %v", readSource)
+	}
+}
+
+func shouldReadFromConsolidated(readSource api.BlockReadSource, defaultReadShadowFirst bool) bool {
+	switch readSource {
+	case api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED:
+		return true
+	case api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY:
+		return false
+	default:
+		return defaultReadShadowFirst
+	}
 }
 
 func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
@@ -1008,7 +1096,7 @@ func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMet
 	return shadow, true
 }
 
-func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, int, int) {
+func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, int, int, error) {
 	selected := make([]*api.BlockMetadata, len(blocks))
 	var shadowCount int
 	var fallbackCount int
@@ -1021,7 +1109,7 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 			zap.Error(err),
 		)
 		copy(selected, blocks)
-		return selected, 0, len(blocks)
+		return selected, 0, len(blocks), xerrors.Errorf("failed to get consolidated block metadata: %w", err)
 	}
 	if len(shadows) != len(blocks) {
 		s.emitShadowReadMetric(shadowOutcomeError, int64(len(blocks)))
@@ -1031,9 +1119,10 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 			zap.Int("num_shadows", len(shadows)),
 		)
 		copy(selected, blocks)
-		return selected, 0, len(blocks)
+		return selected, 0, len(blocks), xerrors.Errorf("consolidated metadata batch lookup returned %d results for %d blocks", len(shadows), len(blocks))
 	}
 
+	var selectionErr error
 	for i, block := range blocks {
 		shadow := shadows[i]
 		if shadow == nil {
@@ -1059,8 +1148,11 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 		)
 		selected[i] = block
 		fallbackCount++
+		if selectionErr == nil {
+			selectionErr = status.Errorf(codes.FailedPrecondition, "invalid consolidated block metadata for height %d", block.GetHeight())
+		}
 	}
-	return selected, shadowCount, fallbackCount
+	return selected, shadowCount, fallbackCount, selectionErr
 }
 
 func (s *Server) downloadBlockWithShadowMetrics(ctx context.Context, block *api.BlockMetadata, path string) (*api.Block, error) {
