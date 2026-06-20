@@ -106,6 +106,8 @@ func TestExtractBlockPayloadsFromChunkFramePreservesInputOrder(t *testing.T) {
 	require.Equal([]byte("bravo-bravo"), duplicatePayloads[0])
 	require.Equal([]byte("alpha"), duplicatePayloads[1])
 	require.Equal([]byte("bravo-bravo"), duplicatePayloads[2])
+	duplicatePayloads[0][0] = 'B'
+	require.Equal([]byte("bravo-bravo"), duplicatePayloads[2])
 }
 
 func TestLookupBlockRejectsMismatchedMetadata(t *testing.T) {

@@ -363,7 +363,7 @@ func ExtractBlockPayloadsFromChunkFrame(frame io.Reader, codec api.Compression, 
 				if previousCRC != read.block.PayloadCRC32 {
 					return nil, xerrors.Errorf("CSCB duplicate block CRC mismatch at height %d: got %08x want %08x", read.block.Height, previousCRC, read.block.PayloadCRC32)
 				}
-				payloads[read.originalIndex] = previousPayload
+				payloads[read.originalIndex] = append([]byte(nil), previousPayload...)
 				continue
 			}
 			return nil, xerrors.Errorf("CSCB block payload overlaps previous read at height %d: start=%d offset=%d", read.block.Height, read.start, offset)
