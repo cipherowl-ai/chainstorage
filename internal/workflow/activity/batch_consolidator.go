@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"time"
 
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -21,8 +20,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
-
-const batchConsolidatorHeartbeatInterval = 10 * time.Second
 
 type (
 	BatchConsolidator struct {
@@ -80,8 +77,7 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if err := a.validateConsolidationMode(); err != nil {
 		return nil, err
 	}
-	stopHeartbeat := startBatchConsolidatorHeartbeat(ctx)
-	defer stopHeartbeat()
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.started")
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
@@ -130,29 +126,6 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 		zap.String("object_key", objectKey),
 	)
 	return response, nil
-}
-
-func startBatchConsolidatorHeartbeat(ctx context.Context) func() {
-	heartbeatCtx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
-	sdkactivity.RecordHeartbeat(heartbeatCtx, "batch_consolidator.started")
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(batchConsolidatorHeartbeatInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-heartbeatCtx.Done():
-				return
-			case <-ticker.C:
-				sdkactivity.RecordHeartbeat(heartbeatCtx, "batch_consolidator.alive")
-			}
-		}
-	}()
-	return func() {
-		cancel()
-		<-done
-	}
 }
 
 func (a *BatchConsolidator) validateConsolidationMode() error {
