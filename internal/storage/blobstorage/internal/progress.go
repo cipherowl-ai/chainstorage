@@ -19,6 +19,11 @@ type (
 		totalRead uint64
 		nextRead  uint64
 	}
+
+	seekableProgressReadCloser struct {
+		*progressReadCloser
+		seeker io.Seeker
+	}
 )
 
 func WithConsolidatedUploadProgress(ctx context.Context, fn ConsolidatedUploadProgress) context.Context {
@@ -40,12 +45,19 @@ func NewConsolidatedUploadProgressReadCloser(ctx context.Context, stage string, 
 	if _, ok := ctx.Value(consolidatedUploadProgressKey{}).(ConsolidatedUploadProgress); !ok {
 		return reader
 	}
-	return &progressReadCloser{
+	progressReader := &progressReadCloser{
 		ctx:      ctx,
 		stage:    stage,
 		reader:   reader,
 		nextRead: consolidatedUploadProgressReadInterval,
 	}
+	if seeker, ok := reader.(io.Seeker); ok {
+		return &seekableProgressReadCloser{
+			progressReadCloser: progressReader,
+			seeker:             seeker,
+		}
+	}
+	return progressReader
 }
 
 func (r *progressReadCloser) Read(p []byte) (int, error) {
@@ -62,4 +74,8 @@ func (r *progressReadCloser) Read(p []byte) (int, error) {
 
 func (r *progressReadCloser) Close() error {
 	return r.reader.Close()
+}
+
+func (r *seekableProgressReadCloser) Seek(offset int64, whence int) (int64, error) {
+	return r.seeker.Seek(offset, whence)
 }

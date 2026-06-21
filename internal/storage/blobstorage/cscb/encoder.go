@@ -81,6 +81,10 @@ type (
 		diskSize uint64
 	}
 
+	readSeekCloser struct {
+		*bytes.Reader
+	}
+
 	blockRecord struct {
 		height               uint64
 		logicalPayloadOffset uint64
@@ -311,7 +315,11 @@ func (o *Object) Open() (io.ReadCloser, error) {
 	if o.tempFile != "" {
 		return os.Open(o.tempFile)
 	}
-	return io.NopCloser(bytes.NewReader(o.data)), nil
+	return readSeekCloser{Reader: bytes.NewReader(o.data)}, nil
+}
+
+func (readSeekCloser) Close() error {
+	return nil
 }
 
 func (o *Object) Bytes() ([]byte, bool) {
