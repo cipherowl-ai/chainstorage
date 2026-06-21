@@ -117,6 +117,30 @@ func TestEncodeCSCB_Gzip(t *testing.T) {
 	require.Equal(append(append([]byte("alpha"), []byte("bravo-bravo")...), []byte("charlie")...), readAllChunks(t, data, header, envelope, api.Compression_GZIP))
 }
 
+func TestObjectOpenInMemoryReaderIsSeekable(t *testing.T) {
+	require := testutil.Require(t)
+
+	object, err := Encode(context.Background(), testEncodeConfig(api.Compression_ZSTD), testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	reader, err := object.Open()
+	require.NoError(err)
+	defer reader.Close()
+
+	seeker, ok := reader.(io.Seeker)
+	require.True(ok)
+	offset, err := seeker.Seek(4, io.SeekStart)
+	require.NoError(err)
+	require.Equal(int64(4), offset)
+
+	buf := make([]byte, 4)
+	n, err := reader.Read(buf)
+	require.NoError(err)
+	require.Equal(4, n)
+	require.Equal([]byte{byte(formatVersion), byte(codecZstd), byte(compressionScopeChunked), 0}, buf)
+}
+
 func TestEncodeCSCB_SpillsWhenMemoryBudgetExceeded(t *testing.T) {
 	require := testutil.Require(t)
 
