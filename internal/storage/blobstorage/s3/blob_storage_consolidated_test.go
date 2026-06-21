@@ -52,12 +52,13 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 				require.True(strings.HasPrefix(*input.Key, "BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/consolidated/v=7/shard=00000000000000000000-00000000000000010000/00000000000000000100-00000000000000000102-"))
 				return nil, &awss3types.NotFound{}
 			}),
-		client.EXPECT().PutObject(gomock.Any(), gomock.Any()).
+		client.EXPECT().PutObject(gomock.Any(), gomock.Any(), gomock.Any()).
 			DoAndReturn(func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*awss3.Options)) (*awss3.PutObjectOutput, error) {
 				require.NotNil(input.Bucket)
 				require.NotEmpty(*input.Bucket)
 				require.NotNil(input.Key)
 				require.NotNil(input.Body)
+				require.NotNil(input.ContentLength)
 				require.NotNil(input.ContentMD5)
 				require.NotNil(input.IfNoneMatch)
 				require.Equal("*", *input.IfNoneMatch)
@@ -69,6 +70,12 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 
 				body, err := io.ReadAll(input.Body)
 				require.NoError(err)
+				require.Equal(int64(len(body)), *input.ContentLength)
+				var options awss3.Options
+				for _, opt := range opts {
+					opt(&options)
+				}
+				require.Equal(aws.RequestChecksumCalculationWhenRequired, options.RequestChecksumCalculation)
 				sum := sha256.Sum256(body)
 				md5Sum := md5.Sum(body)
 				uploadedKey = *input.Key
@@ -213,7 +220,7 @@ func TestBlobStorage_UploadConsolidated_AcceptsConcurrentExactObject(t *testing.
 	gomock.InOrder(
 		client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
 			Return(nil, &awss3types.NotFound{}),
-		client.EXPECT().PutObject(gomock.Any(), gomock.Any()).
+		client.EXPECT().PutObject(gomock.Any(), gomock.Any(), gomock.Any()).
 			Return(nil, &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "object already exists"}),
 		client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).
 			DoAndReturn(func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
