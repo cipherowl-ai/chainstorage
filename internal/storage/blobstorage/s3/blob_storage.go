@@ -294,13 +294,18 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		cscbMetadataUncompressedLength: fmt.Sprintf("%d", object.PayloadUncompressedLength),
 	}
 	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
-		Bucket:      aws.String(s.bucket),
-		Key:         aws.String(object.Key),
-		Body:        reader,
-		ContentMD5:  aws.String(contentMD5),
-		ACL:         awss3types.ObjectCannedACLBucketOwnerFullControl,
-		IfNoneMatch: aws.String("*"),
-		Metadata:    metadata,
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(object.Key),
+		Body:          reader,
+		ContentLength: aws.Int64(int64(object.Length)),
+		ContentMD5:    aws.String(contentMD5),
+		ACL:           awss3types.ObjectCannedACLBucketOwnerFullControl,
+		IfNoneMatch:   aws.String("*"),
+		Metadata:      metadata,
+	}, func(options *awss3.Options) {
+		// Content-MD5 is the integrity check here. Avoid SDK-added CRC32 trailers
+		// that switch large uploads to aws-chunked request bodies.
+		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	}); err != nil {
 		if isObjectPreconditionFailed(err) {
 			found, validateErr := s.validateExistingConsolidatedObject(ctx, object)
