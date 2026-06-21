@@ -98,7 +98,11 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	defer cleanup()
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.payloads_built", len(records))
 
-	objectKey, placements, err := a.blobStorage.UploadConsolidated(ctx, payloads)
+	uploadCtx := blobstorage.WithConsolidatedUploadProgress(ctx, func(stage string, details ...any) {
+		heartbeatDetails := append([]any{"batch_consolidator." + stage}, details...)
+		sdkactivity.RecordHeartbeat(ctx, heartbeatDetails...)
+	})
+	objectKey, placements, err := a.blobStorage.UploadConsolidated(uploadCtx, payloads)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to upload consolidated block object: %w", err)
 	}
