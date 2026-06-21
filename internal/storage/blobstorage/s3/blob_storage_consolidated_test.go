@@ -116,7 +116,11 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	)
 	defer app.Close()
 
-	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
+	var stages []string
+	ctx := internal.WithConsolidatedUploadProgress(context.Background(), func(stage string, details ...any) {
+		stages = append(stages, stage)
+	})
+	objectKey, placements, err := storage.UploadConsolidated(ctx, testS3Payloads())
 	require.NoError(err)
 	require.Equal(uploadedKey, objectKey)
 	require.Len(placements, 2)
@@ -125,6 +129,17 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	require.Equal(uint64(5), placements[0].ByteLength)
 	require.Equal(uint64(5), placements[1].ByteOffset)
 	require.Equal(uint64(6), placements[1].ByteLength)
+	require.Contains(stages, "s3_encode_config_loaded")
+	require.Contains(stages, "cscb_encode_started")
+	require.Contains(stages, "cscb_block_encoded")
+	require.Contains(stages, "cscb_chunk_flushed")
+	require.Contains(stages, "cscb_materialize_started")
+	require.Contains(stages, "s3_md5_started")
+	require.Contains(stages, "s3_md5_finished")
+	require.Contains(stages, "s3_put_started")
+	require.Contains(stages, "s3_put_finished")
+	require.Contains(stages, "s3_head_uploaded_started")
+	require.Contains(stages, "s3_head_uploaded_finished")
 }
 
 func TestBlobStorage_UploadConsolidated_AcceptsExistingExactObject(t *testing.T) {

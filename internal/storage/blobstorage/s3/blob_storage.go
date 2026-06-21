@@ -230,6 +230,7 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 	defer s.logDuration("upload_consolidated", time.Now())
 
 	consolidation := s.config.AWS.Storage.Consolidation
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_encode_config_loaded", len(blocks))
 	object, err := cscb.Encode(ctx, cscb.EncodeConfig{
 		Blockchain:                s.config.Chain.Blockchain,
 		Network:                   s.config.Chain.Network,
@@ -252,6 +253,7 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		return "", nil, err
 	}
 	defer func() { _ = object.Close() }()
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_object_encoded", object.Key, object.Length)
 
 	found, err := s.validateExistingConsolidatedObject(ctx, object)
 	if err != nil {
@@ -282,10 +284,12 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 	}
 	defer func() { _ = reader.Close() }()
 
-	contentMD5, err := computeContentMD5(object)
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_md5_started", object.Key, object.Length)
+	contentMD5, err := computeContentMD5(ctx, object)
 	if err != nil {
 		return false, err
 	}
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_md5_finished", object.Key, object.Length)
 	metadata := map[string]string{
 		cscbMetadataFormat:             "cscb",
 		cscbMetadataCompressionScope:   "batch-chunked",
@@ -293,10 +297,11 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		cscbMetadataCodec:              codecName(compression),
 		cscbMetadataUncompressedLength: fmt.Sprintf("%d", object.PayloadUncompressedLength),
 	}
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_put_started", object.Key, object.Length)
 	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(object.Key),
-		Body:          reader,
+		Body:          internal.NewConsolidatedUploadProgressReadCloser(ctx, "s3_put_read", reader),
 		ContentLength: aws.Int64(int64(object.Length)),
 		ContentMD5:    aws.String(contentMD5),
 		ACL:           awss3types.ObjectCannedACLBucketOwnerFullControl,
@@ -318,10 +323,11 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		}
 		return false, xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
 	}
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_put_finished", object.Key, object.Length)
 	return true, nil
 }
 
-func computeContentMD5(object *cscb.Object) (string, error) {
+func computeContentMD5(ctx context.Context, object *cscb.Object) (string, error) {
 	reader, err := object.Open()
 	if err != nil {
 		return "", err
@@ -330,19 +336,21 @@ func computeContentMD5(object *cscb.Object) (string, error) {
 
 	// #nosec G401 -- S3 Content-MD5 is a transport integrity header, not a cryptographic trust boundary.
 	h := md5.New()
-	if _, err := io.Copy(h, reader); err != nil {
+	if _, err := io.Copy(h, internal.NewConsolidatedUploadProgressReadCloser(ctx, "s3_md5_read", reader)); err != nil {
 		return "", xerrors.Errorf("failed to compute CSCB content md5: %w", err)
 	}
 	return base64.StdEncoding.EncodeToString(h.Sum(nil)), nil
 }
 
 func (s *blobStorageImpl) validateExistingConsolidatedObject(ctx context.Context, object *cscb.Object) (bool, error) {
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_head_existing_started", object.Key)
 	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(object.Key),
 	})
 	if err != nil {
 		if isObjectNotFound(err) {
+			internal.RecordConsolidatedUploadProgress(ctx, "s3_head_existing_not_found", object.Key)
 			return false, nil
 		}
 		return false, xerrors.Errorf("failed to head CSCB object (bucket=%s, key=%s): %w", s.bucket, object.Key, err)
@@ -350,10 +358,12 @@ func (s *blobStorageImpl) validateExistingConsolidatedObject(ctx context.Context
 	if err := validateConsolidatedHead(out, object); err != nil {
 		return false, err
 	}
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_head_existing_finished", object.Key, object.Length)
 	return true, nil
 }
 
 func (s *blobStorageImpl) validateUploadedConsolidatedObject(ctx context.Context, object *cscb.Object) error {
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_head_uploaded_started", object.Key)
 	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(object.Key),
@@ -361,7 +371,11 @@ func (s *blobStorageImpl) validateUploadedConsolidatedObject(ctx context.Context
 	if err != nil {
 		return xerrors.Errorf("failed to validate uploaded CSCB object (bucket=%s, key=%s): %w", s.bucket, object.Key, err)
 	}
-	return validateConsolidatedHead(out, object)
+	if err := validateConsolidatedHead(out, object); err != nil {
+		return err
+	}
+	internal.RecordConsolidatedUploadProgress(ctx, "s3_head_uploaded_finished", object.Key, object.Length)
+	return nil
 }
 
 func validateConsolidatedHead(out *awss3.HeadObjectOutput, object *cscb.Object) error {

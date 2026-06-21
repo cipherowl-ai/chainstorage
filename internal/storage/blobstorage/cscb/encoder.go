@@ -127,6 +127,7 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 	if cfg.MaxBlocks > 0 && uint64(len(blocks)) > cfg.MaxBlocks {
 		return nil, xerrors.Errorf("CSCB block count %d exceeds max_blocks %d", len(blocks), cfg.MaxBlocks)
 	}
+	internal.RecordConsolidatedUploadProgress(ctx, "cscb_encode_started", len(blocks))
 
 	first := blocks[0].Metadata
 	if first == nil {
@@ -183,6 +184,7 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 			blockCount:              currentChunk.blockCount,
 		}
 		chunkRecords = append(chunkRecords, record)
+		internal.RecordConsolidatedUploadProgress(ctx, "cscb_chunk_flushed", record.index, record.startHeight, record.endHeight, record.compressedLength)
 		currentChunk = nil
 		return nil
 	}
@@ -270,6 +272,7 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 		currentChunk.uncompressedLength += payloadLength
 		currentChunk.blockCount++
 		currentChunk.endHeight = metadata.Height + 1
+		internal.RecordConsolidatedUploadProgress(ctx, "cscb_block_encoded", metadata.Height, i+1, len(blocks))
 	}
 	if err := flushChunk(); err != nil {
 		return nil, err
@@ -288,7 +291,7 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 	payloadOffset := uint64(HeaderSize + len(envelope))
 	applyAbsoluteChunkOffsets(envelope, len(blockRecords), payloadOffset)
 	header := buildHeader(cfg.Codec, uint64(len(blockRecords)), uint64(len(chunkRecords)), startHeight, endHeight, envelope, payloadCompressedLength, totalUncompressed, payloadCRC)
-	object, err := materializeObject(cfg.LocalSpillDir, cfg.MemoryBudgetBytes, header, envelope, payloadSink, limiter)
+	object, err := materializeObject(ctx, cfg.LocalSpillDir, cfg.MemoryBudgetBytes, header, envelope, payloadSink, limiter)
 	if err != nil {
 		return nil, err
 	}
@@ -571,14 +574,16 @@ func codecSuffix(codec api.Compression) string {
 	}
 }
 
-func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope []byte, payload *spillBuffer, limiter *spillLimiter) (*Object, error) {
+func materializeObject(ctx context.Context, dir string, memoryBudget *uint64, header []byte, envelope []byte, payload *spillBuffer, limiter *spillLimiter) (*Object, error) {
 	length := uint64(len(header)+len(envelope)) + payload.size
+	internal.RecordConsolidatedUploadProgress(ctx, "cscb_materialize_started", length)
 	if payload.inMemory() && length <= effectiveMemoryBudget(memoryBudget) {
 		data := make([]byte, 0, length)
 		data = append(data, header...)
 		data = append(data, envelope...)
 		data = append(data, payload.buf.Bytes()...)
 		sum := sha256.Sum256(data)
+		internal.RecordConsolidatedUploadProgress(ctx, "cscb_materialized", length)
 		return &Object{
 			SHA256: hex.EncodeToString(sum[:]),
 			Length: length,
@@ -615,6 +620,7 @@ func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope
 	if err != nil {
 		return nil, err
 	}
+	payloadReader = internal.NewConsolidatedUploadProgressReadCloser(ctx, "cscb_materialize_payload_read", payloadReader)
 	if _, err := io.Copy(writer, payloadReader); err != nil {
 		_ = payloadReader.Close()
 		return nil, xerrors.Errorf("failed to write CSCB payload: %w", err)
@@ -626,6 +632,7 @@ func materializeObject(dir string, memoryBudget *uint64, header []byte, envelope
 		return nil, xerrors.Errorf("failed to close CSCB object temp file: %w", err)
 	}
 	success = true
+	internal.RecordConsolidatedUploadProgress(ctx, "cscb_materialized", length)
 	return &Object{
 		SHA256:   hex.EncodeToString(sha.Sum(nil)),
 		Length:   length,

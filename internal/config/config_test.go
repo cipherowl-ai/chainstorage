@@ -126,6 +126,7 @@ func TestValidateConfigs(t *testing.T) {
 		require.GreaterOrEqual(cfg.Chain.EventTag.Latest, cfg.Chain.EventTag.Stable)
 		require.Equal(api.Compression_GZIP, cfg.AWS.Storage.DataCompression)
 		require.Equal(defaultConsolidationConfig(), cfg.AWS.Storage.Consolidation)
+		require.Equal(5*time.Minute, cfg.Workflows.BatchConsolidator.ActivityHeartbeatTimeout)
 
 		require.Equal(fmt.Sprintf("chainstorage-%v", normalizedConfigName), cfg.Cadence.Domain)
 

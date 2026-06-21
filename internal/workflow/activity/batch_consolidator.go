@@ -77,6 +77,7 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if err := a.validateConsolidationMode(); err != nil {
 		return nil, err
 	}
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.started")
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
@@ -95,11 +96,17 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 		return nil, err
 	}
 	defer cleanup()
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.payloads_built", len(records))
 
-	objectKey, placements, err := a.blobStorage.UploadConsolidated(ctx, payloads)
+	uploadCtx := blobstorage.WithConsolidatedUploadProgress(ctx, func(stage string, details ...any) {
+		heartbeatDetails := append([]any{"batch_consolidator." + stage}, details...)
+		sdkactivity.RecordHeartbeat(ctx, heartbeatDetails...)
+	})
+	objectKey, placements, err := a.blobStorage.UploadConsolidated(uploadCtx, payloads)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to upload consolidated block object: %w", err)
 	}
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.object_uploaded", objectKey, len(placements))
 	shadowPlacements, err := makeShadowPlacements(recordsByID, objectKey, placements)
 	if err != nil {
 		return nil, err
@@ -107,6 +114,7 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if err := a.metaStorage.PersistBlockConsolidationShadows(ctx, shadowPlacements); err != nil {
 		return nil, xerrors.Errorf("failed to persist consolidation shadow placements: %w", err)
 	}
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.shadows_persisted", objectKey, len(shadowPlacements))
 
 	response := &BatchConsolidatorResponse{
 		StartHeight:        request.StartHeight,
