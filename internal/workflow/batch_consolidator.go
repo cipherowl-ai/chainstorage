@@ -156,12 +156,10 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			lastShadowObjects := uint64(0)
 			lastShadowBlocks := uint64(0)
 			if usePersistedShadowStats {
-				baseline, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
+				baseline, err := w.batchConsolidator.GetShadowStats(ctx, &activity.BatchConsolidatorStatsRequest{
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
-					MaxBlocks:   maxBlocks,
-					StatsOnly:   true,
 				})
 				if err != nil {
 					return xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
@@ -182,21 +180,29 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				newObjects := uint64(0)
 				newBlocks := uint64(0)
 				if usePersistedShadowStats {
-					if response.ShadowObjects < lastShadowObjects || response.ShadowBlocks < lastShadowBlocks {
+					stats, err := w.batchConsolidator.GetShadowStats(ctx, &activity.BatchConsolidatorStatsRequest{
+						Tag:         tag,
+						StartHeight: batchStart,
+						EndHeight:   batchEnd,
+					})
+					if err != nil {
+						return xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+					}
+					if stats.ShadowObjects < lastShadowObjects || stats.ShadowBlocks < lastShadowBlocks {
 						return xerrors.Errorf(
 							"batch_consolidator shadow stats regressed for batch [%d, %d): objects %d -> %d, blocks %d -> %d",
 							batchStart,
 							batchEnd,
 							lastShadowObjects,
-							response.ShadowObjects,
+							stats.ShadowObjects,
 							lastShadowBlocks,
-							response.ShadowBlocks,
+							stats.ShadowBlocks,
 						)
 					}
-					newObjects = response.ShadowObjects - lastShadowObjects
-					newBlocks = response.ShadowBlocks - lastShadowBlocks
-					lastShadowObjects = response.ShadowObjects
-					lastShadowBlocks = response.ShadowBlocks
+					newObjects = stats.ShadowObjects - lastShadowObjects
+					newBlocks = stats.ShadowBlocks - lastShadowBlocks
+					lastShadowObjects = stats.ShadowObjects
+					lastShadowBlocks = stats.ShadowBlocks
 				}
 				if response.ScannedBlocks == 0 {
 					if newObjects > 0 {
@@ -233,8 +239,8 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 					zap.Uint64("consolidated_blocks", response.ConsolidatedBlocks),
 					zap.Uint64("new_objects", newObjects),
 					zap.Uint64("new_consolidated_blocks", newBlocks),
-					zap.Uint64("shadow_objects", response.ShadowObjects),
-					zap.Uint64("shadow_blocks", response.ShadowBlocks),
+					zap.Uint64("shadow_objects", lastShadowObjects),
+					zap.Uint64("shadow_blocks", lastShadowBlocks),
 					zap.String("object_key", response.ObjectKey),
 				)
 				if response.ScannedBlocks < maxBlocks {
