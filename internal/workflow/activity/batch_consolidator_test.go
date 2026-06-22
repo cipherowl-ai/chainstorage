@@ -367,6 +367,19 @@ func (s *BatchConsolidatorTestSuite) TestGetLatestBlockReturnsMetastoreLatest() 
 	}, response)
 }
 
+func (s *BatchConsolidatorTestSuite) TestGetLatestBlockRejectsNilMetastoreLatest() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorLatestBlockRequest{Tag: 2}
+	s.metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), request.Tag).
+		Return(nil, nil)
+
+	response, err := s.batchConsolidator.GetLatestBlock(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.Nil(response)
+	require.Contains(err.Error(), "latest block not found")
+}
+
 type consolidatedPayloadsMatcher struct {
 	blocks        []*api.Block
 	metadataIDs   []int64

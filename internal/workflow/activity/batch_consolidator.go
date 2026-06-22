@@ -109,7 +109,10 @@ func (a *BatchConsolidator) GetShadowStats(ctx workflow.Context, request *BatchC
 func (a *BatchConsolidator) GetLatestBlock(ctx workflow.Context, request *BatchConsolidatorLatestBlockRequest) (*BatchConsolidatorLatestBlockResponse, error) {
 	var response BatchConsolidatorLatestBlockResponse
 	err := a.latestBlockActivity.executeActivity(ctx, request, &response)
-	return &response, err
+	if err != nil {
+		return nil, err
+	}
+	return &response, nil
 }
 
 func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchConsolidatorStatsRequest) (*BatchConsolidatorStatsResponse, error) {
@@ -138,6 +141,9 @@ func (a *BatchConsolidator) executeLatestBlock(ctx context.Context, request *Bat
 	latestBlock, err := a.metaStorage.GetLatestBlock(ctx, request.Tag)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get latest block for historical backfill safety check: %w", err)
+	}
+	if latestBlock == nil {
+		return nil, xerrors.New("latest block not found for historical backfill safety check")
 	}
 	return &BatchConsolidatorLatestBlockResponse{
 		Tag:    request.Tag,

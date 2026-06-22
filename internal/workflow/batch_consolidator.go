@@ -321,6 +321,9 @@ func (w *BatchConsolidator) validateHistoricalBackfillRange(
 	if err != nil {
 		return xerrors.Errorf("failed to get latest block for historical backfill range validation: %w", err)
 	}
+	if latest == nil {
+		return xerrors.New("latest block response is nil for historical backfill range validation")
+	}
 	safeEndHeight, ok := batchConsolidatorHistoricalSafeEndHeight(latest.Height, irreversibleDistance)
 	if !ok {
 		return xerrors.Errorf(
