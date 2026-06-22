@@ -616,15 +616,59 @@ func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyGzip() {
 		fx.Populate(&s.downloader),
 	)
 	s.blockFile.Compression = api.Compression_GZIP
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
 
 	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
 	require.NoError(err)
 	defer payload.Close()
 	require.Equal(s.blockFile, payload.BlockFile)
+	require.Equal(uint64(len(expectedBlockBytes)), payload.Length)
 
 	got, err := io.ReadAll(payload)
 	require.NoError(err)
 	require.Equal(expectedBlockBytes, got)
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsShortPayload() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, expectedBlockBytes[:len(expectedBlockBytes)-1])),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
+	require.NoError(err)
+	defer payload.Close()
+
+	_, err = io.ReadAll(payload)
+	require.Error(err)
+	require.Contains(err.Error(), "length mismatch")
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsOversizedPayload() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, append(append([]byte(nil), expectedBlockBytes...), []byte("extra")...))),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
+	require.NoError(err)
+	defer payload.Close()
+
+	_, err = io.ReadAll(payload)
+	require.Error(err)
+	require.Contains(err.Error(), "exceeds expected length")
 }
 
 func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_CSCBStreamsSinglePayload() {

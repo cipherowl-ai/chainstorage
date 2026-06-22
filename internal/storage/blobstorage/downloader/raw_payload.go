@@ -51,6 +51,14 @@ type (
 		closeOnce sync.Once
 	}
 
+	exactLengthReadCloser struct {
+		reader    io.ReadCloser
+		height    uint64
+		remaining uint64
+		validated bool
+		closed    bool
+	}
+
 	limitedReadCloser struct {
 		io.Reader
 		closer io.Closer
@@ -258,14 +266,19 @@ func (d *blockDownloaderImpl) openRawLegacyBlockPayload(ctx context.Context, blo
 		_ = httpResp.Body.Close()
 		return nil, xerrors.Errorf("wrap decompressor: %w", err)
 	}
-	return newRawBlockPayload(
-		blockFile,
-		blockFile.GetUncompressedLength(),
-		&multiCloserReadCloser{
-			Reader:  decoder,
-			closers: []io.Closer{decoder, httpResp.Body},
-		},
-	), nil
+	reader := io.ReadCloser(&multiCloserReadCloser{
+		Reader:  decoder,
+		closers: []io.Closer{decoder, httpResp.Body},
+	})
+	length := blockFile.GetUncompressedLength()
+	if length != 0 {
+		reader = &exactLengthReadCloser{
+			reader:    reader,
+			height:    blockFile.GetHeight(),
+			remaining: length,
+		}
+	}
+	return newRawBlockPayload(blockFile, length, reader), nil
 }
 
 func (d *blockDownloaderImpl) openRawCSCBBlockPayload(ctx context.Context, blockFile *api.BlockFile) (*RawBlockPayload, error) {
@@ -327,6 +340,76 @@ func (r *multiCloserReadCloser) Close() error {
 		}
 	})
 	return closeErr
+}
+
+func (r *exactLengthReadCloser) Read(buf []byte) (int, error) {
+	if r.closed {
+		return 0, xerrors.New("legacy raw block payload reader is closed")
+	}
+	if r.remaining == 0 {
+		return 0, r.validateEOF()
+	}
+	if len(buf) == 0 {
+		return 0, nil
+	}
+	if uint64(len(buf)) > r.remaining {
+		buf = buf[:int(r.remaining)]
+	}
+
+	n, err := r.reader.Read(buf)
+	if n > 0 {
+		r.remaining -= uint64(n)
+	}
+	if err != nil {
+		if r.remaining > 0 {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return n, xerrors.Errorf("legacy raw block payload length mismatch at height %d: missing %d bytes: %w", r.height, r.remaining, err)
+		}
+		if err == io.EOF {
+			r.validated = true
+		}
+		return n, err
+	}
+	return n, nil
+}
+
+func (r *exactLengthReadCloser) Close() error {
+	if r.closed {
+		return nil
+	}
+	var closeErr error
+	if !r.validated {
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			closeErr = err
+		}
+	}
+	r.closed = true
+	if err := r.reader.Close(); closeErr == nil && err != nil {
+		closeErr = err
+	}
+	return closeErr
+}
+
+func (r *exactLengthReadCloser) validateEOF() error {
+	if r.validated {
+		return io.EOF
+	}
+	var extra [1]byte
+	n, err := r.reader.Read(extra[:])
+	if n > 0 {
+		r.validated = true
+		return xerrors.Errorf("legacy raw block payload length mismatch at height %d: payload exceeds expected length", r.height)
+	}
+	if err == nil {
+		return nil
+	}
+	if err == io.EOF {
+		r.validated = true
+		return io.EOF
+	}
+	return err
 }
 
 func (r *limitedReadCloser) Close() error {
