@@ -98,11 +98,11 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorProcessesBatches() {
 	})
 	require.NoError(err)
 	require.Len(requests, 5)
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[0])
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[1])
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[2])
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[3])
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1200, EndHeight: 1250, MaxBlocks: 100}, requests[4])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[0])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[1])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[2])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[3])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1200, EndHeight: 1250, MaxBlocks: 100}, requests[4])
 }
 
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCheckpointContinuesAsNew() {
@@ -202,8 +202,8 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCapsWindowAtShardBound
 	})
 	require.NoError(err)
 	require.Len(requests, 2)
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 9500, EndHeight: 10000, MaxBlocks: 25}, requests[0])
-	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 10000, EndHeight: 10500, MaxBlocks: 25}, requests[1])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 9500, EndHeight: 10000, MaxBlocks: 25}, requests[0])
+	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 10000, EndHeight: 10500, MaxBlocks: 25}, requests[1])
 }
 
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUntilEmpty() {
@@ -240,7 +240,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUnti
 	require.NoError(err)
 	require.Len(requests, 3)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
 }
 
@@ -441,7 +441,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCo
 	require.GreaterOrEqual(statsCalls, 3)
 	require.Len(requests, 3)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
 }
 
@@ -491,7 +491,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCo
 	require.Equal(2, statsCalls)
 	require.Len(requests, 2)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
 }
 

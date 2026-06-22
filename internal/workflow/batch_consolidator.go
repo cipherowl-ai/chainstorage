@@ -152,6 +152,11 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return err
 			}
 		}
+		// Keep default shadow activity payloads unchanged for existing workflow history replay.
+		activityMode := config.ConsolidationMode("")
+		if request.Mode != "" {
+			activityMode = mode
+		}
 
 		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
@@ -172,7 +177,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			lastShadowBlocks := uint64(0)
 			if usePersistedShadowStats {
 				baseline, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
-					Mode:        mode,
+					Mode:        activityMode,
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
@@ -185,7 +190,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			}
 			for {
 				response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
-					Mode:        mode,
+					Mode:        activityMode,
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
@@ -198,7 +203,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				newBlocks := uint64(0)
 				if usePersistedShadowStats {
 					stats, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
-						Mode:        mode,
+						Mode:        activityMode,
 						Tag:         tag,
 						StartHeight: batchStart,
 						EndHeight:   batchEnd,
