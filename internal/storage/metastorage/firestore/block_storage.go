@@ -270,6 +270,10 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*internal.ConsolidationPromotionResult, error) {
+	return nil, xerrors.New("PromoteBlockConsolidationShadows not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) getLatestBlockDocRef(tag uint32) *firestore.DocumentRef {
 	return b.client.Doc(fmt.Sprintf("env/%s/blocks/%d-latest", b.env, tag))
 }

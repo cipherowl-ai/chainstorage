@@ -242,6 +242,73 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUnti
 	}
 }
 
+func (s *batchConsolidatorTestSuite) TestPromoteFinalizedProcessesOnlyPlannedRange() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
+	var requests []*activity.BatchConsolidatorRequest
+	s.env.OnActivity(activity.ActivityBatchConsolidatorPlan, mock.Anything, mock.Anything).
+		Return(&activity.BatchConsolidatorPlanResponse{
+			StartHeight:         1000,
+			EndHeight:           1100,
+			LatestHeight:        1200,
+			SafePromotionHeight: 1190,
+			PromotionGateHeight: 1100,
+		}, nil)
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+			}, nil
+		}).Once()
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		}).Once()
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   1300,
+		MaxBlocks:   100,
+	})
+	require.NoError(err)
+	require.Equal([]*activity.BatchConsolidatorRequest{
+		{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100},
+		{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100},
+	}, requests)
+}
+
+func (s *batchConsolidatorTestSuite) TestPromoteFinalizedNoOpsWhenPlanHasNoSafeRange() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
+	s.env.OnActivity(activity.ActivityBatchConsolidatorPlan, mock.Anything, mock.Anything).
+		Return(&activity.BatchConsolidatorPlanResponse{
+			StartHeight:         1000,
+			EndHeight:           1000,
+			LatestHeight:        900,
+			SafePromotionHeight: 0,
+			PromotionGateHeight: 1200,
+		}, nil)
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   1300,
+		MaxBlocks:   100,
+	})
+	require.NoError(err)
+}
+
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCompletionFromShadowStats() {
 	require := testutil.Require(s.T())
 
