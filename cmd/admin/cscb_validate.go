@@ -162,10 +162,15 @@ type (
 
 	cscbFetchResult struct {
 		files    []*api.BlockFile
-		blocks   []*api.Block
+		digests  []cscbBlockDigest
 		duration time.Duration
 		http     cscbHTTPSnapshot
 		err      error
+	}
+
+	cscbBlockDigest struct {
+		height uint64
+		hash   string
 	}
 
 	cscbHTTPSnapshot struct {
@@ -586,7 +591,7 @@ func (v *cscbValidator) runCase(ctx context.Context, validationCase cscbValidati
 			continue
 		}
 
-		comparison := compareCSCBBlocks(legacy.blocks, consolidated.blocks)
+		comparison := compareCSCBDigests(legacy.digests, consolidated.digests)
 		if !comparison.correct {
 			result.Correct = false
 			result.Passed = false
@@ -628,10 +633,10 @@ func (v *cscbValidator) fetch(ctx context.Context, validationCase cscbValidation
 	if err != nil {
 		return cscbFetchResult{duration: time.Since(start), http: v.counter.Snapshot(), err: err}
 	}
-	blocks, err := v.downloadFiles(ctx, files)
+	digests, err := v.hashFiles(ctx, files)
 	return cscbFetchResult{
 		files:    files,
-		blocks:   blocks,
+		digests:  digests,
 		duration: time.Since(start),
 		http:     v.counter.Snapshot(),
 		err:      err,
@@ -669,19 +674,37 @@ func (v *cscbValidator) getFiles(ctx context.Context, validationCase cscbValidat
 	return resp.GetFiles(), nil
 }
 
-func (v *cscbValidator) downloadFiles(ctx context.Context, files []*api.BlockFile) ([]*api.Block, error) {
-	if len(files) == 1 {
-		block, err := v.downloader.Download(ctx, files[0])
-		if err != nil {
-			return nil, xerrors.Errorf("Download failed: %w", err)
-		}
-		return []*api.Block{block}, nil
-	}
-	blocks, err := v.downloader.DownloadMany(ctx, files)
+func (v *cscbValidator) hashFiles(ctx context.Context, files []*api.BlockFile) ([]cscbBlockDigest, error) {
+	iter, err := v.downloader.OpenRawBlockPayloads(ctx, files)
 	if err != nil {
-		return nil, xerrors.Errorf("DownloadMany failed: %w", err)
+		return nil, xerrors.Errorf("OpenRawBlockPayloads failed: %w", err)
 	}
-	return blocks, nil
+	defer iter.Close()
+
+	digests := make([]cscbBlockDigest, 0, len(files))
+	for {
+		payload, err := iter.Next(ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, xerrors.Errorf("read raw block payload failed: %w", err)
+		}
+
+		digest, digestErr := canonicalRawPayloadHash(payload)
+		var closeErr error
+		if payload != nil {
+			closeErr = payload.Close()
+		}
+		if digestErr != nil {
+			return nil, digestErr
+		}
+		if closeErr != nil {
+			return nil, xerrors.Errorf("close raw block payload failed: %w", closeErr)
+		}
+		digests = append(digests, digest)
+	}
+	return digests, nil
 }
 
 type cscbBlockComparison struct {
@@ -717,6 +740,42 @@ func compareCSCBBlocks(legacy []*api.Block, consolidated []*api.Block) cscbBlock
 	}
 	comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
 	return comparison
+}
+
+func compareCSCBDigests(legacy []cscbBlockDigest, consolidated []cscbBlockDigest) cscbBlockComparison {
+	comparison := cscbBlockComparison{correct: true}
+	if len(legacy) != len(consolidated) {
+		comparison.correct = false
+		comparison.mismatchHeights = append(comparison.mismatchHeights, collectDigestHeights(legacy)...)
+		comparison.mismatchHeights = append(comparison.mismatchHeights, collectDigestHeights(consolidated)...)
+		comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
+		return comparison
+	}
+
+	for i := range legacy {
+		if comparison.hashesCompared == 0 {
+			comparison.firstLegacyHash = legacy[i].hash
+			comparison.firstConsolidatedHash = consolidated[i].hash
+		}
+		comparison.hashesCompared++
+
+		if legacy[i].height != consolidated[i].height || legacy[i].hash != consolidated[i].hash {
+			comparison.correct = false
+			comparison.mismatchHeights = append(comparison.mismatchHeights, legacy[i].height, consolidated[i].height)
+		}
+	}
+	comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
+	return comparison
+}
+
+func collectDigestHeights(digests []cscbBlockDigest) []uint64 {
+	heights := make([]uint64, 0, len(digests))
+	for _, digest := range digests {
+		if digest.height > 0 {
+			heights = append(heights, digest.height)
+		}
+	}
+	return heights
 }
 
 func collectBlockHeights(blocks []*api.Block) []uint64 {
@@ -772,6 +831,61 @@ func canonicalBlockHash(block *api.Block) (string, error) {
 	}
 	sum := sha256.Sum256(payload)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func canonicalRawPayloadHash(payload *downloader.RawBlockPayload) (cscbBlockDigest, error) {
+	if payload == nil || payload.BlockFile == nil {
+		return cscbBlockDigest{}, xerrors.New("nil raw block payload")
+	}
+	data, err := io.ReadAll(payload)
+	if err != nil {
+		return cscbBlockDigest{}, xerrors.Errorf("read raw block payload for height %d failed: %w", payload.BlockFile.GetHeight(), err)
+	}
+	hash, err := canonicalRawBlockDataHash(payload.BlockFile, data)
+	if err != nil {
+		return cscbBlockDigest{}, err
+	}
+	return cscbBlockDigest{height: payload.BlockFile.GetHeight(), hash: hash}, nil
+}
+
+func canonicalRawBlockDataHash(blockFile *api.BlockFile, data []byte) (string, error) {
+	if blockFile == nil {
+		return "", xerrors.New("nil block file")
+	}
+	if blockFile.GetSkipped() {
+		return canonicalBlockHash(&api.Block{
+			Metadata: &api.BlockMetadata{
+				Tag:     blockFile.GetTag(),
+				Height:  blockFile.GetHeight(),
+				Skipped: true,
+			},
+		})
+	}
+
+	var block api.Block
+	if err := proto.Unmarshal(data, &block); err != nil {
+		return "", xerrors.Errorf("unmarshal raw block payload for height %d failed: %w", blockFile.GetHeight(), err)
+	}
+	if isCSCBFile(blockFile) {
+		block.Metadata = cscbMetadataFromBlockFile(blockFile)
+	}
+	return canonicalBlockHash(&block)
+}
+
+func cscbMetadataFromBlockFile(blockFile *api.BlockFile) *api.BlockMetadata {
+	return &api.BlockMetadata{
+		Tag:                blockFile.GetTag(),
+		Hash:               blockFile.GetHash(),
+		ParentHash:         blockFile.GetParentHash(),
+		Height:             blockFile.GetHeight(),
+		ParentHeight:       blockFile.GetParentHeight(),
+		Skipped:            blockFile.GetSkipped(),
+		Timestamp:          blockFile.GetBlockTimestamp(),
+		ObjectFormat:       blockFile.GetObjectFormat(),
+		ByteOffset:         blockFile.GetByteOffset(),
+		ByteLength:         blockFile.GetByteLength(),
+		UncompressedLength: blockFile.GetUncompressedLength(),
+	}
 }
 
 func summarizeDurations(durations []time.Duration) cscbLatencySummary {
