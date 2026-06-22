@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -131,6 +132,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		)
 		logger.Info("workflow started")
 		ctx = w.withActivityOptions(ctx)
+		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
 		usePersistedShadowStats := workflow.GetVersion(
 			ctx,
 			batchConsolidatorShadowStatsChangeID,
@@ -156,7 +158,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			lastShadowObjects := uint64(0)
 			lastShadowBlocks := uint64(0)
 			if usePersistedShadowStats {
-				baseline, err := w.batchConsolidator.GetShadowStats(ctx, &activity.BatchConsolidatorStatsRequest{
+				baseline, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
@@ -180,7 +182,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				newObjects := uint64(0)
 				newBlocks := uint64(0)
 				if usePersistedShadowStats {
-					stats, err := w.batchConsolidator.GetShadowStats(ctx, &activity.BatchConsolidatorStatsRequest{
+					stats, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
 						Tag:         tag,
 						StartHeight: batchStart,
 						EndHeight:   batchEnd,
@@ -261,6 +263,34 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow finished")
 		return nil
 	})
+}
+
+func (w *BatchConsolidator) withShadowStatsActivityOptions(
+	ctx workflow.Context,
+	cfg config.BatchConsolidatorWorkflowConfig,
+) workflow.Context {
+	base := cfg.Base()
+	retryPolicy := w.getShadowStatsActivityRetryPolicy(base.ActivityRetry)
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:              base.TaskList,
+		StartToCloseTimeout:    base.ActivityStartToCloseTimeout,
+		ScheduleToCloseTimeout: base.ActivityScheduleToCloseTimeout,
+		HeartbeatTimeout:       base.ActivityHeartbeatTimeout,
+		RetryPolicy:            retryPolicy,
+	})
+}
+
+func (w *BatchConsolidator) getShadowStatsActivityRetryPolicy(cfg *config.RetryPolicy) *temporal.RetryPolicy {
+	retryPolicy := w.getRetryPolicy(cfg)
+	if retryPolicy != nil {
+		retryPolicyCopy := *retryPolicy
+		// Stats reads are side-effect-free and cheap. Unlimited attempts prevent
+		// old workers on the shared task queue from exhausting retries during a
+		// rolling deploy before a new worker polls the new stats activity name.
+		retryPolicyCopy.MaximumAttempts = 0
+		retryPolicy = &retryPolicyCopy
+	}
+	return retryPolicy
 }
 
 func batchConsolidatorWindowEnd(startHeight uint64, requestedEndHeight uint64, batchSize uint64, shardSize uint64) uint64 {
