@@ -40,6 +40,8 @@ func (s *batchConsolidatorTestSuite) SetupTest() {
 	cfg.Workflows.BatchConsolidator.BatchSize = 100
 	cfg.Workflows.BatchConsolidator.CheckpointSize = 500
 	cfg.Workflows.BatchConsolidator.MaxBlocks = 25
+	cfg.Workflows.BatchConsolidator.Storage.Consolidation.Enabled = true
+	cfg.Workflows.BatchConsolidator.Storage.Consolidation.Mode = config.ConsolidationModeShadowDualWrite
 	s.cfg = cfg
 
 	s.env = cadence.NewTestEnv(s)
@@ -96,11 +98,11 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorProcessesBatches() {
 	})
 	require.NoError(err)
 	require.Len(requests, 5)
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[0])
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[1])
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[2])
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[3])
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1200, EndHeight: 1250, MaxBlocks: 100}, requests[4])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[0])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 100}, requests[1])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[2])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1100, EndHeight: 1200, MaxBlocks: 100}, requests[3])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1200, EndHeight: 1250, MaxBlocks: 100}, requests[4])
 }
 
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCheckpointContinuesAsNew() {
@@ -200,8 +202,8 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCapsWindowAtShardBound
 	})
 	require.NoError(err)
 	require.Len(requests, 2)
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 9500, EndHeight: 10000, MaxBlocks: 25}, requests[0])
-	require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 10000, EndHeight: 10500, MaxBlocks: 25}, requests[1])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 9500, EndHeight: 10000, MaxBlocks: 25}, requests[0])
+	require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 10000, EndHeight: 10500, MaxBlocks: 25}, requests[1])
 }
 
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUntilEmpty() {
@@ -238,8 +240,149 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUnti
 	require.NoError(err)
 	require.Len(requests, 3)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillValidatesFinalizedRange() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	var requests []*activity.BatchConsolidatorRequest
+	s.mockHistoricalBackfillLatestHeight(120)
+	s.mockEmptyShadowStats()
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+	})
+	require.NoError(err)
+	require.Len(requests, 1)
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+		MaxBlocks:   25,
+	}, requests[0])
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillRejectsReorgUnsafeRange() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.mockHistoricalBackfillLatestHeight(120)
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   113,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), "historical_backfill range [100, 113) is unsafe")
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillDuplicateRunNoOpsWhenScanEmpty() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	var requests []*activity.BatchConsolidatorRequest
+	s.mockHistoricalBackfillLatestHeight(120)
+	s.mockEmptyShadowStats()
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+	})
+	require.NoError(err)
+	require.Len(requests, 1)
+	require.Equal(config.ConsolidationModeHistoricalBackfill, requests[0].Mode)
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillResumeAfterLostActivityCompletion() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	var requests []*activity.BatchConsolidatorRequest
+	s.mockHistoricalBackfillLatestHeight(120)
+	statsCalls := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			require.Equal(config.ConsolidationModeHistoricalBackfill, request.Mode)
+			statsCalls++
+			if statsCalls == 1 {
+				return &activity.BatchConsolidatorStatsResponse{
+					StartHeight: request.StartHeight,
+					EndHeight:   request.EndHeight,
+				}, nil
+			}
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight:   request.StartHeight,
+				EndHeight:     request.EndHeight,
+				ShadowObjects: 1,
+				ShadowBlocks:  25,
+			}, nil
+		})
+	call := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			require.Equal(config.ConsolidationModeHistoricalBackfill, request.Mode)
+			call++
+			if call == 1 {
+				return nil, xerrors.New("completion lost after side effects")
+			}
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+	})
+	require.NoError(err)
+	require.Equal(2, statsCalls)
+	require.Len(requests, 2)
+}
+
+func TestBatchConsolidatorHistoricalSafeEndHeight(t *testing.T) {
+	require := testutil.Require(t)
+
+	safeEnd, ok := batchConsolidatorHistoricalSafeEndHeight(120, 10)
+	require.True(ok)
+	require.Equal(uint64(112), safeEnd)
+
+	safeEnd, ok = batchConsolidatorHistoricalSafeEndHeight(120, 0)
+	require.True(ok)
+	require.Equal(uint64(121), safeEnd)
+
+	_, ok = batchConsolidatorHistoricalSafeEndHeight(8, 10)
+	require.False(ok)
 }
 
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCompletionFromShadowStats() {
@@ -298,7 +441,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCo
 	require.GreaterOrEqual(statsCalls, 3)
 	require.Len(requests, 3)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
 }
 
@@ -348,7 +491,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCo
 	require.Equal(2, statsCalls)
 	require.Len(requests, 2)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+		require.Equal(&activity.BatchConsolidatorRequest{Mode: config.ConsolidationModeShadowDualWrite, Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
 }
 
@@ -373,6 +516,16 @@ func (s *batchConsolidatorTestSuite) mockEmptyShadowStats() {
 			return &activity.BatchConsolidatorStatsResponse{
 				StartHeight: request.StartHeight,
 				EndHeight:   request.EndHeight,
+			}, nil
+		})
+}
+
+func (s *batchConsolidatorTestSuite) mockHistoricalBackfillLatestHeight(height uint64) {
+	s.env.OnActivity(activity.ActivityBatchConsolidatorLatestBlock, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorLatestBlockRequest) (*activity.BatchConsolidatorLatestBlockResponse, error) {
+			return &activity.BatchConsolidatorLatestBlockResponse{
+				Tag:    request.Tag,
+				Height: height,
 			}, nil
 		})
 }

@@ -448,6 +448,11 @@ func (s *blockStorageTestSuite) TestGetBlocksMissingConsolidationShadowFiltersAn
 	blocks[2].ByteOffset = 10
 	blocks[2].ByteLength = 20
 	blocks[2].UncompressedLength = 20
+	blocks[4] = &api.BlockMetadata{
+		Tag:     tag,
+		Height:  startHeight + 4,
+		Skipped: true,
+	}
 
 	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
 	require.NoError(err)
@@ -462,6 +467,8 @@ func (s *blockStorageTestSuite) TestGetBlocksMissingConsolidationShadowFiltersAn
 	s.equalProto(blocks[1], actual[0].Metadata)
 	require.Equal(s.getBlockMetadataID(ctx, blocks[3]), actual[1].ID)
 	s.equalProto(blocks[3], actual[1].Metadata)
+	require.False(actual[0].Metadata.GetSkipped())
+	require.False(actual[1].Metadata.GetSkipped())
 }
 
 func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {

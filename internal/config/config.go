@@ -608,6 +608,7 @@ const (
 
 	ConsolidationModeLegacyOnly                ConsolidationMode = "legacy_only"
 	ConsolidationModeShadowDualWrite           ConsolidationMode = "shadow_dual_write"
+	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
 
@@ -747,6 +748,7 @@ func (c *Config) validateConsolidationConfig() error {
 	switch consolidation.Mode {
 	case ConsolidationModeLegacyOnly,
 		ConsolidationModeShadowDualWrite,
+		ConsolidationModeHistoricalBackfill,
 		ConsolidationModePromoteFinalized,
 		ConsolidationModeSyncerConsolidatedPrimary:
 	default:
