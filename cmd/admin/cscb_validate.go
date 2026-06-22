@@ -592,7 +592,7 @@ func (v *cscbValidator) runCase(ctx context.Context, validationCase cscbValidati
 			result.Passed = false
 			result.MismatchHeights = appendUnique(result.MismatchHeights, comparison.mismatchHeights...)
 		}
-		if i == 0 {
+		if result.CanonicalHashesCompared == 0 && comparison.hashesCompared > 0 {
 			result.CanonicalHashesCompared = comparison.hashesCompared
 			result.FirstCanonicalHashLegacy = comparison.firstLegacyHash
 			result.FirstCanonicalHashCSCB = comparison.firstConsolidatedHash
@@ -704,10 +704,7 @@ func compareCSCBBlocks(legacy []*api.Block, consolidated []*api.Block) cscbBlock
 	for i := range legacy {
 		legacyHash, legacyErr := canonicalBlockHash(legacy[i])
 		consolidatedHash, consolidatedErr := canonicalBlockHash(consolidated[i])
-		height := legacy[i].GetMetadata().GetHeight()
-		if height == 0 {
-			height = consolidated[i].GetMetadata().GetHeight()
-		}
+		height := firstNonZeroHeight(legacy[i], consolidated[i])
 		if comparison.hashesCompared == 0 {
 			comparison.firstLegacyHash = legacyHash
 			comparison.firstConsolidatedHash = consolidatedHash
@@ -725,24 +722,51 @@ func compareCSCBBlocks(legacy []*api.Block, consolidated []*api.Block) cscbBlock
 func collectBlockHeights(blocks []*api.Block) []uint64 {
 	heights := make([]uint64, 0, len(blocks))
 	for _, block := range blocks {
-		heights = append(heights, block.GetMetadata().GetHeight())
+		if height := firstNonZeroHeight(block); height > 0 {
+			heights = append(heights, height)
+		}
 	}
 	return heights
+}
+
+func firstNonZeroHeight(blocks ...*api.Block) uint64 {
+	for _, block := range blocks {
+		if block == nil || block.GetMetadata() == nil {
+			continue
+		}
+		if height := block.GetMetadata().GetHeight(); height > 0 {
+			return height
+		}
+	}
+	return 0
 }
 
 func canonicalBlockHash(block *api.Block) (string, error) {
 	if block == nil {
 		return "", xerrors.New("nil block")
 	}
-	clone := proto.Clone(block).(*api.Block)
-	if clone.Metadata != nil {
-		clone.Metadata.ObjectKeyMain = ""
-		clone.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
-		clone.Metadata.ByteOffset = 0
-		clone.Metadata.ByteLength = 0
-		clone.Metadata.UncompressedLength = 0
+	if block.Metadata != nil {
+		originalObjectKeyMain := block.Metadata.ObjectKeyMain
+		originalObjectFormat := block.Metadata.ObjectFormat
+		originalByteOffset := block.Metadata.ByteOffset
+		originalByteLength := block.Metadata.ByteLength
+		originalUncompressedLength := block.Metadata.UncompressedLength
+
+		block.Metadata.ObjectKeyMain = ""
+		block.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+		block.Metadata.ByteOffset = 0
+		block.Metadata.ByteLength = 0
+		block.Metadata.UncompressedLength = 0
+
+		defer func() {
+			block.Metadata.ObjectKeyMain = originalObjectKeyMain
+			block.Metadata.ObjectFormat = originalObjectFormat
+			block.Metadata.ByteOffset = originalByteOffset
+			block.Metadata.ByteLength = originalByteLength
+			block.Metadata.UncompressedLength = originalUncompressedLength
+		}()
 	}
-	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(clone)
+	payload, err := proto.MarshalOptions{Deterministic: true}.Marshal(block)
 	if err != nil {
 		return "", err
 	}

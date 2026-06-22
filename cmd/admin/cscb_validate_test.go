@@ -85,6 +85,40 @@ func TestCompareCSCBBlocksDetectsMismatch(t *testing.T) {
 	require.Equal([]uint64{42}, comparison.mismatchHeights)
 }
 
+func TestCompareCSCBBlocksHandlesNilBlocks(t *testing.T) {
+	require := require.New(t)
+	consolidated := &api.Block{
+		Metadata: &api.BlockMetadata{Height: 42, Hash: "hash"},
+	}
+
+	comparison := compareCSCBBlocks([]*api.Block{nil}, []*api.Block{consolidated})
+	require.False(comparison.correct)
+	require.Equal([]uint64{42}, comparison.mismatchHeights)
+}
+
+func TestCanonicalBlockHashRestoresMetadata(t *testing.T) {
+	require := require.New(t)
+	block := &api.Block{
+		Metadata: &api.BlockMetadata{
+			Height:             42,
+			Hash:               "hash",
+			ObjectKeyMain:      "consolidated/object",
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         10,
+			ByteLength:         20,
+			UncompressedLength: 30,
+		},
+	}
+
+	_, err := canonicalBlockHash(block)
+	require.NoError(err)
+	require.Equal("consolidated/object", block.Metadata.ObjectKeyMain)
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, block.Metadata.ObjectFormat)
+	require.Equal(uint64(10), block.Metadata.ByteOffset)
+	require.Equal(uint64(20), block.Metadata.ByteLength)
+	require.Equal(uint64(30), block.Metadata.UncompressedLength)
+}
+
 func TestSummarizeDurationsUsesNearestRankPercentile(t *testing.T) {
 	require := require.New(t)
 	summary := summarizeDurations([]time.Duration{
