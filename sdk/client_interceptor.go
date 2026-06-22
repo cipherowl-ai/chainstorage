@@ -228,6 +228,46 @@ func (c *timeoutableClient) getBlocksByRangeWithTagAndReadSource(
 	})
 }
 
+// OpenRawBlockPayload passes through to the wrapped client. No timeout
+// wrapping: the returned reader lifetime is user-controlled.
+func (c *timeoutableClient) OpenRawBlockPayload(ctx context.Context, height uint64, hash string) (*RawBlockPayload, error) {
+	return c.client.OpenRawBlockPayload(ctx, height, hash)
+}
+
+// OpenRawBlockPayloadWithTag passes through to the wrapped client. No timeout
+// wrapping: the returned reader lifetime is user-controlled.
+func (c *timeoutableClient) OpenRawBlockPayloadWithTag(ctx context.Context, tag uint32, height uint64, hash string) (*RawBlockPayload, error) {
+	return c.client.OpenRawBlockPayloadWithTag(ctx, tag, height, hash)
+}
+
+func (c *timeoutableClient) OpenRawBlockPayloadWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error) {
+	rawPayloadClient, ok := c.client.(RawPayloadReadSourceClient)
+	if !ok {
+		return nil, xerrors.Errorf("client %T does not support raw payload read source override", c.client)
+	}
+	return rawPayloadClient.OpenRawBlockPayloadWithTagAndReadSource(ctx, tag, height, hash, readSource)
+}
+
+// OpenRawBlockPayloadsByRange passes through to the wrapped client. No timeout
+// wrapping: iterator reads are user-controlled.
+func (c *timeoutableClient) OpenRawBlockPayloadsByRange(ctx context.Context, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error) {
+	return c.client.OpenRawBlockPayloadsByRange(ctx, startHeight, endHeight)
+}
+
+// OpenRawBlockPayloadsByRangeWithTag passes through to the wrapped client. No
+// timeout wrapping: iterator reads are user-controlled.
+func (c *timeoutableClient) OpenRawBlockPayloadsByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error) {
+	return c.client.OpenRawBlockPayloadsByRangeWithTag(ctx, tag, startHeight, endHeight)
+}
+
+func (c *timeoutableClient) OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) (RawBlockPayloadIterator, error) {
+	rawPayloadClient, ok := c.client.(RawPayloadReadSourceClient)
+	if !ok {
+		return nil, xerrors.Errorf("client %T does not support raw payload read source override", c.client)
+	}
+	return rawPayloadClient.OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx, tag, startHeight, endHeight, readSource)
+}
+
 func (c *timeoutableClient) GetBlockByTransaction(ctx context.Context, tag uint32, transactionHash string) ([]*api.Block, error) {
 	return intercept(ctx, c.logger, func(ctx context.Context) ([]*api.Block, error) {
 		ctx, cancel := context.WithTimeout(ctx, c.mediumTimeout)
