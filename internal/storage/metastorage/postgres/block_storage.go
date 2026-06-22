@@ -734,6 +734,38 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 	return records, nil
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*internal.ConsolidationShadowStats, error) {
+	if endHeight <= startHeight {
+		return &internal.ConsolidationShadowStats{}, nil
+	}
+	const query = `
+		SELECT
+			COUNT(DISTINCT shadow.consolidated_object_key_main),
+			COUNT(*)
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+			AND shadow.legacy_object_key_main = bm.object_key_main
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
+			AND bm.skipped = false
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''`
+
+	var objects, blocks uint64
+	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&objects, &blocks); err != nil {
+		return nil, xerrors.Errorf("failed to get consolidation shadow stats: %w", err)
+	}
+	return &internal.ConsolidationShadowStats{
+		Objects: objects,
+		Blocks:  blocks,
+	}, nil
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	if len(placements) == 0 {
 		return nil

@@ -262,6 +262,10 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 	return nil, xerrors.New("GetBlocksMissingConsolidationShadow not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*internal.ConsolidationShadowStats, error) {
+	return nil, xerrors.New("GetBlockConsolidationShadowStats not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for Firestore")
 }

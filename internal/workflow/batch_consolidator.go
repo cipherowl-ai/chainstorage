@@ -48,6 +48,8 @@ const (
 	batchConsolidatorObjectCounter            = "workflow.batch_consolidator.object"
 	batchConsolidatorConsolidatedBlockCounter = "workflow.batch_consolidator.consolidated_block"
 	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
+	batchConsolidatorShadowStatsChangeID      = "batch-consolidator-shadow-stats"
+	batchConsolidatorShadowStatsVersion       = 1
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -129,6 +131,12 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		)
 		logger.Info("workflow started")
 		ctx = w.withActivityOptions(ctx)
+		usePersistedShadowStats := workflow.GetVersion(
+			ctx,
+			batchConsolidatorShadowStatsChangeID,
+			workflow.DefaultVersion,
+			batchConsolidatorShadowStatsVersion,
+		) != workflow.DefaultVersion
 
 		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
@@ -145,6 +153,22 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 
 			objectsInBatch := uint64(0)
 			blocksInBatch := uint64(0)
+			lastShadowObjects := uint64(0)
+			lastShadowBlocks := uint64(0)
+			if usePersistedShadowStats {
+				baseline, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
+					Tag:         tag,
+					StartHeight: batchStart,
+					EndHeight:   batchEnd,
+					MaxBlocks:   maxBlocks,
+					StatsOnly:   true,
+				})
+				if err != nil {
+					return xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+				}
+				lastShadowObjects = baseline.ShadowObjects
+				lastShadowBlocks = baseline.ShadowBlocks
+			}
 			for {
 				response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
 					Tag:         tag,
@@ -155,23 +179,62 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				if err != nil {
 					return xerrors.Errorf("failed to consolidate shadow batch [%d, %d): %w", batchStart, batchEnd, err)
 				}
+				newObjects := uint64(0)
+				newBlocks := uint64(0)
+				if usePersistedShadowStats {
+					if response.ShadowObjects < lastShadowObjects || response.ShadowBlocks < lastShadowBlocks {
+						return xerrors.Errorf(
+							"batch_consolidator shadow stats regressed for batch [%d, %d): objects %d -> %d, blocks %d -> %d",
+							batchStart,
+							batchEnd,
+							lastShadowObjects,
+							response.ShadowObjects,
+							lastShadowBlocks,
+							response.ShadowBlocks,
+						)
+					}
+					newObjects = response.ShadowObjects - lastShadowObjects
+					newBlocks = response.ShadowBlocks - lastShadowBlocks
+					lastShadowObjects = response.ShadowObjects
+					lastShadowBlocks = response.ShadowBlocks
+				}
 				if response.ScannedBlocks == 0 {
+					if newObjects > 0 {
+						objectsInBatch += newObjects
+						metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(newObjects))
+					}
+					if newBlocks > 0 {
+						blocksInBatch += newBlocks
+						metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(newBlocks))
+					}
 					metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
 					break
 				}
 				if response.ConsolidatedBlocks == 0 {
 					return xerrors.Errorf("batch_consolidator made no progress for non-empty shadow scan [%d, %d)", batchStart, batchEnd)
 				}
-				objectsInBatch++
-				blocksInBatch += response.ConsolidatedBlocks
-				metrics.Counter(batchConsolidatorObjectCounter).Inc(1)
-				metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(response.ConsolidatedBlocks))
+				if !usePersistedShadowStats {
+					newObjects = 1
+					newBlocks = response.ConsolidatedBlocks
+				}
+				if newObjects > 0 {
+					objectsInBatch += newObjects
+					metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(newObjects))
+				}
+				if newBlocks > 0 {
+					blocksInBatch += newBlocks
+					metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(newBlocks))
+				}
 				logger.Info(
 					"processed shadow object",
 					zap.Uint64("batch_start", batchStart),
 					zap.Uint64("batch_end", batchEnd),
 					zap.Uint64("scanned_blocks", response.ScannedBlocks),
 					zap.Uint64("consolidated_blocks", response.ConsolidatedBlocks),
+					zap.Uint64("new_objects", newObjects),
+					zap.Uint64("new_consolidated_blocks", newBlocks),
+					zap.Uint64("shadow_objects", response.ShadowObjects),
+					zap.Uint64("shadow_blocks", response.ShadowBlocks),
 					zap.String("object_key", response.ObjectKey),
 				)
 				if response.ScannedBlocks < maxBlocks {

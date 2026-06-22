@@ -85,6 +85,9 @@ func (s *BatchConsolidatorTestSuite) TestEmptyScanNoOps() {
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -165,6 +168,9 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	s.metaStorage.EXPECT().
 		PersistBlockConsolidationShadows(gomock.Any(), expectedShadows).
 		Return(nil)
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 2}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -174,6 +180,8 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		ScannedBlocks:      2,
 		ConsolidatedBlocks: 2,
 		ObjectKey:          objectKey,
+		ShadowObjects:      1,
+		ShadowBlocks:       2,
 	}, response)
 	require.Len(capturedPayloadPaths, len(records))
 	for _, path := range capturedPayloadPaths {
@@ -200,6 +208,29 @@ func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBef
 	_, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.Error(err)
 	require.Contains(err.Error(), "downloaded block metadata mismatch")
+}
+
+func (s *BatchConsolidatorTestSuite) TestStatsOnlyReturnsPersistedShadowStats() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   2000,
+		MaxBlocks:   100,
+		StatsOnly:   true,
+	}
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 3, Blocks: 2750}, nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:   request.StartHeight,
+		EndHeight:     request.EndHeight,
+		ShadowObjects: 3,
+		ShadowBlocks:  2750,
+	}, response)
 }
 
 type consolidatedPayloadsMatcher struct {

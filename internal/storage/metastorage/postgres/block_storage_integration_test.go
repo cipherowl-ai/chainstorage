@@ -464,6 +464,32 @@ func (s *blockStorageTestSuite) TestGetBlocksMissingConsolidationShadowFiltersAn
 	s.equalProto(blocks[3], actual[1].Metadata)
 }
 
+func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20, true, "")
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/first.cscb.zstd", 30, 40, 40, true, "")
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/second.cscb.zstd", 50, 60, 60, true, "")
+	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/unvalidated.cscb.zstd", 70, 80, 80, false, "")
+	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/wrong-legacy-key.cscb.zstd", 90, 100, 100, true, "legacy/key/does/not/match")
+
+	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+5)
+	require.NoError(err)
+	require.Equal(uint64(2), stats.Objects)
+	require.Equal(uint64(3), stats.Blocks)
+
+	stats, err = s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight+1, startHeight+3)
+	require.NoError(err)
+	require.Equal(uint64(2), stats.Objects)
+	require.Equal(uint64(2), stats.Blocks)
+}
+
 func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimaryIdentity() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
