@@ -35,6 +35,18 @@ type (
 		Download(ctx context.Context, blockFile *api.BlockFile) (*api.Block, error)
 		DownloadMany(ctx context.Context, blockFiles []*api.BlockFile) ([]*api.Block, error)
 
+		// OpenRawBlockPayload opens the validated, decompressed protobuf
+		// payload bytes for one raw block without unmarshaling api.Block.
+		// Callers MUST close the returned payload.
+		OpenRawBlockPayload(ctx context.Context, blockFile *api.BlockFile) (*RawBlockPayload, error)
+
+		// OpenRawBlockPayloads opens an iterator over validated,
+		// decompressed protobuf payload bytes in blockFiles order without
+		// unmarshaling api.Block. The iterator returns io.EOF when
+		// exhausted. Callers MUST close each returned payload and the
+		// iterator.
+		OpenRawBlockPayloads(ctx context.Context, blockFiles []*api.BlockFile) (RawBlockPayloadIterator, error)
+
 		// DownloadStream spools the compressed block to a local temp
 		// file, decompresses to a second temp file, and returns a
 		// chain-agnostic SpooledBlock handle. The decompressed spool
@@ -96,6 +108,7 @@ type (
 		retry         retry.RetryWithResult[*api.Block]
 		retryBytes    retry.RetryWithResult[[]byte]
 		retryPayloads retry.RetryWithResult[[][]byte]
+		retryRaw      retry.RetryWithResult[*RawBlockPayload]
 	}
 
 	downloadRef struct {
@@ -141,6 +154,7 @@ func NewBlockDownloader(params BlockDownloaderParams) BlockDownloader {
 		retry:         retry.NewWithResult[*api.Block](retry.WithLogger(logger)),
 		retryBytes:    retry.NewWithResult[[]byte](retry.WithLogger(logger)),
 		retryPayloads: retry.NewWithResult[[][]byte](retry.WithLogger(logger)),
+		retryRaw:      retry.NewWithResult[*RawBlockPayload](retry.WithLogger(logger)),
 	}
 }
 

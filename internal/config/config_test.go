@@ -885,6 +885,66 @@ func TestConsolidationHistoricalBackfillModeAccepted(t *testing.T) {
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
+func TestConsolidationPromoteFinalizedRequiresOperatorGates(t *testing.T) {
+	tests := []struct {
+		name        string
+		env         map[string]string
+		expectedErr string
+	}{
+		{
+			name: "missing promotion gate",
+			env: map[string]string{
+				"CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SAFE_PROMOTION_LAG": "100000",
+			},
+			expectedErr: "requires promotion_gate_height",
+		},
+		{
+			name: "missing safe promotion lag",
+			env: map[string]string{
+				"CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_PROMOTION_GATE_HEIGHT": "100000",
+			},
+			expectedErr: "requires safe_promotion_lag",
+		},
+		{
+			name: "safe promotion lag below irreversible distance",
+			env: map[string]string{
+				"CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_PROMOTION_GATE_HEIGHT": "100000",
+				"CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SAFE_PROMOTION_LAG":    "1",
+			},
+			expectedErr: "must be at least irreversible_distance",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := testutil.Require(t)
+			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModePromoteFinalized))
+			for k, v := range test.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := config.New()
+			require.Error(err)
+			require.Contains(err.Error(), test.expectedErr)
+		})
+	}
+}
+
+func TestConsolidationPromoteFinalizedRejectsDynamoDB(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModePromoteFinalized))
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_PROMOTION_GATE_HEIGHT", "100000")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SAFE_PROMOTION_LAG", "100000")
+
+	_, err := config.New()
+	require.Error(err)
+	require.Contains(err.Error(), "requires Postgres meta storage")
+}
+
 func TestParseConfigName(t *testing.T) {
 	tests := []struct {
 		configName string

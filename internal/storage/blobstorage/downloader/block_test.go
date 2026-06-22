@@ -605,6 +605,214 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_CSCB() {
 	}
 }
 
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyGzip() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, expectedBlockCompressedBytes)),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+	s.blockFile.Compression = api.Compression_GZIP
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
+	require.NoError(err)
+	defer payload.Close()
+	require.Equal(s.blockFile, payload.BlockFile)
+	require.Equal(uint64(len(expectedBlockBytes)), payload.Length)
+
+	got, err := io.ReadAll(payload)
+	require.NoError(err)
+	require.Equal(expectedBlockBytes, got)
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsShortPayload() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, expectedBlockBytes[:len(expectedBlockBytes)-1])),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
+	require.NoError(err)
+	defer payload.Close()
+
+	_, err = io.ReadAll(payload)
+	require.Error(err)
+	require.Contains(err.Error(), "length mismatch")
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsOversizedPayload() {
+	require := testutil.Require(s.T())
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(s.newHttpServerFunc(http.MethodGet, http.StatusOK, append(append([]byte(nil), expectedBlockBytes...), []byte("extra")...))),
+		fx.Populate(&s.httpServer),
+		fx.Provide(s.newHttpClientFunc()),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+	s.blockFile.UncompressedLength = uint64(len(expectedBlockBytes))
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), s.blockFile)
+	require.NoError(err)
+	defer payload.Close()
+
+	_, err = io.ReadAll(payload)
+	require.Error(err)
+	require.Contains(err.Error(), "exceeds expected length")
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_CSCBStreamsSinglePayload() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
+	defer fixture.close()
+
+	server, recorder := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	payload, err := s.downloader.OpenRawBlockPayload(context.Background(), fixture.blockFiles[1])
+	require.NoError(err)
+	defer payload.Close()
+	require.Equal(fixture.blockFiles[1], payload.BlockFile)
+	require.Equal(fixture.blockFiles[1].GetByteLength(), payload.Length)
+
+	gotBytes, err := io.ReadAll(payload)
+	require.NoError(err)
+	var rawBlock api.Block
+	require.NoError(proto.Unmarshal(gotBytes, &rawBlock))
+	expected := proto.Clone(fixture.blocks[1]).(*api.Block)
+	if diff := cmp.Diff(expected, &rawBlock, protocmp.Transform()); diff != "" {
+		require.FailNow(diff)
+	}
+
+	require.Equal([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
+	}, recorder.rangesSnapshot())
+}
+
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayloads_CSCBGroupsByChunk() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 4, 2)
+	defer fixture.close()
+
+	server, recorder := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	s.app = testapp.New(
+		s.T(),
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&s.downloader),
+	)
+
+	blockFiles := []*api.BlockFile{
+		fixture.blockFiles[1],
+		fixture.blockFiles[0],
+		fixture.blockFiles[3],
+	}
+	iter, err := s.downloader.OpenRawBlockPayloads(context.Background(), blockFiles)
+	require.NoError(err)
+	defer iter.Close()
+
+	for i, blockFile := range blockFiles {
+		payload, err := iter.Next(context.Background())
+		require.NoError(err)
+		require.Equal(blockFile, payload.BlockFile)
+		gotBytes, err := io.ReadAll(payload)
+		require.NoError(err)
+		require.NoError(payload.Close())
+
+		var rawBlock api.Block
+		require.NoError(proto.Unmarshal(gotBytes, &rawBlock))
+		sourceIndex := int(blockFile.GetHeight() - 100)
+		expected := proto.Clone(fixture.blocks[sourceIndex]).(*api.Block)
+		if diff := cmp.Diff(expected, &rawBlock, protocmp.Transform()); diff != "" {
+			require.FailNow(fmt.Sprintf("payload %d mismatch: %s", i, diff))
+		}
+	}
+	_, err = iter.Next(context.Background())
+	require.ErrorIs(err, io.EOF)
+
+	require.ElementsMatch([]string{
+		"bytes=0-65535",
+		rangeHeader(fixture.index.Chunks[0].CompressedPayloadOffset, fixture.index.Chunks[0].CompressedLength),
+		rangeHeader(fixture.index.Chunks[1].CompressedPayloadOffset, fixture.index.Chunks[1].CompressedLength),
+	}, recorder.rangesSnapshot())
+}
+
+func BenchmarkOpenRawBlockPayload_CSCB_vs_Download(b *testing.B) {
+	fixture := newCSCBDownloaderFixtureWithPayloadSize(b, 2, 2, 4*1024*1024)
+	defer fixture.close()
+
+	server, _ := newRangeHTTPServer(fixture.data)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+
+	var dl BlockDownloader
+	app := testapp.New(
+		b,
+		fx.Provide(func() HTTPClient { return server.Client() }),
+		fx.Provide(NewBlockDownloader),
+		fx.Populate(&dl),
+	)
+	defer app.Close()
+
+	blockFile := fixture.blockFiles[1]
+	b.Run("download_unmarshal", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			block, err := dl.Download(context.Background(), blockFile)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if got := len(block.GetSolana().GetHeader()); got == 0 {
+				b.Fatalf("expected solana payload, got %d bytes", got)
+			}
+		}
+	})
+	b.Run("open_raw_payload", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			payload, err := dl.OpenRawBlockPayload(context.Background(), blockFile)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := io.Copy(io.Discard, payload); err != nil {
+				_ = payload.Close()
+				b.Fatal(err)
+			}
+			if err := payload.Close(); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
 func (s *blockDownloaderTestSuite) newHttpClientFunc() httpClientFunc {
 	return func() HTTPClient {
 		return s.httpServer.Client()
@@ -636,6 +844,10 @@ type cscbDownloaderFixture struct {
 }
 
 func newCSCBDownloaderFixture(t *testing.T, blockCount int, chunkBlocks uint64) *cscbDownloaderFixture {
+	return newCSCBDownloaderFixtureWithPayloadSize(t, blockCount, chunkBlocks, 0)
+}
+
+func newCSCBDownloaderFixtureWithPayloadSize(t testing.TB, blockCount int, chunkBlocks uint64, payloadSize int) *cscbDownloaderFixture {
 	t.Helper()
 	require := testutil.Require(t)
 
@@ -653,6 +865,15 @@ func newCSCBDownloaderFixture(t *testing.T, blockCount int, chunkBlocks uint64) 
 				Height:       height,
 				ParentHeight: height - 1,
 			},
+		}
+		if payloadSize > 0 {
+			block.Blockchain = common.Blockchain_BLOCKCHAIN_SOLANA
+			block.Network = common.Network_NETWORK_SOLANA_MAINNET
+			block.Blobdata = &api.Block_Solana{
+				Solana: &api.SolanaBlobdata{
+					Header: bytes.Repeat([]byte{byte('a' + i)}, payloadSize),
+				},
+			}
 		}
 		blockBytes, err := proto.Marshal(block)
 		require.NoError(err)

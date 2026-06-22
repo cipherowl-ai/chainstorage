@@ -688,6 +688,12 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.shard_size", 10000)
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
 	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
+	if err := v.BindEnv("aws.storage.consolidation.promotion_gate_height"); err != nil {
+		return nil, xerrors.Errorf("failed to bind promotion_gate_height env: %w", err)
+	}
+	if err := v.BindEnv("aws.storage.consolidation.safe_promotion_lag"); err != nil {
+		return nil, xerrors.Errorf("failed to bind safe_promotion_lag env: %w", err)
+	}
 
 	// Read the data in base.yml
 	if err := v.ReadConfig(configReader); err != nil {
@@ -816,6 +822,9 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.PromotionGateHeight == nil {
 		return xerrors.New("consolidation promote_finalized requires promotion_gate_height")
+	}
+	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.SafePromotionLag == nil {
+		return xerrors.New("consolidation promote_finalized requires safe_promotion_lag")
 	}
 	if consolidation.SafePromotionLag != nil && *consolidation.SafePromotionLag < c.Chain.IrreversibleDistance {
 		return xerrors.Errorf(

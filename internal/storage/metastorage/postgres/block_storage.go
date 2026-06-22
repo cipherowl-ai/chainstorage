@@ -843,6 +843,158 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return nil
 }
 
+func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*internal.ConsolidationPromotionResult, error) {
+	if endHeight <= startHeight {
+		return &internal.ConsolidationPromotionResult{}, nil
+	}
+	if limit == 0 {
+		return nil, xerrors.New("consolidation promotion limit must be positive")
+	}
+	if err := b.validateHeight(startHeight); err != nil {
+		return nil, err
+	}
+
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to begin consolidation promotion transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	const invalidShadowQuery = `
+		SELECT shadow.block_metadata_id, shadow.height
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+			AND shadow.tag = bm.tag
+			AND shadow.height = bm.height
+			AND shadow.hash = bm.hash
+			AND shadow.legacy_object_key_main = bm.object_key_main
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
+			AND bm.skipped = false
+			AND bm.byte_length IS NULL
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+			AND shadow.validated_at IS NOT NULL
+			AND (
+				shadow.consolidated_object_key_main IS NULL
+				OR shadow.consolidated_object_key_main = ''
+				OR shadow.object_format <> $4
+				OR shadow.byte_offset < 0
+				OR shadow.byte_length <= 0
+				OR shadow.uncompressed_length IS NULL
+				OR shadow.uncompressed_length <= 0
+			)
+		ORDER BY cb.height ASC
+		LIMIT 1`
+	var invalidMetadataID int64
+	var invalidHeight uint64
+	err = tx.QueryRowContext(
+		ctx,
+		invalidShadowQuery,
+		tag,
+		startHeight,
+		endHeight,
+		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
+	).Scan(&invalidMetadataID, &invalidHeight)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, xerrors.Errorf("failed to validate consolidation promotion shadows: %w", err)
+	}
+	if err == nil {
+		return nil, xerrors.Errorf("invalid consolidation shadow metadata for metadata_id=%d height=%d", invalidMetadataID, invalidHeight)
+	}
+
+	const promoteQuery = `
+		WITH candidates AS (
+			SELECT
+				bm.id AS block_metadata_id,
+				bm.tag,
+				bm.height,
+				bm.hash,
+				bm.object_key_main AS legacy_object_key_main,
+				shadow.consolidated_object_key_main,
+				shadow.object_format,
+				shadow.byte_offset,
+				shadow.byte_length,
+				shadow.uncompressed_length
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+			JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+				AND shadow.tag = bm.tag
+				AND shadow.height = bm.height
+				AND shadow.hash = bm.hash
+				AND shadow.legacy_object_key_main = bm.object_key_main
+			WHERE cb.tag = $1
+				AND cb.height >= $2
+				AND cb.height < $3
+				AND bm.skipped = false
+				AND bm.byte_length IS NULL
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+				AND shadow.validated_at IS NOT NULL
+				AND shadow.consolidated_object_key_main IS NOT NULL
+				AND shadow.consolidated_object_key_main <> ''
+				AND shadow.object_format = $5
+				AND shadow.byte_offset >= 0
+				AND shadow.byte_length > 0
+				AND shadow.uncompressed_length IS NOT NULL
+				AND shadow.uncompressed_length > 0
+			ORDER BY cb.height ASC
+			LIMIT $4
+			FOR UPDATE OF cb, bm, shadow
+		),
+		updated AS (
+			UPDATE block_metadata bm
+			SET
+				object_key_main = candidates.consolidated_object_key_main,
+				object_format = candidates.object_format,
+				byte_offset = candidates.byte_offset,
+				byte_length = candidates.byte_length,
+				uncompressed_length = candidates.uncompressed_length
+			FROM candidates
+			WHERE bm.id = candidates.block_metadata_id
+				AND bm.tag = candidates.tag
+				AND bm.height = candidates.height
+				AND bm.hash = candidates.hash
+				AND bm.object_key_main = candidates.legacy_object_key_main
+				AND bm.skipped = false
+				AND bm.byte_length IS NULL
+			RETURNING bm.id
+		)
+		SELECT
+			(SELECT COUNT(*) FROM candidates),
+			(SELECT COUNT(*) FROM updated)`
+
+	var candidates, promoted uint64
+	if err := tx.QueryRowContext(
+		ctx,
+		promoteQuery,
+		tag,
+		startHeight,
+		endHeight,
+		limit,
+		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
+	).Scan(&candidates, &promoted); err != nil {
+		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
+	}
+	if candidates != promoted {
+		return nil, xerrors.Errorf("consolidation promotion guard failed: selected %d rows but promoted %d", candidates, promoted)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, xerrors.Errorf("failed to commit consolidation promotion: %w", err)
+	}
+	committed = true
+	return &internal.ConsolidationPromotionResult{
+		Blocks: promoted,
+	}, nil
+}
+
 func makeConsolidationShadowBlockMetadata(
 	block *api.BlockMetadata,
 	objectKey string,

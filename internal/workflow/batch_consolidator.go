@@ -121,7 +121,6 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		if shardSize == 0 {
 			return xerrors.New("batch_consolidator storage consolidation shard_size must be positive")
 		}
-
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
 		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
 			tagBlockTag: strconv.Itoa(int(tag)),
@@ -145,20 +144,46 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			batchConsolidatorShadowStatsChangeID,
 			workflow.DefaultVersion,
 			batchConsolidatorShadowStatsVersion,
-		) != workflow.DefaultVersion
+		) != workflow.DefaultVersion && mode != config.ConsolidationModePromoteFinalized
 
 		if mode == config.ConsolidationModeHistoricalBackfill {
 			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
 		}
+
+		workflowEndHeight := request.EndHeight
+		if mode == config.ConsolidationModePromoteFinalized {
+			plan, err := w.batchConsolidator.GetPromotionPlan(ctx, &activity.BatchConsolidatorPlanRequest{
+				Tag:         tag,
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			})
+			if err != nil {
+				return xerrors.Errorf("failed to plan promote_finalized range: %w", err)
+			}
+			workflowEndHeight = plan.EndHeight
+			logger.Info(
+				"planned promote_finalized range",
+				zap.Uint64("requested_end_height", request.EndHeight),
+				zap.Uint64("effective_end_height", workflowEndHeight),
+				zap.Uint64("latest_height", plan.LatestHeight),
+				zap.Uint64("safe_promotion_height", plan.SafePromotionHeight),
+				zap.Uint64("promotion_gate_height", plan.PromotionGateHeight),
+			)
+			if workflowEndHeight <= request.StartHeight {
+				logger.Info("promote_finalized range has no currently safe heights")
+				return nil
+			}
+		}
+
 		// Keep default shadow activity payloads unchanged for existing workflow history replay.
 		activityMode := config.ConsolidationMode("")
 		if request.Mode != "" {
 			activityMode = mode
 		}
 
-		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
+		for batchStart := request.StartHeight; batchStart < workflowEndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
 				newRequest := *request
 				newRequest.StartHeight = batchStart
@@ -166,7 +191,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return w.continueAsNew(ctx, &newRequest)
 			}
 
-			batchEnd := batchConsolidatorWindowEnd(batchStart, request.EndHeight, batchSize, shardSize)
+			batchEnd := batchConsolidatorWindowEnd(batchStart, workflowEndHeight, batchSize, shardSize)
 			if batchEnd <= batchStart {
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
@@ -295,13 +320,14 @@ func batchConsolidatorMode(
 		mode = configMode
 	}
 	switch mode {
-	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill, config.ConsolidationModePromoteFinalized:
 		return mode, nil
 	default:
 		return "", xerrors.Errorf(
-			"batch_consolidator requires mode %q or %q, got %q",
+			"batch_consolidator requires mode %q, %q, or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
 			config.ConsolidationModeHistoricalBackfill,
+			config.ConsolidationModePromoteFinalized,
 			mode,
 		)
 	}

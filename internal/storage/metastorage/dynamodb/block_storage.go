@@ -297,6 +297,10 @@ func (a *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for DynamoDB")
 }
 
+func (a *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*internal.ConsolidationPromotionResult, error) {
+	return nil, xerrors.New("PromoteBlockConsolidationShadows not implemented for DynamoDB")
+}
+
 func makeBlockMetaDataDDBEntry(block *api.BlockMetadata) *model.BlockMetaDataDDBEntry {
 	blockMetaDataDDBEntry := model.BlockMetaDataDDBEntry{
 		BlockPid:           getBlockPidForHeight(block.Tag, block.Height),

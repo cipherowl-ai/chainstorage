@@ -26,6 +26,7 @@ type (
 		baseActivity
 		statsActivity       baseActivity
 		latestBlockActivity baseActivity
+		planActivity        baseActivity
 		config              *config.Config
 		metaStorage         metastorage.MetaStorage
 		blobStorage         blobstorage.BlobStorage
@@ -77,6 +78,20 @@ type (
 		Tag    uint32
 		Height uint64
 	}
+
+	BatchConsolidatorPlanRequest struct {
+		Tag         uint32
+		StartHeight uint64
+		EndHeight   uint64 `validate:"gtfield=StartHeight"`
+	}
+
+	BatchConsolidatorPlanResponse struct {
+		StartHeight         uint64
+		EndHeight           uint64
+		LatestHeight        uint64
+		SafePromotionHeight uint64
+		PromotionGateHeight uint64
+	}
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -84,6 +99,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 		baseActivity:        newBaseActivity(ActivityBatchConsolidator, params.Runtime),
 		statsActivity:       newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
 		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
+		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
 		config:              params.Config,
 		metaStorage:         params.MetaStorage,
 		blobStorage:         params.BlobStorage,
@@ -91,6 +107,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a.register(a.execute)
 	a.statsActivity.register(a.executeStats)
 	a.latestBlockActivity.register(a.executeLatestBlock)
+	a.planActivity.register(a.executePlan)
 	return a
 }
 
@@ -115,11 +132,17 @@ func (a *BatchConsolidator) GetLatestBlock(ctx workflow.Context, request *BatchC
 	return &response, nil
 }
 
+func (a *BatchConsolidator) GetPromotionPlan(ctx workflow.Context, request *BatchConsolidatorPlanRequest) (*BatchConsolidatorPlanResponse, error) {
+	var response BatchConsolidatorPlanResponse
+	err := a.planActivity.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
 func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchConsolidatorStatsRequest) (*BatchConsolidatorStatsResponse, error) {
 	if err := a.statsActivity.validateRequest(request); err != nil {
 		return nil, err
 	}
-	if err := a.validateConsolidationMode(request.Mode); err != nil {
+	if err := a.validateShadowStatsMode(request.Mode); err != nil {
 		return nil, err
 	}
 	stats, err := a.getConsolidationShadowStats(ctx, request.Tag, request.StartHeight, request.EndHeight)
@@ -151,11 +174,41 @@ func (a *BatchConsolidator) executeLatestBlock(ctx context.Context, request *Bat
 	}, nil
 }
 
+func (a *BatchConsolidator) executePlan(ctx context.Context, request *BatchConsolidatorPlanRequest) (*BatchConsolidatorPlanResponse, error) {
+	if err := a.planActivity.validateRequest(request); err != nil {
+		return nil, err
+	}
+	return a.planPromoteFinalized(ctx, request.Tag, request.StartHeight, request.EndHeight)
+}
+
 func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
 	if err := a.validateRequest(request); err != nil {
 		return nil, err
 	}
-	if err := a.validateConsolidationMode(request.Mode); err != nil {
+	mode := request.Mode
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
+	}
+	switch mode {
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+		return a.executeShadowDualWrite(ctx, request)
+	case config.ConsolidationModePromoteFinalized:
+		return a.executePromoteFinalized(ctx, request)
+	default:
+		if err := a.validateConsolidationEnabled(); err != nil {
+			return nil, err
+		}
+		return nil, xerrors.Errorf(
+			"batch consolidator requires consolidation mode %q or %q, got %q",
+			config.ConsolidationModeShadowDualWrite,
+			config.ConsolidationModePromoteFinalized,
+			mode,
+		)
+	}
+}
+
+func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
+	if err := a.validateShadowWriteMode(request.Mode); err != nil {
 		return nil, err
 	}
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.started")
@@ -213,6 +266,93 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	return response, nil
 }
 
+func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
+	if err := a.validatePromoteFinalizedMode(); err != nil {
+		return nil, err
+	}
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.promote_finalized.started")
+
+	plan, err := a.planPromoteFinalized(ctx, request.Tag, request.StartHeight, request.EndHeight)
+	if err != nil {
+		return nil, err
+	}
+	if plan.EndHeight <= request.StartHeight {
+		return &BatchConsolidatorResponse{
+			StartHeight: request.StartHeight,
+			EndHeight:   request.StartHeight,
+		}, nil
+	}
+	result, err := a.metaStorage.PromoteBlockConsolidationShadows(
+		ctx,
+		request.Tag,
+		request.StartHeight,
+		plan.EndHeight,
+		request.MaxBlocks,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
+	}
+	promotedBlocks := uint64(0)
+	if result != nil {
+		promotedBlocks = result.Blocks
+	}
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.promote_finalized.promoted", promotedBlocks)
+	a.getLogger(ctx).Info(
+		"promoted finalized consolidation shadows",
+		zap.Reflect("request", request),
+		zap.Uint64("promoted_blocks", promotedBlocks),
+	)
+	return &BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          plan.EndHeight,
+		ScannedBlocks:      promotedBlocks,
+		ConsolidatedBlocks: promotedBlocks,
+	}, nil
+}
+
+func (a *BatchConsolidator) planPromoteFinalized(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (*BatchConsolidatorPlanResponse, error) {
+	if err := a.validatePromoteFinalizedMode(); err != nil {
+		return nil, err
+	}
+	latest, err := a.metaStorage.GetLatestBlock(ctx, tag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get latest block for consolidation promotion: %w", err)
+	}
+
+	consolidation := a.config.AWS.Storage.Consolidation
+	safeLag := *consolidation.SafePromotionLag
+	gateHeight := *consolidation.PromotionGateHeight
+	safeEnd, safeHeight, ok := promotionSafeEndHeight(latest.GetHeight(), safeLag)
+	if !ok {
+		return &BatchConsolidatorPlanResponse{
+			StartHeight:         startHeight,
+			EndHeight:           startHeight,
+			LatestHeight:        latest.GetHeight(),
+			SafePromotionHeight: 0,
+			PromotionGateHeight: gateHeight,
+		}, nil
+	}
+
+	effectiveEndHeight := endHeight
+	if gateHeight < effectiveEndHeight {
+		effectiveEndHeight = gateHeight
+	}
+	if safeEnd < effectiveEndHeight {
+		effectiveEndHeight = safeEnd
+	}
+	if effectiveEndHeight < startHeight {
+		effectiveEndHeight = startHeight
+	}
+
+	return &BatchConsolidatorPlanResponse{
+		StartHeight:         startHeight,
+		EndHeight:           effectiveEndHeight,
+		LatestHeight:        latest.GetHeight(),
+		SafePromotionHeight: safeHeight,
+		PromotionGateHeight: gateHeight,
+	}, nil
+}
+
 func (a *BatchConsolidator) getConsolidationShadowStats(
 	ctx context.Context,
 	tag uint32,
@@ -229,16 +369,24 @@ func (a *BatchConsolidator) getConsolidationShadowStats(
 	return stats, nil
 }
 
-func (a *BatchConsolidator) validateConsolidationMode(mode config.ConsolidationMode) error {
+func (a *BatchConsolidator) validateConsolidationEnabled() error {
 	consolidation := a.config.AWS.Storage.Consolidation
 	if !consolidation.Enabled {
 		return xerrors.New("batch consolidator requires aws.storage.consolidation.enabled=true")
 	}
+	return nil
+}
+
+func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMode) error {
+	if err := a.validateConsolidationEnabled(); err != nil {
+		return err
+	}
 	if mode == "" {
-		mode = consolidation.Mode
+		mode = a.config.AWS.Storage.Consolidation.Mode
 	}
 	switch mode {
 	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+		return nil
 	default:
 		return xerrors.Errorf(
 			"batch consolidator requires consolidation mode %q or %q, got %q",
@@ -247,7 +395,38 @@ func (a *BatchConsolidator) validateConsolidationMode(mode config.ConsolidationM
 			mode,
 		)
 	}
+}
+
+func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
+	return a.validateShadowWriteMode(mode)
+}
+
+func (a *BatchConsolidator) validatePromoteFinalizedMode() error {
+	if err := a.validateConsolidationEnabled(); err != nil {
+		return err
+	}
+	consolidation := a.config.AWS.Storage.Consolidation
+	if consolidation.Mode != config.ConsolidationModePromoteFinalized {
+		return xerrors.Errorf("batch consolidator requires consolidation mode %q, got %q", config.ConsolidationModePromoteFinalized, consolidation.Mode)
+	}
+	if consolidation.PromotionGateHeight == nil {
+		return xerrors.New("batch consolidator promote_finalized requires promotion_gate_height")
+	}
+	if consolidation.SafePromotionLag == nil {
+		return xerrors.New("batch consolidator promote_finalized requires safe_promotion_lag")
+	}
 	return nil
+}
+
+func promotionSafeEndHeight(latestHeight uint64, safePromotionLag uint64) (uint64, uint64, bool) {
+	if latestHeight < safePromotionLag {
+		return 0, 0, false
+	}
+	safeHeight := latestHeight - safePromotionLag
+	if safeHeight == ^uint64(0) {
+		return safeHeight, safeHeight, true
+	}
+	return safeHeight + 1, safeHeight, true
 }
 
 func (a *BatchConsolidator) buildPayloads(

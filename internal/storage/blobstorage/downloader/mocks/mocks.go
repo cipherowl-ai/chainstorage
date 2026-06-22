@@ -85,3 +85,33 @@ func (mr *MockBlockDownloaderMockRecorder) DownloadStream(arg0, arg1 any) *gomoc
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DownloadStream", reflect.TypeOf((*MockBlockDownloader)(nil).DownloadStream), arg0, arg1)
 }
+
+// OpenRawBlockPayload mocks base method.
+func (m *MockBlockDownloader) OpenRawBlockPayload(arg0 context.Context, arg1 *chainstorage.BlockFile) (*downloader.RawBlockPayload, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayload", arg0, arg1)
+	ret0, _ := ret[0].(*downloader.RawBlockPayload)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayload indicates an expected call of OpenRawBlockPayload.
+func (mr *MockBlockDownloaderMockRecorder) OpenRawBlockPayload(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayload", reflect.TypeOf((*MockBlockDownloader)(nil).OpenRawBlockPayload), arg0, arg1)
+}
+
+// OpenRawBlockPayloads mocks base method.
+func (m *MockBlockDownloader) OpenRawBlockPayloads(arg0 context.Context, arg1 []*chainstorage.BlockFile) (downloader.RawBlockPayloadIterator, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayloads", arg0, arg1)
+	ret0, _ := ret[0].(downloader.RawBlockPayloadIterator)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayloads indicates an expected call of OpenRawBlockPayloads.
+func (mr *MockBlockDownloaderMockRecorder) OpenRawBlockPayloads(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayloads", reflect.TypeOf((*MockBlockDownloader)(nil).OpenRawBlockPayloads), arg0, arg1)
+}

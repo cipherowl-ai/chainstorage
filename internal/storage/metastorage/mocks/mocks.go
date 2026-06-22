@@ -367,6 +367,21 @@ func (mr *MockMetaStorageMockRecorder) PersistBlockMetas(arg0, arg1, arg2, arg3 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PersistBlockMetas", reflect.TypeOf((*MockMetaStorage)(nil).PersistBlockMetas), arg0, arg1, arg2, arg3)
 }
 
+// PromoteBlockConsolidationShadows mocks base method.
+func (m *MockMetaStorage) PromoteBlockConsolidationShadows(arg0 context.Context, arg1 uint32, arg2, arg3, arg4 uint64) (*internal.ConsolidationPromotionResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PromoteBlockConsolidationShadows", arg0, arg1, arg2, arg3, arg4)
+	ret0, _ := ret[0].(*internal.ConsolidationPromotionResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// PromoteBlockConsolidationShadows indicates an expected call of PromoteBlockConsolidationShadows.
+func (mr *MockMetaStorageMockRecorder) PromoteBlockConsolidationShadows(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteBlockConsolidationShadows", reflect.TypeOf((*MockMetaStorage)(nil).PromoteBlockConsolidationShadows), arg0, arg1, arg2, arg3, arg4)
+}
+
 // SetMaxEventId mocks base method.
 func (m *MockMetaStorage) SetMaxEventId(arg0 context.Context, arg1 uint32, arg2 int64) error {
 	m.ctrl.T.Helper()
@@ -735,6 +750,21 @@ func (m *MockBlockStorage) PersistBlockMetas(arg0 context.Context, arg1 bool, ar
 func (mr *MockBlockStorageMockRecorder) PersistBlockMetas(arg0, arg1, arg2, arg3 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PersistBlockMetas", reflect.TypeOf((*MockBlockStorage)(nil).PersistBlockMetas), arg0, arg1, arg2, arg3)
+}
+
+// PromoteBlockConsolidationShadows mocks base method.
+func (m *MockBlockStorage) PromoteBlockConsolidationShadows(arg0 context.Context, arg1 uint32, arg2, arg3, arg4 uint64) (*internal.ConsolidationPromotionResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PromoteBlockConsolidationShadows", arg0, arg1, arg2, arg3, arg4)
+	ret0, _ := ret[0].(*internal.ConsolidationPromotionResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// PromoteBlockConsolidationShadows indicates an expected call of PromoteBlockConsolidationShadows.
+func (mr *MockBlockStorageMockRecorder) PromoteBlockConsolidationShadows(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteBlockConsolidationShadows", reflect.TypeOf((*MockBlockStorage)(nil).PromoteBlockConsolidationShadows), arg0, arg1, arg2, arg3, arg4)
 }
 
 // MockTransactionStorage is a mock of TransactionStorage interface.

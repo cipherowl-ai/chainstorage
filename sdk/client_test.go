@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
 	"github.com/coinbase/chainstorage/internal/config"
@@ -346,6 +349,63 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 	s.require.NoError(err)
 	s.require.Equal(numBlocks, len(fetchedBlocks))
 	s.require.Equal(blocks, fetchedBlocks)
+}
+
+func TestClientOpenRawBlockPayloadWithTag(t *testing.T) {
+	require := testutil.Require(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+	block := testutil.MakeBlock(height, tag)
+	blockBytes, err := proto.Marshal(block)
+	require.NoError(err)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		require.Equal(http.MethodGet, request.Method)
+		_, _ = writer.Write(blockBytes)
+	}))
+	defer server.Close()
+
+	gatewayClient := apimocks.NewMockChainStorageClient(ctrl)
+	blockFile := &api.BlockFile{
+		Tag:     tag,
+		Height:  height,
+		Hash:    hash,
+		FileUrl: server.URL,
+	}
+	gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+		Tag:    tag,
+		Height: height,
+		Hash:   hash,
+	}).Return(&api.GetBlockFileResponse{
+		File: blockFile,
+	}, nil)
+
+	var client Client
+	app := testapp.New(
+		t,
+		Module,
+		parser.Module,
+		fx.Provide(func() downloader.HTTPClient { return server.Client() }),
+		fx.Provide(downloader.NewBlockDownloader),
+		fx.Provide(func() gateway.Client { return gatewayClient }),
+		fx.Populate(&client),
+	)
+	defer app.Close()
+
+	payload, err := client.OpenRawBlockPayloadWithTag(context.Background(), tag, height, hash)
+	require.NoError(err)
+	defer payload.Close()
+	require.Equal(blockFile, payload.BlockFile)
+
+	got, err := io.ReadAll(payload)
+	require.NoError(err)
+	require.Equal(blockBytes, got)
 }
 
 func (s *clientTestSuite) TestStreamBlocks() {

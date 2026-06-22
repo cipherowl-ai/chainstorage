@@ -73,6 +73,22 @@ type (
 		// and thus you may get back FailedPrecondition errors if it goes beyond current tip due to reorg, especially for streaming case.
 		GetBlocksByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) ([]*api.Block, error)
 
+		// OpenRawBlockPayload opens the validated, decompressed protobuf payload bytes for one raw block
+		// without unmarshaling api.Block. height is required and hash is optional.
+		OpenRawBlockPayload(ctx context.Context, height uint64, hash string) (*RawBlockPayload, error)
+
+		// OpenRawBlockPayloadWithTag opens the validated, decompressed protobuf payload bytes for one raw block
+		// without unmarshaling api.Block. tag and hash are optional.
+		OpenRawBlockPayloadWithTag(ctx context.Context, tag uint32, height uint64, hash string) (*RawBlockPayload, error)
+
+		// OpenRawBlockPayloadsByRange opens an iterator over raw block payloads between [startHeight, endHeight)
+		// without unmarshaling api.Block. endHeight is optional and defaults to startHeight + 1.
+		OpenRawBlockPayloadsByRange(ctx context.Context, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error)
+
+		// OpenRawBlockPayloadsByRangeWithTag opens an iterator over raw block payloads between [startHeight, endHeight)
+		// without unmarshaling api.Block. tag is optional and defaults to stable tag.
+		OpenRawBlockPayloadsByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error)
+
 		// GetBlockByTransaction returns the raw block(s) where the transaction resides,
 		// or an empty list if the transaction is not found.
 		// In most networks a transaction belongs to a single block, but there are exceptions.
@@ -120,6 +136,14 @@ type (
 
 		// GetBlocksByRangeWithTagAndReadSource returns raw blocks using the requested blob read source.
 		GetBlocksByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) ([]*api.Block, error)
+	}
+
+	RawPayloadReadSourceClient interface {
+		// OpenRawBlockPayloadWithTagAndReadSource opens raw block payload bytes using the requested blob read source.
+		OpenRawBlockPayloadWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error)
+
+		// OpenRawBlockPayloadsByRangeWithTagAndReadSource opens raw block payload bytes using the requested blob read source.
+		OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) (RawBlockPayloadIterator, error)
 	}
 
 	ChainEventResult struct {
@@ -310,6 +334,106 @@ func (c *clientImpl) downloadBlocksByRange(ctx context.Context, tag uint32, star
 
 func (c *clientImpl) GetBlocksByRange(ctx context.Context, startHeight uint64, endHeight uint64) ([]*api.Block, error) {
 	return c.GetBlocksByRangeWithTag(ctx, c.tag, startHeight, endHeight)
+}
+
+func (c *clientImpl) OpenRawBlockPayload(ctx context.Context, height uint64, hash string) (*RawBlockPayload, error) {
+	return c.OpenRawBlockPayloadWithTag(ctx, c.tag, height, hash)
+}
+
+func (c *clientImpl) OpenRawBlockPayloadWithTag(ctx context.Context, tag uint32, height uint64, hash string) (*RawBlockPayload, error) {
+	return c.OpenRawBlockPayloadWithTagAndReadSource(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+}
+
+func (c *clientImpl) OpenRawBlockPayloadWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error) {
+	payload, err := c.openRawBlockPayload(ctx, tag, height, hash, readSource)
+	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return payload, err
+	}
+
+	c.logger.Warn(
+		"consolidated raw block payload open failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("height", height),
+		zap.String("hash", hash),
+		zap.Error(err),
+	)
+	payload, fallbackErr := c.openRawBlockPayload(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to open consolidated raw block payload and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return payload, nil
+}
+
+func (c *clientImpl) openRawBlockPayload(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error) {
+	blockFile, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
+		Tag:        tag,
+		Height:     height,
+		Hash:       hash,
+		ReadSource: readSource,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
+	}
+
+	payload, err := c.blockDownloader.OpenRawBlockPayload(ctx, blockFile.GetFile())
+	if err != nil {
+		return nil, xerrors.Errorf("failed to open raw block payload (blockFile={%+v}): %w", blockFile.GetFile(), err)
+	}
+	return wrapRawBlockPayload(payload), nil
+}
+
+func (c *clientImpl) OpenRawBlockPayloadsByRange(ctx context.Context, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error) {
+	return c.OpenRawBlockPayloadsByRangeWithTag(ctx, c.tag, startHeight, endHeight)
+}
+
+func (c *clientImpl) OpenRawBlockPayloadsByRangeWithTag(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (RawBlockPayloadIterator, error) {
+	return c.OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+}
+
+func (c *clientImpl) OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) (RawBlockPayloadIterator, error) {
+	if endHeight == 0 {
+		endHeight = startHeight + 1
+	}
+
+	iter, err := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, readSource)
+	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+		return iter, err
+	}
+
+	c.logger.Warn(
+		"consolidated raw block payload range open failed; retrying legacy",
+		zap.Uint32("tag", tag),
+		zap.Uint64("start_height", startHeight),
+		zap.Uint64("end_height", endHeight),
+		zap.Error(err),
+	)
+	iter, fallbackErr := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	if fallbackErr != nil {
+		return nil, xerrors.Errorf("failed to open consolidated raw block payload range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+	}
+	return iter, nil
+}
+
+func (c *clientImpl) openRawBlockPayloadsByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) (RawBlockPayloadIterator, error) {
+	resp, err := c.client.GetBlockFilesByRange(ctx, &api.GetBlockFilesByRangeRequest{
+		Tag:         tag,
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
+		ReadSource:  readSource,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get block file metadata (tag=%d, startHeight=%d, endHeight=%d): %w", tag, startHeight, endHeight, err)
+	}
+	blockFiles := resp.GetFiles()
+	if len(blockFiles) == 0 {
+		return nil, xerrors.Errorf("no block file metadata found")
+	}
+
+	iter, err := c.blockDownloader.OpenRawBlockPayloads(ctx, blockFiles)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to open raw block payload iterator: %w", err)
+	}
+	return &rawBlockPayloadIterator{inner: iter}, nil
 }
 
 func (c *clientImpl) StreamChainEvents(ctx context.Context, cfg StreamingConfiguration) (<-chan *ChainEventResult, error) {

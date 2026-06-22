@@ -365,6 +365,37 @@ func (s *blockStorageTestSuite) insertConsolidationShadow(
 	require.NoError(err)
 }
 
+func (s *blockStorageTestSuite) insertInvalidConsolidationShadow(
+	ctx context.Context,
+	block *api.BlockMetadata,
+	consolidatedObjectKey string,
+	objectFormat api.BlockObjectFormat,
+	byteOffset uint64,
+	byteLength uint64,
+	uncompressedLength uint64,
+) {
+	require := testutil.Require(s.T())
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			object_format, byte_offset, byte_length, uncompressed_length, validated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		s.getBlockMetadataID(ctx, block),
+		block.GetTag(),
+		block.GetHeight(),
+		block.GetHash(),
+		block.GetObjectKeyMain(),
+		consolidatedObjectKey,
+		int32(objectFormat),
+		byteOffset,
+		byteLength,
+		uncompressedLength,
+		time.Now().UTC(),
+	)
+	require.NoError(err)
+}
+
 func expectedConsolidationShadow(
 	block *api.BlockMetadata,
 	consolidatedObjectKey string,
@@ -549,6 +580,162 @@ func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimar
 	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[1])
 	require.Error(err)
 	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesValidatedShadows() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20, true, "")
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/second.cscb.zstd", 30, 40, 40, true, "")
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+3, 10)
+	require.NoError(err)
+	require.Equal(uint64(2), result.Blocks)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20), primary)
+
+	primary, err = s.accessor.GetBlockByHeight(ctx, tag, blocks[1].GetHeight())
+	require.NoError(err)
+	s.equalProto(expectedConsolidationShadow(blocks[1], "consolidated/second.cscb.zstd", 30, 40, 40), primary)
+
+	primary, err = s.accessor.GetBlockByHeight(ctx, tag, blocks[2].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[2], primary)
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsMissingShadowNoOps() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 1, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10)
+	require.NoError(err)
+	require.Equal(uint64(0), result.Blocks)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[0], primary)
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsRejectsInvalidShadowMetadata() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 1, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[0],
+		"consolidated/invalid.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		10,
+		20,
+		20,
+	)
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10)
+	require.Error(err)
+	require.Nil(result)
+	require.Contains(err.Error(), "invalid consolidation shadow metadata")
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[0], primary)
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsSkipsStaleReorgMetadata() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 4, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/stale.cscb.zstd", 10, 20, 20, true, "")
+
+	reorgBlock := proto.Clone(blocks[3]).(*api.BlockMetadata)
+	reorgBlock.Hash = "0xreorg"
+	reorgBlock.ParentHash = blocks[2].GetHash()
+	reorgBlock.ObjectKeyMain = "legacy/reorg.gzip"
+	err = s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{reorgBlock}, blocks[2])
+	require.NoError(err)
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, reorgBlock.GetHeight(), reorgBlock.GetHeight()+1, 10)
+	require.NoError(err)
+	require.Equal(uint64(0), result.Blocks)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, reorgBlock.GetHeight())
+	require.NoError(err)
+	s.equalProto(reorgBlock, primary)
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsIdempotentRetry() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 1, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20, true, "")
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10)
+	require.NoError(err)
+	require.Equal(uint64(1), result.Blocks)
+
+	result, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10)
+	require.NoError(err)
+	require.Equal(uint64(0), result.Blocks)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20), primary)
+}
+
+func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsRollsBackOnInvalidCandidate() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 2, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/valid.cscb.zstd", 10, 20, 20, true, "")
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[1],
+		"consolidated/invalid.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		30,
+		0,
+		40,
+	)
+
+	_, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+2, 10)
+	require.Error(err)
+	require.Contains(err.Error(), "invalid consolidation shadow metadata")
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[0], primary)
+
+	primary, err = s.accessor.GetBlockByHeight(ctx, tag, blocks[1].GetHeight())
+	require.NoError(err)
+	s.equalProto(blocks[1], primary)
 }
 
 func (s *blockStorageTestSuite) TestWatermarkVisibilityControl() {

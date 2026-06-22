@@ -32,6 +32,7 @@ const (
 	ActivityBatchConsolidator            = "activity.batch_consolidator"
 	ActivityBatchConsolidatorStats       = "activity.batch_consolidator.stats"
 	ActivityBatchConsolidatorLatestBlock = "activity.batch_consolidator.latest_block"
+	ActivityBatchConsolidatorPlan        = "activity.batch_consolidator.plan"
 
 	loggerMsg = "activity.request"
 
