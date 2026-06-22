@@ -202,6 +202,27 @@ func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBef
 	require.Contains(err.Error(), "downloaded block metadata mismatch")
 }
 
+func (s *BatchConsolidatorTestSuite) TestGetShadowStatsReturnsPersistedShadowStats() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorStatsRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   2000,
+	}
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 3, Blocks: 2750}, nil)
+
+	response, err := s.batchConsolidator.GetShadowStats(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorStatsResponse{
+		StartHeight:   request.StartHeight,
+		EndHeight:     request.EndHeight,
+		ShadowObjects: 3,
+		ShadowBlocks:  2750,
+	}, response)
+}
+
 type consolidatedPayloadsMatcher struct {
 	blocks        []*api.Block
 	metadataIDs   []int64

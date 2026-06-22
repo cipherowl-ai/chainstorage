@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
@@ -67,6 +68,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorProcessesBatches() {
 
 	var requests []*activity.BatchConsolidatorRequest
 	seenByStart := make(map[uint64]int)
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -104,6 +106,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorProcessesBatches() {
 func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCheckpointContinuesAsNew() {
 	require := testutil.Require(s.T())
 
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(&activity.BatchConsolidatorResponse{
 			ConsolidatedBlocks: 100,
@@ -123,6 +126,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRequestOverridesConfig
 	require := testutil.Require(s.T())
 
 	var requests []*activity.BatchConsolidatorRequest
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -150,6 +154,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCapsMaxBlocksAtStorage
 	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.MaxBlocks = 10
 
 	var requests []*activity.BatchConsolidatorRequest
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -178,6 +183,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorCapsWindowAtShardBound
 	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.ShardSize = 10000
 
 	var requests []*activity.BatchConsolidatorRequest
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -202,10 +208,13 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUnti
 	require := testutil.Require(s.T())
 
 	var requests []*activity.BatchConsolidatorRequest
+	normalCalls := 0
+	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
-			if len(requests) <= 2 {
+			normalCalls++
+			if normalCalls <= 2 {
 				return &activity.BatchConsolidatorResponse{
 					StartHeight:        request.StartHeight,
 					EndHeight:          request.EndHeight,
@@ -231,4 +240,139 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRepeatsHeightBatchUnti
 	for _, request := range requests {
 		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
 	}
+}
+
+func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCompletionFromShadowStats() {
+	require := testutil.Require(s.T())
+
+	var requests []*activity.BatchConsolidatorRequest
+	statsCalls := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			statsCalls++
+			if statsCalls == 1 {
+				return &activity.BatchConsolidatorStatsResponse{
+					StartHeight: request.StartHeight,
+					EndHeight:   request.EndHeight,
+				}, nil
+			}
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight:   request.StartHeight,
+				EndHeight:     request.EndHeight,
+				ShadowObjects: 2,
+				ShadowBlocks:  50,
+			}, nil
+		})
+	call := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			call++
+			switch call {
+			case 1:
+				return nil, xerrors.New("completion lost after side effects")
+			case 2:
+				return &activity.BatchConsolidatorResponse{
+					StartHeight:        request.StartHeight,
+					EndHeight:          request.EndHeight,
+					ScannedBlocks:      request.MaxBlocks,
+					ConsolidatedBlocks: request.MaxBlocks,
+					ObjectKey:          "consolidated/second.cscb.zstd",
+				}, nil
+			default:
+				return &activity.BatchConsolidatorResponse{
+					StartHeight: request.StartHeight,
+					EndHeight:   request.EndHeight,
+				}, nil
+			}
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   1100,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
+
+	require.GreaterOrEqual(statsCalls, 3)
+	require.Len(requests, 3)
+	for _, request := range requests {
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+	}
+}
+
+func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCompletionWhenRetryScanIsEmpty() {
+	require := testutil.Require(s.T())
+
+	var requests []*activity.BatchConsolidatorRequest
+	statsCalls := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			statsCalls++
+			if statsCalls == 1 {
+				return &activity.BatchConsolidatorStatsResponse{
+					StartHeight: request.StartHeight,
+					EndHeight:   request.EndHeight,
+				}, nil
+			}
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight:   request.StartHeight,
+				EndHeight:     request.EndHeight,
+				ShadowObjects: 1,
+				ShadowBlocks:  25,
+			}, nil
+		})
+	call := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			call++
+			if call == 1 {
+				return nil, xerrors.New("completion lost after side effects")
+			}
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   1100,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
+
+	require.Equal(2, statsCalls)
+	require.Len(requests, 2)
+	for _, request := range requests {
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+	}
+}
+
+func (s *batchConsolidatorTestSuite) TestShadowStatsActivityRetryPolicyUsesUnlimitedAttempts() {
+	require := testutil.Require(s.T())
+
+	activityRetry := s.cfg.Workflows.BatchConsolidator.ActivityRetry
+	activityRetry.MaximumAttempts = 3
+	policy := s.batchConsolidator.getShadowStatsActivityRetryPolicy(activityRetry)
+
+	require.NotNil(policy)
+	require.Equal(int32(0), policy.MaximumAttempts)
+	require.Equal(activityRetry.BackoffCoefficient, policy.BackoffCoefficient)
+	require.Equal(activityRetry.InitialInterval, policy.InitialInterval)
+	require.Equal(activityRetry.MaximumInterval, policy.MaximumInterval)
+	require.Equal(int32(3), activityRetry.MaximumAttempts)
+}
+
+func (s *batchConsolidatorTestSuite) mockEmptyShadowStats() {
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
 }

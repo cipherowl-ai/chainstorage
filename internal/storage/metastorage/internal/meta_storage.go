@@ -27,6 +27,7 @@ type (
 		GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error)
 		GetBlocksConsolidationShadow(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error)
 		GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*BlockMetadataRecord, error)
+		GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*ConsolidationShadowStats, error)
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
 	}
 
@@ -85,6 +86,11 @@ type (
 		ByteOffset                uint64
 		ByteLength                uint64
 		UncompressedLength        uint64
+	}
+
+	ConsolidationShadowStats struct {
+		Objects uint64
+		Blocks  uint64
 	}
 
 	MetaStorageFactory interface {

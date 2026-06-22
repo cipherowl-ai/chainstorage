@@ -18,6 +18,7 @@ type (
 	EventsToChainAdaptor         = internal.EventsToChainAdaptor
 	BlockMetadataRecord          = internal.BlockMetadataRecord
 	ConsolidationShadowPlacement = internal.ConsolidationShadowPlacement
+	ConsolidationShadowStats     = internal.ConsolidationShadowStats
 )
 
 const (

@@ -24,9 +24,10 @@ import (
 type (
 	BatchConsolidator struct {
 		baseActivity
-		config      *config.Config
-		metaStorage metastorage.MetaStorage
-		blobStorage blobstorage.BlobStorage
+		statsActivity baseActivity
+		config        *config.Config
+		metaStorage   metastorage.MetaStorage
+		blobStorage   blobstorage.BlobStorage
 	}
 
 	BatchConsolidatorParams struct {
@@ -51,16 +52,31 @@ type (
 		ConsolidatedBlocks uint64
 		ObjectKey          string
 	}
+
+	BatchConsolidatorStatsRequest struct {
+		Tag         uint32
+		StartHeight uint64
+		EndHeight   uint64 `validate:"gtfield=StartHeight"`
+	}
+
+	BatchConsolidatorStatsResponse struct {
+		StartHeight   uint64
+		EndHeight     uint64
+		ShadowObjects uint64
+		ShadowBlocks  uint64
+	}
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a := &BatchConsolidator{
-		baseActivity: newBaseActivity(ActivityBatchConsolidator, params.Runtime),
-		config:       params.Config,
-		metaStorage:  params.MetaStorage,
-		blobStorage:  params.BlobStorage,
+		baseActivity:  newBaseActivity(ActivityBatchConsolidator, params.Runtime),
+		statsActivity: newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
+		config:        params.Config,
+		metaStorage:   params.MetaStorage,
+		blobStorage:   params.BlobStorage,
 	}
 	a.register(a.execute)
+	a.statsActivity.register(a.executeStats)
 	return a
 }
 
@@ -68,6 +84,31 @@ func (a *BatchConsolidator) Execute(ctx workflow.Context, request *BatchConsolid
 	var response BatchConsolidatorResponse
 	err := a.executeActivity(ctx, request, &response)
 	return &response, err
+}
+
+func (a *BatchConsolidator) GetShadowStats(ctx workflow.Context, request *BatchConsolidatorStatsRequest) (*BatchConsolidatorStatsResponse, error) {
+	var response BatchConsolidatorStatsResponse
+	err := a.statsActivity.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchConsolidatorStatsRequest) (*BatchConsolidatorStatsResponse, error) {
+	if err := a.statsActivity.validateRequest(request); err != nil {
+		return nil, err
+	}
+	if err := a.validateConsolidationMode(); err != nil {
+		return nil, err
+	}
+	stats, err := a.getConsolidationShadowStats(ctx, request.Tag, request.StartHeight, request.EndHeight)
+	if err != nil {
+		return nil, err
+	}
+	return &BatchConsolidatorStatsResponse{
+		StartHeight:   request.StartHeight,
+		EndHeight:     request.EndHeight,
+		ShadowObjects: stats.Objects,
+		ShadowBlocks:  stats.Blocks,
+	}, nil
 }
 
 func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
@@ -130,6 +171,22 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 		zap.String("object_key", objectKey),
 	)
 	return response, nil
+}
+
+func (a *BatchConsolidator) getConsolidationShadowStats(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+) (*metastorage.ConsolidationShadowStats, error) {
+	stats, err := a.metaStorage.GetBlockConsolidationShadowStats(ctx, tag, startHeight, endHeight)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get consolidation shadow stats: %w", err)
+	}
+	if stats == nil {
+		return &metastorage.ConsolidationShadowStats{}, nil
+	}
+	return stats, nil
 }
 
 func (a *BatchConsolidator) validateConsolidationMode() error {

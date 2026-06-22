@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -48,6 +49,8 @@ const (
 	batchConsolidatorObjectCounter            = "workflow.batch_consolidator.object"
 	batchConsolidatorConsolidatedBlockCounter = "workflow.batch_consolidator.consolidated_block"
 	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
+	batchConsolidatorShadowStatsChangeID      = "batch-consolidator-shadow-stats"
+	batchConsolidatorShadowStatsVersion       = 1
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -129,6 +132,13 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		)
 		logger.Info("workflow started")
 		ctx = w.withActivityOptions(ctx)
+		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
+		usePersistedShadowStats := workflow.GetVersion(
+			ctx,
+			batchConsolidatorShadowStatsChangeID,
+			workflow.DefaultVersion,
+			batchConsolidatorShadowStatsVersion,
+		) != workflow.DefaultVersion
 
 		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
@@ -145,6 +155,20 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 
 			objectsInBatch := uint64(0)
 			blocksInBatch := uint64(0)
+			lastShadowObjects := uint64(0)
+			lastShadowBlocks := uint64(0)
+			if usePersistedShadowStats {
+				baseline, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+					Tag:         tag,
+					StartHeight: batchStart,
+					EndHeight:   batchEnd,
+				})
+				if err != nil {
+					return xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+				}
+				lastShadowObjects = baseline.ShadowObjects
+				lastShadowBlocks = baseline.ShadowBlocks
+			}
 			for {
 				response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
 					Tag:         tag,
@@ -155,23 +179,70 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				if err != nil {
 					return xerrors.Errorf("failed to consolidate shadow batch [%d, %d): %w", batchStart, batchEnd, err)
 				}
+				newObjects := uint64(0)
+				newBlocks := uint64(0)
+				if usePersistedShadowStats {
+					stats, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+						Tag:         tag,
+						StartHeight: batchStart,
+						EndHeight:   batchEnd,
+					})
+					if err != nil {
+						return xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+					}
+					if stats.ShadowObjects < lastShadowObjects || stats.ShadowBlocks < lastShadowBlocks {
+						return xerrors.Errorf(
+							"batch_consolidator shadow stats regressed for batch [%d, %d): objects %d -> %d, blocks %d -> %d",
+							batchStart,
+							batchEnd,
+							lastShadowObjects,
+							stats.ShadowObjects,
+							lastShadowBlocks,
+							stats.ShadowBlocks,
+						)
+					}
+					newObjects = stats.ShadowObjects - lastShadowObjects
+					newBlocks = stats.ShadowBlocks - lastShadowBlocks
+					lastShadowObjects = stats.ShadowObjects
+					lastShadowBlocks = stats.ShadowBlocks
+				}
 				if response.ScannedBlocks == 0 {
+					if newObjects > 0 {
+						objectsInBatch += newObjects
+						metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(newObjects))
+					}
+					if newBlocks > 0 {
+						blocksInBatch += newBlocks
+						metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(newBlocks))
+					}
 					metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
 					break
 				}
 				if response.ConsolidatedBlocks == 0 {
 					return xerrors.Errorf("batch_consolidator made no progress for non-empty shadow scan [%d, %d)", batchStart, batchEnd)
 				}
-				objectsInBatch++
-				blocksInBatch += response.ConsolidatedBlocks
-				metrics.Counter(batchConsolidatorObjectCounter).Inc(1)
-				metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(response.ConsolidatedBlocks))
+				if !usePersistedShadowStats {
+					newObjects = 1
+					newBlocks = response.ConsolidatedBlocks
+				}
+				if newObjects > 0 {
+					objectsInBatch += newObjects
+					metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(newObjects))
+				}
+				if newBlocks > 0 {
+					blocksInBatch += newBlocks
+					metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(newBlocks))
+				}
 				logger.Info(
 					"processed shadow object",
 					zap.Uint64("batch_start", batchStart),
 					zap.Uint64("batch_end", batchEnd),
 					zap.Uint64("scanned_blocks", response.ScannedBlocks),
 					zap.Uint64("consolidated_blocks", response.ConsolidatedBlocks),
+					zap.Uint64("new_objects", newObjects),
+					zap.Uint64("new_consolidated_blocks", newBlocks),
+					zap.Uint64("shadow_objects", lastShadowObjects),
+					zap.Uint64("shadow_blocks", lastShadowBlocks),
 					zap.String("object_key", response.ObjectKey),
 				)
 				if response.ScannedBlocks < maxBlocks {
@@ -192,6 +263,34 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow finished")
 		return nil
 	})
+}
+
+func (w *BatchConsolidator) withShadowStatsActivityOptions(
+	ctx workflow.Context,
+	cfg config.BatchConsolidatorWorkflowConfig,
+) workflow.Context {
+	base := cfg.Base()
+	retryPolicy := w.getShadowStatsActivityRetryPolicy(base.ActivityRetry)
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:              base.TaskList,
+		StartToCloseTimeout:    base.ActivityStartToCloseTimeout,
+		ScheduleToCloseTimeout: base.ActivityScheduleToCloseTimeout,
+		HeartbeatTimeout:       base.ActivityHeartbeatTimeout,
+		RetryPolicy:            retryPolicy,
+	})
+}
+
+func (w *BatchConsolidator) getShadowStatsActivityRetryPolicy(cfg *config.RetryPolicy) *temporal.RetryPolicy {
+	retryPolicy := w.getRetryPolicy(cfg)
+	if retryPolicy != nil {
+		retryPolicyCopy := *retryPolicy
+		// Stats reads are side-effect-free and cheap. Unlimited attempts prevent
+		// old workers on the shared task queue from exhausting retries during a
+		// rolling deploy before a new worker polls the new stats activity name.
+		retryPolicyCopy.MaximumAttempts = 0
+		retryPolicy = &retryPolicyCopy
+	}
+	return retryPolicy
 }
 
 func batchConsolidatorWindowEnd(startHeight uint64, requestedEndHeight uint64, batchSize uint64, shardSize uint64) uint64 {

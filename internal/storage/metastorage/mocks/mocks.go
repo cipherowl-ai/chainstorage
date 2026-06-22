@@ -144,6 +144,21 @@ func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationShadow(arg0, arg1 an
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadow", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationShadow), arg0, arg1)
 }
 
+// GetBlockConsolidationShadowStats mocks base method.
+func (m *MockMetaStorage) GetBlockConsolidationShadowStats(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) (*internal.ConsolidationShadowStats, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationShadowStats", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(*internal.ConsolidationShadowStats)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationShadowStats indicates an expected call of GetBlockConsolidationShadowStats.
+func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationShadowStats(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadowStats", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationShadowStats), arg0, arg1, arg2, arg3)
+}
+
 // GetBlocksByHeightRange mocks base method.
 func (m *MockMetaStorage) GetBlocksByHeightRange(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) ([]*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -602,6 +617,21 @@ func (m *MockBlockStorage) GetBlockConsolidationShadow(arg0 context.Context, arg
 func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationShadow(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadow", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationShadow), arg0, arg1)
+}
+
+// GetBlockConsolidationShadowStats mocks base method.
+func (m *MockBlockStorage) GetBlockConsolidationShadowStats(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) (*internal.ConsolidationShadowStats, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationShadowStats", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(*internal.ConsolidationShadowStats)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationShadowStats indicates an expected call of GetBlockConsolidationShadowStats.
+func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationShadowStats(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationShadowStats", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationShadowStats), arg0, arg1, arg2, arg3)
 }
 
 // GetBlocksByHeightRange mocks base method.
