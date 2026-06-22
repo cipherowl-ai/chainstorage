@@ -302,6 +302,56 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCo
 	}
 }
 
+func (s *batchConsolidatorTestSuite) TestBatchConsolidatorAccountsLostActivityCompletionWhenRetryScanIsEmpty() {
+	require := testutil.Require(s.T())
+
+	var requests []*activity.BatchConsolidatorRequest
+	statsCalls := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			statsCalls++
+			if statsCalls == 1 {
+				return &activity.BatchConsolidatorStatsResponse{
+					StartHeight: request.StartHeight,
+					EndHeight:   request.EndHeight,
+				}, nil
+			}
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight:   request.StartHeight,
+				EndHeight:     request.EndHeight,
+				ShadowObjects: 1,
+				ShadowBlocks:  25,
+			}, nil
+		})
+	call := 0
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			call++
+			if call == 1 {
+				return nil, xerrors.New("completion lost after side effects")
+			}
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1000,
+		EndHeight:   1100,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
+
+	require.Equal(2, statsCalls)
+	require.Len(requests, 2)
+	for _, request := range requests {
+		require.Equal(&activity.BatchConsolidatorRequest{Tag: 2, StartHeight: 1000, EndHeight: 1100, MaxBlocks: 25}, request)
+	}
+}
+
 func (s *batchConsolidatorTestSuite) mockEmptyShadowStats() {
 	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
