@@ -24,11 +24,12 @@ import (
 type (
 	BatchConsolidator struct {
 		baseActivity
-		statsActivity baseActivity
-		planActivity  baseActivity
-		config        *config.Config
-		metaStorage   metastorage.MetaStorage
-		blobStorage   blobstorage.BlobStorage
+		statsActivity       baseActivity
+		latestBlockActivity baseActivity
+		planActivity        baseActivity
+		config              *config.Config
+		metaStorage         metastorage.MetaStorage
+		blobStorage         blobstorage.BlobStorage
 	}
 
 	BatchConsolidatorParams struct {
@@ -40,6 +41,7 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
+		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
 		Tag         uint32
 		StartHeight uint64
 		EndHeight   uint64 `validate:"gtfield=StartHeight"`
@@ -55,6 +57,7 @@ type (
 	}
 
 	BatchConsolidatorStatsRequest struct {
+		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
 		Tag         uint32
 		StartHeight uint64
 		EndHeight   uint64 `validate:"gtfield=StartHeight"`
@@ -65,6 +68,15 @@ type (
 		EndHeight     uint64
 		ShadowObjects uint64
 		ShadowBlocks  uint64
+	}
+
+	BatchConsolidatorLatestBlockRequest struct {
+		Tag uint32
+	}
+
+	BatchConsolidatorLatestBlockResponse struct {
+		Tag    uint32
+		Height uint64
 	}
 
 	BatchConsolidatorPlanRequest struct {
@@ -84,15 +96,17 @@ type (
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a := &BatchConsolidator{
-		baseActivity:  newBaseActivity(ActivityBatchConsolidator, params.Runtime),
-		statsActivity: newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
-		planActivity:  newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
-		config:        params.Config,
-		metaStorage:   params.MetaStorage,
-		blobStorage:   params.BlobStorage,
+		baseActivity:        newBaseActivity(ActivityBatchConsolidator, params.Runtime),
+		statsActivity:       newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
+		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
+		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
+		config:              params.Config,
+		metaStorage:         params.MetaStorage,
+		blobStorage:         params.BlobStorage,
 	}
 	a.register(a.execute)
 	a.statsActivity.register(a.executeStats)
+	a.latestBlockActivity.register(a.executeLatestBlock)
 	a.planActivity.register(a.executePlan)
 	return a
 }
@@ -109,6 +123,15 @@ func (a *BatchConsolidator) GetShadowStats(ctx workflow.Context, request *BatchC
 	return &response, err
 }
 
+func (a *BatchConsolidator) GetLatestBlock(ctx workflow.Context, request *BatchConsolidatorLatestBlockRequest) (*BatchConsolidatorLatestBlockResponse, error) {
+	var response BatchConsolidatorLatestBlockResponse
+	err := a.latestBlockActivity.executeActivity(ctx, request, &response)
+	if err != nil {
+		return nil, err
+	}
+	return &response, nil
+}
+
 func (a *BatchConsolidator) GetPromotionPlan(ctx workflow.Context, request *BatchConsolidatorPlanRequest) (*BatchConsolidatorPlanResponse, error) {
 	var response BatchConsolidatorPlanResponse
 	err := a.planActivity.executeActivity(ctx, request, &response)
@@ -119,7 +142,7 @@ func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchCons
 	if err := a.statsActivity.validateRequest(request); err != nil {
 		return nil, err
 	}
-	if err := a.validateShadowDualWriteMode(); err != nil {
+	if err := a.validateShadowStatsMode(request.Mode); err != nil {
 		return nil, err
 	}
 	stats, err := a.getConsolidationShadowStats(ctx, request.Tag, request.StartHeight, request.EndHeight)
@@ -134,6 +157,23 @@ func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchCons
 	}, nil
 }
 
+func (a *BatchConsolidator) executeLatestBlock(ctx context.Context, request *BatchConsolidatorLatestBlockRequest) (*BatchConsolidatorLatestBlockResponse, error) {
+	if err := a.latestBlockActivity.validateRequest(request); err != nil {
+		return nil, err
+	}
+	latestBlock, err := a.metaStorage.GetLatestBlock(ctx, request.Tag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get latest block for historical backfill safety check: %w", err)
+	}
+	if latestBlock == nil {
+		return nil, xerrors.New("latest block not found for historical backfill safety check")
+	}
+	return &BatchConsolidatorLatestBlockResponse{
+		Tag:    request.Tag,
+		Height: latestBlock.GetHeight(),
+	}, nil
+}
+
 func (a *BatchConsolidator) executePlan(ctx context.Context, request *BatchConsolidatorPlanRequest) (*BatchConsolidatorPlanResponse, error) {
 	if err := a.planActivity.validateRequest(request); err != nil {
 		return nil, err
@@ -145,8 +185,12 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if err := a.validateRequest(request); err != nil {
 		return nil, err
 	}
-	switch a.config.AWS.Storage.Consolidation.Mode {
-	case config.ConsolidationModeShadowDualWrite:
+	mode := request.Mode
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
+	}
+	switch mode {
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
 		return a.executeShadowDualWrite(ctx, request)
 	case config.ConsolidationModePromoteFinalized:
 		return a.executePromoteFinalized(ctx, request)
@@ -158,13 +202,13 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 			"batch consolidator requires consolidation mode %q or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
 			config.ConsolidationModePromoteFinalized,
-			a.config.AWS.Storage.Consolidation.Mode,
+			mode,
 		)
 	}
 }
 
 func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
-	if err := a.validateShadowDualWriteMode(); err != nil {
+	if err := a.validateShadowWriteMode(request.Mode); err != nil {
 		return nil, err
 	}
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.started")
@@ -333,15 +377,28 @@ func (a *BatchConsolidator) validateConsolidationEnabled() error {
 	return nil
 }
 
-func (a *BatchConsolidator) validateShadowDualWriteMode() error {
+func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMode) error {
 	if err := a.validateConsolidationEnabled(); err != nil {
 		return err
 	}
-	consolidation := a.config.AWS.Storage.Consolidation
-	if consolidation.Mode != config.ConsolidationModeShadowDualWrite {
-		return xerrors.Errorf("batch consolidator requires consolidation mode %q, got %q", config.ConsolidationModeShadowDualWrite, consolidation.Mode)
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
 	}
-	return nil
+	switch mode {
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+		return nil
+	default:
+		return xerrors.Errorf(
+			"batch consolidator requires consolidation mode %q or %q, got %q",
+			config.ConsolidationModeShadowDualWrite,
+			config.ConsolidationModeHistoricalBackfill,
+			mode,
+		)
+	}
+}
+
+func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
+	return a.validateShadowWriteMode(mode)
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {

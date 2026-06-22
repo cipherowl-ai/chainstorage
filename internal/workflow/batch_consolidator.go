@@ -31,6 +31,7 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
+		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
 		Tag            uint32
 		StartHeight    uint64
 		EndHeight      uint64 `validate:"gtfield=StartHeight"`
@@ -51,6 +52,7 @@ const (
 	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
 	batchConsolidatorShadowStatsChangeID      = "batch-consolidator-shadow-stats"
 	batchConsolidatorShadowStatsVersion       = 1
+	maxUint64                                 = ^uint64(0)
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -95,6 +97,10 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		if request.MaxBlocks > 0 {
 			maxBlocks = request.MaxBlocks
 		}
+		mode, err := batchConsolidatorMode(request.Mode, cfg.Storage.Consolidation.Mode)
+		if err != nil {
+			return err
+		}
 		storageMaxBlocks := cfg.Storage.Consolidation.MaxBlocks
 		if storageMaxBlocks == 0 {
 			return xerrors.New("batch_consolidator storage consolidation max_blocks must be positive")
@@ -115,8 +121,6 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		if shardSize == 0 {
 			return xerrors.New("batch_consolidator storage consolidation shard_size must be positive")
 		}
-		mode := cfg.Storage.Consolidation.Mode
-
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
 		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
 			tagBlockTag: strconv.Itoa(int(tag)),
@@ -141,6 +145,12 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			workflow.DefaultVersion,
 			batchConsolidatorShadowStatsVersion,
 		) != workflow.DefaultVersion && mode != config.ConsolidationModePromoteFinalized
+
+		if mode == config.ConsolidationModeHistoricalBackfill {
+			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
+				return err
+			}
+		}
 
 		workflowEndHeight := request.EndHeight
 		if mode == config.ConsolidationModePromoteFinalized {
@@ -167,6 +177,12 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			}
 		}
 
+		// Keep default shadow activity payloads unchanged for existing workflow history replay.
+		activityMode := config.ConsolidationMode("")
+		if request.Mode != "" {
+			activityMode = mode
+		}
+
 		for batchStart := request.StartHeight; batchStart < workflowEndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
 				newRequest := *request
@@ -186,6 +202,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			lastShadowBlocks := uint64(0)
 			if usePersistedShadowStats {
 				baseline, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+					Mode:        activityMode,
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
@@ -198,6 +215,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			}
 			for {
 				response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
+					Mode:        activityMode,
 					Tag:         tag,
 					StartHeight: batchStart,
 					EndHeight:   batchEnd,
@@ -210,6 +228,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				newBlocks := uint64(0)
 				if usePersistedShadowStats {
 					stats, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+						Mode:        activityMode,
 						Tag:         tag,
 						StartHeight: batchStart,
 						EndHeight:   batchEnd,
@@ -290,6 +309,94 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow finished")
 		return nil
 	})
+}
+
+func batchConsolidatorMode(
+	requestMode config.ConsolidationMode,
+	configMode config.ConsolidationMode,
+) (config.ConsolidationMode, error) {
+	mode := requestMode
+	if mode == "" {
+		mode = configMode
+	}
+	switch mode {
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill, config.ConsolidationModePromoteFinalized:
+		return mode, nil
+	default:
+		return "", xerrors.Errorf(
+			"batch_consolidator requires mode %q, %q, or %q, got %q",
+			config.ConsolidationModeShadowDualWrite,
+			config.ConsolidationModeHistoricalBackfill,
+			config.ConsolidationModePromoteFinalized,
+			mode,
+		)
+	}
+}
+
+func (w *BatchConsolidator) validateHistoricalBackfillRange(
+	ctx workflow.Context,
+	logger *zap.Logger,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	irreversibleDistance uint64,
+) error {
+	latest, err := w.batchConsolidator.GetLatestBlock(ctx, &activity.BatchConsolidatorLatestBlockRequest{
+		Tag: tag,
+	})
+	if err != nil {
+		return xerrors.Errorf("failed to get latest block for historical backfill range validation: %w", err)
+	}
+	if latest == nil {
+		return xerrors.New("latest block response is nil for historical backfill range validation")
+	}
+	safeEndHeight, ok := batchConsolidatorHistoricalSafeEndHeight(latest.Height, irreversibleDistance)
+	if !ok {
+		return xerrors.Errorf(
+			"historical_backfill range [%d, %d) is unsafe: latest height %d is below irreversible_distance %d",
+			startHeight,
+			endHeight,
+			latest.Height,
+			irreversibleDistance,
+		)
+	}
+	if endHeight > safeEndHeight {
+		return xerrors.Errorf(
+			"historical_backfill range [%d, %d) is unsafe: end_height must be <= %d for latest_height=%d irreversible_distance=%d",
+			startHeight,
+			endHeight,
+			safeEndHeight,
+			latest.Height,
+			irreversibleDistance,
+		)
+	}
+	logger.Info(
+		"validated historical backfill range",
+		zap.Uint32("tag", tag),
+		zap.Uint64("start_height", startHeight),
+		zap.Uint64("end_height", endHeight),
+		zap.Uint64("latest_height", latest.Height),
+		zap.Uint64("irreversible_distance", irreversibleDistance),
+		zap.Uint64("safe_end_height", safeEndHeight),
+	)
+	return nil
+}
+
+func batchConsolidatorHistoricalSafeEndHeight(latestHeight uint64, irreversibleDistance uint64) (uint64, bool) {
+	if irreversibleDistance == 0 {
+		if latestHeight == maxUint64 {
+			return maxUint64, true
+		}
+		return latestHeight + 1, true
+	}
+	if latestHeight < irreversibleDistance-1 {
+		return 0, false
+	}
+	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
+	if latestFinalizedHeight == maxUint64 {
+		return maxUint64, true
+	}
+	return latestFinalizedHeight + 1, true
 }
 
 func (w *BatchConsolidator) withShadowStatsActivityOptions(
