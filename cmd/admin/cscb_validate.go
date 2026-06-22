@@ -674,12 +674,16 @@ func (v *cscbValidator) getFiles(ctx context.Context, validationCase cscbValidat
 	return resp.GetFiles(), nil
 }
 
-func (v *cscbValidator) hashFiles(ctx context.Context, files []*api.BlockFile) ([]cscbBlockDigest, error) {
+func (v *cscbValidator) hashFiles(ctx context.Context, files []*api.BlockFile) (_ []cscbBlockDigest, retErr error) {
 	iter, err := v.downloader.OpenRawBlockPayloads(ctx, files)
 	if err != nil {
 		return nil, xerrors.Errorf("OpenRawBlockPayloads failed: %w", err)
 	}
-	defer iter.Close()
+	defer func() {
+		if closeErr := iter.Close(); retErr == nil && closeErr != nil {
+			retErr = xerrors.Errorf("close raw block payload iterator failed: %w", closeErr)
+		}
+	}()
 
 	digests := make([]cscbBlockDigest, 0, len(files))
 	for {
