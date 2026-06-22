@@ -29,6 +29,7 @@ type (
 		GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*BlockMetadataRecord, error)
 		GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*ConsolidationShadowStats, error)
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
+		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*ConsolidationPromotionResult, error)
 	}
 
 	EventStorage interface {
@@ -91,6 +92,10 @@ type (
 	ConsolidationShadowStats struct {
 		Objects uint64
 		Blocks  uint64
+	}
+
+	ConsolidationPromotionResult struct {
+		Blocks uint64
 	}
 
 	MetaStorageFactory interface {

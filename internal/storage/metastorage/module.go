@@ -19,6 +19,7 @@ type (
 	BlockMetadataRecord          = internal.BlockMetadataRecord
 	ConsolidationShadowPlacement = internal.ConsolidationShadowPlacement
 	ConsolidationShadowStats     = internal.ConsolidationShadowStats
+	ConsolidationPromotionResult = internal.ConsolidationPromotionResult
 )
 
 const (

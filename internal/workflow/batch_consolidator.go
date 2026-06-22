@@ -115,6 +115,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		if shardSize == 0 {
 			return xerrors.New("batch_consolidator storage consolidation shard_size must be positive")
 		}
+		mode := cfg.Storage.Consolidation.Mode
 
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
 		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
@@ -129,6 +130,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			zap.Uint64("max_blocks", maxBlocks),
 			zap.Uint64("storage_max_blocks", storageMaxBlocks),
 			zap.Uint64("shard_size", shardSize),
+			zap.String("mode", string(mode)),
 		)
 		logger.Info("workflow started")
 		ctx = w.withActivityOptions(ctx)
@@ -138,9 +140,34 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			batchConsolidatorShadowStatsChangeID,
 			workflow.DefaultVersion,
 			batchConsolidatorShadowStatsVersion,
-		) != workflow.DefaultVersion
+		) != workflow.DefaultVersion && mode != config.ConsolidationModePromoteFinalized
 
-		for batchStart := request.StartHeight; batchStart < request.EndHeight; {
+		workflowEndHeight := request.EndHeight
+		if mode == config.ConsolidationModePromoteFinalized {
+			plan, err := w.batchConsolidator.GetPromotionPlan(ctx, &activity.BatchConsolidatorPlanRequest{
+				Tag:         tag,
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			})
+			if err != nil {
+				return xerrors.Errorf("failed to plan promote_finalized range: %w", err)
+			}
+			workflowEndHeight = plan.EndHeight
+			logger.Info(
+				"planned promote_finalized range",
+				zap.Uint64("requested_end_height", request.EndHeight),
+				zap.Uint64("effective_end_height", workflowEndHeight),
+				zap.Uint64("latest_height", plan.LatestHeight),
+				zap.Uint64("safe_promotion_height", plan.SafePromotionHeight),
+				zap.Uint64("promotion_gate_height", plan.PromotionGateHeight),
+			)
+			if workflowEndHeight <= request.StartHeight {
+				logger.Info("promote_finalized range has no currently safe heights")
+				return nil
+			}
+		}
+
+		for batchStart := request.StartHeight; batchStart < workflowEndHeight; {
 			if batchStart-request.StartHeight >= checkpointSize {
 				newRequest := *request
 				newRequest.StartHeight = batchStart
@@ -148,7 +175,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return w.continueAsNew(ctx, &newRequest)
 			}
 
-			batchEnd := batchConsolidatorWindowEnd(batchStart, request.EndHeight, batchSize, shardSize)
+			batchEnd := batchConsolidatorWindowEnd(batchStart, workflowEndHeight, batchSize, shardSize)
 			if batchEnd <= batchStart {
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
