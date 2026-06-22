@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash"
 	"hash/crc32"
 	"io"
 	"sort"
@@ -307,6 +308,16 @@ type blockPayloadRead struct {
 	end           uint64
 }
 
+type blockPayloadStream struct {
+	frame     io.Closer
+	reader    io.ReadCloser
+	block     *BlockDescriptor
+	remaining uint64
+	crc       hash.Hash32
+	validated bool
+	closed    bool
+}
+
 // ExtractBlockPayloadsFromChunkFrame streams a compressed chunk and returns
 // only the requested block payloads in the same order as blocks. It validates
 // each requested block CRC without materializing the full decompressed chunk.
@@ -395,6 +406,42 @@ func ExtractBlockPayloadsFromChunkFrame(frame io.Reader, codec api.Compression, 
 	return payloads, nil
 }
 
+// OpenBlockPayloadFromChunkFrame streams one block payload out of a compressed
+// CSCB chunk frame. The returned reader validates the block payload length and
+// CRC when read to EOF. Close drains unread payload bytes before closing so
+// callers that stop early can still observe validation/short-read errors.
+func OpenBlockPayloadFromChunkFrame(frame io.ReadCloser, codec api.Compression, chunk *ChunkDescriptor, block *BlockDescriptor) (io.ReadCloser, error) {
+	if frame == nil {
+		return nil, xerrors.New("CSCB chunk frame is required")
+	}
+	if chunk == nil {
+		_ = frame.Close()
+		return nil, xerrors.New("CSCB chunk descriptor is required")
+	}
+	if err := validateBlockPayloadBounds(chunk, block); err != nil {
+		_ = frame.Close()
+		return nil, err
+	}
+
+	reader, err := NewChunkDecompressor(frame, codec)
+	if err != nil {
+		_ = frame.Close()
+		return nil, err
+	}
+	if err := discardExactly(reader, block.ChunkRelativeOffset); err != nil {
+		_ = reader.Close()
+		_ = frame.Close()
+		return nil, err
+	}
+	return &blockPayloadStream{
+		frame:     frame,
+		reader:    reader,
+		block:     block,
+		remaining: block.PayloadLength,
+		crc:       crc32.NewIEEE(),
+	}, nil
+}
+
 func NewChunkDecompressor(frame io.Reader, codec api.Compression) (io.ReadCloser, error) {
 	switch codec {
 	case api.Compression_GZIP:
@@ -417,6 +464,94 @@ func NewChunkDecompressor(frame io.Reader, codec api.Compression) (io.ReadCloser
 	default:
 		return nil, xerrors.Errorf("unsupported CSCB codec: %v", codec)
 	}
+}
+
+func validateBlockPayloadBounds(chunk *ChunkDescriptor, block *BlockDescriptor) error {
+	if block == nil {
+		return xerrors.New("CSCB block descriptor is required")
+	}
+	if block.ChunkIndex != chunk.Index {
+		return xerrors.Errorf("CSCB block chunk mismatch at height %d: block=%d chunk=%d", block.Height, block.ChunkIndex, chunk.Index)
+	}
+	end, err := checkedAdd(block.ChunkRelativeOffset, block.PayloadLength)
+	if err != nil {
+		return err
+	}
+	if end > chunk.UncompressedLength {
+		return xerrors.Errorf("CSCB block payload exceeds chunk bounds: end=%d chunk_length=%d", end, chunk.UncompressedLength)
+	}
+	return nil
+}
+
+func (r *blockPayloadStream) Read(p []byte) (int, error) {
+	if r.closed {
+		return 0, xerrors.New("CSCB block payload reader is closed")
+	}
+	if r.remaining == 0 {
+		if err := r.validate(); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if uint64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+	n, err := r.reader.Read(p)
+	if n > 0 {
+		if _, writeErr := r.crc.Write(p[:n]); writeErr != nil {
+			return n, writeErr
+		}
+		r.remaining -= uint64(n)
+	}
+	if err != nil && r.remaining > 0 {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return n, err
+	}
+	if r.remaining == 0 {
+		if validateErr := r.validate(); validateErr != nil {
+			return n, validateErr
+		}
+	}
+	return n, err
+}
+
+func (r *blockPayloadStream) Close() error {
+	if r.closed {
+		return nil
+	}
+	var closeErr error
+	if !r.validated {
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			closeErr = err
+		}
+	}
+	r.closed = true
+	if err := r.reader.Close(); closeErr == nil && err != nil {
+		closeErr = err
+	}
+	if err := r.frame.Close(); closeErr == nil && err != nil {
+		closeErr = err
+	}
+	return closeErr
+}
+
+func (r *blockPayloadStream) validate() error {
+	if r.validated {
+		return nil
+	}
+	r.validated = true
+	if r.remaining != 0 {
+		return xerrors.Errorf("CSCB block payload length mismatch at height %d: missing %d bytes", r.block.Height, r.remaining)
+	}
+	if crc := r.crc.Sum32(); crc != r.block.PayloadCRC32 {
+		return xerrors.Errorf("CSCB block CRC mismatch at height %d: got %08x want %08x", r.block.Height, crc, r.block.PayloadCRC32)
+	}
+	return nil
 }
 
 func ExtractBlockPayload(chunkPayload []byte, block *BlockDescriptor) ([]byte, error) {

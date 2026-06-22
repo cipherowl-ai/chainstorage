@@ -248,6 +248,66 @@ func (mr *MockClientMockRecorder) GetTag() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTag", reflect.TypeOf((*MockClient)(nil).GetTag))
 }
 
+// OpenRawBlockPayload mocks base method.
+func (m *MockClient) OpenRawBlockPayload(arg0 context.Context, arg1 uint64, arg2 string) (*sdk.RawBlockPayload, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayload", arg0, arg1, arg2)
+	ret0, _ := ret[0].(*sdk.RawBlockPayload)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayload indicates an expected call of OpenRawBlockPayload.
+func (mr *MockClientMockRecorder) OpenRawBlockPayload(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayload", reflect.TypeOf((*MockClient)(nil).OpenRawBlockPayload), arg0, arg1, arg2)
+}
+
+// OpenRawBlockPayloadWithTag mocks base method.
+func (m *MockClient) OpenRawBlockPayloadWithTag(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string) (*sdk.RawBlockPayload, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayloadWithTag", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(*sdk.RawBlockPayload)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayloadWithTag indicates an expected call of OpenRawBlockPayloadWithTag.
+func (mr *MockClientMockRecorder) OpenRawBlockPayloadWithTag(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayloadWithTag", reflect.TypeOf((*MockClient)(nil).OpenRawBlockPayloadWithTag), arg0, arg1, arg2, arg3)
+}
+
+// OpenRawBlockPayloadsByRange mocks base method.
+func (m *MockClient) OpenRawBlockPayloadsByRange(arg0 context.Context, arg1, arg2 uint64) (sdk.RawBlockPayloadIterator, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayloadsByRange", arg0, arg1, arg2)
+	ret0, _ := ret[0].(sdk.RawBlockPayloadIterator)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayloadsByRange indicates an expected call of OpenRawBlockPayloadsByRange.
+func (mr *MockClientMockRecorder) OpenRawBlockPayloadsByRange(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayloadsByRange", reflect.TypeOf((*MockClient)(nil).OpenRawBlockPayloadsByRange), arg0, arg1, arg2)
+}
+
+// OpenRawBlockPayloadsByRangeWithTag mocks base method.
+func (m *MockClient) OpenRawBlockPayloadsByRangeWithTag(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) (sdk.RawBlockPayloadIterator, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "OpenRawBlockPayloadsByRangeWithTag", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(sdk.RawBlockPayloadIterator)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// OpenRawBlockPayloadsByRangeWithTag indicates an expected call of OpenRawBlockPayloadsByRangeWithTag.
+func (mr *MockClientMockRecorder) OpenRawBlockPayloadsByRangeWithTag(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "OpenRawBlockPayloadsByRangeWithTag", reflect.TypeOf((*MockClient)(nil).OpenRawBlockPayloadsByRangeWithTag), arg0, arg1, arg2, arg3)
+}
+
 // SetBlockValidation mocks base method.
 func (m *MockClient) SetBlockValidation(arg0 bool) {
 	m.ctrl.T.Helper()

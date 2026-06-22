@@ -3,6 +3,7 @@ package cscb
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -52,6 +53,50 @@ func TestParseIndexAndExtractBlockPayload(t *testing.T) {
 	require.NoError(err)
 	require.Len(streamedPayloads, 1)
 	require.Equal([]byte("bravo-bravo"), streamedPayloads[0])
+
+	stream, err := OpenBlockPayloadFromChunkFrame(io.NopCloser(bytes.NewReader(frame)), index.Header.Codec, chunk, block)
+	require.NoError(err)
+	buf := make([]byte, 5)
+	n, err := stream.Read(buf)
+	require.NoError(err)
+	require.Equal(5, n)
+	require.Equal([]byte("bravo"), buf)
+	require.NoError(stream.Close())
+}
+
+func TestOpenBlockPayloadFromChunkFrameReportsCRCMismatch(t *testing.T) {
+	require := testutil.Require(t)
+
+	object, err := Encode(context.Background(), testEncodeConfig(api.Compression_ZSTD), testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := ParseIndex(data)
+	require.NoError(err)
+
+	metadata := &api.BlockMetadata{
+		Tag:                7,
+		Height:             101,
+		Hash:               "hash-101",
+		ObjectKeyMain:      object.Key,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteOffset:         object.Placements[1].ByteOffset,
+		ByteLength:         object.Placements[1].ByteLength,
+		UncompressedLength: object.Placements[1].UncompressedLength,
+	}
+	block, chunk, err := index.LookupBlock(metadata)
+	require.NoError(err)
+	corruptBlock := *block
+	corruptBlock.PayloadCRC32 ^= 0x1
+
+	frame := data[chunk.CompressedPayloadOffset : chunk.CompressedPayloadOffset+chunk.CompressedLength]
+	stream, err := OpenBlockPayloadFromChunkFrame(io.NopCloser(bytes.NewReader(frame)), index.Header.Codec, chunk, &corruptBlock)
+	require.NoError(err)
+	_, err = io.ReadAll(stream)
+	require.Error(err)
+	require.Contains(err.Error(), "CRC mismatch")
 }
 
 func TestExtractBlockPayloadsFromChunkFramePreservesInputOrder(t *testing.T) {
