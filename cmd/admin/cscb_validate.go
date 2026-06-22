@@ -775,9 +775,7 @@ func compareCSCBDigests(legacy []cscbBlockDigest, consolidated []cscbBlockDigest
 func collectDigestHeights(digests []cscbBlockDigest) []uint64 {
 	heights := make([]uint64, 0, len(digests))
 	for _, digest := range digests {
-		if digest.height > 0 {
-			heights = append(heights, digest.height)
-		}
+		heights = append(heights, digest.height)
 	}
 	return heights
 }

@@ -214,12 +214,12 @@ func TestCompareCSCBDigestsDetectsMismatch(t *testing.T) {
 func TestCompareCSCBDigestsHandlesLengthMismatch(t *testing.T) {
 	require := require.New(t)
 	comparison := compareCSCBDigests(
-		[]cscbBlockDigest{{height: 42, hash: "hash"}},
-		[]cscbBlockDigest{{height: 42, hash: "hash"}, {height: 43, hash: "hash"}},
+		[]cscbBlockDigest{{height: 0, hash: "hash"}},
+		[]cscbBlockDigest{{height: 0, hash: "hash"}, {height: 1, hash: "hash"}},
 	)
 
 	require.False(comparison.correct)
-	require.Equal([]uint64{42, 43}, comparison.mismatchHeights)
+	require.Equal([]uint64{0, 1}, comparison.mismatchHeights)
 	require.Zero(comparison.hashesCompared)
 }
 
