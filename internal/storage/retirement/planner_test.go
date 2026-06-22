@@ -112,6 +112,39 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
+func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+
+	t.Run("validation not passed", func(t *testing.T) {
+		row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		row.Shadow.ValidatedAt = nil
+		store := newFakeStore()
+		report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+		require.NoError(err)
+		require.Len(report.Items, 1)
+		require.Equal(ActionSkip, report.Items[0].Action)
+		require.Equal(SkipValidationNotPassed, report.Items[0].SkipReason)
+		require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+		require.Zero(store.versionCalls[row.LegacyObjectKey])
+	})
+
+	t.Run("range not approved", func(t *testing.T) {
+		row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		store := newFakeStore()
+		req := testRequest(now, false)
+		req.Approval.EndHeight = req.EndHeight - 1
+		report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), req)
+		require.NoError(err)
+		require.Len(report.Items, 1)
+		require.Equal(ActionSkip, report.Items[0].Action)
+		require.Equal(SkipChainRangeNotApproved, report.Items[0].SkipReason)
+		require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+		require.Zero(store.versionCalls[row.LegacyObjectKey])
+	})
+}
+
 func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
