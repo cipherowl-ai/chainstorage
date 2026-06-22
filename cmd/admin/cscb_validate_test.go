@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -117,6 +118,109 @@ func TestCanonicalBlockHashRestoresMetadata(t *testing.T) {
 	require.Equal(uint64(10), block.Metadata.ByteOffset)
 	require.Equal(uint64(20), block.Metadata.ByteLength)
 	require.Equal(uint64(30), block.Metadata.UncompressedLength)
+}
+
+func TestCanonicalRawBlockDataHashIgnoresSourceSpecificMetadata(t *testing.T) {
+	require := require.New(t)
+	block := &api.Block{
+		Metadata: &api.BlockMetadata{
+			Tag:                1,
+			Height:             42,
+			Hash:               "hash",
+			ParentHash:         "parent",
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         1024,
+			ByteLength:         2048,
+			UncompressedLength: 4096,
+		},
+	}
+	payload, err := proto.Marshal(block)
+	require.NoError(err)
+
+	rawHash, err := canonicalRawBlockDataHash(&api.BlockFile{Height: 42}, payload)
+	require.NoError(err)
+	expectedHash, err := canonicalBlockHash(block)
+	require.NoError(err)
+	require.Equal(expectedHash, rawHash)
+}
+
+func TestCanonicalRawBlockDataHashUsesCSCBBlockFileMetadata(t *testing.T) {
+	require := require.New(t)
+	block := &api.Block{
+		Metadata: &api.BlockMetadata{
+			Tag:        1,
+			Height:     42,
+			Hash:       "stale-embedded-hash",
+			ParentHash: "stale-embedded-parent",
+		},
+	}
+	payload, err := proto.Marshal(block)
+	require.NoError(err)
+
+	blockFile := &api.BlockFile{
+		Tag:          1,
+		Height:       42,
+		Hash:         "metadata-hash",
+		ParentHash:   "metadata-parent",
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteLength:   uint64(len(payload)),
+	}
+	rawHash, err := canonicalRawBlockDataHash(blockFile, payload)
+	require.NoError(err)
+
+	expectedHash, err := canonicalBlockHash(&api.Block{
+		Metadata: &api.BlockMetadata{
+			Tag:          1,
+			Height:       42,
+			Hash:         "metadata-hash",
+			ParentHash:   "metadata-parent",
+			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:   uint64(len(payload)),
+		},
+	})
+	require.NoError(err)
+	require.Equal(expectedHash, rawHash)
+}
+
+func TestCanonicalRawBlockDataHashHandlesSkippedBlock(t *testing.T) {
+	require := require.New(t)
+	rawHash, err := canonicalRawBlockDataHash(&api.BlockFile{Tag: 1, Height: 42, Skipped: true}, nil)
+	require.NoError(err)
+	expectedHash, err := canonicalBlockHash(&api.Block{
+		Metadata: &api.BlockMetadata{
+			Tag:     1,
+			Height:  42,
+			Skipped: true,
+		},
+	})
+	require.NoError(err)
+	require.Equal(expectedHash, rawHash)
+}
+
+func TestCompareCSCBDigestsDetectsMismatch(t *testing.T) {
+	require := require.New(t)
+	comparison := compareCSCBDigests(
+		[]cscbBlockDigest{{height: 42, hash: "legacy"}},
+		[]cscbBlockDigest{{height: 42, hash: "consolidated"}},
+	)
+
+	require.False(comparison.correct)
+	require.Equal([]uint64{42}, comparison.mismatchHeights)
+	require.Equal(1, comparison.hashesCompared)
+	require.Equal("legacy", comparison.firstLegacyHash)
+	require.Equal("consolidated", comparison.firstConsolidatedHash)
+}
+
+func TestCompareCSCBDigestsHandlesLengthMismatch(t *testing.T) {
+	require := require.New(t)
+	comparison := compareCSCBDigests(
+		[]cscbBlockDigest{{height: 0, hash: "hash"}},
+		[]cscbBlockDigest{{height: 0, hash: "hash"}, {height: 1, hash: "hash"}},
+	)
+
+	require.False(comparison.correct)
+	require.Equal([]uint64{0, 1}, comparison.mismatchHeights)
+	require.Zero(comparison.hashesCompared)
 }
 
 func TestSummarizeDurationsUsesNearestRankPercentile(t *testing.T) {
