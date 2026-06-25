@@ -766,6 +766,53 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 	}, nil
 }
 
+func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error) {
+	if endHeight <= startHeight {
+		return 0, false, nil
+	}
+	const query = `
+		SELECT cb.height
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+			AND shadow.tag = bm.tag
+			AND shadow.height = bm.height
+			AND shadow.hash = bm.hash
+			AND shadow.legacy_object_key_main = bm.object_key_main
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
+			AND bm.skipped = false
+			AND bm.byte_length IS NULL
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''
+			AND shadow.object_format = $4
+			AND shadow.byte_offset >= 0
+			AND shadow.byte_length > 0
+			AND shadow.uncompressed_length IS NOT NULL
+			AND shadow.uncompressed_length > 0
+		ORDER BY cb.height ASC
+		LIMIT 1`
+	var height uint64
+	if err := b.db.QueryRowContext(
+		ctx,
+		query,
+		tag,
+		startHeight,
+		endHeight,
+		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
+	).Scan(&height); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, xerrors.Errorf("failed to get first promotable consolidation shadow: %w", err)
+	}
+	return height, true, nil
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	if len(placements) == 0 {
 		return nil

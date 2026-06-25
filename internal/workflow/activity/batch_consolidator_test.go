@@ -440,6 +440,35 @@ func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedExecuteCapsAtGateAndSaf
 	}, response)
 }
 
+func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedExecuteAllowsMissingPromotionGate() {
+	require := testutil.Require(s.T())
+	safeLag := uint64(10)
+	s.batchConsolidator.config.AWS.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
+	s.batchConsolidator.config.AWS.Storage.Consolidation.PromotionGateHeight = nil
+	s.batchConsolidator.config.AWS.Storage.Consolidation.SafePromotionLag = &safeLag
+	request := &BatchConsolidatorRequest{
+		Tag:         2,
+		StartHeight: 1_000,
+		EndHeight:   1_200,
+		MaxBlocks:   25,
+	}
+	s.metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), request.Tag).
+		Return(&api.BlockMetadata{Tag: request.Tag, Height: 1_080}, nil)
+	s.metaStorage.EXPECT().
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, uint64(1_071), request.MaxBlocks).
+		Return(&metastorage.ConsolidationPromotionResult{Blocks: 12}, nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          1_071,
+		ScannedBlocks:      12,
+		ConsolidatedBlocks: 12,
+	}, response)
+}
+
 func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedPlanCapsAtGateAndSafeHeight() {
 	require := testutil.Require(s.T())
 	gateHeight := uint64(1_050)
@@ -464,6 +493,32 @@ func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedPlanCapsAtGateAndSafeHe
 		LatestHeight:        1_080,
 		SafePromotionHeight: 1_070,
 		PromotionGateHeight: gateHeight,
+	}, response)
+}
+
+func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedPlanAllowsMissingPromotionGate() {
+	require := testutil.Require(s.T())
+	safeLag := uint64(10)
+	s.batchConsolidator.config.AWS.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
+	s.batchConsolidator.config.AWS.Storage.Consolidation.PromotionGateHeight = nil
+	s.batchConsolidator.config.AWS.Storage.Consolidation.SafePromotionLag = &safeLag
+	request := &BatchConsolidatorPlanRequest{
+		Tag:         2,
+		StartHeight: 1_000,
+		EndHeight:   1_200,
+	}
+	s.metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), request.Tag).
+		Return(&api.BlockMetadata{Tag: request.Tag, Height: 1_080}, nil)
+
+	response, err := s.batchConsolidator.GetPromotionPlan(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorPlanResponse{
+		StartHeight:         request.StartHeight,
+		EndHeight:           1_071,
+		LatestHeight:        1_080,
+		SafePromotionHeight: 1_070,
+		PromotionGateHeight: request.EndHeight,
 	}, response)
 }
 

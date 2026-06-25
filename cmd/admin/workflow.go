@@ -108,7 +108,7 @@ func listWorkflows() error {
 	}
 	defer app.Close()
 	ctx := context.Background()
-	workflows, err := executors.Runtime.ListOpenWorkflows(ctx, app.Config().Cadence.Domain, 0) //list all workflows
+	workflows, err := executors.Runtime.ListOpenWorkflows(ctx, app.Config().Cadence.Domain, 0, "") //list all workflows
 	if err != nil {
 		return xerrors.Errorf("failed to list workflows: %w", err)
 	} else {
@@ -138,7 +138,7 @@ func startWorkflow() error {
 	}
 	defer app.Close()
 
-	ctx := context.WithValue(context.Background(), "workflowId", workflowId)
+	ctx := workflow.WithWorkflowID(context.Background(), workflowId)
 	workflowIdentityString, err := workflowIdentity.String()
 	if err != nil {
 		return xerrors.Errorf("error parsing workflowIdentity: %w", err)

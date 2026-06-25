@@ -66,8 +66,8 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 
 func (w *BatchConsolidator) Execute(ctx context.Context, request *BatchConsolidatorRequest) (client.WorkflowRun, error) {
 	workflowID := w.name
-	if v, ok := ctx.Value("workflowId").(string); ok && v != "" {
-		workflowID = v
+	if override, ok := workflowIDFromContext(ctx); ok {
+		workflowID = override
 	}
 	return w.startWorkflow(ctx, workflowID, request)
 }

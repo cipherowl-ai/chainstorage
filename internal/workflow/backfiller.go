@@ -79,8 +79,8 @@ func NewBackfiller(params BackfillerParams) *Backfiller {
 
 func (w *Backfiller) Execute(ctx context.Context, request *BackfillerRequest) (client.WorkflowRun, error) {
 	workflowId := w.name
-	if v, ok := ctx.Value("workflowId").(string); ok && v != "" {
-		workflowId = v
+	if override, ok := workflowIDFromContext(ctx); ok {
+		workflowId = override
 	}
 	return w.startWorkflow(ctx, workflowId, request)
 }

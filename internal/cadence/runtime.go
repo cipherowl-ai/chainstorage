@@ -7,7 +7,9 @@ import (
 	"net"
 	"time"
 
+	filterpb "go.temporal.io/api/filter/v1"
 	"go.temporal.io/api/serviceerror"
+	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
@@ -41,7 +43,7 @@ type (
 		TerminateWorkflow(ctx context.Context, workflowID string, runID string, reason string) error
 		OnStart(ctx context.Context) error
 		OnStop(ctx context.Context) error
-		ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32) (*workflowservice.ListOpenWorkflowExecutionsResponse, error)
+		ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32, workflowType string) (*workflowservice.ListOpenWorkflowExecutionsResponse, error)
 	}
 
 	RuntimeParams struct {
@@ -57,6 +59,8 @@ type (
 		namespaceClient client.NamespaceClient
 		workers         []worker.Worker
 	}
+
+	listOpenWorkflowsFn func(ctx context.Context, request *workflowservice.ListOpenWorkflowExecutionsRequest) (*workflowservice.ListOpenWorkflowExecutionsResponse, error)
 )
 
 func NewRuntime(params RuntimeParams) (Runtime, error) {
@@ -144,15 +148,43 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 
 }
 
-func (r *runtimeImpl) ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
-	openWorkflows, err := r.workflowClient.ListOpenWorkflow(ctx, &workflowservice.ListOpenWorkflowExecutionsRequest{
-		Namespace:       namespace,
-		MaximumPageSize: maxPageSize,
-	})
-	if err != nil {
-		return nil, xerrors.Errorf("failed to get open workflows: %w", err)
+func (r *runtimeImpl) ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32, workflowType string) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
+	return listOpenWorkflowExecutions(ctx, namespace, maxPageSize, workflowType, r.workflowClient.ListOpenWorkflow)
+}
+
+func listOpenWorkflowExecutions(
+	ctx context.Context,
+	namespace string,
+	maxPageSize int32,
+	workflowType string,
+	listFn listOpenWorkflowsFn,
+) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
+	var executions []*workflowpb.WorkflowExecutionInfo
+	var nextPageToken []byte
+	for {
+		request := &workflowservice.ListOpenWorkflowExecutionsRequest{
+			Namespace:       namespace,
+			MaximumPageSize: maxPageSize,
+			NextPageToken:   nextPageToken,
+		}
+		if workflowType != "" {
+			request.Filters = &workflowservice.ListOpenWorkflowExecutionsRequest_TypeFilter{
+				TypeFilter: &filterpb.WorkflowTypeFilter{Name: workflowType},
+			}
+		}
+
+		openWorkflows, err := listFn(ctx, request)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to get open workflows: %w", err)
+		}
+		if openWorkflows != nil {
+			executions = append(executions, openWorkflows.Executions...)
+			nextPageToken = openWorkflows.GetNextPageToken()
+		}
+		if len(nextPageToken) == 0 {
+			return &workflowservice.ListOpenWorkflowExecutionsResponse{Executions: executions}, nil
+		}
 	}
-	return openWorkflows, nil
 }
 
 func (r *runtimeImpl) RegisterWorkflow(w any, options workflow.RegisterOptions) {
