@@ -939,15 +939,16 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 		summary.LastHeight = file.GetHeight()
 		if file.GetSkipped() {
 			summary.SkippedCount++
-		}
-		if isCSCBFile(file) {
+			formats["SKIPPED"] = struct{}{}
+		} else if isCSCBFile(file) {
 			summary.ConsolidatedObjectCount++
+			formats[file.GetObjectFormat().String()] = struct{}{}
 		} else {
 			summary.LegacyObjectCount++
+			formats[file.GetObjectFormat().String()] = struct{}{}
 		}
 		summary.MetadataByteLength += file.GetByteLength()
 		summary.MetadataUncompressedBytes += file.GetUncompressedLength()
-		formats[file.GetObjectFormat().String()] = struct{}{}
 	}
 	for format := range formats {
 		summary.Formats = append(summary.Formats, format)
