@@ -885,19 +885,12 @@ func TestConsolidationHistoricalBackfillModeAccepted(t *testing.T) {
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
-func TestConsolidationPromoteFinalizedRequiresOperatorGates(t *testing.T) {
+func TestConsolidationPromoteFinalizedRequiresSafePromotionLag(t *testing.T) {
 	tests := []struct {
 		name        string
 		env         map[string]string
 		expectedErr string
 	}{
-		{
-			name: "missing promotion gate",
-			env: map[string]string{
-				"CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SAFE_PROMOTION_LAG": "100000",
-			},
-			expectedErr: "requires promotion_gate_height",
-		},
 		{
 			name: "missing safe promotion lag",
 			env: map[string]string{
@@ -930,6 +923,20 @@ func TestConsolidationPromoteFinalizedRequiresOperatorGates(t *testing.T) {
 			require.Contains(err.Error(), test.expectedErr)
 		})
 	}
+}
+
+func TestConsolidationPromoteFinalizedAllowsMissingPromotionGate(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModePromoteFinalized))
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SAFE_PROMOTION_LAG", "100000")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Nil(cfg.AWS.Storage.Consolidation.PromotionGateHeight)
+	require.NotNil(cfg.AWS.Storage.Consolidation.SafePromotionLag)
 }
 
 func TestConsolidationPromoteFinalizedRejectsDynamoDB(t *testing.T) {

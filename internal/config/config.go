@@ -406,12 +406,22 @@ type (
 	}
 
 	CronConfig struct {
-		BlockRangeSize         uint64 `mapstructure:"block_range_size" validate:"required"`
-		DisableDLQProcessor    bool   `mapstructure:"disable_dlq_processor"`
-		DisablePollingCanary   bool   `mapstructure:"disable_polling_canary"`
-		DisableStreamingCanary bool   `mapstructure:"disable_streaming_canary"`
-		DisableNodeCanary      bool   `mapstructure:"disable_node_canary"`
-		DisableWorkflowStatus  bool   `mapstructure:"disable_workflow_status"`
+		BlockRangeSize         uint64                      `mapstructure:"block_range_size" validate:"required"`
+		BatchConsolidator      BatchConsolidatorCronConfig `mapstructure:"batch_consolidator"`
+		DisableDLQProcessor    bool                        `mapstructure:"disable_dlq_processor"`
+		DisablePollingCanary   bool                        `mapstructure:"disable_polling_canary"`
+		DisableStreamingCanary bool                        `mapstructure:"disable_streaming_canary"`
+		DisableNodeCanary      bool                        `mapstructure:"disable_node_canary"`
+		DisableWorkflowStatus  bool                        `mapstructure:"disable_workflow_status"`
+	}
+
+	BatchConsolidatorCronConfig struct {
+		Enabled            bool          `mapstructure:"enabled"`
+		Spec               string        `mapstructure:"spec"`
+		Parallelism        int64         `mapstructure:"parallelism"`
+		DelayStartDuration time.Duration `mapstructure:"delay_start_duration"`
+		StartHeight        uint64        `mapstructure:"start_height"`
+		MaxRangeBlocks     uint64        `mapstructure:"max_range_blocks"`
 	}
 
 	StorageConfig struct {
@@ -672,6 +682,11 @@ func New(opts ...ConfigOption) (*Config, error) {
 		v.SetDefault("aws.reset_local", true)
 	}
 	v.SetDefault("chain.client.tx_batch_size", 100)
+	v.SetDefault("cron.batch_consolidator.enabled", false)
+	v.SetDefault("cron.batch_consolidator.spec", "@every 30m")
+	v.SetDefault("cron.batch_consolidator.parallelism", 1)
+	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
+	v.SetDefault("cron.batch_consolidator.max_range_blocks", 10000)
 	v.SetDefault("aws.storage.consolidation.enabled", false)
 	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeLegacyOnly))
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
@@ -819,9 +834,6 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.ShadowTimeout <= 0 {
 		return xerrors.New("consolidation shadow_timeout must be positive")
-	}
-	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.PromotionGateHeight == nil {
-		return xerrors.New("consolidation promote_finalized requires promotion_gate_height")
 	}
 	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.SafePromotionLag == nil {
 		return xerrors.New("consolidation promote_finalized requires safe_promotion_lag")

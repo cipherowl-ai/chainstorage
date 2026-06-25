@@ -321,7 +321,10 @@ func (a *BatchConsolidator) planPromoteFinalized(ctx context.Context, tag uint32
 
 	consolidation := a.config.AWS.Storage.Consolidation
 	safeLag := *consolidation.SafePromotionLag
-	gateHeight := *consolidation.PromotionGateHeight
+	gateHeight := endHeight
+	if consolidation.PromotionGateHeight != nil {
+		gateHeight = *consolidation.PromotionGateHeight
+	}
 	safeEnd, safeHeight, ok := promotionSafeEndHeight(latest.GetHeight(), safeLag)
 	if !ok {
 		return &BatchConsolidatorPlanResponse{
@@ -408,9 +411,6 @@ func (a *BatchConsolidator) validatePromoteFinalizedMode() error {
 	consolidation := a.config.AWS.Storage.Consolidation
 	if consolidation.Mode != config.ConsolidationModePromoteFinalized {
 		return xerrors.Errorf("batch consolidator requires consolidation mode %q, got %q", config.ConsolidationModePromoteFinalized, consolidation.Mode)
-	}
-	if consolidation.PromotionGateHeight == nil {
-		return xerrors.New("batch consolidator promote_finalized requires promotion_gate_height")
 	}
 	if consolidation.SafePromotionLag == nil {
 		return xerrors.New("batch consolidator promote_finalized requires safe_promotion_lag")

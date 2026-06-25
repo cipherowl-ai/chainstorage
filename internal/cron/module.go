@@ -25,4 +25,8 @@ var Module = fx.Options(
 		Group:  "task",
 		Target: NewWorkflowStatus,
 	}),
+	fx.Provide(fx.Annotated{
+		Group:  "task",
+		Target: NewBatchConsolidator,
+	}),
 )

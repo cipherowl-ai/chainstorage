@@ -611,6 +611,56 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesVali
 	s.equalProto(blocks[2], primary)
 }
 
+func (s *blockStorageTestSuite) TestGetFirstPromotableBlockConsolidationShadowFiltersCandidates() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 6, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[0],
+		"consolidated/invalid.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		10,
+		0,
+		20,
+	)
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/skipped.cscb.zstd", 10, 20, 20, true, "")
+	_, err = s.db.ExecContext(
+		ctx,
+		`UPDATE block_metadata SET skipped = true WHERE tag = $1 AND height = $2 AND hash = $3`,
+		blocks[1].GetTag(),
+		blocks[1].GetHeight(),
+		blocks[1].GetHash(),
+	)
+	require.NoError(err)
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/unvalidated.cscb.zstd", 10, 20, 20, false, "")
+	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/promoted.cscb.zstd", 10, 20, 20, true, "")
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[3].GetHeight(), blocks[3].GetHeight()+1, 10)
+	require.NoError(err)
+	require.Equal(uint64(1), result.Blocks)
+	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/first-promotable.cscb.zstd", 10, 20, 20, true, "")
+
+	height, found, err := s.accessor.GetFirstPromotableBlockConsolidationShadow(ctx, tag, startHeight, startHeight+uint64(len(blocks)))
+	require.NoError(err)
+	require.True(found)
+	require.Equal(blocks[4].GetHeight(), height)
+
+	height, found, err = s.accessor.GetFirstPromotableBlockConsolidationShadow(ctx, tag, startHeight, blocks[4].GetHeight())
+	require.NoError(err)
+	require.False(found)
+	require.Zero(height)
+
+	height, found, err = s.accessor.GetFirstPromotableBlockConsolidationShadow(ctx, tag, blocks[4].GetHeight()+1, startHeight+uint64(len(blocks)))
+	require.NoError(err)
+	require.False(found)
+	require.Zero(height)
+}
+
 func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsMissingShadowNoOps() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
