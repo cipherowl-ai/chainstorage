@@ -265,7 +265,7 @@ func TestSummarizeCSCBFilesDoesNotCountSkippedBlocksAsLegacyFallback(t *testing.
 	require.Equal(1, summary.LegacyObjectCount)
 	require.Equal(uint64(100), summary.FirstHeight)
 	require.Equal(uint64(102), summary.LastHeight)
-	require.Equal([]string{"BLOCK_OBJECT_FORMAT_CSCB_BATCH", "BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK", "SKIPPED"}, summary.Formats)
+	require.Equal([]string{"BLOCK_OBJECT_FORMAT_CSCB_BATCH", "BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK"}, summary.Formats)
 }
 
 func TestSanitizeCSCBStringRedactsEmbeddedURLs(t *testing.T) {

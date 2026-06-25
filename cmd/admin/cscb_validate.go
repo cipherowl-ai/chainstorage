@@ -939,7 +939,6 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 		summary.LastHeight = file.GetHeight()
 		if file.GetSkipped() {
 			summary.SkippedCount++
-			formats["SKIPPED"] = struct{}{}
 		} else if isCSCBFile(file) {
 			summary.ConsolidatedObjectCount++
 			formats[file.GetObjectFormat().String()] = struct{}{}
@@ -1111,14 +1110,20 @@ func writeCSCBMarkdownReport(path string, report *cscbValidationReport) error {
 			continue
 		}
 		fmt.Fprintf(&b, "### %s\n\n", c.Name)
-		fmt.Fprintf(&b, "- legacy files: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
+		fmt.Fprintf(&b, "- legacy files: `%d`, skipped: `%d`, legacy_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
 			c.Legacy.Files.Count,
+			c.Legacy.Files.SkippedCount,
+			c.Legacy.Files.LegacyObjectCount,
+			c.Legacy.Files.ConsolidatedObjectCount,
 			strings.Join(c.Legacy.Files.Formats, ","),
 			c.Legacy.HTTP.Requests,
 			c.Legacy.HTTP.Bytes,
 		)
-		fmt.Fprintf(&b, "- consolidated files: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
+		fmt.Fprintf(&b, "- consolidated files: `%d`, skipped: `%d`, legacy_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
 			c.Consolidated.Files.Count,
+			c.Consolidated.Files.SkippedCount,
+			c.Consolidated.Files.LegacyObjectCount,
+			c.Consolidated.Files.ConsolidatedObjectCount,
 			strings.Join(c.Consolidated.Files.Formats, ","),
 			c.Consolidated.HTTP.Requests,
 			c.Consolidated.HTTP.Bytes,
