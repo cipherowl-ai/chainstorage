@@ -209,19 +209,17 @@ func (t *batchConsolidatorTask) autoPromoteWorkflowID() string {
 }
 
 func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Context) (string, bool, error) {
-	openWorkflows, err := t.runtime.ListOpenWorkflows(ctx, t.config.Cadence.Domain, batchConsolidatorOpenPageSize)
+	workflowIdentity := t.config.Workflows.BatchConsolidator.WorkflowIdentity
+	openWorkflows, err := t.runtime.ListOpenWorkflows(ctx, t.config.Cadence.Domain, batchConsolidatorOpenPageSize, workflowIdentity)
 	if err != nil {
 		return "", false, xerrors.Errorf("failed to list open workflows for batch_consolidator cron: %w", err)
 	}
 	if openWorkflows == nil {
 		return "", false, nil
 	}
-	workflowIdentity := t.config.Workflows.BatchConsolidator.WorkflowIdentity
 	for _, wf := range openWorkflows.Executions {
-		workflowID := wf.GetExecution().GetWorkflowId()
-		if workflowID == workflowIdentity ||
-			strings.HasPrefix(workflowID, workflowIdentity+"/") ||
-			strings.HasPrefix(workflowID, workflowIdentity+".") {
+		if wf.GetType().GetName() == workflowIdentity {
+			workflowID := wf.GetExecution().GetWorkflowId()
 			return workflowID, true, nil
 		}
 	}

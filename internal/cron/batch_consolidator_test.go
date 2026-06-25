@@ -27,9 +27,10 @@ import (
 
 type (
 	batchConsolidatorCronRuntime struct {
-		logger         *zap.Logger
-		openWorkflowID []string
-		executions     []batchConsolidatorCronExecution
+		logger                *zap.Logger
+		openWorkflowID        []string
+		requestedWorkflowType string
+		executions            []batchConsolidatorCronExecution
 	}
 
 	batchConsolidatorCronExecution struct {
@@ -115,13 +116,14 @@ func TestBatchConsolidatorCronNoOpsWhenNoPromotableShadowExists(t *testing.T) {
 func TestBatchConsolidatorCronSkipsWhenBatchConsolidatorWorkflowIsAlreadyOpen(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
-	runtime.openWorkflowID = []string{"workflow.batch_consolidator.solana-mainnet.1-2.promote"}
+	runtime.openWorkflowID = []string{"custom-manual-promote-workflow-id"}
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
 
 	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
 	metaStorage.EXPECT().GetFirstPromotableBlockConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
+	require.Equal(t, "workflow.batch_consolidator", runtime.requestedWorkflowType)
 	require.Empty(t, runtime.executions)
 }
 
@@ -209,11 +211,13 @@ func (r *batchConsolidatorCronRuntime) OnStop(ctx context.Context) error {
 	return nil
 }
 
-func (r *batchConsolidatorCronRuntime) ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
+func (r *batchConsolidatorCronRuntime) ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32, workflowType string) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {
+	r.requestedWorkflowType = workflowType
 	executions := make([]*workflowpb.WorkflowExecutionInfo, 0, len(r.openWorkflowID))
 	for _, workflowID := range r.openWorkflowID {
 		executions = append(executions, &workflowpb.WorkflowExecutionInfo{
 			Execution: &commonpb.WorkflowExecution{WorkflowId: workflowID},
+			Type:      &commonpb.WorkflowType{Name: workflowType},
 		})
 	}
 	return &workflowservice.ListOpenWorkflowExecutionsResponse{Executions: executions}, nil

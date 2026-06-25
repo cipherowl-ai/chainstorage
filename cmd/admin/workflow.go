@@ -108,7 +108,7 @@ func listWorkflows() error {
 	}
 	defer app.Close()
 	ctx := context.Background()
-	workflows, err := executors.Runtime.ListOpenWorkflows(ctx, app.Config().Cadence.Domain, 0) //list all workflows
+	workflows, err := executors.Runtime.ListOpenWorkflows(ctx, app.Config().Cadence.Domain, 0, "") //list all workflows
 	if err != nil {
 		return xerrors.Errorf("failed to list workflows: %w", err)
 	} else {
