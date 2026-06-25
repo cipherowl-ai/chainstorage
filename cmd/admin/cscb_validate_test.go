@@ -240,6 +240,34 @@ func TestSummarizeDurationsUsesNearestRankPercentile(t *testing.T) {
 	require.Equal(float64(50), summary.MaxMs)
 }
 
+func TestSummarizeCSCBFilesDoesNotCountSkippedBlocksAsLegacyFallback(t *testing.T) {
+	require := require.New(t)
+
+	summary := summarizeCSCBFiles([]*api.BlockFile{
+		{
+			Height:       100,
+			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:   1024,
+		},
+		{
+			Height:  101,
+			Skipped: true,
+		},
+		{
+			Height:     102,
+			ByteLength: 512,
+		},
+	})
+
+	require.Equal(3, summary.Count)
+	require.Equal(1, summary.ConsolidatedObjectCount)
+	require.Equal(1, summary.SkippedCount)
+	require.Equal(1, summary.LegacyObjectCount)
+	require.Equal(uint64(100), summary.FirstHeight)
+	require.Equal(uint64(102), summary.LastHeight)
+	require.Equal([]string{"BLOCK_OBJECT_FORMAT_CSCB_BATCH", "BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK"}, summary.Formats)
+}
+
 func TestSanitizeCSCBStringRedactsEmbeddedURLs(t *testing.T) {
 	require := require.New(t)
 	errText := `Download failed: blockFile={FileUrl:"https://bucket.s3.amazonaws.com/key?X-Amz-Signature=secret", Height:42}`
