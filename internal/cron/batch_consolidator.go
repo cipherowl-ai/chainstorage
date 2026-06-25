@@ -182,7 +182,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
 	}
-	workflowCtx := context.WithValue(ctx, "workflowId", workflowID)
+	workflowCtx := workflow.WithWorkflowID(ctx, workflowID)
 	run, err := t.batchConsolidator.Execute(workflowCtx, request)
 	if err != nil {
 		if isWorkflowAlreadyStarted(err) {

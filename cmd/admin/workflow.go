@@ -138,7 +138,7 @@ func startWorkflow() error {
 	}
 	defer app.Close()
 
-	ctx := context.WithValue(context.Background(), "workflowId", workflowId)
+	ctx := workflow.WithWorkflowID(context.Background(), workflowId)
 	workflowIdentityString, err := workflowIdentity.String()
 	if err != nil {
 		return xerrors.Errorf("error parsing workflowIdentity: %w", err)
