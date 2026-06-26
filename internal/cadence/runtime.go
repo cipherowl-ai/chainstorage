@@ -127,12 +127,7 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 		workers[i] = worker.New(
 			workflowClient,
 			workerConfig.TaskList,
-			worker.Options{
-				// Enable this option to allow worker to process sessions. Defaults to false.
-				EnableSessionWorker: true,
-				// If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
-				DeadlockDetectionTimeout: 2 * time.Second,
-			},
+			newWorkerOptions(workerConfig),
 		)
 	}
 
@@ -146,6 +141,20 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 
 	return runtime, nil
 
+}
+
+func newWorkerOptions(workerConfig config.WorkerConfig) worker.Options {
+	options := worker.Options{
+		// Enable this option to allow worker to process sessions. Defaults to false.
+		EnableSessionWorker: true,
+		// If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
+		DeadlockDetectionTimeout: 2 * time.Second,
+	}
+	if workerConfig.MaxConcurrentActivityExecutionSize > 0 {
+		options.MaxConcurrentActivityExecutionSize = workerConfig.MaxConcurrentActivityExecutionSize
+	}
+
+	return options
 }
 
 func (r *runtimeImpl) ListOpenWorkflows(ctx context.Context, namespace string, maxPageSize int32, workflowType string) (*workflowservice.ListOpenWorkflowExecutionsResponse, error) {

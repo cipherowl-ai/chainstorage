@@ -206,7 +206,8 @@ type (
 	}
 
 	WorkerConfig struct {
-		TaskList string `mapstructure:"task_list"`
+		TaskList                           string `mapstructure:"task_list"`
+		MaxConcurrentActivityExecutionSize int    `mapstructure:"max_concurrent_activity_execution_size"`
 	}
 
 	WorkflowConfig struct {
