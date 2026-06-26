@@ -3,12 +3,37 @@ package cadence
 import (
 	"context"
 	"testing"
+	"time"
 
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
 )
+
+func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
+	require := require.New(t)
+
+	options := newWorkerOptions(config.WorkerConfig{TaskList: "default"})
+
+	require.True(options.EnableSessionWorker)
+	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Zero(options.MaxConcurrentActivityExecutionSize)
+}
+
+func TestNewWorkerOptionsAppliesActivityConcurrencyLimit(t *testing.T) {
+	require := require.New(t)
+
+	options := newWorkerOptions(config.WorkerConfig{
+		TaskList:                           "batch_consolidator",
+		MaxConcurrentActivityExecutionSize: 1,
+	})
+
+	require.True(options.EnableSessionWorker)
+	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Equal(1, options.MaxConcurrentActivityExecutionSize)
+}
 
 func TestListOpenWorkflowExecutionsPaginatesAndAppliesTypeFilter(t *testing.T) {
 	require := require.New(t)
