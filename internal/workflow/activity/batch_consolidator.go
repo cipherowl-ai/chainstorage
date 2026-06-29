@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"time"
 
 	sdkactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/workflow"
@@ -214,10 +215,14 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.started")
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
+	totalStart := time.Now()
+	scanStart := time.Now()
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to scan missing consolidation shadows: %w", err)
 	}
+	scanDuration := time.Since(scanStart)
+	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
 		return &BatchConsolidatorResponse{
 			StartHeight: request.StartHeight,
@@ -225,29 +230,39 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 		}, nil
 	}
 
+	buildStart := time.Now()
 	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, records)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
+	buildDuration := time.Since(buildStart)
+	rawBytes := consolidatedPayloadBytes(payloads)
+	logger.Info("built consolidated payloads", zap.Int("blocks", len(payloads)), zap.Uint64("raw_bytes", rawBytes), zap.Duration("duration", buildDuration))
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.payloads_built", len(records))
 
 	uploadCtx := blobstorage.WithConsolidatedUploadProgress(ctx, func(stage string, details ...any) {
 		heartbeatDetails := append([]any{"batch_consolidator." + stage}, details...)
 		sdkactivity.RecordHeartbeat(ctx, heartbeatDetails...)
 	})
+	uploadStart := time.Now()
 	objectKey, placements, err := a.blobStorage.UploadConsolidated(uploadCtx, payloads)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to upload consolidated block object: %w", err)
 	}
+	uploadDuration := time.Since(uploadStart)
+	logger.Info("uploaded consolidated block object", zap.String("object_key", objectKey), zap.Int("placements", len(placements)), zap.Duration("duration", uploadDuration))
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.object_uploaded", objectKey, len(placements))
 	shadowPlacements, err := makeShadowPlacements(recordsByID, objectKey, placements)
 	if err != nil {
 		return nil, err
 	}
+	persistStart := time.Now()
 	if err := a.metaStorage.PersistBlockConsolidationShadows(ctx, shadowPlacements); err != nil {
 		return nil, xerrors.Errorf("failed to persist consolidation shadow placements: %w", err)
 	}
+	persistDuration := time.Since(persistStart)
+	logger.Info("persisted consolidation shadow placements", zap.Int("placements", len(shadowPlacements)), zap.Duration("duration", persistDuration))
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.shadows_persisted", objectKey, len(shadowPlacements))
 
 	response := &BatchConsolidatorResponse{
@@ -262,6 +277,12 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 		zap.Int("scanned_blocks", len(records)),
 		zap.Int("consolidated_blocks", len(shadowPlacements)),
 		zap.String("object_key", objectKey),
+		zap.Uint64("raw_bytes", rawBytes),
+		zap.Duration("scan_duration", scanDuration),
+		zap.Duration("build_duration", buildDuration),
+		zap.Duration("upload_duration", uploadDuration),
+		zap.Duration("persist_duration", persistDuration),
+		zap.Duration("total_duration", time.Since(totalStart)),
 	)
 	return response, nil
 }
@@ -535,6 +556,14 @@ func writeRawBlockPayloadTempFile(raw []byte, dir string) (blobstorage.PayloadSo
 	success = true
 	length := uint64(len(raw))
 	return blobstorage.NewFilePayloadSource(path, length), path, length, nil
+}
+
+func consolidatedPayloadBytes(payloads []blobstorage.ConsolidatedBlockPayload) uint64 {
+	var total uint64
+	for _, payload := range payloads {
+		total += payload.UncompressedLength
+	}
+	return total
 }
 
 func validateDownloadedBlock(expected *api.BlockMetadata, block *api.Block) error {

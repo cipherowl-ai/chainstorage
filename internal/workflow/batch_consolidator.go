@@ -38,6 +38,12 @@ type (
 		BatchSize      uint64
 		CheckpointSize uint64
 		MaxBlocks      uint64
+		Parallelism    int `validate:"omitempty,gt=0"`
+	}
+
+	batchConsolidatorPendingActivity struct {
+		request *activity.BatchConsolidatorRequest
+		future  workflow.Future
 	}
 )
 
@@ -52,6 +58,7 @@ const (
 	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
 	batchConsolidatorShadowStatsChangeID      = "batch-consolidator-shadow-stats"
 	batchConsolidatorShadowStatsVersion       = 1
+	batchConsolidatorMaxParallelism           = 10
 	maxUint64                                 = ^uint64(0)
 )
 
@@ -97,6 +104,13 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		if request.MaxBlocks > 0 {
 			maxBlocks = request.MaxBlocks
 		}
+		parallelism := 1
+		if request.Parallelism > 0 {
+			parallelism = request.Parallelism
+		}
+		if parallelism > batchConsolidatorMaxParallelism {
+			return xerrors.Errorf("batch_consolidator parallelism(%d) exceeds max(%d)", parallelism, batchConsolidatorMaxParallelism)
+		}
 		mode, err := batchConsolidatorMode(request.Mode, cfg.Storage.Consolidation.Mode)
 		if err != nil {
 			return err
@@ -134,6 +148,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			zap.Uint64("max_blocks", maxBlocks),
 			zap.Uint64("storage_max_blocks", storageMaxBlocks),
 			zap.Uint64("shard_size", shardSize),
+			zap.Int("parallelism", parallelism),
 			zap.String("mode", string(mode)),
 		)
 		logger.Info("workflow started")
@@ -194,6 +209,35 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			batchEnd := batchConsolidatorWindowEnd(batchStart, workflowEndHeight, batchSize, shardSize)
 			if batchEnd <= batchStart {
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
+			}
+
+			if mode == config.ConsolidationModeHistoricalBackfill && parallelism > 1 {
+				objectsInBatch, blocksInBatch, err := w.processHistoricalBackfillBatchParallel(
+					ctx,
+					statsCtx,
+					logger,
+					metrics,
+					tag,
+					activityMode,
+					batchStart,
+					batchEnd,
+					maxBlocks,
+					parallelism,
+					usePersistedShadowStats,
+				)
+				if err != nil {
+					return err
+				}
+				metrics.Gauge(batchConsolidatorHeightGauge).Update(float64(batchEnd - 1))
+				logger.Info(
+					"processed shadow batch",
+					zap.Uint64("batch_start", batchStart),
+					zap.Uint64("batch_end", batchEnd),
+					zap.Uint64("objects", objectsInBatch),
+					zap.Uint64("consolidated_blocks", blocksInBatch),
+				)
+				batchStart = batchEnd
+				continue
 			}
 
 			objectsInBatch := uint64(0)
@@ -309,6 +353,155 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow finished")
 		return nil
 	})
+}
+
+func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
+	ctx workflow.Context,
+	statsCtx workflow.Context,
+	logger *zap.Logger,
+	metrics client.MetricsHandler,
+	tag uint32,
+	activityMode config.ConsolidationMode,
+	batchStart uint64,
+	batchEnd uint64,
+	maxBlocks uint64,
+	parallelism int,
+	usePersistedShadowStats bool,
+) (uint64, uint64, error) {
+	lastShadowObjects := uint64(0)
+	lastShadowBlocks := uint64(0)
+	if usePersistedShadowStats {
+		baseline, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+			Mode:        activityMode,
+			Tag:         tag,
+			StartHeight: batchStart,
+			EndHeight:   batchEnd,
+		})
+		if err != nil {
+			return 0, 0, xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+		}
+		lastShadowObjects = baseline.ShadowObjects
+		lastShadowBlocks = baseline.ShadowBlocks
+	}
+
+	objectsInBatch := uint64(0)
+	blocksInBatch := uint64(0)
+	for windowStart := batchStart; windowStart < batchEnd; {
+		pending := make([]batchConsolidatorPendingActivity, 0, parallelism)
+		for len(pending) < parallelism && windowStart < batchEnd {
+			windowEnd := batchConsolidatorObjectWindowEnd(windowStart, batchEnd, maxBlocks)
+			if windowEnd <= windowStart {
+				return 0, 0, xerrors.Errorf("batch_consolidator made no parallel window progress from %d to %d", windowStart, windowEnd)
+			}
+			request := &activity.BatchConsolidatorRequest{
+				Mode:        activityMode,
+				Tag:         tag,
+				StartHeight: windowStart,
+				EndHeight:   windowEnd,
+				MaxBlocks:   maxBlocks,
+			}
+			pending = append(pending, batchConsolidatorPendingActivity{
+				request: request,
+				future:  workflow.ExecuteActivity(ctx, activity.ActivityBatchConsolidator, request),
+			})
+			windowStart = windowEnd
+		}
+
+		var firstErr error
+		type successResult struct {
+			request  *activity.BatchConsolidatorRequest
+			response activity.BatchConsolidatorResponse
+		}
+		successes := make([]successResult, 0, len(pending))
+		for _, item := range pending {
+			var response activity.BatchConsolidatorResponse
+			request := item.request
+			if err := item.future.Get(ctx, &response); err != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("failed to consolidate shadow batch [%d, %d): %w", request.StartHeight, request.EndHeight, err)
+				}
+				continue
+			}
+			successes = append(successes, successResult{request: request, response: response})
+		}
+		if firstErr != nil {
+			return 0, 0, firstErr
+		}
+
+		for _, success := range successes {
+			request := success.request
+			response := success.response
+			if response.ScannedBlocks == 0 {
+				metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
+				continue
+			}
+			if response.ConsolidatedBlocks == 0 {
+				return 0, 0, xerrors.Errorf(
+					"batch_consolidator made no progress for non-empty shadow scan [%d, %d)",
+					request.StartHeight,
+					request.EndHeight,
+				)
+			}
+
+			newObjects := uint64(0)
+			newBlocks := uint64(0)
+			if !usePersistedShadowStats {
+				newObjects = 1
+				newBlocks = response.ConsolidatedBlocks
+				objectsInBatch += newObjects
+				blocksInBatch += newBlocks
+				metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(newObjects))
+				metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(newBlocks))
+			}
+			logger.Info(
+				"processed shadow object",
+				zap.Uint64("batch_start", batchStart),
+				zap.Uint64("batch_end", batchEnd),
+				zap.Uint64("window_start", request.StartHeight),
+				zap.Uint64("window_end", request.EndHeight),
+				zap.Uint64("scanned_blocks", response.ScannedBlocks),
+				zap.Uint64("consolidated_blocks", response.ConsolidatedBlocks),
+				zap.Uint64("new_objects", newObjects),
+				zap.Uint64("new_consolidated_blocks", newBlocks),
+				zap.Uint64("shadow_objects", lastShadowObjects),
+				zap.Uint64("shadow_blocks", lastShadowBlocks),
+				zap.String("object_key", response.ObjectKey),
+			)
+		}
+	}
+
+	if usePersistedShadowStats {
+		stats, err := w.batchConsolidator.GetShadowStats(statsCtx, &activity.BatchConsolidatorStatsRequest{
+			Mode:        activityMode,
+			Tag:         tag,
+			StartHeight: batchStart,
+			EndHeight:   batchEnd,
+		})
+		if err != nil {
+			return 0, 0, xerrors.Errorf("failed to get consolidation shadow stats for batch [%d, %d): %w", batchStart, batchEnd, err)
+		}
+		if stats.ShadowObjects < lastShadowObjects || stats.ShadowBlocks < lastShadowBlocks {
+			return 0, 0, xerrors.Errorf(
+				"batch_consolidator shadow stats regressed for batch [%d, %d): objects %d -> %d, blocks %d -> %d",
+				batchStart,
+				batchEnd,
+				lastShadowObjects,
+				stats.ShadowObjects,
+				lastShadowBlocks,
+				stats.ShadowBlocks,
+			)
+		}
+		objectsInBatch = stats.ShadowObjects - lastShadowObjects
+		blocksInBatch = stats.ShadowBlocks - lastShadowBlocks
+		if objectsInBatch > 0 {
+			metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(objectsInBatch))
+		}
+		if blocksInBatch > 0 {
+			metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(blocksInBatch))
+		}
+	}
+
+	return objectsInBatch, blocksInBatch, nil
 }
 
 func batchConsolidatorMode(
@@ -437,6 +630,14 @@ func batchConsolidatorWindowEnd(startHeight uint64, requestedEndHeight uint64, b
 		return shardEnd
 	}
 	return batchEnd
+}
+
+func batchConsolidatorObjectWindowEnd(startHeight uint64, batchEnd uint64, maxBlocks uint64) uint64 {
+	windowEnd := startHeight + maxBlocks
+	if windowEnd < startHeight || windowEnd > batchEnd {
+		return batchEnd
+	}
+	return windowEnd
 }
 
 func batchConsolidatorShardEnd(height uint64, shardSize uint64) uint64 {
