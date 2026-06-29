@@ -280,19 +280,25 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		zap.Duration("duration", headExistingDuration),
 	)
 	var uploadDuration time.Duration
+	var uploadMD5Duration time.Duration
+	var uploadPutDuration time.Duration
 	var headUploadedDuration time.Duration
 	if !found {
 		uploadStart := time.Now()
-		uploaded, err := s.uploadConsolidatedObject(ctx, object, consolidation.Codec)
+		uploaded, md5Duration, putDuration, err := s.uploadConsolidatedObject(ctx, object, consolidation.Codec)
 		if err != nil {
 			return "", nil, err
 		}
 		uploadDuration = time.Since(uploadStart)
+		uploadMD5Duration = md5Duration
+		uploadPutDuration = putDuration
 		s.logger.Info(
 			"put CSCB object",
 			zap.String("object_key", object.Key),
 			zap.Bool("uploaded", uploaded),
 			zap.Uint64("bytes", object.Length),
+			zap.Duration("md5_duration", uploadMD5Duration),
+			zap.Duration("s3_put_duration", uploadPutDuration),
 			zap.Duration("duration", uploadDuration),
 		)
 		if uploaded {
@@ -319,27 +325,31 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		zap.Uint64("payload_uncompressed_bytes", object.PayloadUncompressedLength),
 		zap.Duration("encode_duration", encodeDuration),
 		zap.Duration("head_existing_duration", headExistingDuration),
-		zap.Duration("put_duration", uploadDuration),
+		zap.Duration("md5_duration", uploadMD5Duration),
+		zap.Duration("s3_put_duration", uploadPutDuration),
+		zap.Duration("upload_duration", uploadDuration),
 		zap.Duration("head_uploaded_duration", headUploadedDuration),
 		zap.Duration("total_duration", time.Since(totalStart)),
 	)
 	return object.Key, object.Placements, nil
 }
 
-func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *cscb.Object, compression api.Compression) (bool, error) {
+func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *cscb.Object, compression api.Compression) (bool, time.Duration, time.Duration, error) {
 	if object.Length > maxSinglePutObjectSize {
-		return false, xerrors.Errorf("CSCB object length %d exceeds v1 single-put limit %d", object.Length, maxSinglePutObjectSize)
+		return false, 0, 0, xerrors.Errorf("CSCB object length %d exceeds v1 single-put limit %d", object.Length, maxSinglePutObjectSize)
 	}
 	reader, err := object.Open()
 	if err != nil {
-		return false, err
+		return false, 0, 0, err
 	}
 	defer func() { _ = reader.Close() }()
 
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_md5_started", object.Key, object.Length)
+	md5Start := time.Now()
 	contentMD5, err := computeContentMD5(ctx, object)
+	md5Duration := time.Since(md5Start)
 	if err != nil {
-		return false, err
+		return false, md5Duration, 0, err
 	}
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_md5_finished", object.Key, object.Length)
 	metadata := map[string]string{
@@ -350,6 +360,7 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		cscbMetadataUncompressedLength: fmt.Sprintf("%d", object.PayloadUncompressedLength),
 	}
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_put_started", object.Key, object.Length)
+	putStart := time.Now()
 	if _, err := s.client.PutObject(ctx, &awss3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(object.Key),
@@ -364,19 +375,21 @@ func (s *blobStorageImpl) uploadConsolidatedObject(ctx context.Context, object *
 		// that switch large uploads to aws-chunked request bodies.
 		options.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 	}); err != nil {
+		putDuration := time.Since(putStart)
 		if isObjectPreconditionFailed(err) {
 			found, validateErr := s.validateExistingConsolidatedObject(ctx, object)
 			if validateErr != nil {
-				return false, validateErr
+				return false, md5Duration, putDuration, validateErr
 			}
 			if found {
-				return false, nil
+				return false, md5Duration, putDuration, nil
 			}
 		}
-		return false, xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
+		return false, md5Duration, putDuration, xerrors.Errorf("failed to upload CSCB object to s3: %w", err)
 	}
+	putDuration := time.Since(putStart)
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_put_finished", object.Key, object.Length)
-	return true, nil
+	return true, md5Duration, putDuration, nil
 }
 
 func computeContentMD5(ctx context.Context, object *cscb.Object) (string, error) {

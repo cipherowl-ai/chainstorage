@@ -58,6 +58,7 @@ const (
 	batchConsolidatorEmptyBatchCounter        = "workflow.batch_consolidator.empty_batch"
 	batchConsolidatorShadowStatsChangeID      = "batch-consolidator-shadow-stats"
 	batchConsolidatorShadowStatsVersion       = 1
+	batchConsolidatorMaxParallelism           = 10
 	maxUint64                                 = ^uint64(0)
 )
 
@@ -106,6 +107,9 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		parallelism := 1
 		if request.Parallelism > 0 {
 			parallelism = request.Parallelism
+		}
+		if parallelism > batchConsolidatorMaxParallelism {
+			return xerrors.Errorf("batch_consolidator parallelism(%d) exceeds max(%d)", parallelism, batchConsolidatorMaxParallelism)
 		}
 		mode, err := batchConsolidatorMode(request.Mode, cfg.Storage.Consolidation.Mode)
 		if err != nil {

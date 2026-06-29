@@ -286,6 +286,21 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorIgnoresParallelismOuts
 	}
 }
 
+func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRejectsExcessiveParallelism() {
+	require := testutil.Require(s.T())
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+		Parallelism: batchConsolidatorMaxParallelism + 1,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), "parallelism(11) exceeds max(10)")
+}
+
 func (s *batchConsolidatorTestSuite) TestHistoricalBackfillValidatesFinalizedRange() {
 	require := testutil.Require(s.T())
 
