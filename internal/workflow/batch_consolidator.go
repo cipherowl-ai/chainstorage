@@ -408,6 +408,11 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 		}
 
 		var firstErr error
+		type successResult struct {
+			request  *activity.BatchConsolidatorRequest
+			response activity.BatchConsolidatorResponse
+		}
+		successes := make([]successResult, 0, len(pending))
 		for _, item := range pending {
 			var response activity.BatchConsolidatorResponse
 			request := item.request
@@ -417,7 +422,15 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 				}
 				continue
 			}
+			successes = append(successes, successResult{request: request, response: response})
+		}
+		if firstErr != nil {
+			return 0, 0, firstErr
+		}
 
+		for _, success := range successes {
+			request := success.request
+			response := success.response
 			if response.ScannedBlocks == 0 {
 				metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
 				continue
@@ -454,9 +467,6 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 				zap.Uint64("shadow_blocks", lastShadowBlocks),
 				zap.String("object_key", response.ObjectKey),
 			)
-		}
-		if firstErr != nil {
-			return 0, 0, firstErr
 		}
 	}
 
