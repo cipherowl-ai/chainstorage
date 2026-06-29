@@ -748,6 +748,7 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND shadow.legacy_object_key_main = bm.object_key_main
 			AND shadow.tag = cb.tag
 			AND shadow.height = cb.height
+			AND shadow.hash = bm.hash
 		WHERE cb.tag = $1
 			AND cb.height >= $2
 			AND cb.height < $3
