@@ -229,8 +229,10 @@ func (s *blobStorageImpl) Upload(ctx context.Context, block *api.Block, compress
 func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []internal.ConsolidatedBlockPayload) (string, []internal.BlockPlacement, error) {
 	defer s.logDuration("upload_consolidated", time.Now())
 
+	totalStart := time.Now()
 	consolidation := s.config.AWS.Storage.Consolidation
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_encode_config_loaded", len(blocks))
+	encodeStart := time.Now()
 	object, err := cscb.Encode(ctx, cscb.EncodeConfig{
 		Blockchain:                s.config.Chain.Blockchain,
 		Network:                   s.config.Chain.Network,
@@ -253,24 +255,74 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		return "", nil, err
 	}
 	defer func() { _ = object.Close() }()
+	encodeDuration := time.Since(encodeStart)
 	internal.RecordConsolidatedUploadProgress(ctx, "s3_object_encoded", object.Key, object.Length)
+	s.logger.Info(
+		"encoded CSCB object",
+		zap.String("object_key", object.Key),
+		zap.Int("blocks", len(blocks)),
+		zap.Uint64("compressed_bytes", object.Length),
+		zap.Uint64("payload_compressed_bytes", object.PayloadCompressedLength),
+		zap.Uint64("payload_uncompressed_bytes", object.PayloadUncompressedLength),
+		zap.Duration("duration", encodeDuration),
+	)
 
+	headExistingStart := time.Now()
 	found, err := s.validateExistingConsolidatedObject(ctx, object)
 	if err != nil {
 		return "", nil, err
 	}
+	headExistingDuration := time.Since(headExistingStart)
+	s.logger.Info(
+		"checked existing CSCB object",
+		zap.String("object_key", object.Key),
+		zap.Bool("found", found),
+		zap.Duration("duration", headExistingDuration),
+	)
+	var uploadDuration time.Duration
+	var headUploadedDuration time.Duration
 	if !found {
+		uploadStart := time.Now()
 		uploaded, err := s.uploadConsolidatedObject(ctx, object, consolidation.Codec)
 		if err != nil {
 			return "", nil, err
 		}
+		uploadDuration = time.Since(uploadStart)
+		s.logger.Info(
+			"put CSCB object",
+			zap.String("object_key", object.Key),
+			zap.Bool("uploaded", uploaded),
+			zap.Uint64("bytes", object.Length),
+			zap.Duration("duration", uploadDuration),
+		)
 		if uploaded {
+			headUploadedStart := time.Now()
 			if err := s.validateUploadedConsolidatedObject(ctx, object); err != nil {
 				return "", nil, err
 			}
+			headUploadedDuration = time.Since(headUploadedStart)
+			s.logger.Info(
+				"validated uploaded CSCB object",
+				zap.String("object_key", object.Key),
+				zap.Uint64("bytes", object.Length),
+				zap.Duration("duration", headUploadedDuration),
+			)
 			s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(object.Length) * time.Millisecond)
 		}
 	}
+	s.logger.Info(
+		"finished consolidated upload",
+		zap.String("object_key", object.Key),
+		zap.Bool("existing_object", found),
+		zap.Int("blocks", len(blocks)),
+		zap.Uint64("compressed_bytes", object.Length),
+		zap.Uint64("payload_uncompressed_bytes", object.PayloadUncompressedLength),
+		zap.Duration("encode_duration", encodeDuration),
+		zap.Duration("head_existing_duration", headExistingDuration),
+		zap.Duration("put_duration", uploadDuration),
+		zap.Duration("head_uploaded_duration", headUploadedDuration),
+		zap.Duration("total_duration", time.Since(totalStart)),
+	)
 	return object.Key, object.Placements, nil
 }
 
