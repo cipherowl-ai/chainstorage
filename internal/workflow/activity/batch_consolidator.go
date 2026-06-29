@@ -146,10 +146,23 @@ func (a *BatchConsolidator) executeStats(ctx context.Context, request *BatchCons
 	if err := a.validateShadowStatsMode(request.Mode); err != nil {
 		return nil, err
 	}
+	logger := a.statsActivity.getLogger(ctx).With(zap.Reflect("request", request))
+	statsStart := time.Now()
+	logger.Info("started consolidation shadow stats")
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.stats.started", request.Tag, request.StartHeight, request.EndHeight)
 	stats, err := a.getConsolidationShadowStats(ctx, request.Tag, request.StartHeight, request.EndHeight)
 	if err != nil {
+		logger.Error("failed consolidation shadow stats", zap.Duration("duration", time.Since(statsStart)), zap.Error(err))
 		return nil, err
 	}
+	statsDuration := time.Since(statsStart)
+	logger.Info(
+		"finished consolidation shadow stats",
+		zap.Uint64("shadow_objects", stats.Objects),
+		zap.Uint64("shadow_blocks", stats.Blocks),
+		zap.Duration("duration", statsDuration),
+	)
+	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.stats.completed", request.Tag, request.StartHeight, request.EndHeight, stats.Objects, stats.Blocks)
 	return &BatchConsolidatorStatsResponse{
 		StartHeight:   request.StartHeight,
 		EndHeight:     request.EndHeight,

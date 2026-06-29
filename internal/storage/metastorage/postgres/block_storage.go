@@ -746,9 +746,14 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
 		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
 			AND shadow.legacy_object_key_main = bm.object_key_main
+			AND shadow.tag = cb.tag
+			AND shadow.height = cb.height
 		WHERE cb.tag = $1
 			AND cb.height >= $2
 			AND cb.height < $3
+			AND shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.height < $3
 			AND bm.skipped = false
 			AND bm.object_key_main IS NOT NULL
 			AND bm.object_key_main <> ''

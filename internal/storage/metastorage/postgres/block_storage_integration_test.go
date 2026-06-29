@@ -336,10 +336,36 @@ func (s *blockStorageTestSuite) insertConsolidationShadow(
 	validated bool,
 	legacyObjectKeyMain string,
 ) {
-	require := testutil.Require(s.T())
 	if legacyObjectKeyMain == "" {
 		legacyObjectKeyMain = block.GetObjectKeyMain()
 	}
+	s.insertConsolidationShadowWithIdentity(
+		ctx,
+		block,
+		consolidatedObjectKey,
+		byteOffset,
+		byteLength,
+		uncompressedLength,
+		validated,
+		legacyObjectKeyMain,
+		block.GetTag(),
+		block.GetHeight(),
+	)
+}
+
+func (s *blockStorageTestSuite) insertConsolidationShadowWithIdentity(
+	ctx context.Context,
+	block *api.BlockMetadata,
+	consolidatedObjectKey string,
+	byteOffset uint64,
+	byteLength uint64,
+	uncompressedLength uint64,
+	validated bool,
+	legacyObjectKeyMain string,
+	shadowTag uint32,
+	shadowHeight uint64,
+) {
+	require := testutil.Require(s.T())
 	var validatedAt any
 	if validated {
 		validatedAt = time.Now().UTC()
@@ -351,8 +377,8 @@ func (s *blockStorageTestSuite) insertConsolidationShadow(
 			object_format, byte_offset, byte_length, uncompressed_length, validated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		s.getBlockMetadataID(ctx, block),
-		block.GetTag(),
-		block.GetHeight(),
+		shadowTag,
+		shadowHeight,
 		block.GetHash(),
 		legacyObjectKeyMain,
 		consolidatedObjectKey,
@@ -506,7 +532,7 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
 	startHeight := s.config.Chain.BlockStartHeight
-	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 7, tag)
 
 	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
 	require.NoError(err)
@@ -516,8 +542,10 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
 	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/second.cscb.zstd", 50, 60, 60, true, "")
 	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/unvalidated.cscb.zstd", 70, 80, 80, false, "")
 	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/wrong-legacy-key.cscb.zstd", 90, 100, 100, true, "legacy/key/does/not/match")
+	s.insertConsolidationShadowWithIdentity(ctx, blocks[5], "consolidated/wrong-tag.cscb.zstd", 110, 120, 120, true, blocks[5].GetObjectKeyMain(), tag+1, blocks[5].GetHeight())
+	s.insertConsolidationShadowWithIdentity(ctx, blocks[6], "consolidated/wrong-height.cscb.zstd", 130, 140, 140, true, blocks[6].GetObjectKeyMain(), tag, blocks[6].GetHeight()+1000)
 
-	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+5)
+	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+7)
 	require.NoError(err)
 	require.Equal(uint64(2), stats.Objects)
 	require.Equal(uint64(3), stats.Blocks)
