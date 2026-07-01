@@ -39,7 +39,7 @@ type (
 )
 
 const (
-	autoPromoteFinalizedSuffix       = "auto_promote_finalized"
+	autoConsolidateSuffix            = "auto_consolidate"
 	batchConsolidatorOpenPageSize    = 1000
 	defaultBatchConsolidatorCronSpec = "@every 30m"
 )
@@ -87,19 +87,26 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	if !consolidation.Enabled {
 		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.enabled=true")
 	}
-	if consolidation.Mode != config.ConsolidationModePromoteFinalized {
-		return xerrors.Errorf("batch_consolidator cron requires consolidation mode %q, got %q", config.ConsolidationModePromoteFinalized, consolidation.Mode)
+	if consolidation.Mode == config.ConsolidationModeLegacyOnly {
+		return xerrors.Errorf("batch_consolidator cron requires non-legacy consolidation mode, got %q", consolidation.Mode)
 	}
-	if consolidation.SafePromotionLag == nil {
-		return xerrors.New("batch_consolidator cron requires safe_promotion_lag")
+	if consolidation.MaxBlocks == 0 {
+		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.max_blocks to be positive")
 	}
 
 	cronConfig := t.config.Cron.BatchConsolidator
 	if cronConfig.MaxRangeBlocks == 0 {
 		return xerrors.New("batch_consolidator cron max_range_blocks must be positive")
 	}
+	if cronConfig.MaxRangeBlocks < consolidation.MaxBlocks {
+		return xerrors.Errorf(
+			"batch_consolidator cron max_range_blocks(%d) must be at least consolidation max_blocks(%d)",
+			cronConfig.MaxRangeBlocks,
+			consolidation.MaxBlocks,
+		)
+	}
 
-	workflowID := t.autoPromoteWorkflowID()
+	workflowID := t.autoConsolidateWorkflowID()
 	openWorkflowID, open, err := t.openBatchConsolidatorWorkflow(ctx)
 	if err != nil {
 		return err
@@ -122,18 +129,15 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	if latest == nil {
 		return xerrors.New("latest block not found for batch_consolidator cron")
 	}
-	searchEnd, safeHeight, ok := batchConsolidatorCronSafeEndHeight(latest.GetHeight(), *consolidation.SafePromotionLag)
+	searchEnd, safeHeight, ok := batchConsolidatorCronSafeEndHeight(latest.GetHeight(), t.config.Chain.IrreversibleDistance)
 	if !ok {
 		t.logger.Info(
-			"batch_consolidator cron has no safe promotion range",
+			"batch_consolidator cron has no irreversible consolidation range",
 			zap.Uint32("tag", tag),
 			zap.Uint64("latest_height", latest.GetHeight()),
-			zap.Uint64("safe_promotion_lag", *consolidation.SafePromotionLag),
+			zap.Uint64("irreversible_distance", t.config.Chain.IrreversibleDistance),
 		)
 		return nil
-	}
-	if consolidation.PromotionGateHeight != nil && *consolidation.PromotionGateHeight < searchEnd {
-		searchEnd = *consolidation.PromotionGateHeight
 	}
 	if searchEnd <= searchStart {
 		t.logger.Info(
@@ -142,42 +146,42 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 			zap.Uint64("start_height", searchStart),
 			zap.Uint64("safe_end_height", searchEnd),
 			zap.Uint64("latest_height", latest.GetHeight()),
-			zap.Uint64("safe_promotion_height", safeHeight),
+			zap.Uint64("safe_consolidation_height", safeHeight),
 		)
 		return nil
 	}
 
-	startHeight, found, err := t.metaStorage.GetFirstPromotableBlockConsolidationShadow(ctx, tag, searchStart, searchEnd)
+	startHeight, found, err := t.metaStorage.GetFirstBlockMissingConsolidationShadow(ctx, tag, searchStart, searchEnd)
 	if err != nil {
-		return xerrors.Errorf("failed to get first promotable consolidation shadow: %w", err)
+		return xerrors.Errorf("failed to get first block missing consolidation shadow: %w", err)
 	}
 	if !found {
 		t.logger.Info(
-			"batch_consolidator cron found no promotable consolidation shadows",
+			"batch_consolidator cron found no blocks missing consolidation shadows",
 			zap.Uint32("tag", tag),
 			zap.Uint64("start_height", searchStart),
 			zap.Uint64("end_height", searchEnd),
 			zap.Uint64("latest_height", latest.GetHeight()),
-			zap.Uint64("safe_promotion_height", safeHeight),
+			zap.Uint64("safe_consolidation_height", safeHeight),
 		)
 		return nil
 	}
 
-	endHeight := batchConsolidatorCronRangeEnd(startHeight, cronConfig.MaxRangeBlocks)
-	if endHeight > searchEnd {
-		endHeight = searchEnd
-	}
-	if endHeight <= startHeight {
+	endHeight, fullWindow := batchConsolidatorCronRangeEnd(startHeight, searchEnd, cronConfig.MaxRangeBlocks, consolidation.MaxBlocks)
+	if !fullWindow {
 		t.logger.Info(
-			"batch_consolidator cron planned an empty promotion range",
+			"batch_consolidator cron waiting for a full consolidation window",
 			zap.Uint32("tag", tag),
 			zap.Uint64("start_height", startHeight),
-			zap.Uint64("end_height", endHeight),
+			zap.Uint64("safe_end_height", searchEnd),
+			zap.Uint64("max_range_blocks", cronConfig.MaxRangeBlocks),
+			zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
 		)
 		return nil
 	}
 
 	request := &workflow.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
 		Tag:         tag,
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
@@ -186,7 +190,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	run, err := t.batchConsolidator.Execute(workflowCtx, request)
 	if err != nil {
 		if isWorkflowAlreadyStarted(err) {
-			t.logger.Info("batch_consolidator cron skipped because auto promotion workflow was already started", zap.String("workflow_id", workflowID))
+			t.logger.Info("batch_consolidator cron skipped because auto consolidation workflow was already started", zap.String("workflow_id", workflowID))
 			return nil
 		}
 		return xerrors.Errorf("failed to start batch_consolidator cron workflow: %w", err)
@@ -199,13 +203,13 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
 		zap.Uint64("latest_height", latest.GetHeight()),
-		zap.Uint64("safe_promotion_height", safeHeight),
+		zap.Uint64("safe_consolidation_height", safeHeight),
 	)
 	return nil
 }
 
-func (t *batchConsolidatorTask) autoPromoteWorkflowID() string {
-	return fmt.Sprintf("%s/%s", t.config.Workflows.BatchConsolidator.WorkflowIdentity, autoPromoteFinalizedSuffix)
+func (t *batchConsolidatorTask) autoConsolidateWorkflowID() string {
+	return fmt.Sprintf("%s/%s", t.config.Workflows.BatchConsolidator.WorkflowIdentity, autoConsolidateSuffix)
 }
 
 func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Context) (string, bool, error) {
@@ -226,23 +230,35 @@ func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Contex
 	return "", false, nil
 }
 
-func batchConsolidatorCronSafeEndHeight(latestHeight uint64, safePromotionLag uint64) (uint64, uint64, bool) {
-	if latestHeight < safePromotionLag {
+func batchConsolidatorCronSafeEndHeight(latestHeight uint64, irreversibleDistance uint64) (uint64, uint64, bool) {
+	if latestHeight < irreversibleDistance {
 		return 0, 0, false
 	}
-	safeHeight := latestHeight - safePromotionLag
+	safeHeight := latestHeight - irreversibleDistance
 	if safeHeight == ^uint64(0) {
 		return safeHeight, safeHeight, true
 	}
 	return safeHeight + 1, safeHeight, true
 }
 
-func batchConsolidatorCronRangeEnd(startHeight uint64, maxRangeBlocks uint64) uint64 {
-	endHeight := startHeight + maxRangeBlocks
-	if endHeight < startHeight {
-		return ^uint64(0)
+func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, maxRangeBlocks uint64, consolidationWindowBlocks uint64) (uint64, bool) {
+	if safeEndHeight <= startHeight || maxRangeBlocks == 0 || consolidationWindowBlocks == 0 {
+		return 0, false
 	}
-	return endHeight
+	availableBlocks := safeEndHeight - startHeight
+	rangeBlocks := maxRangeBlocks
+	if rangeBlocks > availableBlocks {
+		rangeBlocks = availableBlocks
+	}
+	fullWindowBlocks := (rangeBlocks / consolidationWindowBlocks) * consolidationWindowBlocks
+	if fullWindowBlocks == 0 {
+		return 0, false
+	}
+	endHeight := startHeight + fullWindowBlocks
+	if endHeight < startHeight {
+		return ^uint64(0), true
+	}
+	return endHeight, true
 }
 
 func isWorkflowAlreadyStarted(err error) bool {

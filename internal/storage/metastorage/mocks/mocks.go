@@ -279,6 +279,22 @@ func (mr *MockMetaStorageMockRecorder) GetEventsByEventIdRange(arg0, arg1, arg2,
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetEventsByEventIdRange", reflect.TypeOf((*MockMetaStorage)(nil).GetEventsByEventIdRange), arg0, arg1, arg2, arg3)
 }
 
+// GetFirstBlockMissingConsolidationShadow mocks base method.
+func (m *MockMetaStorage) GetFirstBlockMissingConsolidationShadow(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) (uint64, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetFirstBlockMissingConsolidationShadow", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(uint64)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// GetFirstBlockMissingConsolidationShadow indicates an expected call of GetFirstBlockMissingConsolidationShadow.
+func (mr *MockMetaStorageMockRecorder) GetFirstBlockMissingConsolidationShadow(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetFirstBlockMissingConsolidationShadow", reflect.TypeOf((*MockMetaStorage)(nil).GetFirstBlockMissingConsolidationShadow), arg0, arg1, arg2, arg3)
+}
+
 // GetFirstEventIdByBlockHeight mocks base method.
 func (m *MockMetaStorage) GetFirstEventIdByBlockHeight(arg0 context.Context, arg1 uint32, arg2 uint64) (int64, error) {
 	m.ctrl.T.Helper()
@@ -723,6 +739,22 @@ func (m *MockBlockStorage) GetBlocksMissingConsolidationShadow(arg0 context.Cont
 func (mr *MockBlockStorageMockRecorder) GetBlocksMissingConsolidationShadow(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlocksMissingConsolidationShadow", reflect.TypeOf((*MockBlockStorage)(nil).GetBlocksMissingConsolidationShadow), arg0, arg1, arg2, arg3, arg4)
+}
+
+// GetFirstBlockMissingConsolidationShadow mocks base method.
+func (m *MockBlockStorage) GetFirstBlockMissingConsolidationShadow(arg0 context.Context, arg1 uint32, arg2, arg3 uint64) (uint64, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetFirstBlockMissingConsolidationShadow", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(uint64)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// GetFirstBlockMissingConsolidationShadow indicates an expected call of GetFirstBlockMissingConsolidationShadow.
+func (mr *MockBlockStorageMockRecorder) GetFirstBlockMissingConsolidationShadow(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetFirstBlockMissingConsolidationShadow", reflect.TypeOf((*MockBlockStorage)(nil).GetFirstBlockMissingConsolidationShadow), arg0, arg1, arg2, arg3)
 }
 
 // GetFirstPromotableBlockConsolidationShadow mocks base method.

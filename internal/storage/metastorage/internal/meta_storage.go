@@ -28,6 +28,7 @@ type (
 		GetBlocksConsolidationShadow(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error)
 		GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*BlockMetadataRecord, error)
 		GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*ConsolidationShadowStats, error)
+		GetFirstBlockMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error)
 		GetFirstPromotableBlockConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error)
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
 		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*ConsolidationPromotionResult, error)
