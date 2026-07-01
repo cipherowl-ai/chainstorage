@@ -875,7 +875,17 @@ func TestConsolidationReadShadowFirstRejectsDynamoDB(t *testing.T) {
 	require.Contains(err.Error(), "requires Postgres meta storage")
 }
 
-func TestConsolidationHistoricalBackfillModeAccepted(t *testing.T) {
+func TestConsolidationAutoConsolidateModeAccepted(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeAutoConsolidate))
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(config.ConsolidationModeAutoConsolidate, cfg.AWS.Storage.Consolidation.Mode)
+}
+
+func TestConsolidationHistoricalBackfillModeAcceptedAsDeprecatedAlias(t *testing.T) {
 	require := testutil.Require(t)
 
 	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeHistoricalBackfill))

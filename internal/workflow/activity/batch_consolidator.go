@@ -42,7 +42,7 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
+		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill"`
 		Tag         uint32
 		StartHeight uint64
 		EndHeight   uint64 `validate:"gtfield=StartHeight"`
@@ -58,7 +58,7 @@ type (
 	}
 
 	BatchConsolidatorStatsRequest struct {
-		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
+		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill"`
 		Tag         uint32
 		StartHeight uint64
 		EndHeight   uint64 `validate:"gtfield=StartHeight"`
@@ -177,10 +177,10 @@ func (a *BatchConsolidator) executeLatestBlock(ctx context.Context, request *Bat
 	}
 	latestBlock, err := a.metaStorage.GetLatestBlock(ctx, request.Tag)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to get latest block for historical backfill safety check: %w", err)
+		return nil, xerrors.Errorf("failed to get latest block for auto_consolidate safety check: %w", err)
 	}
 	if latestBlock == nil {
-		return nil, xerrors.New("latest block not found for historical backfill safety check")
+		return nil, xerrors.New("latest block not found for auto_consolidate safety check")
 	}
 	return &BatchConsolidatorLatestBlockResponse{
 		Tag:    request.Tag,
@@ -203,9 +203,10 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if mode == "" {
 		mode = a.config.AWS.Storage.Consolidation.Mode
 	}
-	switch mode {
-	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+	if mode.IsShadowWrite() {
 		return a.executeShadowDualWrite(ctx, request)
+	}
+	switch mode {
 	case config.ConsolidationModePromoteFinalized:
 		return a.executePromoteFinalized(ctx, request)
 	default:
@@ -213,8 +214,9 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 			return nil, err
 		}
 		return nil, xerrors.Errorf(
-			"batch consolidator requires consolidation mode %q or %q, got %q",
+			"batch consolidator requires consolidation mode %q, %q, or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
+			config.ConsolidationModeAutoConsolidate,
 			config.ConsolidationModePromoteFinalized,
 			mode,
 		)
@@ -237,6 +239,23 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	scanDuration := time.Since(scanStart)
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
+		return &BatchConsolidatorResponse{
+			StartHeight: request.StartHeight,
+			EndHeight:   request.EndHeight,
+		}, nil
+	}
+	mode := request.Mode
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
+	}
+	if mode.IsAutoConsolidate() && !isFullContiguousConsolidationWindow(records, request.StartHeight, request.MaxBlocks) {
+		logger.Info(
+			"auto consolidate waiting for a full contiguous consolidation window",
+			zap.Uint64("start_height", request.StartHeight),
+			zap.Uint64("end_height", request.EndHeight),
+			zap.Uint64("max_blocks", request.MaxBlocks),
+			zap.Int("records", len(records)),
+		)
 		return &BatchConsolidatorResponse{
 			StartHeight: request.StartHeight,
 			EndHeight:   request.EndHeight,
@@ -421,21 +440,36 @@ func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMod
 	if mode == "" {
 		mode = a.config.AWS.Storage.Consolidation.Mode
 	}
-	switch mode {
-	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill:
+	if mode.IsShadowWrite() {
 		return nil
-	default:
-		return xerrors.Errorf(
-			"batch consolidator requires consolidation mode %q or %q, got %q",
-			config.ConsolidationModeShadowDualWrite,
-			config.ConsolidationModeHistoricalBackfill,
-			mode,
-		)
 	}
+	return xerrors.Errorf(
+		"batch consolidator requires consolidation mode %q, %q, or %q, got %q",
+		config.ConsolidationModeShadowDualWrite,
+		config.ConsolidationModeAutoConsolidate,
+		config.ConsolidationModeHistoricalBackfill,
+		mode,
+	)
 }
 
 func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
 	return a.validateShadowWriteMode(mode)
+}
+
+func isFullContiguousConsolidationWindow(records []*metastorage.BlockMetadataRecord, startHeight uint64, maxBlocks uint64) bool {
+	if maxBlocks == 0 || uint64(len(records)) != maxBlocks {
+		return false
+	}
+	for i, record := range records {
+		if record == nil || record.Metadata == nil {
+			return false
+		}
+		expectedHeight := startHeight + uint64(i)
+		if expectedHeight < startHeight || record.Metadata.GetHeight() != expectedHeight {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {
