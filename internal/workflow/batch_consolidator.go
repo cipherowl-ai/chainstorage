@@ -31,7 +31,7 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill"`
+		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write historical_backfill"`
 		Tag            uint32
 		StartHeight    uint64
 		EndHeight      uint64 `validate:"gtfield=StartHeight"`
@@ -161,8 +161,8 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			batchConsolidatorShadowStatsVersion,
 		) != workflow.DefaultVersion && mode != config.ConsolidationModePromoteFinalized
 
-		if mode.IsAutoConsolidate() {
-			if err := w.validateAutoConsolidateRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
+		if mode == config.ConsolidationModeHistoricalBackfill {
+			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
 		}
@@ -211,8 +211,8 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
 
-			if mode.IsAutoConsolidate() {
-				objectsInBatch, blocksInBatch, err := w.processAutoConsolidateBatchParallel(
+			if mode == config.ConsolidationModeHistoricalBackfill && parallelism > 1 {
+				objectsInBatch, blocksInBatch, err := w.processHistoricalBackfillBatchParallel(
 					ctx,
 					statsCtx,
 					logger,
@@ -355,7 +355,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 	})
 }
 
-func (w *BatchConsolidator) processAutoConsolidateBatchParallel(
+func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 	ctx workflow.Context,
 	statsCtx workflow.Context,
 	logger *zap.Logger,
@@ -389,15 +389,9 @@ func (w *BatchConsolidator) processAutoConsolidateBatchParallel(
 	for windowStart := batchStart; windowStart < batchEnd; {
 		pending := make([]batchConsolidatorPendingActivity, 0, parallelism)
 		for len(pending) < parallelism && windowStart < batchEnd {
-			windowEnd, fullWindow := batchConsolidatorFullObjectWindowEnd(windowStart, batchEnd, maxBlocks)
-			if !fullWindow {
-				logger.Info(
-					"auto consolidate waiting for a full object window",
-					zap.Uint64("window_start", windowStart),
-					zap.Uint64("batch_end", batchEnd),
-					zap.Uint64("max_blocks", maxBlocks),
-				)
-				break
+			windowEnd := batchConsolidatorObjectWindowEnd(windowStart, batchEnd, maxBlocks)
+			if windowEnd <= windowStart {
+				return 0, 0, xerrors.Errorf("batch_consolidator made no parallel window progress from %d to %d", windowStart, windowEnd)
 			}
 			request := &activity.BatchConsolidatorRequest{
 				Mode:        activityMode,
@@ -411,9 +405,6 @@ func (w *BatchConsolidator) processAutoConsolidateBatchParallel(
 				future:  workflow.ExecuteActivity(ctx, activity.ActivityBatchConsolidator, request),
 			})
 			windowStart = windowEnd
-		}
-		if len(pending) == 0 {
-			break
 		}
 
 		var firstErr error
@@ -522,16 +513,12 @@ func batchConsolidatorMode(
 		mode = configMode
 	}
 	switch mode {
-	case config.ConsolidationModeShadowDualWrite,
-		config.ConsolidationModeAutoConsolidate,
-		config.ConsolidationModeHistoricalBackfill,
-		config.ConsolidationModePromoteFinalized:
+	case config.ConsolidationModeShadowDualWrite, config.ConsolidationModeHistoricalBackfill, config.ConsolidationModePromoteFinalized:
 		return mode, nil
 	default:
 		return "", xerrors.Errorf(
-			"batch_consolidator requires mode %q, %q, %q, or %q, got %q",
+			"batch_consolidator requires mode %q, %q, or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
-			config.ConsolidationModeAutoConsolidate,
 			config.ConsolidationModeHistoricalBackfill,
 			config.ConsolidationModePromoteFinalized,
 			mode,
@@ -539,7 +526,7 @@ func batchConsolidatorMode(
 	}
 }
 
-func (w *BatchConsolidator) validateAutoConsolidateRange(
+func (w *BatchConsolidator) validateHistoricalBackfillRange(
 	ctx workflow.Context,
 	logger *zap.Logger,
 	tag uint32,
@@ -551,15 +538,15 @@ func (w *BatchConsolidator) validateAutoConsolidateRange(
 		Tag: tag,
 	})
 	if err != nil {
-		return xerrors.Errorf("failed to get latest block for auto_consolidate range validation: %w", err)
+		return xerrors.Errorf("failed to get latest block for historical backfill range validation: %w", err)
 	}
 	if latest == nil {
-		return xerrors.New("latest block response is nil for auto_consolidate range validation")
+		return xerrors.New("latest block response is nil for historical backfill range validation")
 	}
-	safeEndHeight, ok := batchConsolidatorAutoConsolidateSafeEndHeight(latest.Height, irreversibleDistance)
+	safeEndHeight, ok := batchConsolidatorHistoricalSafeEndHeight(latest.Height, irreversibleDistance)
 	if !ok {
 		return xerrors.Errorf(
-			"auto_consolidate range [%d, %d) is unsafe: latest height %d is below irreversible_distance %d",
+			"historical_backfill range [%d, %d) is unsafe: latest height %d is below irreversible_distance %d",
 			startHeight,
 			endHeight,
 			latest.Height,
@@ -568,7 +555,7 @@ func (w *BatchConsolidator) validateAutoConsolidateRange(
 	}
 	if endHeight > safeEndHeight {
 		return xerrors.Errorf(
-			"auto_consolidate range [%d, %d) is unsafe: end_height must be <= %d for latest_height=%d irreversible_distance=%d",
+			"historical_backfill range [%d, %d) is unsafe: end_height must be <= %d for latest_height=%d irreversible_distance=%d",
 			startHeight,
 			endHeight,
 			safeEndHeight,
@@ -577,7 +564,7 @@ func (w *BatchConsolidator) validateAutoConsolidateRange(
 		)
 	}
 	logger.Info(
-		"validated auto consolidate range",
+		"validated historical backfill range",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
@@ -588,7 +575,7 @@ func (w *BatchConsolidator) validateAutoConsolidateRange(
 	return nil
 }
 
-func batchConsolidatorAutoConsolidateSafeEndHeight(latestHeight uint64, irreversibleDistance uint64) (uint64, bool) {
+func batchConsolidatorHistoricalSafeEndHeight(latestHeight uint64, irreversibleDistance uint64) (uint64, bool) {
 	if irreversibleDistance == 0 {
 		if latestHeight == maxUint64 {
 			return maxUint64, true
@@ -651,17 +638,6 @@ func batchConsolidatorObjectWindowEnd(startHeight uint64, batchEnd uint64, maxBl
 		return batchEnd
 	}
 	return windowEnd
-}
-
-func batchConsolidatorFullObjectWindowEnd(startHeight uint64, batchEnd uint64, maxBlocks uint64) (uint64, bool) {
-	if maxBlocks == 0 || batchEnd <= startHeight {
-		return 0, false
-	}
-	windowEnd := startHeight + maxBlocks
-	if windowEnd < startHeight || windowEnd > batchEnd {
-		return 0, false
-	}
-	return windowEnd, true
 }
 
 func batchConsolidatorShardEnd(height uint64, shardSize uint64) uint64 {

@@ -617,11 +617,8 @@ const (
 	DLQType_SQS         DLQType = 1
 	DLQType_FIRESTORE   DLQType = 2
 
-	ConsolidationModeLegacyOnly      ConsolidationMode = "legacy_only"
-	ConsolidationModeShadowDualWrite ConsolidationMode = "shadow_dual_write"
-	ConsolidationModeAutoConsolidate ConsolidationMode = "auto_consolidate"
-	// Deprecated: use ConsolidationModeAutoConsolidate. This remains accepted so
-	// existing Temporal histories and manually-started workflows can replay.
+	ConsolidationModeLegacyOnly                ConsolidationMode = "legacy_only"
+	ConsolidationModeShadowDualWrite           ConsolidationMode = "shadow_dual_write"
 	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
@@ -638,16 +635,6 @@ const (
 	chainstorageAddressLocal = "http://localhost:9090"
 	tagSidechain             = "sidechain"
 )
-
-func (m ConsolidationMode) IsAutoConsolidate() bool {
-	return m == ConsolidationModeAutoConsolidate
-}
-
-func (m ConsolidationMode) IsShadowWrite() bool {
-	return m == ConsolidationModeShadowDualWrite ||
-		m == ConsolidationModeAutoConsolidate ||
-		m == ConsolidationModeHistoricalBackfill
-}
 
 func New(opts ...ConfigOption) (*Config, error) {
 	validate := validator.New()
@@ -783,7 +770,6 @@ func (c *Config) validateConsolidationConfig() error {
 	switch consolidation.Mode {
 	case ConsolidationModeLegacyOnly,
 		ConsolidationModeShadowDualWrite,
-		ConsolidationModeAutoConsolidate,
 		ConsolidationModeHistoricalBackfill,
 		ConsolidationModePromoteFinalized,
 		ConsolidationModeSyncerConsolidatedPrimary:

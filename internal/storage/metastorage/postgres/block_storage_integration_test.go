@@ -528,21 +528,6 @@ func (s *blockStorageTestSuite) TestGetBlocksMissingConsolidationShadowFiltersAn
 	s.equalProto(blocks[3], actual[1].Metadata)
 	require.False(actual[0].Metadata.GetSkipped())
 	require.False(actual[1].Metadata.GetSkipped())
-
-	height, found, err := s.accessor.GetFirstBlockMissingConsolidationShadow(ctx, tag, startHeight, startHeight+5)
-	require.NoError(err)
-	require.True(found)
-	require.Equal(blocks[1].GetHeight(), height)
-
-	height, found, err = s.accessor.GetFirstBlockMissingConsolidationShadow(ctx, tag, blocks[2].GetHeight(), startHeight+5)
-	require.NoError(err)
-	require.True(found)
-	require.Equal(blocks[3].GetHeight(), height)
-
-	height, found, err = s.accessor.GetFirstBlockMissingConsolidationShadow(ctx, tag, startHeight, blocks[1].GetHeight())
-	require.NoError(err)
-	require.False(found)
-	require.Zero(height)
 }
 
 func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {

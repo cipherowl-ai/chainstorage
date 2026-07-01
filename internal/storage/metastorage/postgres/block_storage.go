@@ -655,13 +655,11 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 	}
 	query := fmt.Sprintf(`
 		SELECT %s
-		FROM block_metadata bm
-		JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id
-			AND cb.tag = bm.tag
-			AND cb.height = bm.height
-		WHERE bm.tag = $1
-			AND bm.height >= $2
-			AND bm.height < $3
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
 			AND bm.skipped = false
 			AND bm.byte_length IS NULL
 			AND bm.object_key_main IS NOT NULL
@@ -673,7 +671,7 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 					AND shadow.legacy_object_key_main = bm.object_key_main
 					AND shadow.validated_at IS NOT NULL
 			)
-		ORDER BY bm.height ASC
+		ORDER BY cb.height ASC
 		LIMIT $4`, canonicalBlockMetadataColumns)
 
 	rows, err := b.db.QueryContext(ctx, query, tag, startHeight, endHeight, limit)
@@ -736,42 +734,6 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 	return records, nil
 }
 
-func (b *blockStorageImpl) GetFirstBlockMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error) {
-	if endHeight <= startHeight {
-		return 0, false, nil
-	}
-	const query = `
-		SELECT bm.height
-		FROM block_metadata bm
-		JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id
-			AND cb.tag = bm.tag
-			AND cb.height = bm.height
-		WHERE bm.tag = $1
-			AND bm.height >= $2
-			AND bm.height < $3
-			AND bm.skipped = false
-			AND bm.byte_length IS NULL
-			AND bm.object_key_main IS NOT NULL
-			AND bm.object_key_main <> ''
-			AND NOT EXISTS (
-				SELECT 1
-				FROM block_consolidation_shadow shadow
-				WHERE shadow.block_metadata_id = bm.id
-					AND shadow.legacy_object_key_main = bm.object_key_main
-					AND shadow.validated_at IS NOT NULL
-			)
-		ORDER BY bm.height ASC
-		LIMIT 1`
-	var height uint64
-	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&height); err != nil {
-		if err == sql.ErrNoRows {
-			return 0, false, nil
-		}
-		return 0, false, xerrors.Errorf("failed to get first block missing consolidation shadow: %w", err)
-	}
-	return height, true, nil
-}
-
 func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*internal.ConsolidationShadowStats, error) {
 	if endHeight <= startHeight {
 		return &internal.ConsolidationShadowStats{}, nil
@@ -815,19 +777,17 @@ func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 		return 0, false, nil
 	}
 	const query = `
-		SELECT shadow.height
-		FROM block_consolidation_shadow shadow
-		JOIN block_metadata bm ON bm.id = shadow.block_metadata_id
+		SELECT cb.height
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
 			AND shadow.tag = bm.tag
 			AND shadow.height = bm.height
 			AND shadow.hash = bm.hash
 			AND shadow.legacy_object_key_main = bm.object_key_main
-		JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id
-			AND cb.tag = bm.tag
-			AND cb.height = bm.height
-		WHERE shadow.tag = $1
-			AND shadow.height >= $2
-			AND shadow.height < $3
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
 			AND bm.skipped = false
 			AND bm.byte_length IS NULL
 			AND bm.object_key_main IS NOT NULL
@@ -840,7 +800,7 @@ func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 			AND shadow.byte_length > 0
 			AND shadow.uncompressed_length IS NOT NULL
 			AND shadow.uncompressed_length > 0
-		ORDER BY shadow.height ASC
+		ORDER BY cb.height ASC
 		LIMIT 1`
 	var height uint64
 	if err := b.db.QueryRowContext(
