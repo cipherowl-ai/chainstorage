@@ -242,6 +242,23 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 			EndHeight:   request.EndHeight,
 		}, nil
 	}
+	mode := request.Mode
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
+	}
+	if mode == config.ConsolidationModeHistoricalBackfill && !isFullContiguousConsolidationWindow(records, request.StartHeight, request.MaxBlocks) {
+		logger.Info(
+			"historical backfill waiting for a full contiguous consolidation window",
+			zap.Uint64("start_height", request.StartHeight),
+			zap.Uint64("end_height", request.EndHeight),
+			zap.Uint64("max_blocks", request.MaxBlocks),
+			zap.Int("records", len(records)),
+		)
+		return &BatchConsolidatorResponse{
+			StartHeight: request.StartHeight,
+			EndHeight:   request.EndHeight,
+		}, nil
+	}
 
 	buildStart := time.Now()
 	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, records)
@@ -436,6 +453,22 @@ func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMod
 
 func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
 	return a.validateShadowWriteMode(mode)
+}
+
+func isFullContiguousConsolidationWindow(records []*metastorage.BlockMetadataRecord, startHeight uint64, maxBlocks uint64) bool {
+	if maxBlocks == 0 || uint64(len(records)) != maxBlocks {
+		return false
+	}
+	for i, record := range records {
+		if record == nil || record.Metadata == nil {
+			return false
+		}
+		expectedHeight := startHeight + uint64(i)
+		if expectedHeight < startHeight || record.Metadata.GetHeight() != expectedHeight {
+			return false
+		}
+	}
+	return true
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {

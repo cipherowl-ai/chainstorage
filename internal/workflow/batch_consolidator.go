@@ -211,7 +211,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
 
-			if mode == config.ConsolidationModeHistoricalBackfill && parallelism > 1 {
+			if mode == config.ConsolidationModeHistoricalBackfill {
 				objectsInBatch, blocksInBatch, err := w.processHistoricalBackfillBatchParallel(
 					ctx,
 					statsCtx,
@@ -389,9 +389,15 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 	for windowStart := batchStart; windowStart < batchEnd; {
 		pending := make([]batchConsolidatorPendingActivity, 0, parallelism)
 		for len(pending) < parallelism && windowStart < batchEnd {
-			windowEnd := batchConsolidatorObjectWindowEnd(windowStart, batchEnd, maxBlocks)
-			if windowEnd <= windowStart {
-				return 0, 0, xerrors.Errorf("batch_consolidator made no parallel window progress from %d to %d", windowStart, windowEnd)
+			windowEnd, fullWindow := batchConsolidatorFullObjectWindowEnd(windowStart, batchEnd, maxBlocks)
+			if !fullWindow {
+				logger.Info(
+					"historical backfill waiting for a full object window",
+					zap.Uint64("window_start", windowStart),
+					zap.Uint64("batch_end", batchEnd),
+					zap.Uint64("max_blocks", maxBlocks),
+				)
+				break
 			}
 			request := &activity.BatchConsolidatorRequest{
 				Mode:        activityMode,
@@ -405,6 +411,9 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 				future:  workflow.ExecuteActivity(ctx, activity.ActivityBatchConsolidator, request),
 			})
 			windowStart = windowEnd
+		}
+		if len(pending) == 0 {
+			break
 		}
 
 		var firstErr error
@@ -638,6 +647,17 @@ func batchConsolidatorObjectWindowEnd(startHeight uint64, batchEnd uint64, maxBl
 		return batchEnd
 	}
 	return windowEnd
+}
+
+func batchConsolidatorFullObjectWindowEnd(startHeight uint64, batchEnd uint64, maxBlocks uint64) (uint64, bool) {
+	if maxBlocks == 0 || batchEnd <= startHeight {
+		return 0, false
+	}
+	windowEnd := startHeight + maxBlocks
+	if windowEnd < startHeight || windowEnd > batchEnd {
+		return 0, false
+	}
+	return windowEnd, true
 }
 
 func batchConsolidatorShardEnd(height uint64, shardSize uint64) uint64 {

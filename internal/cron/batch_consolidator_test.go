@@ -90,6 +90,33 @@ func TestBatchConsolidatorCronWaitsForFullConsolidationWindow(t *testing.T) {
 	require.Empty(t, runtime.executions)
 }
 
+func TestBatchConsolidatorCronSkipsShardTailWithoutFullConsolidationWindow(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.StartHeight = 9_000
+	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 12_000}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(9_000), uint64(11_901)).
+		Return(uint64(9_500), true, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(10_000), uint64(11_901)).
+		Return(uint64(10_000), true, nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         tag,
+		StartHeight: 10_000,
+		EndHeight:   11_000,
+	}, runtime.executions[0].request)
+}
+
 func TestBatchConsolidatorCronDoesNotCapHistoricalBackfillAtPromotionGate(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()

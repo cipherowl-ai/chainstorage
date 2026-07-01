@@ -322,6 +322,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillValidatesFinalizedRan
 		Tag:         2,
 		StartHeight: 100,
 		EndHeight:   111,
+		MaxBlocks:   11,
 	})
 	require.NoError(err)
 	require.Len(requests, 1)
@@ -330,7 +331,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillValidatesFinalizedRan
 		Tag:         2,
 		StartHeight: 100,
 		EndHeight:   111,
-		MaxBlocks:   25,
+		MaxBlocks:   11,
 	}, requests[0])
 }
 
@@ -371,10 +372,28 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillDuplicateRunNoOpsWhen
 		Tag:         2,
 		StartHeight: 100,
 		EndHeight:   111,
+		MaxBlocks:   11,
 	})
 	require.NoError(err)
 	require.Len(requests, 1)
 	require.Equal(config.ConsolidationModeHistoricalBackfill, requests[0].Mode)
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillWaitsForFullObjectWindow() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.mockHistoricalBackfillLatestHeight(120)
+	s.mockEmptyShadowStats()
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
 }
 
 func (s *batchConsolidatorTestSuite) TestHistoricalBackfillProcessesObjectWindowsInParallel() {
@@ -529,6 +548,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillResumeAfterLostActivi
 		Tag:         2,
 		StartHeight: 100,
 		EndHeight:   111,
+		MaxBlocks:   11,
 	})
 	require.NoError(err)
 	require.Equal(2, statsCalls)

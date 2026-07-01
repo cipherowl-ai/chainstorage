@@ -93,6 +93,16 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	if consolidation.MaxBlocks == 0 {
 		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.max_blocks to be positive")
 	}
+	if consolidation.ShardSize == 0 {
+		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.shard_size to be positive")
+	}
+	if consolidation.MaxBlocks > consolidation.ShardSize {
+		return xerrors.Errorf(
+			"batch_consolidator cron consolidation max_blocks(%d) must be <= shard_size(%d)",
+			consolidation.MaxBlocks,
+			consolidation.ShardSize,
+		)
+	}
 
 	cronConfig := t.config.Cron.BatchConsolidator
 	if cronConfig.MaxRangeBlocks == 0 {
@@ -151,31 +161,26 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		return nil
 	}
 
-	startHeight, found, err := t.metaStorage.GetFirstBlockMissingConsolidationShadow(ctx, tag, searchStart, searchEnd)
+	startHeight, endHeight, found, err := t.nextHistoricalBackfillRange(
+		ctx,
+		tag,
+		searchStart,
+		searchEnd,
+		cronConfig.MaxRangeBlocks,
+		consolidation.MaxBlocks,
+		consolidation.ShardSize,
+	)
 	if err != nil {
-		return xerrors.Errorf("failed to get first block missing consolidation shadow: %w", err)
+		return err
 	}
 	if !found {
 		t.logger.Info(
-			"batch_consolidator cron found no blocks missing consolidation shadows",
+			"batch_consolidator cron found no full consolidation window",
 			zap.Uint32("tag", tag),
 			zap.Uint64("start_height", searchStart),
 			zap.Uint64("end_height", searchEnd),
 			zap.Uint64("latest_height", latest.GetHeight()),
 			zap.Uint64("safe_consolidation_height", safeHeight),
-		)
-		return nil
-	}
-
-	endHeight, fullWindow := batchConsolidatorCronRangeEnd(startHeight, searchEnd, cronConfig.MaxRangeBlocks, consolidation.MaxBlocks)
-	if !fullWindow {
-		t.logger.Info(
-			"batch_consolidator cron waiting for a full consolidation window",
-			zap.Uint32("tag", tag),
-			zap.Uint64("start_height", startHeight),
-			zap.Uint64("safe_end_height", searchEnd),
-			zap.Uint64("max_range_blocks", cronConfig.MaxRangeBlocks),
-			zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
 		)
 		return nil
 	}
@@ -206,6 +211,58 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		zap.Uint64("safe_consolidation_height", safeHeight),
 	)
 	return nil
+}
+
+func (t *batchConsolidatorTask) nextHistoricalBackfillRange(
+	ctx context.Context,
+	tag uint32,
+	searchStart uint64,
+	searchEnd uint64,
+	maxRangeBlocks uint64,
+	consolidationWindowBlocks uint64,
+	shardSize uint64,
+) (uint64, uint64, bool, error) {
+	for searchStart < searchEnd {
+		startHeight, found, err := t.metaStorage.GetFirstBlockMissingConsolidationShadow(ctx, tag, searchStart, searchEnd)
+		if err != nil {
+			return 0, 0, false, xerrors.Errorf("failed to get first block missing consolidation shadow: %w", err)
+		}
+		if !found {
+			return 0, 0, false, nil
+		}
+		windowStart := batchConsolidatorCronFullWindowStart(startHeight, consolidationWindowBlocks, shardSize)
+		if windowStart >= searchEnd {
+			return 0, 0, false, nil
+		}
+		if windowStart != startHeight {
+			t.logger.Info(
+				"batch_consolidator cron skipped shard tail without a full consolidation window",
+				zap.Uint32("tag", tag),
+				zap.Uint64("missing_height", startHeight),
+				zap.Uint64("next_window_start", windowStart),
+				zap.Uint64("safe_end_height", searchEnd),
+				zap.Uint64("consolidation_max_blocks", consolidationWindowBlocks),
+				zap.Uint64("shard_size", shardSize),
+			)
+			searchStart = windowStart
+			continue
+		}
+		endHeight, fullWindow := batchConsolidatorCronRangeEnd(windowStart, searchEnd, maxRangeBlocks, consolidationWindowBlocks, shardSize)
+		if !fullWindow {
+			t.logger.Info(
+				"batch_consolidator cron waiting for a full consolidation window",
+				zap.Uint32("tag", tag),
+				zap.Uint64("start_height", windowStart),
+				zap.Uint64("safe_end_height", searchEnd),
+				zap.Uint64("max_range_blocks", maxRangeBlocks),
+				zap.Uint64("consolidation_max_blocks", consolidationWindowBlocks),
+				zap.Uint64("shard_size", shardSize),
+			)
+			return 0, 0, false, nil
+		}
+		return windowStart, endHeight, true, nil
+	}
+	return 0, 0, false, nil
 }
 
 func (t *batchConsolidatorTask) autoConsolidateWorkflowID() string {
@@ -241,24 +298,39 @@ func batchConsolidatorCronSafeEndHeight(latestHeight uint64, irreversibleDistanc
 	return safeHeight + 1, safeHeight, true
 }
 
-func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, maxRangeBlocks uint64, consolidationWindowBlocks uint64) (uint64, bool) {
-	if safeEndHeight <= startHeight || maxRangeBlocks == 0 || consolidationWindowBlocks == 0 {
+func batchConsolidatorCronFullWindowStart(startHeight uint64, consolidationWindowBlocks uint64, shardSize uint64) uint64 {
+	shardEnd := batchConsolidatorCronShardEnd(startHeight, shardSize)
+	windowEnd := startHeight + consolidationWindowBlocks
+	if windowEnd >= startHeight && windowEnd <= shardEnd {
+		return startHeight
+	}
+	return shardEnd
+}
+
+func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, maxRangeBlocks uint64, consolidationWindowBlocks uint64, shardSize uint64) (uint64, bool) {
+	if safeEndHeight <= startHeight || maxRangeBlocks == 0 || consolidationWindowBlocks == 0 || shardSize == 0 {
 		return 0, false
 	}
-	availableBlocks := safeEndHeight - startHeight
-	rangeBlocks := maxRangeBlocks
-	if rangeBlocks > availableBlocks {
-		rangeBlocks = availableBlocks
+	rangeLimit := safeEndHeight
+	if maxRangeBlocks < safeEndHeight-startHeight {
+		rangeLimit = startHeight + maxRangeBlocks
 	}
-	fullWindowBlocks := (rangeBlocks / consolidationWindowBlocks) * consolidationWindowBlocks
-	if fullWindowBlocks == 0 {
+	endHeight := startHeight
+	for {
+		nextEnd := endHeight + consolidationWindowBlocks
+		if nextEnd < endHeight || nextEnd > rangeLimit || nextEnd > batchConsolidatorCronShardEnd(endHeight, shardSize) {
+			break
+		}
+		endHeight = nextEnd
+	}
+	if endHeight == startHeight {
 		return 0, false
-	}
-	endHeight := startHeight + fullWindowBlocks
-	if endHeight < startHeight {
-		return ^uint64(0), true
 	}
 	return endHeight, true
+}
+
+func batchConsolidatorCronShardEnd(height uint64, shardSize uint64) uint64 {
+	return (height/shardSize + 1) * shardSize
 }
 
 func isWorkflowAlreadyStarted(err error) bool {
