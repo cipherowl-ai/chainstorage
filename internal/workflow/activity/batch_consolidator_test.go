@@ -140,6 +140,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	require := testutil.Require(s.T())
 	records, blocks := makeConsolidatorFixture(2, 1000)
 	request := &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
 		Tag:         records[0].Metadata.GetTag(),
 		StartHeight: 1000,
 		EndHeight:   1002,

@@ -174,6 +174,20 @@ func TestBatchConsolidatorCronSkipsWhenBatchConsolidatorWorkflowIsAlreadyOpen(t 
 	require.Empty(t, runtime.executions)
 }
 
+func TestBatchConsolidatorCronRequiresAutoConsolidateMode(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
+
+	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	err := task.Run(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `batch_consolidator cron requires consolidation mode "auto_consolidate", got "promote_finalized"`)
+	require.Empty(t, runtime.executions)
+}
+
 func newBatchConsolidatorCronTask(t *testing.T) (*batchConsolidatorTask, *batchConsolidatorCronRuntime, *metastoragemocks.MockMetaStorage, *config.Config, *gomock.Controller) {
 	t.Helper()
 	cfg, err := config.New()

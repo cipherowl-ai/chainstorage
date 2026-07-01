@@ -444,9 +444,10 @@ func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMod
 		return nil
 	}
 	return xerrors.Errorf(
-		"batch consolidator requires consolidation mode %q or %q, got %q",
+		"batch consolidator requires consolidation mode %q, %q, or %q, got %q",
 		config.ConsolidationModeShadowDualWrite,
 		config.ConsolidationModeAutoConsolidate,
+		config.ConsolidationModeHistoricalBackfill,
 		mode,
 	)
 }

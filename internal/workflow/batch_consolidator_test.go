@@ -338,9 +338,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateValidatesFinalizedRange(
 func (s *batchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemainsAccepted() {
 	require := testutil.Require(s.T())
 
-	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
 	var requests []*activity.BatchConsolidatorRequest
-	s.mockAutoConsolidateLatestHeight(120)
 	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
@@ -356,11 +354,17 @@ func (s *batchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemain
 		Tag:         2,
 		StartHeight: 100,
 		EndHeight:   111,
-		MaxBlocks:   11,
+		MaxBlocks:   25,
 	})
 	require.NoError(err)
 	require.Len(requests, 1)
-	require.Equal(config.ConsolidationModeHistoricalBackfill, requests[0].Mode)
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   111,
+		MaxBlocks:   25,
+	}, requests[0])
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateRejectsReorgUnsafeRange() {

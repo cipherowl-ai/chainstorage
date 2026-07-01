@@ -529,9 +529,10 @@ func batchConsolidatorMode(
 		return mode, nil
 	default:
 		return "", xerrors.Errorf(
-			"batch_consolidator requires mode %q, %q, or %q, got %q",
+			"batch_consolidator requires mode %q, %q, %q, or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
 			config.ConsolidationModeAutoConsolidate,
+			config.ConsolidationModeHistoricalBackfill,
 			config.ConsolidationModePromoteFinalized,
 			mode,
 		)

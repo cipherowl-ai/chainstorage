@@ -87,8 +87,8 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	if !consolidation.Enabled {
 		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.enabled=true")
 	}
-	if consolidation.Mode == config.ConsolidationModeLegacyOnly {
-		return xerrors.Errorf("batch_consolidator cron requires non-legacy consolidation mode, got %q", consolidation.Mode)
+	if consolidation.Mode != config.ConsolidationModeAutoConsolidate {
+		return xerrors.Errorf("batch_consolidator cron requires consolidation mode %q, got %q", config.ConsolidationModeAutoConsolidate, consolidation.Mode)
 	}
 	if consolidation.MaxBlocks == 0 {
 		return xerrors.New("batch_consolidator cron requires aws.storage.consolidation.max_blocks to be positive")

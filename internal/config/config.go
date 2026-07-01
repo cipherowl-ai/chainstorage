@@ -640,11 +640,13 @@ const (
 )
 
 func (m ConsolidationMode) IsAutoConsolidate() bool {
-	return m == ConsolidationModeAutoConsolidate || m == ConsolidationModeHistoricalBackfill
+	return m == ConsolidationModeAutoConsolidate
 }
 
 func (m ConsolidationMode) IsShadowWrite() bool {
-	return m == ConsolidationModeShadowDualWrite || m.IsAutoConsolidate()
+	return m == ConsolidationModeShadowDualWrite ||
+		m == ConsolidationModeAutoConsolidate ||
+		m == ConsolidationModeHistoricalBackfill
 }
 
 func New(opts ...ConfigOption) (*Config, error) {
