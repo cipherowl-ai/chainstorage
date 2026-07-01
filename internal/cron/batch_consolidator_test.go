@@ -46,7 +46,7 @@ type (
 
 var _ cadence.Runtime = (*batchConsolidatorCronRuntime)(nil)
 
-func TestBatchConsolidatorCronStartsFullWindowHistoricalBackfillWorkflow(t *testing.T) {
+func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
@@ -65,7 +65,7 @@ func TestBatchConsolidatorCronStartsFullWindowHistoricalBackfillWorkflow(t *test
 	require.Equal(t, "workflow.batch_consolidator/auto_consolidate", runtime.executions[0].options.ID)
 	require.Equal(t, "default", runtime.executions[0].options.TaskQueue)
 	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         tag,
 		StartHeight: 1_500,
 		EndHeight:   3_500,
@@ -110,14 +110,14 @@ func TestBatchConsolidatorCronSkipsShardTailWithoutFullConsolidationWindow(t *te
 	require.NoError(t, task.Run(context.Background()))
 	require.Len(t, runtime.executions, 1)
 	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         tag,
 		StartHeight: 10_000,
 		EndHeight:   11_000,
 	}, runtime.executions[0].request)
 }
 
-func TestBatchConsolidatorCronDoesNotCapHistoricalBackfillAtPromotionGate(t *testing.T) {
+func TestBatchConsolidatorCronDoesNotCapAutoConsolidateAtPromotionGate(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	gateHeight := uint64(1_600)
@@ -136,7 +136,7 @@ func TestBatchConsolidatorCronDoesNotCapHistoricalBackfillAtPromotionGate(t *tes
 	require.NoError(t, task.Run(context.Background()))
 	require.Len(t, runtime.executions, 1)
 	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         tag,
 		StartHeight: 1_000,
 		EndHeight:   4_000,
@@ -184,7 +184,7 @@ func newBatchConsolidatorCronTask(t *testing.T) (*batchConsolidatorTask, *batchC
 	cfg.Cron.BatchConsolidator.Enabled = true
 	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 	cfg.AWS.Storage.Consolidation.Enabled = true
-	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModeHistoricalBackfill
+	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModeAutoConsolidate
 	cfg.AWS.Storage.Consolidation.MaxBlocks = 1_000
 	safeLag := uint64(100)
 	cfg.AWS.Storage.Consolidation.SafePromotionLag = &safeLag

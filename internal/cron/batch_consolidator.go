@@ -161,7 +161,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		return nil
 	}
 
-	startHeight, endHeight, found, err := t.nextHistoricalBackfillRange(
+	startHeight, endHeight, found, err := t.nextAutoConsolidateRange(
 		ctx,
 		tag,
 		searchStart,
@@ -186,7 +186,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	}
 
 	request := &workflow.BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         tag,
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
@@ -213,7 +213,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	return nil
 }
 
-func (t *batchConsolidatorTask) nextHistoricalBackfillRange(
+func (t *batchConsolidatorTask) nextAutoConsolidateRange(
 	ctx context.Context,
 	tag uint32,
 	searchStart uint64,

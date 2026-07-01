@@ -9,7 +9,7 @@
 
 **Services involved:**
 - `internal/cron/` - schedules automatic batch consolidation workflows.
-- `internal/workflow/` - executes `historical_backfill` and `promote_finalized` modes.
+- `internal/workflow/` - executes `auto_consolidate` and `promote_finalized` modes.
 - `internal/storage/metastorage/postgres/` - finds missing or promotable consolidation metadata.
 
 **Dependencies confirmed with user:** yes
@@ -26,7 +26,7 @@
 
 1. The normal scheduler stalls because it promotes existing sidecars instead of creating missing sidecars.
    - Supports: cron requires `promote_finalized` and calls `GetFirstPromotableBlockConsolidationShadow`.
-   - Conflicts: manual historical backfills work.
+   - Conflicts: manual deprecated `historical_backfill` alias workflows work.
 2. Partial object creation happens because cron caps by safe end without flooring to full object windows.
    - Supports: old `batchConsolidatorCronRangeEnd` only applied `max_range_blocks`, then min-capped at safe end.
    - Conflicts: workflow can technically process arbitrary ranges.
@@ -46,7 +46,7 @@ The cron was still modeled as a finalized-shadow promotion scheduler, while Sola
 
 ## Fix
 
-- Schedule `historical_backfill` workflows from the first missing consolidation sidecar row.
+- Schedule `auto_consolidate` workflows from the first missing consolidation sidecar row.
 - Floor scheduled ranges to complete `consolidation.max_blocks` windows and leave residual blocks waiting.
 - Stop using `promotion_gate_height` as an upper cap for sidecar creation.
 - Rewrite missing/promotable lookup queries to start from the more selective indexed tables and add a partial promotable-shadow index.

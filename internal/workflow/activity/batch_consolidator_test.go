@@ -94,7 +94,28 @@ func (s *BatchConsolidatorTestSuite) TestEmptyScanNoOps() {
 	}, response)
 }
 
-func (s *BatchConsolidatorTestSuite) TestHistoricalBackfillEmptyScanNoOpsWhenShadowsAlreadyExist() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanNoOpsWhenShadowsAlreadyExist() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   100,
+	}
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(nil, nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight: request.StartHeight,
+		EndHeight:   request.EndHeight,
+	}, response)
+}
+
+func (s *BatchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemainsAccepted() {
 	require := testutil.Require(s.T())
 	request := &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeHistoricalBackfill,
@@ -203,12 +224,12 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	}
 }
 
-func (s *BatchConsolidatorTestSuite) TestHistoricalBackfillWaitsForFullContiguousWindow() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateWaitsForFullContiguousWindow() {
 	require := testutil.Require(s.T())
 	records, _ := makeConsolidatorFixture(3, 1000)
 	records = []*metastorage.BlockMetadataRecord{records[0], records[2]}
 	request := &BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         records[0].Metadata.GetTag(),
 		StartHeight: 1000,
 		EndHeight:   1003,
@@ -251,7 +272,7 @@ func (s *BatchConsolidatorTestSuite) TestUploadFailureDoesNotPersistShadowPlacem
 	require := testutil.Require(s.T())
 	records, blocks := makeConsolidatorFixture(1, 1000)
 	request := &BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         records[0].Metadata.GetTag(),
 		StartHeight: 1000,
 		EndHeight:   1001,
