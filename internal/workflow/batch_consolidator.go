@@ -62,6 +62,8 @@ const (
 	batchConsolidatorHistoricalParallelismVersion  = 1
 	batchConsolidatorAutoSerialChangeID            = "batch-consolidator-auto-serial"
 	batchConsolidatorAutoSerialVersion             = 1
+	batchConsolidatorAutoCursorChangeID            = "batch-consolidator-auto-cursor"
+	batchConsolidatorAutoCursorVersion             = 1
 	batchConsolidatorMaxParallelism                = 10
 	maxUint64                                      = ^uint64(0)
 )
@@ -183,6 +185,15 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				batchConsolidatorAutoSerialVersion,
 			)
 		}
+		autoConsolidateCursorVersion := workflow.DefaultVersion
+		if mode.IsAutoConsolidate() {
+			autoConsolidateCursorVersion = workflow.GetVersion(
+				ctx,
+				batchConsolidatorAutoCursorChangeID,
+				workflow.DefaultVersion,
+				batchConsolidatorAutoCursorVersion,
+			)
+		}
 
 		if historicalBackfillVersion != workflow.DefaultVersion {
 			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
@@ -193,7 +204,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			if err := w.validateAutoConsolidateRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
-			if autoConsolidateVersion != workflow.DefaultVersion &&
+			if autoConsolidateCursorVersion != workflow.DefaultVersion &&
 				!batchConsolidatorAutoRangeHasOnlyFullObjectWindows(request.StartHeight, request.EndHeight, batchSize, maxBlocks, shardSize) {
 				return xerrors.Errorf(
 					"auto_consolidate range [%d, %d) must contain only full object windows of max_blocks=%d",
@@ -277,10 +288,11 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				continue
 			}
 
-			if mode.IsAutoConsolidate() {
-				autoConsolidateParallelism := parallelism
-				if autoConsolidateVersion != workflow.DefaultVersion {
-					autoConsolidateParallelism = 1
+			if mode.IsAutoConsolidate() &&
+				(autoConsolidateCursorVersion != workflow.DefaultVersion || autoConsolidateVersion == workflow.DefaultVersion) {
+				autoConsolidateParallelism := 1
+				if autoConsolidateCursorVersion == workflow.DefaultVersion {
+					autoConsolidateParallelism = parallelism
 				}
 				objectsInBatch, blocksInBatch, err := w.processAutoConsolidateBatchParallel(
 					ctx,
@@ -420,7 +432,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			batchStart = batchEnd
 		}
 
-		if mode.IsAutoConsolidate() && autoConsolidateVersion != workflow.DefaultVersion {
+		if mode.IsAutoConsolidate() && autoConsolidateCursorVersion != workflow.DefaultVersion {
 			if _, err := w.batchConsolidator.UpdateAutoConsolidateCursor(cursorCtx, &activity.BatchConsolidatorCursorRequest{
 				Tag:    tag,
 				Height: workflowEndHeight,

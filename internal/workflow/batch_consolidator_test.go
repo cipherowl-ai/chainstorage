@@ -649,6 +649,11 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesP
 		temporalworkflow.DefaultVersion,
 		batchConsolidatorAutoSerialVersion,
 	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnGetVersion(
+		batchConsolidatorAutoCursorChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoCursorVersion,
+	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -702,6 +707,58 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesP
 		EndHeight:   200,
 		MaxBlocks:   25,
 	}, requests[3])
+}
+
+func (s *batchConsolidatorTestSuite) TestAutoConsolidateSerialVersionWithoutCursorPreservesOldScanner() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
+	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
+	var requests []*activity.BatchConsolidatorRequest
+	s.mockAutoConsolidateLatestHeight(220)
+	s.mockEmptyShadowStats()
+	s.env.OnGetVersion(
+		batchConsolidatorAutoSerialChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoSerialVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoSerialVersion))
+	s.env.OnGetVersion(
+		batchConsolidatorAutoCursorChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoCursorVersion,
+	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			if len(requests) == 1 {
+				return &activity.BatchConsolidatorResponse{
+					StartHeight:        request.StartHeight,
+					EndHeight:          request.EndHeight,
+					ScannedBlocks:      request.EndHeight - request.StartHeight,
+					ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+					ObjectKey:          "consolidated/object.zstd",
+				}, nil
+			}
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+		Parallelism: 4,
+	})
+	require.NoError(err)
+	require.Equal([]*activity.BatchConsolidatorRequest{
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 200, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 200, MaxBlocks: 25},
+	}, requests)
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateResumeAfterLostActivityCompletion() {

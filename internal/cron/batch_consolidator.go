@@ -207,10 +207,34 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 			return err
 		}
 		if !bootstrapFound {
+			cursorEnd, cursorEndFound := batchConsolidatorCronRangeEnd(
+				cronConfig.StartHeight,
+				searchEnd,
+				cronConfig.MaxRangeBlocks,
+				consolidation.MaxBlocks,
+				consolidation.ShardSize,
+			)
+			if !cursorEndFound {
+				t.logger.Info(
+					"batch_consolidator cron found no missing consolidation shadow and no full window to bootstrap cursor",
+					zap.Uint32("tag", tag),
+					zap.Uint64("configured_start_height", cronConfig.StartHeight),
+					zap.Uint64("safe_end_height", searchEnd),
+					zap.Uint64("latest_height", latest.GetHeight()),
+					zap.Uint64("safe_consolidation_height", safeHeight),
+					zap.Uint64("max_range_blocks", cronConfig.MaxRangeBlocks),
+					zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
+				)
+				return nil
+			}
+			if err := t.metaStorage.SetBlockConsolidationCursor(ctx, metastorage.BatchConsolidatorAutoConsolidateCursor, tag, cursorEnd); err != nil {
+				return xerrors.Errorf("failed to bootstrap auto_consolidate cursor to height %d: %w", cursorEnd, err)
+			}
 			t.logger.Info(
-				"batch_consolidator cron found no missing consolidation shadow to bootstrap cursor",
+				"batch_consolidator cron bootstrapped cursor from already consolidated range",
 				zap.Uint32("tag", tag),
 				zap.Uint64("configured_start_height", cronConfig.StartHeight),
+				zap.Uint64("cursor_height", cursorEnd),
 				zap.Uint64("safe_end_height", searchEnd),
 				zap.Uint64("latest_height", latest.GetHeight()),
 				zap.Uint64("safe_consolidation_height", safeHeight),

@@ -227,7 +227,7 @@ func TestBatchConsolidatorCronWaitsWhenCursorHasNoFullNewWindow(t *testing.T) {
 	require.Empty(t, runtime.executions)
 }
 
-func TestBatchConsolidatorCronWaitsWhenNoMissingShadowBootstrapsCursor(t *testing.T) {
+func TestBatchConsolidatorCronBootstrapsCursorWhenNoMissingShadow(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
@@ -242,6 +242,9 @@ func TestBatchConsolidatorCronWaitsWhenNoMissingShadowBootstrapsCursor(t *testin
 	metaStorage.EXPECT().
 		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(11_901)).
 		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag, uint64(11_000)).
+		Return(nil)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)
