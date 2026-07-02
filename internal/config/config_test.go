@@ -142,6 +142,20 @@ func TestValidateConfigs(t *testing.T) {
 	})
 }
 
+func TestSolanaProductionCadenceKeepAliveConfig(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New(
+		config.WithEnvironment(config.EnvProduction),
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+
+	require.NoError(err)
+	require.Equal(10*time.Second, cfg.Cadence.KeepAliveTime)
+	require.Equal(30*time.Second, cfg.Cadence.KeepAliveTimeout)
+}
+
 func TestDerivedConfigValues(t *testing.T) {
 	testapp.TestAllConfigs(t, func(t *testing.T, cfg *config.Config) {
 		require := testutil.Require(t)

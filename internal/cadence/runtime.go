@@ -63,11 +63,6 @@ type (
 	listOpenWorkflowsFn func(ctx context.Context, request *workflowservice.ListOpenWorkflowExecutionsRequest) (*workflowservice.ListOpenWorkflowExecutionsResponse, error)
 )
 
-const (
-	temporalClientKeepAliveTime    = 10 * time.Second
-	temporalClientKeepAliveTimeout = 30 * time.Second
-)
-
 func NewRuntime(params RuntimeParams) (Runtime, error) {
 	if params.TestEnv != nil {
 		return newTestRuntime(params.TestEnv, params.Logger)
@@ -123,9 +118,12 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 }
 
 func newConnectionOptions(address string, cadenceConfig config.CadenceConfig, env config.Env) (client.ConnectionOptions, error) {
-	connectionOptions := client.ConnectionOptions{
-		KeepAliveTime:    temporalClientKeepAliveTime,
-		KeepAliveTimeout: temporalClientKeepAliveTimeout,
+	connectionOptions := client.ConnectionOptions{}
+	if cadenceConfig.KeepAliveTime > 0 {
+		connectionOptions.KeepAliveTime = cadenceConfig.KeepAliveTime
+	}
+	if cadenceConfig.KeepAliveTimeout > 0 {
+		connectionOptions.KeepAliveTimeout = cadenceConfig.KeepAliveTimeout
 	}
 
 	tlsConfig := cadenceConfig.TLSConfig

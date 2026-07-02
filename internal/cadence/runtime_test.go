@@ -14,12 +14,32 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 )
 
-func TestNewConnectionOptionsSetsTemporalKeepAlive(t *testing.T) {
+func TestNewConnectionOptionsLeavesTemporalKeepAliveUnsetByDefault(t *testing.T) {
 	require := require.New(t)
 
 	options, err := newConnectionOptions(
 		"temporal.example.com:7233",
 		config.CadenceConfig{},
+		config.EnvProduction,
+	)
+
+	require.NoError(err)
+	require.Zero(options.KeepAliveTime)
+	require.Zero(options.KeepAliveTimeout)
+	require.False(options.DisableKeepAliveCheck)
+	require.False(options.DisableKeepAlivePermitWithoutStream)
+	require.Nil(options.TLS)
+}
+
+func TestNewConnectionOptionsAppliesConfiguredTemporalKeepAlive(t *testing.T) {
+	require := require.New(t)
+
+	options, err := newConnectionOptions(
+		"temporal.example.com:7233",
+		config.CadenceConfig{
+			KeepAliveTime:    10 * time.Second,
+			KeepAliveTimeout: 30 * time.Second,
+		},
 		config.EnvProduction,
 	)
 
@@ -37,6 +57,8 @@ func TestNewConnectionOptionsPreservesTLSConfig(t *testing.T) {
 	options, err := newConnectionOptions(
 		"temporal.example.com:7233",
 		config.CadenceConfig{
+			KeepAliveTime:    10 * time.Second,
+			KeepAliveTimeout: 30 * time.Second,
 			TLSConfig: config.CadenceTLSConfig{
 				Enabled:          true,
 				ValidateHostname: true,
@@ -52,6 +74,40 @@ func TestNewConnectionOptionsPreservesTLSConfig(t *testing.T) {
 	require.False(options.TLS.InsecureSkipVerify)
 	require.Equal(10*time.Second, options.KeepAliveTime)
 	require.Equal(30*time.Second, options.KeepAliveTimeout)
+}
+
+func TestNewConnectionOptionsSuppressesTLSConfigForLocalEnv(t *testing.T) {
+	require := require.New(t)
+
+	options, err := newConnectionOptions(
+		"temporal.example.com:7233",
+		config.CadenceConfig{
+			TLSConfig: config.CadenceTLSConfig{
+				Enabled: true,
+			},
+		},
+		config.EnvLocal,
+	)
+
+	require.NoError(err)
+	require.Nil(options.TLS)
+}
+
+func TestNewConnectionOptionsRejectsInvalidCA(t *testing.T) {
+	require := require.New(t)
+
+	_, err := newConnectionOptions(
+		"temporal.example.com:7233",
+		config.CadenceConfig{
+			TLSConfig: config.CadenceTLSConfig{
+				Enabled:              true,
+				CertificateAuthority: "not-pem",
+			},
+		},
+		config.EnvProduction,
+	)
+
+	require.ErrorContains(err, "failed to parse CA certificate")
 }
 
 func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
