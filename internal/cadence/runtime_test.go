@@ -2,6 +2,7 @@ package cadence
 
 import (
 	"context"
+	"crypto/tls"
 	"testing"
 	"time"
 
@@ -12,6 +13,46 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/config"
 )
+
+func TestNewConnectionOptionsSetsTemporalKeepAlive(t *testing.T) {
+	require := require.New(t)
+
+	options, err := newConnectionOptions(
+		"temporal.example.com:7233",
+		config.CadenceConfig{},
+		config.EnvProduction,
+	)
+
+	require.NoError(err)
+	require.Equal(10*time.Second, options.KeepAliveTime)
+	require.Equal(30*time.Second, options.KeepAliveTimeout)
+	require.False(options.DisableKeepAliveCheck)
+	require.False(options.DisableKeepAlivePermitWithoutStream)
+	require.Nil(options.TLS)
+}
+
+func TestNewConnectionOptionsPreservesTLSConfig(t *testing.T) {
+	require := require.New(t)
+
+	options, err := newConnectionOptions(
+		"temporal.example.com:7233",
+		config.CadenceConfig{
+			TLSConfig: config.CadenceTLSConfig{
+				Enabled:          true,
+				ValidateHostname: true,
+			},
+		},
+		config.EnvProduction,
+	)
+
+	require.NoError(err)
+	require.NotNil(options.TLS)
+	require.Equal(uint16(tls.VersionTLS12), options.TLS.MinVersion)
+	require.Equal("temporal.example.com", options.TLS.ServerName)
+	require.False(options.TLS.InsecureSkipVerify)
+	require.Equal(10*time.Second, options.KeepAliveTime)
+	require.Equal(30*time.Second, options.KeepAliveTimeout)
+}
 
 func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
 	require := require.New(t)
