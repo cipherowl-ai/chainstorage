@@ -171,9 +171,8 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		return nil
 	}
 
-	repairScanStart := searchStart
 	if cursorFound {
-		repairScanStart = cronConfig.StartHeight
+		repairScanStart := cronConfig.StartHeight
 		if cursorHeight > consolidation.ShardSize && cursorHeight-consolidation.ShardSize > repairScanStart {
 			repairScanStart = cursorHeight - consolidation.ShardSize
 		}
