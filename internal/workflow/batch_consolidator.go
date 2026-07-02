@@ -162,17 +162,17 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			workflow.DefaultVersion,
 			batchConsolidatorShadowStatsVersion,
 		) != workflow.DefaultVersion && mode != config.ConsolidationModePromoteFinalized
-		useHistoricalBackfillParallelism := false
-		if mode == config.ConsolidationModeHistoricalBackfill && parallelism > 1 {
-			useHistoricalBackfillParallelism = workflow.GetVersion(
+		historicalBackfillVersion := workflow.DefaultVersion
+		if mode == config.ConsolidationModeHistoricalBackfill {
+			historicalBackfillVersion = workflow.GetVersion(
 				ctx,
 				batchConsolidatorHistoricalParallelismChangeID,
 				workflow.DefaultVersion,
 				batchConsolidatorHistoricalParallelismVersion,
-			) != workflow.DefaultVersion
+			)
 		}
 
-		if mode == config.ConsolidationModeHistoricalBackfill {
+		if historicalBackfillVersion != workflow.DefaultVersion {
 			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
@@ -227,7 +227,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
 
-			if useHistoricalBackfillParallelism {
+			if historicalBackfillVersion != workflow.DefaultVersion && parallelism > 1 {
 				objectsInBatch, blocksInBatch, err := w.processHistoricalBackfillBatchParallel(
 					ctx,
 					statsCtx,
