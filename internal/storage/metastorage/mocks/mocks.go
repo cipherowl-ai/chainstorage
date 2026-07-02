@@ -129,6 +129,22 @@ func (mr *MockMetaStorageMockRecorder) GetBlockByTimestamp(arg0, arg1, arg2 any)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByTimestamp", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockByTimestamp), arg0, arg1, arg2)
 }
 
+// GetBlockConsolidationCursor mocks base method.
+func (m *MockMetaStorage) GetBlockConsolidationCursor(arg0 context.Context, arg1 string, arg2 uint32) (uint64, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationCursor", arg0, arg1, arg2)
+	ret0, _ := ret[0].(uint64)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// GetBlockConsolidationCursor indicates an expected call of GetBlockConsolidationCursor.
+func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationCursor(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationCursor", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationCursor), arg0, arg1, arg2)
+}
+
 // GetBlockConsolidationShadow mocks base method.
 func (m *MockMetaStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -414,6 +430,20 @@ func (mr *MockMetaStorageMockRecorder) PromoteBlockConsolidationShadows(arg0, ar
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteBlockConsolidationShadows", reflect.TypeOf((*MockMetaStorage)(nil).PromoteBlockConsolidationShadows), arg0, arg1, arg2, arg3, arg4)
 }
 
+// SetBlockConsolidationCursor mocks base method.
+func (m *MockMetaStorage) SetBlockConsolidationCursor(arg0 context.Context, arg1 string, arg2 uint32, arg3 uint64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetBlockConsolidationCursor", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetBlockConsolidationCursor indicates an expected call of SetBlockConsolidationCursor.
+func (mr *MockMetaStorageMockRecorder) SetBlockConsolidationCursor(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetBlockConsolidationCursor", reflect.TypeOf((*MockMetaStorage)(nil).SetBlockConsolidationCursor), arg0, arg1, arg2, arg3)
+}
+
 // SetMaxEventId mocks base method.
 func (m *MockMetaStorage) SetMaxEventId(arg0 context.Context, arg1 uint32, arg2 int64) error {
 	m.ctrl.T.Helper()
@@ -651,6 +681,22 @@ func (mr *MockBlockStorageMockRecorder) GetBlockByTimestamp(arg0, arg1, arg2 any
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockByTimestamp", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockByTimestamp), arg0, arg1, arg2)
 }
 
+// GetBlockConsolidationCursor mocks base method.
+func (m *MockBlockStorage) GetBlockConsolidationCursor(arg0 context.Context, arg1 string, arg2 uint32) (uint64, bool, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationCursor", arg0, arg1, arg2)
+	ret0, _ := ret[0].(uint64)
+	ret1, _ := ret[1].(bool)
+	ret2, _ := ret[2].(error)
+	return ret0, ret1, ret2
+}
+
+// GetBlockConsolidationCursor indicates an expected call of GetBlockConsolidationCursor.
+func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationCursor(arg0, arg1, arg2 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationCursor", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationCursor), arg0, arg1, arg2)
+}
+
 // GetBlockConsolidationShadow mocks base method.
 func (m *MockBlockStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -829,6 +875,20 @@ func (m *MockBlockStorage) PromoteBlockConsolidationShadows(arg0 context.Context
 func (mr *MockBlockStorageMockRecorder) PromoteBlockConsolidationShadows(arg0, arg1, arg2, arg3, arg4 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PromoteBlockConsolidationShadows", reflect.TypeOf((*MockBlockStorage)(nil).PromoteBlockConsolidationShadows), arg0, arg1, arg2, arg3, arg4)
+}
+
+// SetBlockConsolidationCursor mocks base method.
+func (m *MockBlockStorage) SetBlockConsolidationCursor(arg0 context.Context, arg1 string, arg2 uint32, arg3 uint64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetBlockConsolidationCursor", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetBlockConsolidationCursor indicates an expected call of SetBlockConsolidationCursor.
+func (mr *MockBlockStorageMockRecorder) SetBlockConsolidationCursor(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetBlockConsolidationCursor", reflect.TypeOf((*MockBlockStorage)(nil).SetBlockConsolidationCursor), arg0, arg1, arg2, arg3)
 }
 
 // MockTransactionStorage is a mock of TransactionStorage interface.

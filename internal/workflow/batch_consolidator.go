@@ -192,6 +192,15 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			if err := w.validateAutoConsolidateRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
+			if autoConsolidateVersion != workflow.DefaultVersion &&
+				!batchConsolidatorAutoRangeHasOnlyFullObjectWindows(request.StartHeight, request.EndHeight, batchSize, maxBlocks, shardSize) {
+				return xerrors.Errorf(
+					"auto_consolidate range [%d, %d) must contain only full object windows of max_blocks=%d",
+					request.StartHeight,
+					request.EndHeight,
+					maxBlocks,
+				)
+			}
 		}
 
 		workflowEndHeight := request.EndHeight
@@ -267,7 +276,11 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				continue
 			}
 
-			if mode.IsAutoConsolidate() && autoConsolidateVersion == workflow.DefaultVersion {
+			if mode.IsAutoConsolidate() {
+				autoConsolidateParallelism := parallelism
+				if autoConsolidateVersion != workflow.DefaultVersion {
+					autoConsolidateParallelism = 1
+				}
 				objectsInBatch, blocksInBatch, err := w.processAutoConsolidateBatchParallel(
 					ctx,
 					statsCtx,
@@ -278,7 +291,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 					batchStart,
 					batchEnd,
 					maxBlocks,
-					parallelism,
+					autoConsolidateParallelism,
 					usePersistedShadowStats,
 				)
 				if err != nil {
@@ -404,6 +417,16 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				zap.Uint64("consolidated_blocks", blocksInBatch),
 			)
 			batchStart = batchEnd
+		}
+
+		if mode.IsAutoConsolidate() && autoConsolidateVersion != workflow.DefaultVersion {
+			if _, err := w.batchConsolidator.UpdateAutoConsolidateCursor(ctx, &activity.BatchConsolidatorCursorRequest{
+				Tag:    tag,
+				Height: workflowEndHeight,
+			}); err != nil {
+				return xerrors.Errorf("failed to update auto_consolidate cursor to height %d: %w", workflowEndHeight, err)
+			}
+			logger.Info("updated auto_consolidate cursor", zap.Uint32("tag", tag), zap.Uint64("height", workflowEndHeight))
 		}
 
 		logger.Info("workflow finished")
@@ -924,6 +947,27 @@ func batchConsolidatorFullObjectWindowEnd(startHeight uint64, batchEnd uint64, m
 		return batchEnd, false
 	}
 	return windowEnd, true
+}
+
+func batchConsolidatorAutoRangeHasOnlyFullObjectWindows(startHeight uint64, endHeight uint64, batchSize uint64, maxBlocks uint64, shardSize uint64) bool {
+	if endHeight <= startHeight || batchSize == 0 || maxBlocks == 0 || shardSize == 0 {
+		return false
+	}
+	for batchStart := startHeight; batchStart < endHeight; {
+		batchEnd := batchConsolidatorWindowEnd(batchStart, endHeight, batchSize, shardSize)
+		if batchEnd <= batchStart {
+			return false
+		}
+		for windowStart := batchStart; windowStart < batchEnd; {
+			windowEnd, fullWindow := batchConsolidatorFullObjectWindowEnd(windowStart, batchEnd, maxBlocks)
+			if !fullWindow || windowEnd <= windowStart {
+				return false
+			}
+			windowStart = windowEnd
+		}
+		batchStart = batchEnd
+	}
+	return true
 }
 
 func batchConsolidatorShardEnd(height uint64, shardSize uint64) uint64 {

@@ -18,6 +18,7 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	metastoragemocks "github.com/coinbase/chainstorage/internal/storage/metastorage/mocks"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	"github.com/coinbase/chainstorage/internal/utils/timesource"
@@ -54,11 +55,14 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
 		GetLatestBlock(gomock.Any(), tag).
 		Return(&api.BlockMetadata{Tag: tag, Height: 5_000}, nil)
 	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(4_901)).
-		Return(uint64(1_500), true, nil)
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Len(t, runtime.executions, 1)
@@ -67,8 +71,8 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         tag,
-		StartHeight: 1_500,
-		EndHeight:   3_500,
+		StartHeight: 1_000,
+		EndHeight:   3_000,
 	}, runtime.executions[0].request)
 }
 
@@ -80,32 +84,35 @@ func TestBatchConsolidatorCronWaitsForFullConsolidationWindow(t *testing.T) {
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
 		GetLatestBlock(gomock.Any(), tag).
 		Return(&api.BlockMetadata{Tag: tag, Height: 2_098}, nil)
 	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(1_999)).
-		Return(uint64(1_000), true, nil)
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)
 }
 
-func TestBatchConsolidatorCronSkipsShardTailWithoutFullConsolidationWindow(t *testing.T) {
+func TestBatchConsolidatorCronUsesPersistedCursor(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
-	cfg.Cron.BatchConsolidator.StartHeight = 9_000
+	cfg.Cron.BatchConsolidator.StartHeight = 1_000
 	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(10_000), true, nil)
+	metaStorage.EXPECT().
 		GetLatestBlock(gomock.Any(), tag).
 		Return(&api.BlockMetadata{Tag: tag, Height: 12_000}, nil)
 	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(9_000), uint64(11_901)).
-		Return(uint64(9_500), true, nil)
-	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(10_000), uint64(11_901)).
-		Return(uint64(10_000), true, nil)
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Len(t, runtime.executions, 1)
@@ -127,11 +134,14 @@ func TestBatchConsolidatorCronDoesNotCapAutoConsolidateAtPromotionGate(t *testin
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
 		GetLatestBlock(gomock.Any(), tag).
 		Return(&api.BlockMetadata{Tag: tag, Height: 5_000}, nil)
 	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(4_901)).
-		Return(uint64(1_000), true, nil)
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Len(t, runtime.executions, 1)
@@ -143,18 +153,21 @@ func TestBatchConsolidatorCronDoesNotCapAutoConsolidateAtPromotionGate(t *testin
 	}, runtime.executions[0].request)
 }
 
-func TestBatchConsolidatorCronNoOpsWhenNoMissingConsolidationShadowExists(t *testing.T) {
+func TestBatchConsolidatorCronWaitsWhenCursorHasNoFullNewWindow(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(1_000), true, nil)
+	metaStorage.EXPECT().
 		GetLatestBlock(gomock.Any(), tag).
 		Return(&api.BlockMetadata{Tag: tag, Height: 2_000}, nil)
 	metaStorage.EXPECT().
-		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(1_901)).
-		Return(uint64(0), false, nil)
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)
@@ -166,6 +179,7 @@ func TestBatchConsolidatorCronSkipsWhenBatchConsolidatorWorkflowIsAlreadyOpen(t 
 	runtime.openWorkflowID = []string{"custom-manual-promote-workflow-id"}
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
 
+	metaStorage.EXPECT().GetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
 	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 
@@ -179,6 +193,7 @@ func TestBatchConsolidatorCronRequiresAutoConsolidateMode(t *testing.T) {
 	defer ctrl.Finish()
 	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModePromoteFinalized
 
+	metaStorage.EXPECT().GetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
 	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 

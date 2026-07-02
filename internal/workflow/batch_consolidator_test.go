@@ -309,6 +309,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateValidatesFinalizedRange(
 	var requests []*activity.BatchConsolidatorRequest
 	s.mockAutoConsolidateLatestHeight(120)
 	s.mockEmptyShadowStats()
+	s.mockAutoConsolidateCursorUpdate(111)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -409,6 +410,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDuplicateRunNoOpsWhenSca
 	var requests []*activity.BatchConsolidatorRequest
 	s.mockAutoConsolidateLatestHeight(120)
 	s.mockEmptyShadowStats()
+	s.mockAutoConsolidateCursorUpdate(111)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -430,21 +432,47 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDuplicateRunNoOpsWhenSca
 	require.Equal(config.ConsolidationModeAutoConsolidate, requests[0].Mode)
 }
 
-func (s *batchConsolidatorTestSuite) TestAutoConsolidateLeavesWindowSelectionToSerialActivity() {
+func (s *batchConsolidatorTestSuite) TestAutoConsolidateProcessesFullObjectWindowsSerially() {
 	require := testutil.Require(s.T())
 
 	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
 	var requests []*activity.BatchConsolidatorRequest
-	s.mockAutoConsolidateLatestHeight(120)
+	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
+	s.mockAutoConsolidateCursorUpdate(200)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
 			return &activity.BatchConsolidatorResponse{
-				StartHeight: request.StartHeight,
-				EndHeight:   request.EndHeight,
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
 			}, nil
 		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
+	require.Equal([]*activity.BatchConsolidatorRequest{
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 125, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 125, EndHeight: 150, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 150, EndHeight: 175, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 175, EndHeight: 200, MaxBlocks: 25},
+	}, requests)
+}
+
+func (s *batchConsolidatorTestSuite) TestAutoConsolidateRejectsPartialObjectWindowRange() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.mockAutoConsolidateLatestHeight(120)
 
 	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
@@ -453,15 +481,8 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateLeavesWindowSelectionToS
 		EndHeight:   111,
 		MaxBlocks:   25,
 	})
-	require.NoError(err)
-	require.Len(requests, 1)
-	require.Equal(&activity.BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeAutoConsolidate,
-		Tag:         2,
-		StartHeight: 100,
-		EndHeight:   111,
-		MaxBlocks:   25,
-	}, requests[0])
+	require.Error(err)
+	require.Contains(err.Error(), "must contain only full object windows")
 }
 
 func (s *batchConsolidatorTestSuite) TestHistoricalBackfillProcessesObjectWindowsInParallel() {
@@ -582,22 +603,17 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 	normalCalls := 0
 	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
+	s.mockAutoConsolidateCursorUpdate(200)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
 			normalCalls++
-			if normalCalls == 1 {
-				return &activity.BatchConsolidatorResponse{
-					StartHeight:        request.StartHeight,
-					EndHeight:          request.EndHeight,
-					ScannedBlocks:      request.MaxBlocks,
-					ConsolidatedBlocks: request.MaxBlocks,
-					ObjectKey:          "consolidated/object.zstd",
-				}, nil
-			}
 			return &activity.BatchConsolidatorResponse{
-				StartHeight: request.StartHeight,
-				EndHeight:   request.EndHeight,
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
 			}, nil
 		})
 
@@ -610,16 +626,13 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 		Parallelism: 4,
 	})
 	require.NoError(err)
-	require.Len(requests, 2)
-	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{
-			Mode:        config.ConsolidationModeAutoConsolidate,
-			Tag:         2,
-			StartHeight: 100,
-			EndHeight:   200,
-			MaxBlocks:   25,
-		}, request)
-	}
+	require.Equal(4, normalCalls)
+	require.Equal([]*activity.BatchConsolidatorRequest{
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 125, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 125, EndHeight: 150, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 150, EndHeight: 175, MaxBlocks: 25},
+		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 175, EndHeight: 200, MaxBlocks: 25},
+	}, requests)
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesParallelObjectWindows() {
@@ -697,6 +710,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateResumeAfterLostActivityC
 	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
 	var requests []*activity.BatchConsolidatorRequest
 	s.mockAutoConsolidateLatestHeight(120)
+	s.mockAutoConsolidateCursorUpdate(111)
 	statsCalls := 0
 	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
@@ -980,6 +994,19 @@ func (s *batchConsolidatorTestSuite) mockAutoConsolidateLatestHeight(height uint
 			return &activity.BatchConsolidatorLatestBlockResponse{
 				Tag:    request.Tag,
 				Height: height,
+			}, nil
+		})
+}
+
+func (s *batchConsolidatorTestSuite) mockAutoConsolidateCursorUpdate(height uint64) {
+	s.env.OnActivity(activity.ActivityBatchConsolidatorCursor, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorCursorRequest) (*activity.BatchConsolidatorCursorResponse, error) {
+			require := testutil.Require(s.T())
+			require.Equal(uint64(2), uint64(request.Tag))
+			require.Equal(height, request.Height)
+			return &activity.BatchConsolidatorCursorResponse{
+				Tag:    request.Tag,
+				Height: request.Height,
 			}, nil
 		})
 }

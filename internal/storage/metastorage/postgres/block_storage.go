@@ -859,6 +859,40 @@ func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 	return height, true, nil
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error) {
+	if name == "" {
+		return 0, false, xerrors.New("block consolidation cursor name must be non-empty")
+	}
+	const query = `
+		SELECT height
+		FROM block_consolidation_cursor
+		WHERE name = $1 AND tag = $2`
+	var height uint64
+	if err := b.db.QueryRowContext(ctx, query, name, tag).Scan(&height); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, false, nil
+		}
+		return 0, false, xerrors.Errorf("failed to get block consolidation cursor %q for tag %d: %w", name, tag, err)
+	}
+	return height, true, nil
+}
+
+func (b *blockStorageImpl) SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error {
+	if name == "" {
+		return xerrors.New("block consolidation cursor name must be non-empty")
+	}
+	const query = `
+		INSERT INTO block_consolidation_cursor (name, tag, height, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (name, tag) DO UPDATE SET
+			height = GREATEST(block_consolidation_cursor.height, EXCLUDED.height),
+			updated_at = NOW()`
+	if _, err := b.db.ExecContext(ctx, query, name, tag, height); err != nil {
+		return xerrors.Errorf("failed to set block consolidation cursor %q for tag %d to height %d: %w", name, tag, height, err)
+	}
+	return nil
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	if len(placements) == 0 {
 		return nil

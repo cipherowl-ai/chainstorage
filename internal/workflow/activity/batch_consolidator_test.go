@@ -225,10 +225,11 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	}
 }
 
-func (s *BatchConsolidatorTestSuite) TestAutoConsolidateWaitsForFullContiguousWindow() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateConsolidatesNonContiguousWindowRecords() {
 	require := testutil.Require(s.T())
-	records, _ := makeConsolidatorFixture(3, 1000)
+	records, blocks := makeConsolidatorFixture(3, 1000)
 	records = []*metastorage.BlockMetadataRecord{records[0], records[2]}
+	blocks = []*api.Block{blocks[0], blocks[2]}
 	request := &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         records[0].Metadata.GetTag(),
@@ -236,16 +237,76 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateWaitsForFullContiguousWi
 		EndHeight:   1003,
 		MaxBlocks:   3,
 	}
+	objectKey := "consolidated/v=000000000001/shard=000000001000-000000001999/000000001000-000000001003-sha.zstd"
+	placements := []blobstorage.BlockPlacement{
+		{
+			MetadataID:         records[0].ID,
+			Height:             records[0].Metadata.GetHeight(),
+			Hash:               records[0].Metadata.GetHash(),
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         0,
+			ByteLength:         100,
+			UncompressedLength: 100,
+		},
+		{
+			MetadataID:         records[1].ID,
+			Height:             records[1].Metadata.GetHeight(),
+			Hash:               records[1].Metadata.GetHash(),
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         100,
+			ByteLength:         110,
+			UncompressedLength: 110,
+		},
+	}
+	expectedShadows := []*metastorage.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           records[0].ID,
+			Tag:                       records[0].Metadata.GetTag(),
+			Height:                    records[0].Metadata.GetHeight(),
+			Hash:                      records[0].Metadata.GetHash(),
+			LegacyObjectKeyMain:       records[0].Metadata.GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: objectKey,
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                0,
+			ByteLength:                100,
+			UncompressedLength:        100,
+		},
+		{
+			BlockMetadataID:           records[1].ID,
+			Tag:                       records[1].Metadata.GetTag(),
+			Height:                    records[1].Metadata.GetHeight(),
+			Hash:                      records[1].Metadata.GetHash(),
+			LegacyObjectKeyMain:       records[1].Metadata.GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: objectKey,
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                100,
+			ByteLength:                110,
+			UncompressedLength:        110,
+		},
+	}
+	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(records, nil)
+	for i, record := range records {
+		s.blobStorage.EXPECT().Download(gomock.Any(), record.Metadata).Return(blocks[i], nil)
+	}
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID, records[1].ID})).
+		Return(objectKey, placements, nil)
+	s.metaStorage.EXPECT().
+		PersistBlockConsolidationShadows(gomock.Any(), expectedShadows).
+		Return(nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
 	require.Equal(&BatchConsolidatorResponse{
-		StartHeight: request.StartHeight,
-		EndHeight:   request.EndHeight,
+		StartHeight:        request.StartHeight,
+		EndHeight:          request.EndHeight,
+		ScannedBlocks:      2,
+		ConsolidatedBlocks: 2,
+		ObjectKey:          objectKey,
 	}, response)
 }
 
@@ -340,6 +401,24 @@ func (s *BatchConsolidatorTestSuite) TestGetLatestBlockRejectsNilMetastoreLatest
 	require.Error(err)
 	require.Nil(response)
 	require.Contains(err.Error(), "latest block not found")
+}
+
+func (s *BatchConsolidatorTestSuite) TestUpdateAutoConsolidateCursorPersistsExclusiveHeight() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorCursorRequest{
+		Tag:    2,
+		Height: 11_000,
+	}
+	s.metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, request.Tag, request.Height).
+		Return(nil)
+
+	response, err := s.batchConsolidator.UpdateAutoConsolidateCursor(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorCursorResponse{
+		Tag:    request.Tag,
+		Height: request.Height,
+	}, response)
 }
 
 func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedPromotesShadows() {
