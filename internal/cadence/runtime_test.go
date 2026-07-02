@@ -18,8 +18,9 @@ func TestNewConnectionOptionsLeavesTemporalKeepAliveUnsetByDefault(t *testing.T)
 	require := require.New(t)
 
 	options, err := newConnectionOptions(
-		"temporal.example.com:7233",
-		config.CadenceConfig{},
+		config.CadenceConfig{
+			Address: "temporal.example.com:7233",
+		},
 		config.EnvProduction,
 	)
 
@@ -35,8 +36,8 @@ func TestNewConnectionOptionsAppliesConfiguredTemporalKeepAlive(t *testing.T) {
 	require := require.New(t)
 
 	options, err := newConnectionOptions(
-		"temporal.example.com:7233",
 		config.CadenceConfig{
+			Address:          "temporal.example.com:7233",
 			KeepAliveTime:    10 * time.Second,
 			KeepAliveTimeout: 30 * time.Second,
 		},
@@ -55,8 +56,8 @@ func TestNewConnectionOptionsPreservesTLSConfig(t *testing.T) {
 	require := require.New(t)
 
 	options, err := newConnectionOptions(
-		"temporal.example.com:7233",
 		config.CadenceConfig{
+			Address:          "temporal.example.com:7233",
 			KeepAliveTime:    10 * time.Second,
 			KeepAliveTimeout: 30 * time.Second,
 			TLSConfig: config.CadenceTLSConfig{
@@ -80,8 +81,8 @@ func TestNewConnectionOptionsSuppressesTLSConfigForLocalEnv(t *testing.T) {
 	require := require.New(t)
 
 	options, err := newConnectionOptions(
-		"temporal.example.com:7233",
 		config.CadenceConfig{
+			Address: "temporal.example.com:7233",
 			TLSConfig: config.CadenceTLSConfig{
 				Enabled: true,
 			},
@@ -97,8 +98,8 @@ func TestNewConnectionOptionsRejectsInvalidCA(t *testing.T) {
 	require := require.New(t)
 
 	_, err := newConnectionOptions(
-		"temporal.example.com:7233",
 		config.CadenceConfig{
+			Address: "temporal.example.com:7233",
 			TLSConfig: config.CadenceTLSConfig{
 				Enabled:              true,
 				CertificateAuthority: "not-pem",

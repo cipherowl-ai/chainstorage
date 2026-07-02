@@ -73,7 +73,7 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 	runtimeLogger := logur.LoggerToKV(zapadapter.New(logger))
 
 	address := params.Config.Cadence.Address
-	connectionOptions, err := newConnectionOptions(address, params.Config.Cadence, params.Config.Env())
+	connectionOptions, err := newConnectionOptions(params.Config.Cadence, params.Config.Env())
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func NewRuntime(params RuntimeParams) (Runtime, error) {
 
 }
 
-func newConnectionOptions(address string, cadenceConfig config.CadenceConfig, env config.Env) (client.ConnectionOptions, error) {
+func newConnectionOptions(cadenceConfig config.CadenceConfig, env config.Env) (client.ConnectionOptions, error) {
 	connectionOptions := client.ConnectionOptions{}
 	if cadenceConfig.KeepAliveTime > 0 {
 		connectionOptions.KeepAliveTime = cadenceConfig.KeepAliveTime
@@ -128,9 +128,9 @@ func newConnectionOptions(address string, cadenceConfig config.CadenceConfig, en
 
 	tlsConfig := cadenceConfig.TLSConfig
 	if tlsConfig.Enabled && env != config.EnvLocal {
-		host, _, err := net.SplitHostPort(address)
+		host, _, err := net.SplitHostPort(cadenceConfig.Address)
 		if err != nil {
-			return client.ConnectionOptions{}, xerrors.Errorf("failed to parse address (%v): %w", address, err)
+			return client.ConnectionOptions{}, xerrors.Errorf("failed to parse address (%v): %w", cadenceConfig.Address, err)
 		}
 
 		connectionOptions.TLS = &tls.Config{
