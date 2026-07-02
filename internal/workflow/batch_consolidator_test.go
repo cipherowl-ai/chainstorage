@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
+	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
 
@@ -619,6 +620,75 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 			MaxBlocks:   25,
 		}, request)
 	}
+}
+
+func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesParallelObjectWindows() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
+	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
+	var requests []*activity.BatchConsolidatorRequest
+	s.mockAutoConsolidateLatestHeight(220)
+	s.mockEmptyShadowStats()
+	s.env.OnGetVersion(
+		batchConsolidatorAutoSerialChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoSerialVersion,
+	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requests = append(requests, request)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+		Parallelism: 4,
+	})
+	require.NoError(err)
+	require.Len(requests, 4)
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].StartHeight < requests[j].StartHeight
+	})
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   125,
+		MaxBlocks:   25,
+	}, requests[0])
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 125,
+		EndHeight:   150,
+		MaxBlocks:   25,
+	}, requests[1])
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 150,
+		EndHeight:   175,
+		MaxBlocks:   25,
+	}, requests[2])
+	require.Equal(&activity.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 175,
+		EndHeight:   200,
+		MaxBlocks:   25,
+	}, requests[3])
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateResumeAfterLostActivityCompletion() {
