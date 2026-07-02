@@ -171,6 +171,69 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		return nil
 	}
 
+	repairScanStart := searchStart
+	if cursorFound {
+		repairScanStart = cronConfig.StartHeight
+		if cursorHeight > consolidation.ShardSize && cursorHeight-consolidation.ShardSize > repairScanStart {
+			repairScanStart = cursorHeight - consolidation.ShardSize
+		}
+		if repairScanStart < searchStart {
+			repairStart, repairFound, err := t.firstAutoConsolidateWindowStart(
+				ctx,
+				tag,
+				repairScanStart,
+				searchStart,
+				cronConfig.StartHeight,
+				consolidation.MaxBlocks,
+				consolidation.ShardSize,
+			)
+			if err != nil {
+				return err
+			}
+			if repairFound {
+				searchStart = repairStart
+			}
+		}
+	} else {
+		bootstrapStart, bootstrapFound, err := t.firstAutoConsolidateWindowStart(
+			ctx,
+			tag,
+			cronConfig.StartHeight,
+			searchEnd,
+			cronConfig.StartHeight,
+			consolidation.MaxBlocks,
+			consolidation.ShardSize,
+		)
+		if err != nil {
+			return err
+		}
+		if !bootstrapFound {
+			t.logger.Info(
+				"batch_consolidator cron found no missing consolidation shadow to bootstrap cursor",
+				zap.Uint32("tag", tag),
+				zap.Uint64("configured_start_height", cronConfig.StartHeight),
+				zap.Uint64("safe_end_height", searchEnd),
+				zap.Uint64("latest_height", latest.GetHeight()),
+				zap.Uint64("safe_consolidation_height", safeHeight),
+			)
+			return nil
+		}
+		searchStart = bootstrapStart
+	}
+
+	normalizedStart := batchConsolidatorCronFullWindowStartAtOrAfter(searchStart, consolidation.MaxBlocks, consolidation.ShardSize)
+	if normalizedStart != searchStart {
+		t.logger.Info(
+			"batch_consolidator cron advanced start height to next full consolidation window",
+			zap.Uint32("tag", tag),
+			zap.Uint64("start_height", searchStart),
+			zap.Uint64("normalized_start_height", normalizedStart),
+			zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
+			zap.Uint64("shard_size", consolidation.ShardSize),
+		)
+		searchStart = normalizedStart
+	}
+
 	startHeight := searchStart
 	endHeight, found := batchConsolidatorCronRangeEnd(
 		searchStart,
@@ -231,6 +294,35 @@ func (t *batchConsolidatorTask) autoConsolidateWorkflowID() string {
 	return fmt.Sprintf("%s/%s", t.config.Workflows.BatchConsolidator.WorkflowIdentity, autoConsolidateSuffix)
 }
 
+func (t *batchConsolidatorTask) firstAutoConsolidateWindowStart(
+	ctx context.Context,
+	tag uint32,
+	searchStart uint64,
+	searchEnd uint64,
+	lowerBound uint64,
+	consolidationWindowBlocks uint64,
+	shardSize uint64,
+) (uint64, bool, error) {
+	if searchEnd <= searchStart {
+		return 0, false, nil
+	}
+	missingHeight, found, err := t.metaStorage.GetFirstBlockMissingConsolidationShadow(ctx, tag, searchStart, searchEnd)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to get first block missing consolidation shadow: %w", err)
+	}
+	if !found {
+		return 0, false, nil
+	}
+	windowStart := batchConsolidatorCronObjectWindowStart(missingHeight, consolidationWindowBlocks, shardSize)
+	if windowStart < lowerBound {
+		windowStart = batchConsolidatorCronFullWindowStartAtOrAfter(lowerBound, consolidationWindowBlocks, shardSize)
+	}
+	if windowStart >= searchEnd {
+		return 0, false, nil
+	}
+	return windowStart, true, nil
+}
+
 func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Context) (string, bool, error) {
 	workflowIdentity := t.config.Workflows.BatchConsolidator.WorkflowIdentity
 	openWorkflows, err := t.runtime.ListOpenWorkflows(ctx, t.config.Cadence.Domain, batchConsolidatorOpenPageSize, workflowIdentity)
@@ -280,6 +372,26 @@ func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, max
 		return 0, false
 	}
 	return endHeight, true
+}
+
+func batchConsolidatorCronObjectWindowStart(height uint64, consolidationWindowBlocks uint64, shardSize uint64) uint64 {
+	if consolidationWindowBlocks == 0 || shardSize == 0 {
+		return height
+	}
+	shardStart := (height / shardSize) * shardSize
+	offset := height - shardStart
+	return shardStart + (offset/consolidationWindowBlocks)*consolidationWindowBlocks
+}
+
+func batchConsolidatorCronFullWindowStartAtOrAfter(startHeight uint64, consolidationWindowBlocks uint64, shardSize uint64) uint64 {
+	if consolidationWindowBlocks == 0 || shardSize == 0 {
+		return startHeight
+	}
+	windowEnd := startHeight + consolidationWindowBlocks
+	if windowEnd >= startHeight && windowEnd <= batchConsolidatorCronShardEnd(startHeight, shardSize) {
+		return startHeight
+	}
+	return batchConsolidatorCronShardEnd(startHeight, shardSize)
 }
 
 func batchConsolidatorCronShardEnd(height uint64, shardSize uint64) uint64 {

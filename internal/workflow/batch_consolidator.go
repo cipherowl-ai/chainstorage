@@ -158,6 +158,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow started")
 		ctx = w.withActivityOptions(ctx)
 		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
+		cursorCtx := w.withCursorActivityOptions(ctx, cfg)
 		usePersistedShadowStats := workflow.GetVersion(
 			ctx,
 			batchConsolidatorShadowStatsChangeID,
@@ -420,7 +421,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		}
 
 		if mode.IsAutoConsolidate() && autoConsolidateVersion != workflow.DefaultVersion {
-			if _, err := w.batchConsolidator.UpdateAutoConsolidateCursor(ctx, &activity.BatchConsolidatorCursorRequest{
+			if _, err := w.batchConsolidator.UpdateAutoConsolidateCursor(cursorCtx, &activity.BatchConsolidatorCursorRequest{
 				Tag:    tag,
 				Height: workflowEndHeight,
 			}); err != nil {
@@ -915,6 +916,34 @@ func (w *BatchConsolidator) getShadowStatsActivityRetryPolicy(cfg *config.RetryP
 		// Stats reads are side-effect-free and cheap. Unlimited attempts prevent
 		// old workers on the shared task queue from exhausting retries during a
 		// rolling deploy before a new worker polls the new stats activity name.
+		retryPolicyCopy.MaximumAttempts = 0
+		retryPolicy = &retryPolicyCopy
+	}
+	return retryPolicy
+}
+
+func (w *BatchConsolidator) withCursorActivityOptions(
+	ctx workflow.Context,
+	cfg config.BatchConsolidatorWorkflowConfig,
+) workflow.Context {
+	base := cfg.Base()
+	retryPolicy := w.getCursorActivityRetryPolicy(base.ActivityRetry)
+	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		TaskQueue:              base.TaskList,
+		StartToCloseTimeout:    base.ActivityStartToCloseTimeout,
+		ScheduleToCloseTimeout: base.ActivityScheduleToCloseTimeout,
+		HeartbeatTimeout:       base.ActivityHeartbeatTimeout,
+		RetryPolicy:            retryPolicy,
+	})
+}
+
+func (w *BatchConsolidator) getCursorActivityRetryPolicy(cfg *config.RetryPolicy) *temporal.RetryPolicy {
+	retryPolicy := w.getRetryPolicy(cfg)
+	if retryPolicy != nil {
+		retryPolicyCopy := *retryPolicy
+		// Cursor writes are monotonic and idempotent. Unlimited attempts prevent
+		// old workers on the shared task queue from exhausting retries during a
+		// rolling deploy before a new worker polls the new cursor activity name.
 		retryPolicyCopy.MaximumAttempts = 0
 		retryPolicy = &retryPolicyCopy
 	}

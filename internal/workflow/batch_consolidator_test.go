@@ -978,6 +978,21 @@ func (s *batchConsolidatorTestSuite) TestShadowStatsActivityRetryPolicyUsesUnlim
 	require.Equal(int32(3), activityRetry.MaximumAttempts)
 }
 
+func (s *batchConsolidatorTestSuite) TestCursorActivityRetryPolicyUsesUnlimitedAttempts() {
+	require := testutil.Require(s.T())
+
+	activityRetry := s.cfg.Workflows.BatchConsolidator.ActivityRetry
+	activityRetry.MaximumAttempts = 3
+	policy := s.batchConsolidator.getCursorActivityRetryPolicy(activityRetry)
+
+	require.NotNil(policy)
+	require.Equal(int32(0), policy.MaximumAttempts)
+	require.Equal(activityRetry.BackoffCoefficient, policy.BackoffCoefficient)
+	require.Equal(activityRetry.InitialInterval, policy.InitialInterval)
+	require.Equal(activityRetry.MaximumInterval, policy.MaximumInterval)
+	require.Equal(int32(3), activityRetry.MaximumAttempts)
+}
+
 func (s *batchConsolidatorTestSuite) mockEmptyShadowStats() {
 	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
