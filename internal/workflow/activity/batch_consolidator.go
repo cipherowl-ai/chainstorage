@@ -28,6 +28,7 @@ type (
 		statsActivity       baseActivity
 		latestBlockActivity baseActivity
 		planActivity        baseActivity
+		cursorActivity      baseActivity
 		config              *config.Config
 		metaStorage         metastorage.MetaStorage
 		blobStorage         blobstorage.BlobStorage
@@ -93,6 +94,16 @@ type (
 		SafePromotionHeight uint64
 		PromotionGateHeight uint64
 	}
+
+	BatchConsolidatorCursorRequest struct {
+		Tag    uint32
+		Height uint64
+	}
+
+	BatchConsolidatorCursorResponse struct {
+		Tag    uint32
+		Height uint64
+	}
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -101,6 +112,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 		statsActivity:       newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
 		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
 		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
+		cursorActivity:      newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
 		config:              params.Config,
 		metaStorage:         params.MetaStorage,
 		blobStorage:         params.BlobStorage,
@@ -109,6 +121,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a.statsActivity.register(a.executeStats)
 	a.latestBlockActivity.register(a.executeLatestBlock)
 	a.planActivity.register(a.executePlan)
+	a.cursorActivity.register(a.executeCursor)
 	return a
 }
 
@@ -136,6 +149,12 @@ func (a *BatchConsolidator) GetLatestBlock(ctx workflow.Context, request *BatchC
 func (a *BatchConsolidator) GetPromotionPlan(ctx workflow.Context, request *BatchConsolidatorPlanRequest) (*BatchConsolidatorPlanResponse, error) {
 	var response BatchConsolidatorPlanResponse
 	err := a.planActivity.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *BatchConsolidator) UpdateAutoConsolidateCursor(ctx workflow.Context, request *BatchConsolidatorCursorRequest) (*BatchConsolidatorCursorResponse, error) {
+	var response BatchConsolidatorCursorResponse
+	err := a.cursorActivity.executeActivity(ctx, request, &response)
 	return &response, err
 }
 
@@ -195,6 +214,19 @@ func (a *BatchConsolidator) executePlan(ctx context.Context, request *BatchConso
 	return a.planPromoteFinalized(ctx, request.Tag, request.StartHeight, request.EndHeight)
 }
 
+func (a *BatchConsolidator) executeCursor(ctx context.Context, request *BatchConsolidatorCursorRequest) (*BatchConsolidatorCursorResponse, error) {
+	if err := a.cursorActivity.validateRequest(request); err != nil {
+		return nil, err
+	}
+	if err := a.metaStorage.SetBlockConsolidationCursor(ctx, metastorage.BatchConsolidatorAutoConsolidateCursor, request.Tag, request.Height); err != nil {
+		return nil, xerrors.Errorf("failed to update auto_consolidate cursor: %w", err)
+	}
+	return &BatchConsolidatorCursorResponse{
+		Tag:    request.Tag,
+		Height: request.Height,
+	}, nil
+}
+
 func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
 	if err := a.validateRequest(request); err != nil {
 		return nil, err
@@ -239,23 +271,6 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	scanDuration := time.Since(scanStart)
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
-		return &BatchConsolidatorResponse{
-			StartHeight: request.StartHeight,
-			EndHeight:   request.EndHeight,
-		}, nil
-	}
-	mode := request.Mode
-	if mode == "" {
-		mode = a.config.AWS.Storage.Consolidation.Mode
-	}
-	if mode.IsAutoConsolidate() && !isFullContiguousConsolidationWindow(records, request.StartHeight, request.MaxBlocks) {
-		logger.Info(
-			"auto consolidate waiting for a full contiguous consolidation window",
-			zap.Uint64("start_height", request.StartHeight),
-			zap.Uint64("end_height", request.EndHeight),
-			zap.Uint64("max_blocks", request.MaxBlocks),
-			zap.Int("records", len(records)),
-		)
 		return &BatchConsolidatorResponse{
 			StartHeight: request.StartHeight,
 			EndHeight:   request.EndHeight,
@@ -454,22 +469,6 @@ func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMod
 
 func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
 	return a.validateShadowWriteMode(mode)
-}
-
-func isFullContiguousConsolidationWindow(records []*metastorage.BlockMetadataRecord, startHeight uint64, maxBlocks uint64) bool {
-	if maxBlocks == 0 || uint64(len(records)) != maxBlocks {
-		return false
-	}
-	for i, record := range records {
-		if record == nil || record.Metadata == nil {
-			return false
-		}
-		expectedHeight := startHeight + uint64(i)
-		if expectedHeight < startHeight || record.Metadata.GetHeight() != expectedHeight {
-			return false
-		}
-	}
-	return true
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {

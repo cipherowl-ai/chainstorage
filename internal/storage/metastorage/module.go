@@ -25,6 +25,8 @@ type (
 const (
 	EventIdStartValue = model.EventIdStartValue
 	EventIdDeleted    = model.EventIdDeleted
+
+	BatchConsolidatorAutoConsolidateCursor = internal.BatchConsolidatorAutoConsolidateCursor
 )
 
 func NewEventsToChainAdaptor() *EventsToChainAdaptor {

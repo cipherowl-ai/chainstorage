@@ -301,6 +301,14 @@ func (a *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 	return 0, false, xerrors.New("GetFirstPromotableBlockConsolidationShadow not implemented for DynamoDB")
 }
 
+func (a *blockStorageImpl) GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error) {
+	return 0, false, xerrors.New("GetBlockConsolidationCursor not implemented for DynamoDB")
+}
+
+func (a *blockStorageImpl) SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error {
+	return xerrors.New("SetBlockConsolidationCursor not implemented for DynamoDB")
+}
+
 func (a *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for DynamoDB")
 }
