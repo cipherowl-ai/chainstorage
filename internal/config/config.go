@@ -177,10 +177,12 @@ type (
 	}
 
 	CadenceConfig struct {
-		Address         string           `mapstructure:"address" validate:"required"`
-		Domain          string           `mapstructure:"domain" validate:"required"`
-		RetentionPeriod int32            `mapstructure:"retention_period" validate:"required"`
-		TLSConfig       CadenceTLSConfig `mapstructure:"tls" validate:"required"`
+		Address          string           `mapstructure:"address" validate:"required"`
+		Domain           string           `mapstructure:"domain" validate:"required"`
+		RetentionPeriod  int32            `mapstructure:"retention_period" validate:"required"`
+		KeepAliveTime    time.Duration    `mapstructure:"keep_alive_time"`
+		KeepAliveTimeout time.Duration    `mapstructure:"keep_alive_timeout"`
+		TLSConfig        CadenceTLSConfig `mapstructure:"tls" validate:"required"`
 	}
 
 	CadenceTLSConfig struct {
