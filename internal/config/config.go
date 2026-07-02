@@ -620,8 +620,8 @@ const (
 	ConsolidationModeLegacyOnly      ConsolidationMode = "legacy_only"
 	ConsolidationModeShadowDualWrite ConsolidationMode = "shadow_dual_write"
 	ConsolidationModeAutoConsolidate ConsolidationMode = "auto_consolidate"
-	// Deprecated: use ConsolidationModeAutoConsolidate. This remains accepted so
-	// existing Temporal histories and manually-started workflows can replay.
+	// Historical backfill is the manual catch-up mode. It remains separate from
+	// auto_consolidate, which is the normal serial cron mode.
 	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"

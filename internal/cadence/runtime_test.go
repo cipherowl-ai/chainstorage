@@ -5,11 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/stretchr/testify/require"
 	commonpb "go.temporal.io/api/common/v1"
 	workflowpb "go.temporal.io/api/workflow/v1"
 	"go.temporal.io/api/workflowservice/v1"
+
+	"github.com/coinbase/chainstorage/internal/config"
 )
 
 func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
