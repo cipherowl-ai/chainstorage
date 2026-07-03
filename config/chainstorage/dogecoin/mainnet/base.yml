@@ -68,13 +68,9 @@ chain:
     stable: 0
   feature:
     default_stable_event: true
-    rosetta_parser: true
+    rosetta_parser: false
   irreversible_distance: 60
   network: NETWORK_DOGECOIN_MAINNET
-  rosetta:
-    block_not_found_error_codes: 4
-    blockchain: dogecoin
-    network: mainnet
 config_name: dogecoin_mainnet
 cron:
   block_range_size: 4
