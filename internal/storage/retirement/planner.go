@@ -15,8 +15,6 @@ type Planner struct {
 	store ObjectStore
 }
 
-const defaultLegacyObjectRetention = 72 * time.Hour
-
 func NewPlanner(repo Repository, store ObjectStore) *Planner {
 	return &Planner{
 		repo:  repo,
@@ -30,9 +28,6 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	}
 	if req.Bucket == "" {
 		return nil, xerrors.New("bucket is required")
-	}
-	if req.GracePeriod == 0 {
-		req.GracePeriod = defaultLegacyObjectRetention
 	}
 	if req.Now.IsZero() {
 		req.Now = time.Now().UTC()
@@ -53,7 +48,6 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 		Tag:         req.Tag,
 		StartHeight: req.StartHeight,
 		EndHeight:   req.EndHeight,
-		GracePeriod: req.GracePeriod.String(),
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
 			ClientMigrationApproved: req.ClientMigrationApproved,
@@ -136,9 +130,6 @@ func (p *Planner) planRow(
 	if shadow.LegacyObjectRetireAfter != nil {
 		eligibleAt := *shadow.LegacyObjectRetireAfter
 		item.EligibleAt = &eligibleAt
-	} else if shadow.ValidatedAt != nil {
-		eligibleAt := shadow.ValidatedAt.Add(req.GracePeriod)
-		item.EligibleAt = &eligibleAt
 	}
 	if shadow.ValidatedAt == nil {
 		item.SkipReason = SkipValidationNotPassed
@@ -152,8 +143,12 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipInvalidMetadataReference
 		return item
 	}
+	if shadow.LegacyObjectRetiredAt == nil || shadow.LegacyObjectRetireAfter == nil {
+		item.SkipReason = SkipMissingRetirementMarker
+		return item
+	}
 	if item.EligibleAt != nil && req.Now.Before(*item.EligibleAt) {
-		item.SkipReason = SkipGracePeriodActive
+		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
 	if !approvalMatches(req) {

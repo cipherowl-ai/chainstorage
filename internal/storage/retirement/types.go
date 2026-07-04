@@ -76,7 +76,6 @@ type (
 		EndHeight               uint64
 		Limit                   uint64
 		Now                     time.Time
-		GracePeriod             time.Duration
 		Execute                 bool
 		ClientMigrationApproved bool
 		FallbackErrorCount      uint64
@@ -100,7 +99,6 @@ type (
 		Tag         uint32      `json:"tag"`
 		StartHeight uint64      `json:"start_height"`
 		EndHeight   uint64      `json:"end_height"`
-		GracePeriod string      `json:"grace_period"`
 		Approval    Approval    `json:"approval"`
 		SafetyGates SafetyGates `json:"safety_gates"`
 		Summary     Summary     `json:"summary"`
@@ -150,8 +148,9 @@ const (
 	SkipMissingConsolidationShadow = "missing_consolidation_shadow"
 	SkipValidationNotPassed        = "validation_not_passed"
 	SkipActiveMetadataStillLegacy  = "active_metadata_still_legacy"
+	SkipMissingRetirementMarker    = "missing_retirement_marker"
 	SkipInvalidMetadataReference   = "invalid_metadata_reference"
-	SkipGracePeriodActive          = "grace_period_active"
+	SkipRetentionPeriodActive      = "retention_period_active"
 	SkipChainRangeNotApproved      = "chain_range_not_approved"
 	SkipActiveFallbackOrReadErrors = "active_fallback_or_read_errors"
 	SkipFileClientsNotApproved     = "file_clients_not_approved"

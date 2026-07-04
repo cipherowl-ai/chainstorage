@@ -25,7 +25,6 @@ type retirementFlags struct {
 	startHeight             uint64
 	endHeight               uint64
 	limit                   uint64
-	gracePeriod             time.Duration
 	approveChain            string
 	approveStartHeight      uint64
 	approveEndHeight        uint64
@@ -67,7 +66,6 @@ version; rows without a version id are skipped to avoid delete-marker-only clean
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.startHeight, "start-height", 0, "inclusive block start height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.endHeight, "end-height", 0, "exclusive block end height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.limit, "limit", 0, "maximum rows to scan; default scans the full range")
-	cmd.Flags().DurationVar(&legacyRetirementFlags.gracePeriod, "grace-period", 0, "fallback minimum age after validated_at when legacy_object_retire_after is not set; default uses aws.storage.consolidation.legacy_object_retention")
 	cmd.Flags().StringVar(&legacyRetirementFlags.approveChain, "approve-chain", "", "explicit chain approval, e.g. solana-mainnet")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
@@ -111,10 +109,6 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 	}
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
-	gracePeriod := flags.gracePeriod
-	if gracePeriod == 0 {
-		gracePeriod = cfg.AWS.Storage.Consolidation.LegacyObjectRetention
-	}
 	targetChain := approvalChainFromFlags()
 	logger.Info("planning legacy single-block retirement",
 		zap.String("environment", string(cfg.Env())),
@@ -149,7 +143,6 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 		EndHeight:               flags.endHeight,
 		Limit:                   flags.limit,
 		Now:                     time.Now().UTC(),
-		GracePeriod:             gracePeriod,
 		Execute:                 flags.execute,
 		ClientMigrationApproved: flags.clientMigrationApproved,
 		FallbackErrorCount:      flags.fallbackErrorCount,

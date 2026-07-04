@@ -109,6 +109,9 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanNoOpsWhenShadow
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 100}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -133,6 +136,9 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanPromotesExistin
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 100}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -141,6 +147,31 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanPromotesExistin
 		EndHeight:      request.EndHeight,
 		PromotedBlocks: 12,
 	}, response)
+}
+
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanRejectsMissingCoverage() {
+	require := testutil.Require(s.T())
+	request := &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   100,
+	}
+	s.metaStorage.EXPECT().
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		Return(&metastorage.ConsolidationPromotionResult{}, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(nil, nil)
+	s.metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 99}, nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.Equal(&BatchConsolidatorResponse{}, response)
+	require.Contains(err.Error(), "auto_consolidate requires full validated consolidation coverage")
 }
 
 func (s *BatchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemainsAccepted() {
