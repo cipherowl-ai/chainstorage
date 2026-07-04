@@ -259,6 +259,14 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 	return nil, xerrors.New("GetBlocksConsolidationShadow not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) GetBlockConsolidationLegacy(ctx context.Context, block *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	return nil, xerrors.New("GetBlockConsolidationLegacy not implemented for Firestore")
+}
+
+func (b *blockStorageImpl) GetBlocksConsolidationLegacy(ctx context.Context, blocks []*chainstorage.BlockMetadata) ([]*chainstorage.BlockMetadata, error) {
+	return nil, xerrors.New("GetBlocksConsolidationLegacy not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*internal.BlockMetadataRecord, error) {
 	return nil, xerrors.New("GetBlocksMissingConsolidationShadow not implemented for Firestore")
 }

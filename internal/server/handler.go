@@ -424,8 +424,8 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 	}
 
 	if shouldReadFromConsolidated(req.GetReadSource(), false) {
-		if shadow, ok := s.getShadowBlockMetadata(ctx, block); ok {
-			blockFile, err := s.newBlockFile(shadow)
+		if consolidated, ok := s.getConsolidatedBlockMetadata(ctx, block); ok {
+			blockFile, err := s.newBlockFile(consolidated)
 			if err == nil {
 				s.emitBlocksMetric(formatFile, clientID, 1)
 				return &api.GetBlockFileResponse{File: blockFile}, nil
@@ -436,13 +436,29 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 				zap.Uint32("tag", block.GetTag()),
 				zap.Uint64("height", block.GetHeight()),
 				zap.String("hash", block.GetHash()),
-				zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+				zap.String("consolidated_object_key", consolidated.GetObjectKeyMain()),
 				zap.Error(err),
 			)
+			if legacy, ok := s.getLegacyBlockMetadata(ctx, block); ok {
+				if blockFile, err := s.newBlockFile(legacy); err == nil {
+					s.emitBlocksMetric(formatFile, clientID, 1)
+					s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, 1)
+					return &api.GetBlockFileResponse{File: blockFile}, nil
+				}
+			}
 		}
 	}
 
 	blockFile, err := s.newBlockFile(block)
+	if err != nil && isConsolidatedBlockMetadata(block) {
+		if legacy, ok := s.getLegacyBlockMetadata(ctx, block); ok {
+			if legacyBlockFile, legacyErr := s.newBlockFile(legacy); legacyErr == nil {
+				s.emitBlocksMetric(formatFile, clientID, 1)
+				s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, 1)
+				return &api.GetBlockFileResponse{File: legacyBlockFile}, nil
+			}
+		}
+	}
 	if err != nil {
 		return nil, xerrors.Errorf("failed to prepare block file: %w", err)
 	}
@@ -480,7 +496,14 @@ func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFile
 			zap.Int("shadow_blocks", shadowCount),
 			zap.Error(err),
 		)
-		blockFiles, err = s.newBlockFiles(blocks)
+		if legacyBlocks, ok := s.selectLegacyBlockMetadata(ctx, blocks); ok {
+			blockFiles, err = s.newBlockFiles(legacyBlocks)
+		}
+	}
+	if err != nil && hasConsolidatedBlockMetadata(blocks) {
+		if legacyBlocks, ok := s.selectLegacyBlockMetadata(ctx, blocks); ok {
+			blockFiles, err = s.newBlockFiles(legacyBlocks)
+		}
 	}
 	if err != nil {
 		return nil, xerrors.Errorf("newBlockFile error: %w", err)
@@ -963,18 +986,23 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		return output, nil
 	}
 
-	shadow, ok := s.getShadowBlockMetadata(ctx, block)
+	consolidated, ok := s.getConsolidatedBlockMetadata(ctx, block)
 	if !ok {
-		output, err := s.downloadBlockWithShadowMetrics(ctx, block, shadowPathLegacy)
+		legacy, ok := s.getLegacyBlockMetadata(ctx, block)
+		if !ok {
+			s.emitShadowReadMetric(shadowOutcomeFallbackFailure, 1)
+			return nil, xerrors.Errorf("failed to find legacy fallback block metadata for height %d: %w", block.GetHeight(), storage.ErrItemNotFound)
+		}
+		output, err := s.downloadBlockWithShadowMetrics(ctx, legacy, shadowPathLegacy)
 		if err != nil {
 			s.emitShadowReadMetric(shadowOutcomeFallbackFailure, 1)
-			return nil, xerrors.Errorf("failed to download fallback legacy block from blob storage (input={%+v}): %w", block, err)
+			return nil, xerrors.Errorf("failed to download fallback legacy block from blob storage (input={%+v}): %w", legacy, err)
 		}
 		s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, 1)
 		return output, nil
 	}
 
-	output, err := s.downloadBlockWithShadowMetrics(ctx, shadow, shadowPathConsolidated)
+	output, err := s.downloadBlockWithShadowMetrics(ctx, consolidated, shadowPathConsolidated)
 	if err == nil {
 		s.emitShadowReadMetric(shadowOutcomeSuccess, 1)
 		return blockWithPrimaryMetadata(output, block), nil
@@ -986,13 +1014,18 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		zap.Uint32("tag", block.GetTag()),
 		zap.Uint64("height", block.GetHeight()),
 		zap.String("hash", block.GetHash()),
-		zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+		zap.String("consolidated_object_key", consolidated.GetObjectKeyMain()),
 		zap.Error(err),
 	)
-	fallback, fallbackErr := s.downloadBlockWithShadowMetrics(ctx, block, shadowPathLegacy)
+	legacy, ok := s.getLegacyBlockMetadata(ctx, block)
+	if !ok {
+		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, 1)
+		return nil, err
+	}
+	fallback, fallbackErr := s.downloadBlockWithShadowMetrics(ctx, legacy, shadowPathLegacy)
 	if fallbackErr != nil {
 		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, 1)
-		return nil, xerrors.Errorf("failed to download fallback legacy block from blob storage (input={%+v}): %w", block, fallbackErr)
+		return nil, xerrors.Errorf("failed to download fallback legacy block from blob storage (input={%+v}): %w", legacy, fallbackErr)
 	}
 	s.emitShadowReadMetric(shadowOutcomeFallbackSuccess, 1)
 	return fallback, nil
@@ -1027,7 +1060,12 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 		zap.Int("shadow_blocks", shadowCount),
 		zap.Error(err),
 	)
-	fallback, fallbackErr := s.downloadBlocksWithShadowMetrics(ctx, blocks)
+	legacyBlocks, ok := s.selectLegacyBlockMetadata(ctx, blocks)
+	if !ok {
+		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, int64(len(blocks)))
+		return nil, err
+	}
+	fallback, fallbackErr := s.downloadBlocksWithShadowMetrics(ctx, legacyBlocks)
 	if fallbackErr != nil {
 		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, int64(len(blocks)))
 		return nil, xerrors.Errorf("failed to download fallback legacy blocks from blob storage: %w", fallbackErr)
@@ -1056,6 +1094,38 @@ func shouldReadFromConsolidated(readSource api.BlockReadSource, defaultReadShado
 	default:
 		return defaultReadShadowFirst
 	}
+}
+
+func (s *Server) getConsolidatedBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
+	if isConsolidatedBlockMetadata(block) {
+		return block, true
+	}
+	return s.getShadowBlockMetadata(ctx, block)
+}
+
+func (s *Server) getLegacyBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
+	if !isConsolidatedBlockMetadata(block) {
+		return block, true
+	}
+
+	legacy, err := s.metaStorage.GetBlockConsolidationLegacy(ctx, block)
+	if err != nil {
+		if xerrors.Is(err, storage.ErrItemNotFound) {
+			s.emitShadowReadMetric(shadowOutcomeMiss, 1)
+			return nil, false
+		}
+		s.emitShadowReadMetric(shadowOutcomeError, 1)
+		s.logger.Warn(
+			"legacy metadata lookup for promoted consolidated block failed",
+			zap.Uint32("tag", block.GetTag()),
+			zap.Uint64("height", block.GetHeight()),
+			zap.String("hash", block.GetHash()),
+			zap.String("consolidated_object_key", block.GetObjectKeyMain()),
+			zap.Error(err),
+		)
+		return nil, false
+	}
+	return legacy, true
 }
 
 func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
@@ -1126,6 +1196,11 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 	for i, block := range blocks {
 		shadow := shadows[i]
 		if shadow == nil {
+			if isConsolidatedBlockMetadata(block) {
+				selected[i] = block
+				shadowCount++
+				continue
+			}
 			s.emitShadowReadMetric(shadowOutcomeMiss, 1)
 			selected[i] = block
 			fallbackCount++
@@ -1153,6 +1228,45 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 		}
 	}
 	return selected, shadowCount, fallbackCount, selectionErr
+}
+
+func (s *Server) selectLegacyBlockMetadata(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, bool) {
+	if !hasConsolidatedBlockMetadata(blocks) {
+		return blocks, true
+	}
+
+	selected := make([]*api.BlockMetadata, len(blocks))
+	legacyBlocks, err := s.metaStorage.GetBlocksConsolidationLegacy(ctx, blocks)
+	if err != nil {
+		s.emitShadowReadMetric(shadowOutcomeError, int64(len(blocks)))
+		s.logger.Warn(
+			"legacy metadata batch lookup for promoted consolidated blocks failed",
+			zap.Int("num_blocks", len(blocks)),
+			zap.Error(err),
+		)
+		return nil, false
+	}
+	if len(legacyBlocks) != len(blocks) {
+		s.emitShadowReadMetric(shadowOutcomeError, int64(len(blocks)))
+		s.logger.Warn(
+			"legacy metadata batch lookup returned invalid result count",
+			zap.Int("num_blocks", len(blocks)),
+			zap.Int("num_legacy_blocks", len(legacyBlocks)),
+		)
+		return nil, false
+	}
+	for i, block := range blocks {
+		if isConsolidatedBlockMetadata(block) {
+			if legacyBlocks[i] == nil {
+				s.emitShadowReadMetric(shadowOutcomeMiss, 1)
+				return nil, false
+			}
+			selected[i] = legacyBlocks[i]
+			continue
+		}
+		selected[i] = block
+	}
+	return selected, true
 }
 
 func (s *Server) downloadBlockWithShadowMetrics(ctx context.Context, block *api.BlockMetadata, path string) (*api.Block, error) {
@@ -1222,6 +1336,15 @@ func blocksWithPrimaryMetadata(blocks []*api.Block, metadatas []*api.BlockMetada
 
 func isConsolidatedBlockMetadata(metadata *api.BlockMetadata) bool {
 	return metadata.GetObjectFormat() == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH && metadata.GetByteLength() > 0
+}
+
+func hasConsolidatedBlockMetadata(metadatas []*api.BlockMetadata) bool {
+	for _, metadata := range metadatas {
+		if isConsolidatedBlockMetadata(metadata) {
+			return true
+		}
+	}
+	return false
 }
 
 func shadowReadErrorOutcome(err error) string {

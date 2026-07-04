@@ -146,6 +146,21 @@ func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationCursor(arg0, arg1, a
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationCursor", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationCursor), arg0, arg1, arg2)
 }
 
+// GetBlockConsolidationLegacy mocks base method.
+func (m *MockMetaStorage) GetBlockConsolidationLegacy(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationLegacy", arg0, arg1)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationLegacy indicates an expected call of GetBlockConsolidationLegacy.
+func (mr *MockMetaStorageMockRecorder) GetBlockConsolidationLegacy(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationLegacy", reflect.TypeOf((*MockMetaStorage)(nil).GetBlockConsolidationLegacy), arg0, arg1)
+}
+
 // GetBlockConsolidationShadow mocks base method.
 func (m *MockMetaStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -204,6 +219,21 @@ func (m *MockMetaStorage) GetBlocksByHeights(arg0 context.Context, arg1 uint32, 
 func (mr *MockMetaStorageMockRecorder) GetBlocksByHeights(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlocksByHeights", reflect.TypeOf((*MockMetaStorage)(nil).GetBlocksByHeights), arg0, arg1, arg2)
+}
+
+// GetBlocksConsolidationLegacy mocks base method.
+func (m *MockMetaStorage) GetBlocksConsolidationLegacy(arg0 context.Context, arg1 []*chainstorage.BlockMetadata) ([]*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlocksConsolidationLegacy", arg0, arg1)
+	ret0, _ := ret[0].([]*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlocksConsolidationLegacy indicates an expected call of GetBlocksConsolidationLegacy.
+func (mr *MockMetaStorageMockRecorder) GetBlocksConsolidationLegacy(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlocksConsolidationLegacy", reflect.TypeOf((*MockMetaStorage)(nil).GetBlocksConsolidationLegacy), arg0, arg1)
 }
 
 // GetBlocksConsolidationShadow mocks base method.
@@ -698,6 +728,21 @@ func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationCursor(arg0, arg1, 
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationCursor", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationCursor), arg0, arg1, arg2)
 }
 
+// GetBlockConsolidationLegacy mocks base method.
+func (m *MockBlockStorage) GetBlockConsolidationLegacy(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlockConsolidationLegacy", arg0, arg1)
+	ret0, _ := ret[0].(*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlockConsolidationLegacy indicates an expected call of GetBlockConsolidationLegacy.
+func (mr *MockBlockStorageMockRecorder) GetBlockConsolidationLegacy(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlockConsolidationLegacy", reflect.TypeOf((*MockBlockStorage)(nil).GetBlockConsolidationLegacy), arg0, arg1)
+}
+
 // GetBlockConsolidationShadow mocks base method.
 func (m *MockBlockStorage) GetBlockConsolidationShadow(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (*chainstorage.BlockMetadata, error) {
 	m.ctrl.T.Helper()
@@ -756,6 +801,21 @@ func (m *MockBlockStorage) GetBlocksByHeights(arg0 context.Context, arg1 uint32,
 func (mr *MockBlockStorageMockRecorder) GetBlocksByHeights(arg0, arg1, arg2 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlocksByHeights", reflect.TypeOf((*MockBlockStorage)(nil).GetBlocksByHeights), arg0, arg1, arg2)
+}
+
+// GetBlocksConsolidationLegacy mocks base method.
+func (m *MockBlockStorage) GetBlocksConsolidationLegacy(arg0 context.Context, arg1 []*chainstorage.BlockMetadata) ([]*chainstorage.BlockMetadata, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetBlocksConsolidationLegacy", arg0, arg1)
+	ret0, _ := ret[0].([]*chainstorage.BlockMetadata)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBlocksConsolidationLegacy indicates an expected call of GetBlocksConsolidationLegacy.
+func (mr *MockBlockStorageMockRecorder) GetBlocksConsolidationLegacy(arg0, arg1 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBlocksConsolidationLegacy", reflect.TypeOf((*MockBlockStorage)(nil).GetBlocksConsolidationLegacy), arg0, arg1)
 }
 
 // GetBlocksConsolidationShadow mocks base method.

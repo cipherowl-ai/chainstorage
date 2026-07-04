@@ -479,6 +479,16 @@ func expectedConsolidationShadow(
 	return shadow
 }
 
+func expectedConsolidationLegacy(block *api.BlockMetadata, legacyObjectKey string) *api.BlockMetadata {
+	legacy := proto.Clone(block).(*api.BlockMetadata)
+	legacy.ObjectKeyMain = legacyObjectKey
+	legacy.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	legacy.ByteOffset = 0
+	legacy.ByteLength = 0
+	legacy.UncompressedLength = 0
+	return legacy
+}
+
 func (s *blockStorageTestSuite) TestGetConsolidationShadowPredicates() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
@@ -513,6 +523,29 @@ func (s *blockStorageTestSuite) TestGetConsolidationShadowPredicates() {
 	_, err = s.accessor.GetBlockConsolidationShadow(ctx, skipped)
 	require.Error(err)
 	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
+func (s *blockStorageTestSuite) TestGetBlockConsolidationLegacyAfterPromotion() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 1, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/promoted.cscb.zstd", 100, 200, 200, true, "")
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultLegacyObjectRetention)
+	require.NoError(err)
+	require.Equal(uint64(1), result.Blocks)
+
+	promoted, err := s.accessor.GetBlockByHeight(ctx, tag, blocks[0].GetHeight())
+	require.NoError(err)
+	s.equalProto(expectedConsolidationShadow(blocks[0], "consolidated/promoted.cscb.zstd", 100, 200, 200), promoted)
+
+	legacy, err := s.accessor.GetBlockConsolidationLegacy(ctx, promoted)
+	require.NoError(err)
+	s.equalProto(expectedConsolidationLegacy(promoted, blocks[0].GetObjectKeyMain()), legacy)
 }
 
 func (s *blockStorageTestSuite) TestGetBlocksConsolidationShadowPreservesOrderAndMisses() {

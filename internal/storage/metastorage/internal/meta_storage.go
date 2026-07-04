@@ -27,6 +27,8 @@ type (
 		GetBlockByTimestamp(ctx context.Context, tag uint32, timestamp uint64) (*api.BlockMetadata, error)
 		GetBlockConsolidationShadow(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error)
 		GetBlocksConsolidationShadow(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error)
+		GetBlockConsolidationLegacy(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error)
+		GetBlocksConsolidationLegacy(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error)
 		GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*BlockMetadataRecord, error)
 		GetBlockConsolidationShadowStats(ctx context.Context, tag uint32, startHeight, endHeight uint64) (*ConsolidationShadowStats, error)
 		GetFirstBlockMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error)

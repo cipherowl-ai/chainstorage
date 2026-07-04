@@ -136,6 +136,16 @@ func makeShadowBlockMetadata(block *api.BlockMetadata) *api.BlockMetadata {
 	return shadow
 }
 
+func makeLegacyBlockMetadata(block *api.BlockMetadata, objectKey string) *api.BlockMetadata {
+	legacy := proto.Clone(block).(*api.BlockMetadata)
+	legacy.ObjectKeyMain = objectKey
+	legacy.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	legacy.ByteOffset = 0
+	legacy.ByteLength = 0
+	legacy.UncompressedLength = 0
+	return legacy
+}
+
 func TestIsShadowValidationError(t *testing.T) {
 	tests := []struct {
 		name string
@@ -455,6 +465,49 @@ func (s *handlerTestSuite) TestGetBlockFile_ReadSourceConsolidatedFallsBackOnPre
 		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata.GetObjectKeyMain()).Times(1).Return("", xerrors.New("presign failed")),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKeyMain).Times(1).Return("http://endpoint/legacy", nil),
+	)
+
+	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
+		Height:     height,
+		Hash:       hash,
+		ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(expected, resp.File)
+}
+
+func (s *handlerTestSuite) TestGetBlockFile_PromotedConsolidatedFallsBackToLegacy() {
+	const (
+		height              uint64 = 13193825
+		hash                       = "0xda5a0439434adf072394e0b94f78e56032c5409a2c58668995f306b171ff4ace"
+		parentHash                 = "0xba6a6c85739b50384625e10718524fb2c1fcf88858eabf6db9bd851902b53546"
+		legacyObjectKeyMain        = "legacy/foo/bar"
+	)
+
+	require := testutil.Require(s.T())
+	tag := s.app.Config().Chain.BlockTag.Stable
+	legacyMetadata := &api.BlockMetadata{
+		Tag:           tag,
+		Hash:          hash,
+		ParentHash:    parentHash,
+		Height:        height,
+		ObjectKeyMain: legacyObjectKeyMain,
+	}
+	promotedMetadata := makeShadowBlockMetadata(legacyMetadata)
+	expected := &api.BlockFile{
+		Tag:        tag,
+		Hash:       hash,
+		ParentHash: parentHash,
+		Height:     height,
+		FileUrl:    "http://endpoint/legacy",
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, height, hash).Times(1).Return(promotedMetadata, nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), promotedMetadata.GetObjectKeyMain()).Times(1).Return("", xerrors.New("presign failed")),
+		s.metaStorage.EXPECT().GetBlockConsolidationLegacy(gomock.Any(), promotedMetadata).Times(1).Return(legacyMetadata, nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), legacyObjectKeyMain).Times(1).Return("http://endpoint/legacy", nil),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -1118,6 +1171,41 @@ func (s *handlerTestSuite) TestGetRawBlock_ReadSourceConsolidatedFallsBackOnShad
 	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
 }
 
+func (s *handlerTestSuite) TestGetRawBlock_PromotedConsolidatedFallsBackToLegacy() {
+	const (
+		height uint64 = 13193825
+	)
+
+	require := testutil.Require(s.T())
+	scope := tally.NewTestScope("", nil)
+	s.server.metrics = newServerMetrics(scope)
+
+	tag := s.app.Config().Chain.BlockTag.Stable
+	legacyMetadata := testutil.MakeBlockMetadatasFromStartHeight(height, 1, tag)[0]
+	promotedMetadata := makeShadowBlockMetadata(legacyMetadata)
+	legacyBlock := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, promotedMetadata.GetHeight(), promotedMetadata.GetHash()).Times(1).Return(promotedMetadata, nil),
+		s.blobStorage.EXPECT().Download(gomock.Any(), promotedMetadata).Times(1).Return(nil, xerrors.New("consolidated object missing")),
+		s.metaStorage.EXPECT().GetBlockConsolidationLegacy(gomock.Any(), promotedMetadata).Times(1).Return(legacyMetadata, nil),
+		s.blobStorage.EXPECT().Download(gomock.Any(), legacyMetadata).Times(1).Return(legacyBlock, nil),
+	)
+
+	resp, err := s.server.GetRawBlock(context.Background(), &api.GetRawBlockRequest{
+		Height:     promotedMetadata.GetHeight(),
+		Hash:       promotedMetadata.GetHash(),
+		ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(legacyBlock, resp.Block)
+
+	snapshot := scope.Snapshot()
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=error"].Value())
+	require.Equal(int64(1), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
+}
+
 func (s *handlerTestSuite) TestGetRawBlock_ReadSourceConsolidatedFallsBackOnMiss() {
 	const (
 		height uint64 = 13193825
@@ -1434,6 +1522,53 @@ func (s *handlerTestSuite) TestGetRawBlocksByRange_ReadSourceConsolidatedFallsBa
 	require.NoError(err)
 	require.NotNil(resp)
 	require.Equal(blocks, resp.Blocks)
+
+	snapshot := scope.Snapshot()
+	require.Equal(int64(numBlocks), snapshot.Counters()["server.shadow_read+outcome=error"].Value())
+	require.Equal(int64(numBlocks), snapshot.Counters()["server.shadow_read+outcome=fallback_success"].Value())
+}
+
+func (s *handlerTestSuite) TestGetRawBlocksByRange_PromotedConsolidatedFallsBackToLegacy() {
+	const (
+		startHeight uint64 = 9000
+		endHeight   uint64 = 9003
+		numBlocks          = int(endHeight - startHeight)
+	)
+
+	require := testutil.Require(s.T())
+	scope := tally.NewTestScope("", nil)
+	s.server.metrics = newServerMetrics(scope)
+
+	tag := s.app.Config().GetLatestBlockTag()
+	legacyMetadatas := testutil.MakeBlockMetadatasFromStartHeight(startHeight, numBlocks, tag)
+	promotedMetadatas := make([]*api.BlockMetadata, len(legacyMetadatas))
+	for i, legacyMetadata := range legacyMetadatas {
+		promotedMetadatas[i] = makeShadowBlockMetadata(legacyMetadata)
+	}
+	legacyBlocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
+	expectedBlocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
+	for i, block := range expectedBlocks {
+		block.Metadata = promotedMetadatas[i]
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), tag, startHeight, endHeight).Times(1).Return(promotedMetadatas, nil),
+		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Times(1).Return(testutil.MakeBlockMetadata(10000, tag), nil),
+		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), promotedMetadatas).Times(1).Return(make([]*api.BlockMetadata, len(promotedMetadatas)), nil),
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), promotedMetadatas).Times(1).Return(nil, xerrors.New("consolidated object missing")),
+		s.metaStorage.EXPECT().GetBlocksConsolidationLegacy(gomock.Any(), promotedMetadatas).Times(1).Return(legacyMetadatas, nil),
+		s.blobStorage.EXPECT().DownloadMany(gomock.Any(), legacyMetadatas).Times(1).Return(legacyBlocks, nil),
+	)
+
+	resp, err := s.server.GetRawBlocksByRange(context.Background(), &api.GetRawBlocksByRangeRequest{
+		Tag:         tag,
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
+		ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(expectedBlocks, resp.Blocks)
 
 	snapshot := scope.Snapshot()
 	require.Equal(int64(numBlocks), snapshot.Counters()["server.shadow_read+outcome=error"].Value())
