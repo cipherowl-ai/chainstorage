@@ -783,7 +783,6 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 		FROM canonical_blocks cb
 		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
 		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-			AND shadow.legacy_object_key_main = bm.object_key_main
 			AND shadow.tag = cb.tag
 			AND shadow.height = cb.height
 			AND shadow.hash = bm.hash
@@ -794,6 +793,16 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND shadow.height >= $2
 			AND shadow.height < $3
 			AND bm.skipped = false
+			AND (
+				shadow.legacy_object_key_main = bm.object_key_main
+				OR (
+					bm.object_key_main = shadow.consolidated_object_key_main
+					AND bm.object_format = shadow.object_format
+					AND bm.byte_offset = shadow.byte_offset
+					AND bm.byte_length = shadow.byte_length
+					AND bm.uncompressed_length = shadow.uncompressed_length
+				)
+			)
 			AND bm.object_key_main IS NOT NULL
 			AND bm.object_key_main <> ''
 			AND shadow.validated_at IS NOT NULL
@@ -970,16 +979,28 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return nil
 }
 
-func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*internal.ConsolidationPromotionResult, error) {
+func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	limit uint64,
+	legacyObjectRetention time.Duration,
+) (*internal.ConsolidationPromotionResult, error) {
 	if endHeight <= startHeight {
 		return &internal.ConsolidationPromotionResult{}, nil
 	}
 	if limit == 0 {
 		return nil, xerrors.New("consolidation promotion limit must be positive")
 	}
+	if legacyObjectRetention <= 0 {
+		return nil, xerrors.New("legacy object retention must be positive")
+	}
 	if err := b.validateHeight(startHeight); err != nil {
 		return nil, err
 	}
+	legacyObjectRetiredAt := time.Now().UTC()
+	legacyObjectRetireAfter := legacyObjectRetiredAt.Add(legacyObjectRetention)
 
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1093,12 +1114,26 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context,
 				AND bm.skipped = false
 				AND bm.byte_length IS NULL
 			RETURNING bm.id
+		),
+		retired AS (
+			UPDATE block_consolidation_shadow shadow
+			SET
+				legacy_object_retired_at = $6,
+				legacy_object_retire_after = $7
+			FROM candidates
+			WHERE shadow.block_metadata_id = candidates.block_metadata_id
+				AND shadow.tag = candidates.tag
+				AND shadow.height = candidates.height
+				AND shadow.hash = candidates.hash
+				AND shadow.legacy_object_key_main = candidates.legacy_object_key_main
+			RETURNING shadow.block_metadata_id
 		)
 		SELECT
 			(SELECT COUNT(*) FROM candidates),
-			(SELECT COUNT(*) FROM updated)`
+			(SELECT COUNT(*) FROM updated),
+			(SELECT COUNT(*) FROM retired)`
 
-	var candidates, promoted uint64
+	var candidates, promoted, retired uint64
 	if err := tx.QueryRowContext(
 		ctx,
 		promoteQuery,
@@ -1107,11 +1142,16 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context,
 		endHeight,
 		limit,
 		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
-	).Scan(&candidates, &promoted); err != nil {
+		legacyObjectRetiredAt,
+		legacyObjectRetireAfter,
+	).Scan(&candidates, &promoted, &retired); err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
 	}
 	if candidates != promoted {
 		return nil, xerrors.Errorf("consolidation promotion guard failed: selected %d rows but promoted %d", candidates, promoted)
+	}
+	if candidates != retired {
+		return nil, xerrors.Errorf("consolidation retirement guard failed: selected %d rows but marked %d for retirement", candidates, retired)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, xerrors.Errorf("failed to commit consolidation promotion: %w", err)

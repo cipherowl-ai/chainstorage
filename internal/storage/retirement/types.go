@@ -19,29 +19,34 @@ type (
 	}
 
 	MetadataRow struct {
-		BlockMetadataID     int64
-		Tag                 uint32
-		Height              uint64
-		Hash                string
-		Skipped             bool
-		LegacyObjectKey     string
-		PrimaryObjectFormat api.BlockObjectFormat
-		PrimaryByteLength   uint64
-		Shadow              *ConsolidationShadow
+		BlockMetadataID           int64
+		Tag                       uint32
+		Height                    uint64
+		Hash                      string
+		Skipped                   bool
+		PrimaryObjectKey          string
+		LegacyObjectKey           string
+		PrimaryObjectFormat       api.BlockObjectFormat
+		PrimaryByteOffset         uint64
+		PrimaryByteLength         uint64
+		PrimaryUncompressedLength uint64
+		Shadow                    *ConsolidationShadow
 	}
 
 	ConsolidationShadow struct {
-		Tag                   uint32
-		Height                uint64
-		Hash                  string
-		LegacyObjectKey       string
-		ConsolidatedObjectKey string
-		ObjectFormat          api.BlockObjectFormat
-		ByteOffset            uint64
-		ByteLength            uint64
-		UncompressedLength    uint64
-		ValidatedAt           *time.Time
-		FormatVersion         int
+		Tag                     uint32
+		Height                  uint64
+		Hash                    string
+		LegacyObjectKey         string
+		ConsolidatedObjectKey   string
+		ObjectFormat            api.BlockObjectFormat
+		ByteOffset              uint64
+		ByteLength              uint64
+		UncompressedLength      uint64
+		ValidatedAt             *time.Time
+		LegacyObjectRetiredAt   *time.Time
+		LegacyObjectRetireAfter *time.Time
+		FormatVersion           int
 	}
 
 	ObjectHead struct {
@@ -127,6 +132,7 @@ type (
 		LegacyBytes     uint64     `json:"legacy_bytes"`
 		ConsolidatedKey string     `json:"consolidated_key"`
 		ValidatedAt     *time.Time `json:"validated_at"`
+		RetiredAt       *time.Time `json:"retired_at"`
 		EligibleAt      *time.Time `json:"eligible_at"`
 		Action          string     `json:"action"`
 		SkipReason      string     `json:"skip_reason"`
@@ -139,21 +145,21 @@ const (
 	ActionDeleteObjectVersion  = "delete_object_version"
 	ActionDeletedObjectVersion = "deleted_object_version"
 
-	SkipSkippedBlock                = "skipped_block"
-	SkipPrimaryNotLegacySingleBlock = "primary_not_legacy_single_block"
-	SkipMissingLegacyKey            = "missing_legacy_key"
-	SkipMissingConsolidationShadow  = "missing_consolidation_shadow"
-	SkipValidationNotPassed         = "validation_not_passed"
-	SkipInvalidMetadataReference    = "invalid_metadata_reference"
-	SkipGracePeriodActive           = "grace_period_active"
-	SkipChainRangeNotApproved       = "chain_range_not_approved"
-	SkipActiveFallbackOrReadErrors  = "active_fallback_or_read_errors"
-	SkipFileClientsNotApproved      = "file_clients_not_approved"
-	SkipMissingCSCBObject           = "missing_cscb_object"
-	SkipLegacyObjectMissing         = "legacy_object_missing"
-	SkipLegacyCurrentDeleteMarker   = "legacy_current_delete_marker"
-	SkipLegacyVersionIDUnavailable  = "legacy_version_id_unavailable"
-	SkipProductionDeletionDisabled  = "production_deletion_disabled"
-	SkipObjectInspectionFailed      = "object_inspection_failed"
-	SkipVersionedDeleteFailed       = "versioned_delete_failed"
+	SkipSkippedBlock               = "skipped_block"
+	SkipMissingLegacyKey           = "missing_legacy_key"
+	SkipMissingConsolidationShadow = "missing_consolidation_shadow"
+	SkipValidationNotPassed        = "validation_not_passed"
+	SkipActiveMetadataStillLegacy  = "active_metadata_still_legacy"
+	SkipInvalidMetadataReference   = "invalid_metadata_reference"
+	SkipGracePeriodActive          = "grace_period_active"
+	SkipChainRangeNotApproved      = "chain_range_not_approved"
+	SkipActiveFallbackOrReadErrors = "active_fallback_or_read_errors"
+	SkipFileClientsNotApproved     = "file_clients_not_approved"
+	SkipMissingCSCBObject          = "missing_cscb_object"
+	SkipLegacyObjectMissing        = "legacy_object_missing"
+	SkipLegacyCurrentDeleteMarker  = "legacy_current_delete_marker"
+	SkipLegacyVersionIDUnavailable = "legacy_version_id_unavailable"
+	SkipProductionDeletionDisabled = "production_deletion_disabled"
+	SkipObjectInspectionFailed     = "object_inspection_failed"
+	SkipVersionedDeleteFailed      = "versioned_delete_failed"
 )

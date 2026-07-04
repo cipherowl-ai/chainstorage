@@ -50,11 +50,11 @@ func newLegacyRetirementPlanCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plan-legacy-single-blocks",
 		Short: "dry-run legacy single-block object retirement after CSCB validation",
-		Long: `Plan retirement for legacy single-block S3 objects that already have validated CSCB shadow metadata.
+		Long: `Plan retirement for legacy single-block S3 objects whose active metadata has already been promoted to validated CSCB metadata.
 
 The command is dry-run by default. It emits one auditable JSON report containing the bucket,
 legacy key, version id when available, height, hash, legacy bytes, consolidated key,
-validated_at, eligible_at, action, and skip reason for every scanned canonical row.
+validated_at, retired_at, eligible_at, action, and skip reason for every scanned canonical row.
 
 Production deletion is disabled. Non-production execution deletes only an explicit S3 object
 version; rows without a version id are skipped to avoid delete-marker-only cleanup.`,
@@ -67,7 +67,7 @@ version; rows without a version id are skipped to avoid delete-marker-only clean
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.startHeight, "start-height", 0, "inclusive block start height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.endHeight, "end-height", 0, "exclusive block end height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.limit, "limit", 0, "maximum rows to scan; default scans the full range")
-	cmd.Flags().DurationVar(&legacyRetirementFlags.gracePeriod, "grace-period", 7*24*time.Hour, "minimum age after validated_at before a row is eligible")
+	cmd.Flags().DurationVar(&legacyRetirementFlags.gracePeriod, "grace-period", 0, "fallback minimum age after validated_at when legacy_object_retire_after is not set; default uses aws.storage.consolidation.legacy_object_retention")
 	cmd.Flags().StringVar(&legacyRetirementFlags.approveChain, "approve-chain", "", "explicit chain approval, e.g. solana-mainnet")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
 	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
@@ -111,6 +111,10 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 	}
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
+	gracePeriod := flags.gracePeriod
+	if gracePeriod == 0 {
+		gracePeriod = cfg.AWS.Storage.Consolidation.LegacyObjectRetention
+	}
 	targetChain := approvalChainFromFlags()
 	logger.Info("planning legacy single-block retirement",
 		zap.String("environment", string(cfg.Env())),
@@ -145,7 +149,7 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 		EndHeight:               flags.endHeight,
 		Limit:                   flags.limit,
 		Now:                     time.Now().UTC(),
-		GracePeriod:             flags.gracePeriod,
+		GracePeriod:             gracePeriod,
 		Execute:                 flags.execute,
 		ClientMigrationApproved: flags.clientMigrationApproved,
 		FallbackErrorCount:      flags.fallbackErrorCount,
