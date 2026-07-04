@@ -289,7 +289,7 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
 		if mode.IsAutoConsolidate() {
-			if err := a.validateFullAutoConsolidationCoverage(ctx, request); err != nil {
+			if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
 				return nil, err
 			}
 		}
@@ -299,14 +299,10 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 			PromotedBlocks: prePromotedBlocks,
 		}, nil
 	}
-	if mode.IsAutoConsolidate() && !isFullContiguousConsolidationWindow(records, request.StartHeight, request.MaxBlocks) {
-		return nil, xerrors.Errorf(
-			"auto_consolidate requires a full contiguous consolidation window: start_height=%d end_height=%d max_blocks=%d records=%d",
-			request.StartHeight,
-			request.EndHeight,
-			request.MaxBlocks,
-			len(records),
-		)
+	if mode.IsAutoConsolidate() {
+		if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
+			return nil, err
+		}
 	}
 
 	buildStart := time.Now()
@@ -443,23 +439,41 @@ func (a *BatchConsolidator) promoteConsolidatedBlocks(ctx context.Context, mode 
 	return result.Blocks, nil
 }
 
-func (a *BatchConsolidator) validateFullAutoConsolidationCoverage(ctx context.Context, request *BatchConsolidatorRequest) error {
-	stats, err := a.metaStorage.GetBlockConsolidationShadowStats(ctx, request.Tag, request.StartHeight, request.EndHeight)
+func (a *BatchConsolidator) validateFullAutoConsolidationWindow(ctx context.Context, request *BatchConsolidatorRequest) error {
+	blocks, err := a.metaStorage.GetBlocksByHeightRange(ctx, request.Tag, request.StartHeight, request.EndHeight)
 	if err != nil {
-		return xerrors.Errorf("failed to verify auto_consolidate coverage: %w", err)
+		return xerrors.Errorf("failed to verify auto_consolidate canonical window: %w", err)
 	}
-	if stats == nil || stats.Blocks != request.MaxBlocks {
-		actualBlocks := uint64(0)
-		if stats != nil {
-			actualBlocks = stats.Blocks
-		}
+	if request.MaxBlocks == 0 || uint64(len(blocks)) != request.MaxBlocks {
 		return xerrors.Errorf(
-			"auto_consolidate requires full validated consolidation coverage before empty success: start_height=%d end_height=%d max_blocks=%d covered_blocks=%d",
+			"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d canonical_blocks=%d",
 			request.StartHeight,
 			request.EndHeight,
 			request.MaxBlocks,
-			actualBlocks,
+			len(blocks),
 		)
+	}
+	for i, block := range blocks {
+		if block == nil {
+			return xerrors.Errorf(
+				"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d nil_index=%d",
+				request.StartHeight,
+				request.EndHeight,
+				request.MaxBlocks,
+				i,
+			)
+		}
+		expectedHeight := request.StartHeight + uint64(i)
+		if expectedHeight < request.StartHeight || block.GetHeight() != expectedHeight {
+			return xerrors.Errorf(
+				"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d expected_height=%d actual_height=%d",
+				request.StartHeight,
+				request.EndHeight,
+				request.MaxBlocks,
+				expectedHeight,
+				block.GetHeight(),
+			)
+		}
 	}
 	return nil
 }
@@ -562,22 +576,6 @@ func isFullAutoConsolidationRequest(request *BatchConsolidatorRequest) bool {
 		return false
 	}
 	return request.EndHeight-request.StartHeight == request.MaxBlocks
-}
-
-func isFullContiguousConsolidationWindow(records []*metastorage.BlockMetadataRecord, startHeight uint64, maxBlocks uint64) bool {
-	if maxBlocks == 0 || uint64(len(records)) != maxBlocks {
-		return false
-	}
-	for i, record := range records {
-		if record == nil || record.Metadata == nil {
-			return false
-		}
-		expectedHeight := startHeight + uint64(i)
-		if expectedHeight < startHeight || record.Metadata.GetHeight() != expectedHeight {
-			return false
-		}
-	}
-	return true
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {

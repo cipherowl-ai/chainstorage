@@ -110,8 +110,8 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanNoOpsWhenShadow
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
 	s.metaStorage.EXPECT().
-		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
-		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 100}, nil)
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(makeCanonicalWindow(100, 100), nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -137,8 +137,8 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanPromotesExistin
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
 	s.metaStorage.EXPECT().
-		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
-		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 100}, nil)
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(makeCanonicalWindow(100, 100), nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -165,13 +165,13 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanRejectsMissingC
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(nil, nil)
 	s.metaStorage.EXPECT().
-		GetBlockConsolidationShadowStats(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
-		Return(&metastorage.ConsolidationShadowStats{Objects: 1, Blocks: 99}, nil)
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(makeCanonicalWindow(99, 100), nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.Error(err)
 	require.Equal(&BatchConsolidatorResponse{}, response)
-	require.Contains(err.Error(), "auto_consolidate requires full validated consolidation coverage")
+	require.Contains(err.Error(), "auto_consolidate requires a full canonical consolidation window")
 }
 
 func (s *BatchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemainsAccepted() {
@@ -294,10 +294,11 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	}
 }
 
-func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsPartialContiguousWindow() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateAllowsPartialRetryWindow() {
 	require := testutil.Require(s.T())
-	records, _ := makeConsolidatorFixture(3, 1000)
+	records, blocks := makeConsolidatorFixture(3, 1000)
 	records = records[:2]
+	blocks = blocks[:2]
 	request := &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         records[0].Metadata.GetTag(),
@@ -307,22 +308,42 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsPartialContiguous
 	}
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).Times(2).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(records, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(makeCanonicalWindow(3, 1000), nil)
+	for i := range records {
+		s.blobStorage.EXPECT().Download(gomock.Any(), records[i].Metadata).Return(blocks[i], nil)
+	}
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID, records[1].ID})).
+		Return("object-key", makeConsolidatorPlacements(records), nil)
+	s.metaStorage.EXPECT().
+		PersistBlockConsolidationShadows(gomock.Any(), gomock.Any()).
+		Return(nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
-	require.Error(err)
-	require.Equal(&BatchConsolidatorResponse{}, response)
-	require.Contains(err.Error(), "auto_consolidate requires a full contiguous consolidation window")
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          request.EndHeight,
+		ScannedBlocks:      2,
+		ConsolidatedBlocks: 2,
+		ObjectKey:          "object-key",
+	}, response)
 }
 
-func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsGappedWindow() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateAllowsGappedMissingShadowScanWhenCanonicalWindowIsFull() {
 	require := testutil.Require(s.T())
-	records, _ := makeConsolidatorFixture(3, 1000)
-	records = []*metastorage.BlockMetadataRecord{records[0], records[2]}
+	allRecords, allBlocks := makeConsolidatorFixture(3, 1000)
+	records := []*metastorage.BlockMetadataRecord{allRecords[0], allRecords[2]}
+	blocks := []*api.Block{allBlocks[0], allBlocks[2]}
+	canonicalWindow := makeCanonicalWindow(3, 1000)
+	canonicalWindow[1].Skipped = true
 	request := &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
 		Tag:         records[0].Metadata.GetTag(),
@@ -332,16 +353,33 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsGappedWindow() {
 	}
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).Times(2).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(records, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(canonicalWindow, nil)
+	for i := range records {
+		s.blobStorage.EXPECT().Download(gomock.Any(), records[i].Metadata).Return(blocks[i], nil)
+	}
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID, records[1].ID})).
+		Return("object-key", makeConsolidatorPlacements(records), nil)
+	s.metaStorage.EXPECT().
+		PersistBlockConsolidationShadows(gomock.Any(), gomock.Any()).
+		Return(nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
-	require.Error(err)
-	require.Equal(&BatchConsolidatorResponse{}, response)
-	require.Contains(err.Error(), "auto_consolidate requires a full contiguous consolidation window")
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          request.EndHeight,
+		ScannedBlocks:      2,
+		ConsolidatedBlocks: 2,
+		ObjectKey:          "object-key",
+	}, response)
 }
 
 func (s *BatchConsolidatorTestSuite) TestDownloadedBlockMetadataMismatchFailsBeforeUpload() {
@@ -381,6 +419,9 @@ func (s *BatchConsolidatorTestSuite) TestUploadFailureDoesNotPersistShadowPlacem
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(records, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
+		Return(makeCanonicalWindow(1, 1000), nil)
 	s.blobStorage.EXPECT().Download(gomock.Any(), records[0].Metadata).Return(blocks[0], nil)
 	s.blobStorage.EXPECT().
 		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID})).
@@ -722,4 +763,29 @@ func makeConsolidatorFixture(count int, startHeight uint64) ([]*metastorage.Bloc
 		}
 	}
 	return records, blocks
+}
+
+func makeCanonicalWindow(count int, startHeight uint64) []*api.BlockMetadata {
+	records, _ := makeConsolidatorFixture(count, startHeight)
+	blocks := make([]*api.BlockMetadata, len(records))
+	for i, record := range records {
+		blocks[i] = proto.Clone(record.Metadata).(*api.BlockMetadata)
+	}
+	return blocks
+}
+
+func makeConsolidatorPlacements(records []*metastorage.BlockMetadataRecord) []blobstorage.BlockPlacement {
+	placements := make([]blobstorage.BlockPlacement, len(records))
+	for i, record := range records {
+		placements[i] = blobstorage.BlockPlacement{
+			MetadataID:         record.ID,
+			Height:             record.Metadata.GetHeight(),
+			Hash:               record.Metadata.GetHash(),
+			ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:         uint64(i * 100),
+			ByteLength:         100,
+			UncompressedLength: 100,
+		}
+	}
+	return placements
 }
