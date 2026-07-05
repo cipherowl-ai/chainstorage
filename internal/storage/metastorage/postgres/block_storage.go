@@ -810,13 +810,25 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND shadow.height >= $2
 			AND shadow.height < $3
 			AND (
-				shadow.legacy_object_key_main = eligible.object_key_main
+				(
+					shadow.legacy_object_key_main = eligible.object_key_main
+					AND eligible.byte_length IS NULL
+					AND shadow.object_format = $4
+					AND shadow.byte_offset >= 0
+					AND shadow.byte_length > 0
+					AND shadow.uncompressed_length IS NOT NULL
+					AND shadow.uncompressed_length > 0
+				)
 				OR (
 					eligible.object_key_main = shadow.consolidated_object_key_main
+					AND eligible.object_format = $4
 					AND eligible.object_format = shadow.object_format
 					AND eligible.byte_offset = shadow.byte_offset
 					AND eligible.byte_length = shadow.byte_length
+					AND eligible.byte_length > 0
 					AND eligible.uncompressed_length = shadow.uncompressed_length
+					AND eligible.uncompressed_length IS NOT NULL
+					AND eligible.uncompressed_length > 0
 				)
 			)
 			AND shadow.validated_at IS NOT NULL
@@ -824,7 +836,7 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND shadow.consolidated_object_key_main <> ''`
 
 	var objects, blocks, eligibleBlocks uint64
-	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&objects, &blocks, &eligibleBlocks); err != nil {
+	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight, int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH)).Scan(&objects, &blocks, &eligibleBlocks); err != nil {
 		return nil, xerrors.Errorf("failed to get consolidation shadow stats: %w", err)
 	}
 	return &internal.ConsolidationShadowStats{

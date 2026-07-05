@@ -642,6 +642,55 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsExcludesSkip
 	require.Equal(uint64(2), stats.EligibleBlocks)
 }
 
+func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsRequiresPromotionValidShadows() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/valid.cscb.zstd", 10, 20, 20, true, "")
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[1],
+		"consolidated/wrong-format.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		30,
+		40,
+		40,
+	)
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[2],
+		"consolidated/zero-byte-length.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		50,
+		0,
+		60,
+	)
+	s.insertInvalidConsolidationShadow(
+		ctx,
+		blocks[3],
+		"consolidated/zero-uncompressed-length.cscb.zstd",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		70,
+		80,
+		0,
+	)
+	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/promoted.cscb.zstd", 90, 100, 100, true, "")
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[4].GetHeight(), blocks[4].GetHeight()+1, 10, config.DefaultLegacyObjectRetention)
+	require.NoError(err)
+	require.Equal(uint64(1), result.Blocks)
+
+	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+5)
+	require.NoError(err)
+	require.Equal(uint64(2), stats.Objects)
+	require.Equal(uint64(2), stats.Blocks)
+	require.Equal(uint64(5), stats.EligibleBlocks)
+}
+
 func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimaryIdentity() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
