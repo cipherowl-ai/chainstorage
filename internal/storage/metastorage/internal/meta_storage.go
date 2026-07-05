@@ -95,8 +95,9 @@ type (
 	}
 
 	ConsolidationShadowStats struct {
-		Objects uint64
-		Blocks  uint64
+		Objects        uint64
+		Blocks         uint64
+		EligibleBlocks uint64
 	}
 
 	ConsolidationPromotionResult struct {

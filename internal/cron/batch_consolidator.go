@@ -364,13 +364,14 @@ func (t *batchConsolidatorTask) verifyAutoConsolidateCoverage(ctx context.Contex
 	if err != nil {
 		return xerrors.Errorf("failed to get auto_consolidate coverage stats for range [%d, %d): %w", startHeight, endHeight, err)
 	}
-	expectedBlocks := endHeight - startHeight
-	actualBlocks := uint64(0)
+	eligibleBlocks := uint64(0)
+	shadowBlocks := uint64(0)
 	if stats != nil {
-		actualBlocks = stats.Blocks
+		eligibleBlocks = stats.EligibleBlocks
+		shadowBlocks = stats.Blocks
 	}
-	if actualBlocks != expectedBlocks {
-		return xerrors.Errorf("auto_consolidate coverage mismatch for range [%d, %d): expected %d blocks, got %d", startHeight, endHeight, expectedBlocks, actualBlocks)
+	if shadowBlocks != eligibleBlocks {
+		return xerrors.Errorf("auto_consolidate coverage mismatch for range [%d, %d): expected %d eligible blocks, got %d shadow blocks", startHeight, endHeight, eligibleBlocks, shadowBlocks)
 	}
 	return nil
 }

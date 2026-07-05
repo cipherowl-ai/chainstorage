@@ -606,11 +606,34 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
 	require.NoError(err)
 	require.Equal(uint64(2), stats.Objects)
 	require.Equal(uint64(3), stats.Blocks)
+	require.Equal(uint64(8), stats.EligibleBlocks)
 
 	stats, err = s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight+1, startHeight+3)
 	require.NoError(err)
 	require.Equal(uint64(2), stats.Objects)
 	require.Equal(uint64(2), stats.Blocks)
+	require.Equal(uint64(2), stats.EligibleBlocks)
+}
+
+func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsExcludesSkippedBlocks() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
+	blocks[1].Skipped = true
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+
+	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20, true, "")
+	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/skipped.cscb.zstd", 30, 40, 40, true, "")
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/second.cscb.zstd", 50, 60, 60, true, "")
+
+	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+3)
+	require.NoError(err)
+	require.Equal(uint64(2), stats.Objects)
+	require.Equal(uint64(2), stats.Blocks)
+	require.Equal(uint64(2), stats.EligibleBlocks)
 }
 
 func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimaryIdentity() {
@@ -708,6 +731,7 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesVali
 	require.NoError(err)
 	require.Equal(uint64(2), stats.Objects)
 	require.Equal(uint64(2), stats.Blocks)
+	require.Equal(uint64(3), stats.EligibleBlocks)
 }
 
 func (s *blockStorageTestSuite) TestGetFirstPromotableBlockConsolidationShadowFiltersCandidates() {

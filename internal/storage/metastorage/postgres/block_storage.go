@@ -777,45 +777,60 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 		return &internal.ConsolidationShadowStats{}, nil
 	}
 	const query = `
+		WITH eligible AS (
+			SELECT
+				bm.id,
+				bm.tag,
+				bm.height,
+				bm.hash,
+				bm.object_key_main,
+				bm.object_format,
+				bm.byte_offset,
+				bm.byte_length,
+				bm.uncompressed_length
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+			WHERE cb.tag = $1
+				AND cb.height >= $2
+				AND cb.height < $3
+				AND bm.skipped = false
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+		)
 		SELECT
 			COUNT(DISTINCT shadow.consolidated_object_key_main),
+			COUNT(shadow.block_metadata_id),
 			COUNT(*)
-		FROM canonical_blocks cb
-		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
-		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-			AND shadow.tag = cb.tag
-			AND shadow.height = cb.height
-			AND shadow.hash = bm.hash
-		WHERE cb.tag = $1
-			AND cb.height >= $2
-			AND cb.height < $3
+		FROM eligible
+		LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = eligible.id
+			AND shadow.tag = eligible.tag
+			AND shadow.height = eligible.height
+			AND shadow.hash = eligible.hash
 			AND shadow.tag = $1
 			AND shadow.height >= $2
 			AND shadow.height < $3
-			AND bm.skipped = false
 			AND (
-				shadow.legacy_object_key_main = bm.object_key_main
+				shadow.legacy_object_key_main = eligible.object_key_main
 				OR (
-					bm.object_key_main = shadow.consolidated_object_key_main
-					AND bm.object_format = shadow.object_format
-					AND bm.byte_offset = shadow.byte_offset
-					AND bm.byte_length = shadow.byte_length
-					AND bm.uncompressed_length = shadow.uncompressed_length
+					eligible.object_key_main = shadow.consolidated_object_key_main
+					AND eligible.object_format = shadow.object_format
+					AND eligible.byte_offset = shadow.byte_offset
+					AND eligible.byte_length = shadow.byte_length
+					AND eligible.uncompressed_length = shadow.uncompressed_length
 				)
 			)
-			AND bm.object_key_main IS NOT NULL
-			AND bm.object_key_main <> ''
 			AND shadow.validated_at IS NOT NULL
 			AND shadow.consolidated_object_key_main IS NOT NULL
 			AND shadow.consolidated_object_key_main <> ''`
 
-	var objects, blocks uint64
-	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&objects, &blocks); err != nil {
+	var objects, blocks, eligibleBlocks uint64
+	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&objects, &blocks, &eligibleBlocks); err != nil {
 		return nil, xerrors.Errorf("failed to get consolidation shadow stats: %w", err)
 	}
 	return &internal.ConsolidationShadowStats{
-		Objects: objects,
-		Blocks:  blocks,
+		Objects:        objects,
+		Blocks:         blocks,
+		EligibleBlocks: eligibleBlocks,
 	}, nil
 }
 

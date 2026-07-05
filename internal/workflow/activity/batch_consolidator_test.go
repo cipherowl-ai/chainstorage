@@ -149,7 +149,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanPromotesExistin
 	}, response)
 }
 
-func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanRejectsMissingCoverage() {
+func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsMissingCoverageBeforePromotion() {
 	require := testutil.Require(s.T())
 	request := &BatchConsolidatorRequest{
 		Mode:        config.ConsolidationModeAutoConsolidate,
@@ -160,10 +160,10 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanRejectsMissingC
 	}
 	s.metaStorage.EXPECT().
 		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
-		Return(&metastorage.ConsolidationPromotionResult{}, nil)
+		Times(0)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
-		Return(nil, nil)
+		Times(0)
 	s.metaStorage.EXPECT().
 		GetBlocksByHeightRange(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight).
 		Return(makeCanonicalWindow(99, 100), nil)

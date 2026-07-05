@@ -276,6 +276,11 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 			request.MaxBlocks,
 		)
 	}
+	if mode.IsAutoConsolidate() {
+		if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
+			return nil, err
+		}
+	}
 	prePromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
 	if err != nil {
 		return nil, err
@@ -288,21 +293,11 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	scanDuration := time.Since(scanStart)
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
-		if mode.IsAutoConsolidate() {
-			if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
-				return nil, err
-			}
-		}
 		return &BatchConsolidatorResponse{
 			StartHeight:    request.StartHeight,
 			EndHeight:      request.EndHeight,
 			PromotedBlocks: prePromotedBlocks,
 		}, nil
-	}
-	if mode.IsAutoConsolidate() {
-		if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
-			return nil, err
-		}
 	}
 
 	buildStart := time.Now()
