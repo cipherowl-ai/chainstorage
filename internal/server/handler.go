@@ -424,11 +424,14 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 	}
 
 	if shouldReadFromConsolidated(req.GetReadSource(), false) {
-		if shadow, ok := s.getShadowBlockMetadata(ctx, block); ok {
-			blockFile, err := s.newBlockFile(shadow)
+		if consolidated, ok := s.getConsolidatedBlockMetadata(ctx, block); ok {
+			blockFile, err := s.newBlockFile(consolidated)
 			if err == nil {
 				s.emitBlocksMetric(formatFile, clientID, 1)
 				return &api.GetBlockFileResponse{File: blockFile}, nil
+			}
+			if isConsolidatedBlockMetadata(block) {
+				return nil, xerrors.Errorf("failed to prepare consolidated block file: %w", err)
 			}
 			s.emitShadowReadMetric(shadowOutcomeError, 1)
 			s.logger.Warn(
@@ -436,7 +439,7 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 				zap.Uint32("tag", block.GetTag()),
 				zap.Uint64("height", block.GetHeight()),
 				zap.String("hash", block.GetHash()),
-				zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+				zap.String("consolidated_object_key", consolidated.GetObjectKeyMain()),
 				zap.Error(err),
 			)
 		}
@@ -473,6 +476,9 @@ func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFile
 
 	blockFiles, err := s.newBlockFiles(selectedBlocks)
 	if err != nil && shadowCount > 0 {
+		if allConsolidatedBlockMetadata(blocks) {
+			return nil, xerrors.Errorf("newBlockFile error: %w", err)
+		}
 		s.emitShadowReadMetric(shadowOutcomeError, int64(shadowCount))
 		s.logger.Warn(
 			"failed to prepare consolidated block files; falling back to legacy",
@@ -963,7 +969,7 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		return output, nil
 	}
 
-	shadow, ok := s.getShadowBlockMetadata(ctx, block)
+	consolidated, ok := s.getConsolidatedBlockMetadata(ctx, block)
 	if !ok {
 		output, err := s.downloadBlockWithShadowMetrics(ctx, block, shadowPathLegacy)
 		if err != nil {
@@ -974,10 +980,14 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		return output, nil
 	}
 
-	output, err := s.downloadBlockWithShadowMetrics(ctx, shadow, shadowPathConsolidated)
+	output, err := s.downloadBlockWithShadowMetrics(ctx, consolidated, shadowPathConsolidated)
 	if err == nil {
 		s.emitShadowReadMetric(shadowOutcomeSuccess, 1)
 		return blockWithPrimaryMetadata(output, block), nil
+	}
+	if isConsolidatedBlockMetadata(block) {
+		s.emitShadowReadMetric(shadowReadErrorOutcome(err), 1)
+		return nil, err
 	}
 
 	s.emitShadowReadMetric(shadowReadErrorOutcome(err), 1)
@@ -986,7 +996,7 @@ func (s *Server) getBlockFromBlobStorage(ctx context.Context, block *api.BlockMe
 		zap.Uint32("tag", block.GetTag()),
 		zap.Uint64("height", block.GetHeight()),
 		zap.String("hash", block.GetHash()),
-		zap.String("shadow_object_key", shadow.GetObjectKeyMain()),
+		zap.String("consolidated_object_key", consolidated.GetObjectKeyMain()),
 		zap.Error(err),
 	)
 	fallback, fallbackErr := s.downloadBlockWithShadowMetrics(ctx, block, shadowPathLegacy)
@@ -1018,6 +1028,10 @@ func (s *Server) getBlocksFromBlobStorage(ctx context.Context, blocks []*api.Blo
 	if shadowCount == 0 {
 		s.emitShadowReadMetric(shadowOutcomeFallbackFailure, int64(fallbackCount))
 		return nil, xerrors.Errorf("failed to download blocks from blob storage: %w", err)
+	}
+	if allConsolidatedBlockMetadata(blocks) {
+		s.emitShadowReadMetric(shadowReadErrorOutcome(err), int64(shadowCount))
+		return nil, err
 	}
 
 	s.emitShadowReadMetric(shadowReadErrorOutcome(err), int64(shadowCount))
@@ -1056,6 +1070,13 @@ func shouldReadFromConsolidated(readSource api.BlockReadSource, defaultReadShado
 	default:
 		return defaultReadShadowFirst
 	}
+}
+
+func (s *Server) getConsolidatedBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
+	if isConsolidatedBlockMetadata(block) {
+		return block, true
+	}
+	return s.getShadowBlockMetadata(ctx, block)
 }
 
 func (s *Server) getShadowBlockMetadata(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, bool) {
@@ -1126,6 +1147,11 @@ func (s *Server) selectShadowBlockMetadata(ctx context.Context, blocks []*api.Bl
 	for i, block := range blocks {
 		shadow := shadows[i]
 		if shadow == nil {
+			if isConsolidatedBlockMetadata(block) {
+				selected[i] = block
+				shadowCount++
+				continue
+			}
 			s.emitShadowReadMetric(shadowOutcomeMiss, 1)
 			selected[i] = block
 			fallbackCount++
@@ -1222,6 +1248,18 @@ func blocksWithPrimaryMetadata(blocks []*api.Block, metadatas []*api.BlockMetada
 
 func isConsolidatedBlockMetadata(metadata *api.BlockMetadata) bool {
 	return metadata.GetObjectFormat() == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH && metadata.GetByteLength() > 0
+}
+
+func allConsolidatedBlockMetadata(metadatas []*api.BlockMetadata) bool {
+	if len(metadatas) == 0 {
+		return false
+	}
+	for _, metadata := range metadatas {
+		if !isConsolidatedBlockMetadata(metadata) {
+			return false
+		}
+	}
+	return true
 }
 
 func shadowReadErrorOutcome(err error) string {
