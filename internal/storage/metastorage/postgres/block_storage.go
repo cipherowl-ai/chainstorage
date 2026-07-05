@@ -646,110 +646,6 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 	return shadows, nil
 }
 
-func (b *blockStorageImpl) GetBlockConsolidationLegacy(ctx context.Context, block *api.BlockMetadata) (*api.BlockMetadata, error) {
-	blocks, err := b.GetBlocksConsolidationLegacy(ctx, []*api.BlockMetadata{block})
-	if err != nil {
-		return nil, err
-	}
-	if len(blocks) == 0 || blocks[0] == nil {
-		return nil, xerrors.Errorf("consolidation legacy metadata not found: %w", errors.ErrItemNotFound)
-	}
-	return blocks[0], nil
-}
-
-func (b *blockStorageImpl) GetBlocksConsolidationLegacy(ctx context.Context, blocks []*api.BlockMetadata) ([]*api.BlockMetadata, error) {
-	legacyBlocks := make([]*api.BlockMetadata, len(blocks))
-	placeholders := make([]string, 0, len(blocks))
-	args := make([]interface{}, 0, len(blocks)*9)
-	nextArg := 1
-	for i, block := range blocks {
-		if block.GetSkipped() || block.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH {
-			continue
-		}
-		placeholders = append(placeholders, fmt.Sprintf(
-			"($%d::int, $%d::int, $%d::bigint, $%d::varchar, $%d::text, $%d::int, $%d::bigint, $%d::bigint, $%d::bigint)",
-			nextArg,
-			nextArg+1,
-			nextArg+2,
-			nextArg+3,
-			nextArg+4,
-			nextArg+5,
-			nextArg+6,
-			nextArg+7,
-			nextArg+8,
-		))
-		args = append(
-			args,
-			i,
-			block.GetTag(),
-			block.GetHeight(),
-			block.GetHash(),
-			block.GetObjectKeyMain(),
-			int32(block.GetObjectFormat()),
-			block.GetByteOffset(),
-			block.GetByteLength(),
-			block.GetUncompressedLength(),
-		)
-		nextArg += 9
-	}
-	if len(placeholders) == 0 {
-		return legacyBlocks, nil
-	}
-
-	query := fmt.Sprintf(`
-		WITH input(ord, tag, height, hash, consolidated_object_key_main, object_format, byte_offset, byte_length, uncompressed_length) AS (
-			VALUES %s
-		)
-		SELECT
-			input.ord,
-			shadow.legacy_object_key_main
-		FROM input
-		LEFT JOIN LATERAL (
-			SELECT legacy_object_key_main
-			FROM block_consolidation_shadow
-			WHERE tag = input.tag
-				AND height = input.height
-				AND hash = input.hash
-				AND consolidated_object_key_main = input.consolidated_object_key_main
-				AND object_format = input.object_format
-				AND byte_offset = input.byte_offset
-				AND byte_length = input.byte_length
-				AND uncompressed_length = input.uncompressed_length
-				AND validated_at IS NOT NULL
-				AND legacy_object_key_main IS NOT NULL
-				AND legacy_object_key_main <> ''
-			ORDER BY created_at DESC
-			LIMIT 1
-		) shadow ON true
-		ORDER BY input.ord ASC`, strings.Join(placeholders, ", "))
-	rows, err := b.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to get consolidation legacy metadata: %w", err)
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-
-	for rows.Next() {
-		var ord int
-		var legacyKey sql.NullString
-		if err := rows.Scan(&ord, &legacyKey); err != nil {
-			return nil, xerrors.Errorf("failed to scan consolidation legacy metadata: %w", err)
-		}
-		if !legacyKey.Valid {
-			continue
-		}
-		if ord < 0 || ord >= len(blocks) {
-			return nil, xerrors.Errorf("consolidation legacy input order out of range: %d", ord)
-		}
-		legacyBlocks[ord] = makeConsolidationLegacyBlockMetadata(blocks[ord], legacyKey.String)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, xerrors.Errorf("failed to iterate consolidation legacy metadata: %w", err)
-	}
-	return legacyBlocks, nil
-}
-
 func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) ([]*internal.BlockMetadataRecord, error) {
 	if endHeight <= startHeight {
 		return nil, nil
@@ -1281,16 +1177,6 @@ func makeConsolidationShadowBlockMetadata(
 	shadow.ByteLength = byteLength
 	shadow.UncompressedLength = uncompressedLength
 	return shadow
-}
-
-func makeConsolidationLegacyBlockMetadata(block *api.BlockMetadata, objectKey string) *api.BlockMetadata {
-	legacy := proto.Clone(block).(*api.BlockMetadata)
-	legacy.ObjectKeyMain = objectKey
-	legacy.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
-	legacy.ByteOffset = 0
-	legacy.ByteLength = 0
-	legacy.UncompressedLength = 0
-	return legacy
 }
 
 func uint64Value(value sql.NullInt64) uint64 {
