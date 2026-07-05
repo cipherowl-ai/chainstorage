@@ -60,7 +60,7 @@ func (s *fakeStore) DeleteObjectVersion(ctx context.Context, bucket string, key 
 	return nil
 }
 
-func TestPlannerPlan_NotEligibleGracePeriod(t *testing.T) {
+func TestPlannerPlan_NotEligibleRetentionPeriod(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-time.Hour)
@@ -72,7 +72,25 @@ func TestPlannerPlan_NotEligibleGracePeriod(t *testing.T) {
 	require.NoError(err)
 	require.Len(report.Items, 1)
 	require.Equal(ActionSkip, report.Items[0].Action)
-	require.Equal(SkipGracePeriodActive, report.Items[0].SkipReason)
+	require.Equal(SkipRetentionPeriodActive, report.Items[0].SkipReason)
+	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+	require.Zero(store.versionCalls[row.LegacyObjectKey])
+}
+
+func TestPlannerPlan_MissingRetirementMarkerIsNeverEligible(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-30 * 24 * time.Hour)
+	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row.Shadow.LegacyObjectRetiredAt = nil
+	row.Shadow.LegacyObjectRetireAfter = nil
+	store := newFakeStore()
+
+	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipMissingRetirementMarker, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 	require.Zero(store.versionCalls[row.LegacyObjectKey])
 }
@@ -110,6 +128,24 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipInvalidMetadataReference, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+}
+
+func TestPlannerPlan_ActiveLegacyMetadataIsNeverRetired(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+	row := activeLegacyTestRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	store := newFakeStore()
+	store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
+	store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{Exists: true, Bytes: 1024}
+
+	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipActiveMetadataStillLegacy, report.Items[0].SkipReason)
+	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+	require.Zero(store.versionCalls[row.LegacyObjectKey])
 }
 
 func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
@@ -181,13 +217,40 @@ func TestPlannerPlan_SkippedReorgAndPromotedRows(t *testing.T) {
 	promoted := testRow(102, "hash-102", "consolidated/primary.cscb.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	promoted.PrimaryObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
 	promoted.PrimaryByteLength = 123
+	promoted.PrimaryObjectKey = "consolidated/primary.cscb.zstd"
 
 	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{skipped, stale, promoted}}, newFakeStore()).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 	require.Len(report.Items, 3)
 	require.Equal(SkipSkippedBlock, report.Items[0].SkipReason)
 	require.Equal(SkipInvalidMetadataReference, report.Items[1].SkipReason)
-	require.Equal(SkipPrimaryNotLegacySingleBlock, report.Items[2].SkipReason)
+	require.Equal(SkipInvalidMetadataReference, report.Items[2].SkipReason)
+}
+
+func TestPlannerPlan_PromotedRowUsesShadowLegacyKeyAndRetireAfter(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-time.Hour)
+	retiredAt := now.Add(-2 * time.Minute)
+	retireAfter := now.Add(-time.Minute)
+	legacyKey := "legacy/102.zstd"
+	cscbKey := "consolidated/primary.cscb.zstd"
+	row := testRow(102, "hash-102", legacyKey, cscbKey, validatedAt)
+	row.Shadow.LegacyObjectRetiredAt = &retiredAt
+	row.Shadow.LegacyObjectRetireAfter = &retireAfter
+	store := newFakeStore()
+	store.versions[legacyKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
+	store.heads[cscbKey] = ObjectHead{Exists: true, Bytes: 1024}
+
+	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(ActionReportOnly, report.Items[0].Action)
+	require.Equal(legacyKey, report.Items[0].Key)
+	require.Equal(cscbKey, report.Items[0].ConsolidatedKey)
+	require.Equal(retiredAt, *report.Items[0].RetiredAt)
+	require.Equal(retireAfter, *report.Items[0].EligibleAt)
+	require.Empty(report.Items[0].SkipReason)
 }
 
 func TestPlannerPlan_VersionedDeleteMarkerBehavior(t *testing.T) {
@@ -325,7 +388,6 @@ func testRequest(now time.Time, execute bool) PlanRequest {
 		StartHeight:             428058000,
 		EndHeight:               428059000,
 		Now:                     now,
-		GracePeriod:             7 * 24 * time.Hour,
 		Execute:                 execute,
 		ClientMigrationApproved: true,
 		Approval: Approval{
@@ -337,25 +399,43 @@ func testRequest(now time.Time, execute bool) PlanRequest {
 }
 
 func testRow(height uint64, hash string, legacyKey string, cscbKey string, validatedAt time.Time) MetadataRow {
+	retiredAt := validatedAt
+	retireAfter := validatedAt.Add(72 * time.Hour)
 	return MetadataRow{
-		BlockMetadataID:     int64(height),
-		Tag:                 0,
-		Height:              height,
-		Hash:                hash,
-		LegacyObjectKey:     legacyKey,
-		PrimaryObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		BlockMetadataID:           int64(height),
+		Tag:                       0,
+		Height:                    height,
+		Hash:                      hash,
+		PrimaryObjectKey:          cscbKey,
+		LegacyObjectKey:           legacyKey,
+		PrimaryObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		PrimaryByteOffset:         100,
+		PrimaryByteLength:         200,
+		PrimaryUncompressedLength: 300,
 		Shadow: &ConsolidationShadow{
-			Tag:                   0,
-			Height:                height,
-			Hash:                  hash,
-			LegacyObjectKey:       legacyKey,
-			ConsolidatedObjectKey: cscbKey,
-			ObjectFormat:          api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
-			ByteOffset:            100,
-			ByteLength:            200,
-			UncompressedLength:    300,
-			ValidatedAt:           &validatedAt,
-			FormatVersion:         1,
+			Tag:                     0,
+			Height:                  height,
+			Hash:                    hash,
+			LegacyObjectKey:         legacyKey,
+			ConsolidatedObjectKey:   cscbKey,
+			ObjectFormat:            api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:              100,
+			ByteLength:              200,
+			UncompressedLength:      300,
+			ValidatedAt:             &validatedAt,
+			LegacyObjectRetiredAt:   &retiredAt,
+			LegacyObjectRetireAfter: &retireAfter,
+			FormatVersion:           1,
 		},
 	}
+}
+
+func activeLegacyTestRow(height uint64, hash string, legacyKey string, cscbKey string, validatedAt time.Time) MetadataRow {
+	row := testRow(height, hash, legacyKey, cscbKey, validatedAt)
+	row.PrimaryObjectKey = legacyKey
+	row.PrimaryObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	row.PrimaryByteOffset = 0
+	row.PrimaryByteLength = 0
+	row.PrimaryUncompressedLength = 0
+	return row
 }

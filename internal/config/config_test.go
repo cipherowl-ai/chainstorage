@@ -909,6 +909,32 @@ func TestConsolidationHistoricalBackfillModeAcceptedAsDeprecatedAlias(t *testing
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
+func TestConsolidationLegacyObjectRetentionConfig(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(config.DefaultLegacyObjectRetention, cfg.AWS.Storage.Consolidation.LegacyObjectRetention)
+
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "24h")
+	cfg, err = config.New()
+	require.NoError(err)
+	require.Equal(24*time.Hour, cfg.AWS.Storage.Consolidation.LegacyObjectRetention)
+}
+
+func TestConsolidationLegacyObjectRetentionMustBePositiveWhenEnabled(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeAutoConsolidate))
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "0s")
+
+	_, err := config.New()
+	require.Error(err)
+	require.Contains(err.Error(), "legacy_object_retention must be positive")
+}
+
 func TestConsolidationPromoteFinalizedRequiresSafePromotionLag(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1082,6 +1108,7 @@ func defaultConsolidationConfig() config.ConsolidationConfig {
 		ShardSize:              10000,
 		MultipartThreshold:     134217728,
 		ReadShadowFirst:        false,
+		LegacyObjectRetention:  config.DefaultLegacyObjectRetention,
 	}
 }
 

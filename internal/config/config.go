@@ -455,6 +455,7 @@ type (
 		ReadShadowFirst                     bool              `mapstructure:"read_shadow_first"`
 		PromotionGateHeight                 *uint64           `mapstructure:"promotion_gate_height"`
 		SafePromotionLag                    *uint64           `mapstructure:"safe_promotion_lag"`
+		LegacyObjectRetention               time.Duration     `mapstructure:"legacy_object_retention"`
 		LegacyShadowWriteAfterSyncerCutover bool              `mapstructure:"legacy_shadow_write_after_syncer_cutover"`
 	}
 
@@ -627,6 +628,7 @@ const (
 	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
+	DefaultLegacyObjectRetention                                 = 72 * time.Hour
 
 	AWSAccountDevelopment AWSAccount = "development"
 	AWSAccountProduction  AWSAccount = "production"
@@ -719,6 +721,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.shard_size", 10000)
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
 	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
+	v.SetDefault("aws.storage.consolidation.legacy_object_retention", DefaultLegacyObjectRetention.String())
 	if err := v.BindEnv("aws.storage.consolidation.promotion_gate_height"); err != nil {
 		return nil, xerrors.Errorf("failed to bind promotion_gate_height env: %w", err)
 	}
@@ -851,6 +854,9 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.ShadowTimeout <= 0 {
 		return xerrors.New("consolidation shadow_timeout must be positive")
+	}
+	if consolidation.LegacyObjectRetention <= 0 {
+		return xerrors.New("consolidation legacy_object_retention must be positive")
 	}
 	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.SafePromotionLag == nil {
 		return xerrors.New("consolidation promote_finalized requires safe_promotion_lag")

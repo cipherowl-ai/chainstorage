@@ -36,8 +36,11 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 			COALESCE(bm.hash, ''),
 			bm.skipped,
 			COALESCE(bm.object_key_main, ''),
+			COALESCE(shadow.legacy_object_key_main, bm.object_key_main, ''),
 			bm.object_format,
+			bm.byte_offset,
 			bm.byte_length,
+			bm.uncompressed_length,
 			shadow.tag,
 			shadow.height,
 			shadow.hash,
@@ -48,6 +51,8 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 			shadow.byte_length,
 			shadow.uncompressed_length,
 			shadow.validated_at,
+			shadow.legacy_object_retired_at,
+			shadow.legacy_object_retire_after,
 			shadow.format_version
 		FROM canonical_blocks cb
 		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
@@ -70,7 +75,9 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 	for rows.Next() {
 		var row MetadataRow
 		var primaryObjectFormat int64
+		var primaryByteOffset sql.NullInt64
 		var primaryByteLength sql.NullInt64
+		var primaryUncompressedLength sql.NullInt64
 		var shadowTag sql.NullInt64
 		var shadowHeight sql.NullInt64
 		var shadowHash sql.NullString
@@ -81,6 +88,8 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 		var shadowByteLength sql.NullInt64
 		var shadowUncompressedLength sql.NullInt64
 		var shadowValidatedAt sql.NullTime
+		var shadowLegacyObjectRetiredAt sql.NullTime
+		var shadowLegacyObjectRetireAfter sql.NullTime
 		var shadowFormatVersion sql.NullInt64
 		if err := rows.Scan(
 			&row.BlockMetadataID,
@@ -88,9 +97,12 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 			&row.Height,
 			&row.Hash,
 			&row.Skipped,
+			&row.PrimaryObjectKey,
 			&row.LegacyObjectKey,
 			&primaryObjectFormat,
+			&primaryByteOffset,
 			&primaryByteLength,
+			&primaryUncompressedLength,
 			&shadowTag,
 			&shadowHeight,
 			&shadowHash,
@@ -101,12 +113,16 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 			&shadowByteLength,
 			&shadowUncompressedLength,
 			&shadowValidatedAt,
+			&shadowLegacyObjectRetiredAt,
+			&shadowLegacyObjectRetireAfter,
 			&shadowFormatVersion,
 		); err != nil {
 			return nil, xerrors.Errorf("failed to scan retirement metadata row: %w", err)
 		}
 		row.PrimaryObjectFormat = api.BlockObjectFormat(primaryObjectFormat)
+		row.PrimaryByteOffset = nullableUint64(primaryByteOffset)
 		row.PrimaryByteLength = nullableUint64(primaryByteLength)
+		row.PrimaryUncompressedLength = nullableUint64(primaryUncompressedLength)
 		if shadowTag.Valid {
 			shadow := &ConsolidationShadow{
 				Tag:                   uint32(shadowTag.Int64),
@@ -123,6 +139,14 @@ func (r *PostgresRepository) ListMetadataRows(ctx context.Context, tag uint32, s
 			if shadowValidatedAt.Valid {
 				value := shadowValidatedAt.Time
 				shadow.ValidatedAt = &value
+			}
+			if shadowLegacyObjectRetiredAt.Valid {
+				value := shadowLegacyObjectRetiredAt.Time
+				shadow.LegacyObjectRetiredAt = &value
+			}
+			if shadowLegacyObjectRetireAfter.Valid {
+				value := shadowLegacyObjectRetireAfter.Time
+				shadow.LegacyObjectRetireAfter = &value
 			}
 			row.Shadow = shadow
 		}

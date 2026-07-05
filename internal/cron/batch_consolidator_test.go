@@ -243,8 +243,63 @@ func TestBatchConsolidatorCronBootstrapsCursorWhenNoMissingShadow(t *testing.T) 
 		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(11_901)).
 		Return(uint64(0), false, nil)
 	metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), tag, uint64(1_000), uint64(11_000)).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 10, Blocks: 10_000, EligibleBlocks: 10_000}, nil)
+	metaStorage.EXPECT().
 		SetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag, uint64(11_000)).
 		Return(nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+}
+
+func TestBatchConsolidatorCronBootstrapsCursorWithSkippedBlocks(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.StartHeight = 1_000
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 12_000}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(11_901)).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), tag, uint64(1_000), uint64(11_000)).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 10, Blocks: 9_990, EligibleBlocks: 9_990}, nil)
+	metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag, uint64(11_000)).
+		Return(nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+}
+
+func TestBatchConsolidatorCronDoesNotBootstrapCursorWithoutFullCoverage(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.StartHeight = 1_000
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 12_000}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(11_901)).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetBlockConsolidationShadowStats(gomock.Any(), tag, uint64(1_000), uint64(11_000)).
+		Return(&metastorage.ConsolidationShadowStats{Objects: 9, Blocks: 9_999, EligibleBlocks: 10_000}, nil)
+	metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Times(0)
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)

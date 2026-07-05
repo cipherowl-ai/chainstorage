@@ -29,9 +29,6 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	if req.Bucket == "" {
 		return nil, xerrors.New("bucket is required")
 	}
-	if req.GracePeriod == 0 {
-		req.GracePeriod = 7 * 24 * time.Hour
-	}
 	if req.Now.IsZero() {
 		req.Now = time.Now().UTC()
 	}
@@ -51,7 +48,6 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 		Tag:         req.Tag,
 		StartHeight: req.StartHeight,
 		EndHeight:   req.EndHeight,
-		GracePeriod: req.GracePeriod.String(),
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
 			ClientMigrationApproved: req.ClientMigrationApproved,
@@ -119,10 +115,6 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipSkippedBlock
 		return item
 	}
-	if row.PrimaryObjectFormat == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH || row.PrimaryByteLength > 0 {
-		item.SkipReason = SkipPrimaryNotLegacySingleBlock
-		return item
-	}
 	if row.LegacyObjectKey == "" {
 		item.SkipReason = SkipMissingLegacyKey
 		return item
@@ -134,20 +126,29 @@ func (p *Planner) planRow(
 	shadow := row.Shadow
 	item.ConsolidatedKey = shadow.ConsolidatedObjectKey
 	item.ValidatedAt = shadow.ValidatedAt
-	if shadow.ValidatedAt != nil {
-		eligibleAt := shadow.ValidatedAt.Add(req.GracePeriod)
+	item.RetiredAt = shadow.LegacyObjectRetiredAt
+	if shadow.LegacyObjectRetireAfter != nil {
+		eligibleAt := *shadow.LegacyObjectRetireAfter
 		item.EligibleAt = &eligibleAt
 	}
 	if shadow.ValidatedAt == nil {
 		item.SkipReason = SkipValidationNotPassed
 		return item
 	}
+	if !isPrimaryConsolidated(row) {
+		item.SkipReason = SkipActiveMetadataStillLegacy
+		return item
+	}
 	if !validShadowReference(row, shadow) {
 		item.SkipReason = SkipInvalidMetadataReference
 		return item
 	}
+	if shadow.LegacyObjectRetiredAt == nil || shadow.LegacyObjectRetireAfter == nil {
+		item.SkipReason = SkipMissingRetirementMarker
+		return item
+	}
 	if item.EligibleAt != nil && req.Now.Before(*item.EligibleAt) {
-		item.SkipReason = SkipGracePeriodActive
+		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
 	if !approvalMatches(req) {
@@ -231,6 +232,16 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 	if shadow.LegacyObjectKey != row.LegacyObjectKey {
 		return false
 	}
+	if !isPrimaryConsolidated(row) {
+		return false
+	}
+	if row.PrimaryObjectKey != shadow.ConsolidatedObjectKey ||
+		row.PrimaryObjectFormat != shadow.ObjectFormat ||
+		row.PrimaryByteOffset != shadow.ByteOffset ||
+		row.PrimaryByteLength != shadow.ByteLength ||
+		row.PrimaryUncompressedLength != shadow.UncompressedLength {
+		return false
+	}
 	if shadow.ConsolidatedObjectKey == "" {
 		return false
 	}
@@ -241,6 +252,12 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 		return false
 	}
 	return true
+}
+
+func isPrimaryConsolidated(row MetadataRow) bool {
+	return row.PrimaryObjectFormat == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH &&
+		row.PrimaryObjectKey != "" &&
+		row.PrimaryByteLength > 0
 }
 
 func approvalMatches(req PlanRequest) bool {

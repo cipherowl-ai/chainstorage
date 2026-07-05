@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -33,7 +34,7 @@ type (
 		GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error)
 		SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
-		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*ConsolidationPromotionResult, error)
+		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, legacyObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
 	}
 
 	EventStorage interface {
@@ -94,8 +95,9 @@ type (
 	}
 
 	ConsolidationShadowStats struct {
-		Objects uint64
-		Blocks  uint64
+		Objects        uint64
+		Blocks         uint64
+		EligibleBlocks uint64
 	}
 
 	ConsolidationPromotionResult struct {
