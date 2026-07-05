@@ -620,7 +620,13 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsExcludesSkip
 	ctx := context.Background()
 	startHeight := s.config.Chain.BlockStartHeight
 	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
-	blocks[1].Skipped = true
+	blocks[1] = &api.BlockMetadata{
+		Tag:     tag,
+		Height:  startHeight + 1,
+		Skipped: true,
+	}
+	blocks[2].ParentHeight = blocks[0].Height
+	blocks[2].ParentHash = blocks[0].Hash
 
 	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
 	require.NoError(err)
