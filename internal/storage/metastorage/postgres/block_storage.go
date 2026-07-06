@@ -777,36 +777,72 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 		return &internal.ConsolidationShadowStats{}, nil
 	}
 	const query = `
+		WITH eligible AS (
+			SELECT
+				bm.id,
+				bm.tag,
+				bm.height,
+				bm.hash,
+				bm.object_key_main,
+				bm.object_format,
+				bm.byte_offset,
+				bm.byte_length,
+				bm.uncompressed_length
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+			WHERE cb.tag = $1
+				AND cb.height >= $2
+				AND cb.height < $3
+				AND bm.skipped = false
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+		)
 		SELECT
 			COUNT(DISTINCT shadow.consolidated_object_key_main),
+			COUNT(shadow.block_metadata_id),
 			COUNT(*)
-		FROM canonical_blocks cb
-		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
-		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-			AND shadow.legacy_object_key_main = bm.object_key_main
-			AND shadow.tag = cb.tag
-			AND shadow.height = cb.height
-			AND shadow.hash = bm.hash
-		WHERE cb.tag = $1
-			AND cb.height >= $2
-			AND cb.height < $3
+		FROM eligible
+		LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = eligible.id
+			AND shadow.tag = eligible.tag
+			AND shadow.height = eligible.height
+			AND shadow.hash = eligible.hash
 			AND shadow.tag = $1
 			AND shadow.height >= $2
 			AND shadow.height < $3
-			AND bm.skipped = false
-			AND bm.object_key_main IS NOT NULL
-			AND bm.object_key_main <> ''
+			AND (
+				(
+					shadow.legacy_object_key_main = eligible.object_key_main
+					AND eligible.byte_length IS NULL
+					AND shadow.object_format = $4
+					AND shadow.byte_offset >= 0
+					AND shadow.byte_length > 0
+					AND shadow.uncompressed_length IS NOT NULL
+					AND shadow.uncompressed_length > 0
+				)
+				OR (
+					eligible.object_key_main = shadow.consolidated_object_key_main
+					AND eligible.object_format = $4
+					AND eligible.object_format = shadow.object_format
+					AND eligible.byte_offset = shadow.byte_offset
+					AND eligible.byte_length = shadow.byte_length
+					AND eligible.byte_length > 0
+					AND eligible.uncompressed_length = shadow.uncompressed_length
+					AND eligible.uncompressed_length IS NOT NULL
+					AND eligible.uncompressed_length > 0
+				)
+			)
 			AND shadow.validated_at IS NOT NULL
 			AND shadow.consolidated_object_key_main IS NOT NULL
 			AND shadow.consolidated_object_key_main <> ''`
 
-	var objects, blocks uint64
-	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight).Scan(&objects, &blocks); err != nil {
+	var objects, blocks, eligibleBlocks uint64
+	if err := b.db.QueryRowContext(ctx, query, tag, startHeight, endHeight, int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH)).Scan(&objects, &blocks, &eligibleBlocks); err != nil {
 		return nil, xerrors.Errorf("failed to get consolidation shadow stats: %w", err)
 	}
 	return &internal.ConsolidationShadowStats{
-		Objects: objects,
-		Blocks:  blocks,
+		Objects:        objects,
+		Blocks:         blocks,
+		EligibleBlocks: eligibleBlocks,
 	}, nil
 }
 
@@ -970,16 +1006,28 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return nil
 }
 
-func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64) (*internal.ConsolidationPromotionResult, error) {
+func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	limit uint64,
+	legacyObjectRetention time.Duration,
+) (*internal.ConsolidationPromotionResult, error) {
 	if endHeight <= startHeight {
 		return &internal.ConsolidationPromotionResult{}, nil
 	}
 	if limit == 0 {
 		return nil, xerrors.New("consolidation promotion limit must be positive")
 	}
+	if legacyObjectRetention <= 0 {
+		return nil, xerrors.New("legacy object retention must be positive")
+	}
 	if err := b.validateHeight(startHeight); err != nil {
 		return nil, err
 	}
+	legacyObjectRetiredAt := time.Now().UTC()
+	legacyObjectRetireAfter := legacyObjectRetiredAt.Add(legacyObjectRetention)
 
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1093,12 +1141,26 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context,
 				AND bm.skipped = false
 				AND bm.byte_length IS NULL
 			RETURNING bm.id
+		),
+		retired AS (
+			UPDATE block_consolidation_shadow shadow
+			SET
+				legacy_object_retired_at = $6,
+				legacy_object_retire_after = $7
+			FROM candidates
+			WHERE shadow.block_metadata_id = candidates.block_metadata_id
+				AND shadow.tag = candidates.tag
+				AND shadow.height = candidates.height
+				AND shadow.hash = candidates.hash
+				AND shadow.legacy_object_key_main = candidates.legacy_object_key_main
+			RETURNING shadow.block_metadata_id
 		)
 		SELECT
 			(SELECT COUNT(*) FROM candidates),
-			(SELECT COUNT(*) FROM updated)`
+			(SELECT COUNT(*) FROM updated),
+			(SELECT COUNT(*) FROM retired)`
 
-	var candidates, promoted uint64
+	var candidates, promoted, retired uint64
 	if err := tx.QueryRowContext(
 		ctx,
 		promoteQuery,
@@ -1107,11 +1169,16 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context,
 		endHeight,
 		limit,
 		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
-	).Scan(&candidates, &promoted); err != nil {
+		legacyObjectRetiredAt,
+		legacyObjectRetireAfter,
+	).Scan(&candidates, &promoted, &retired); err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
 	}
 	if candidates != promoted {
 		return nil, xerrors.Errorf("consolidation promotion guard failed: selected %d rows but promoted %d", candidates, promoted)
+	}
+	if candidates != retired {
+		return nil, xerrors.Errorf("consolidation retirement guard failed: selected %d rows but marked %d for retirement", candidates, retired)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, xerrors.Errorf("failed to commit consolidation promotion: %w", err)

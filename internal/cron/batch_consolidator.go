@@ -227,6 +227,16 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 				)
 				return nil
 			}
+			if err := t.verifyAutoConsolidateCoverage(ctx, tag, cronConfig.StartHeight, cursorEnd); err != nil {
+				t.logger.Info(
+					"batch_consolidator cron skipped cursor bootstrap because already consolidated range did not pass coverage verification",
+					zap.Uint32("tag", tag),
+					zap.Uint64("configured_start_height", cronConfig.StartHeight),
+					zap.Uint64("cursor_height", cursorEnd),
+					zap.Error(err),
+				)
+				return nil
+			}
 			if err := t.metaStorage.SetBlockConsolidationCursor(ctx, metastorage.BatchConsolidatorAutoConsolidateCursor, tag, cursorEnd); err != nil {
 				return xerrors.Errorf("failed to bootstrap auto_consolidate cursor to height %d: %w", cursorEnd, err)
 			}
@@ -344,6 +354,26 @@ func (t *batchConsolidatorTask) firstAutoConsolidateWindowStart(
 		return 0, false, nil
 	}
 	return windowStart, true, nil
+}
+
+func (t *batchConsolidatorTask) verifyAutoConsolidateCoverage(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) error {
+	if endHeight <= startHeight {
+		return xerrors.Errorf("invalid auto_consolidate coverage range [%d, %d)", startHeight, endHeight)
+	}
+	stats, err := t.metaStorage.GetBlockConsolidationShadowStats(ctx, tag, startHeight, endHeight)
+	if err != nil {
+		return xerrors.Errorf("failed to get auto_consolidate coverage stats for range [%d, %d): %w", startHeight, endHeight, err)
+	}
+	eligibleBlocks := uint64(0)
+	shadowBlocks := uint64(0)
+	if stats != nil {
+		eligibleBlocks = stats.EligibleBlocks
+		shadowBlocks = stats.Blocks
+	}
+	if shadowBlocks != eligibleBlocks {
+		return xerrors.Errorf("auto_consolidate coverage mismatch for range [%d, %d): expected %d eligible blocks, got %d shadow blocks", startHeight, endHeight, eligibleBlocks, shadowBlocks)
+	}
+	return nil
 }
 
 func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Context) (string, bool, error) {

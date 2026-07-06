@@ -55,6 +55,7 @@ type (
 		EndHeight          uint64
 		ScannedBlocks      uint64
 		ConsolidatedBlocks uint64
+		PromotedBlocks     uint64
 		ObjectKey          string
 	}
 
@@ -263,6 +264,27 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 
 	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
 	totalStart := time.Now()
+	mode := request.Mode
+	if mode == "" {
+		mode = a.config.AWS.Storage.Consolidation.Mode
+	}
+	if mode.IsAutoConsolidate() && !isFullAutoConsolidationRequest(request) {
+		return nil, xerrors.Errorf(
+			"auto_consolidate requires exactly one full consolidation window: start_height=%d end_height=%d max_blocks=%d",
+			request.StartHeight,
+			request.EndHeight,
+			request.MaxBlocks,
+		)
+	}
+	if mode.IsAutoConsolidate() {
+		if err := a.validateFullAutoConsolidationWindow(ctx, request); err != nil {
+			return nil, err
+		}
+	}
+	prePromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
+	if err != nil {
+		return nil, err
+	}
 	scanStart := time.Now()
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
 	if err != nil {
@@ -272,8 +294,9 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
 		return &BatchConsolidatorResponse{
-			StartHeight: request.StartHeight,
-			EndHeight:   request.EndHeight,
+			StartHeight:    request.StartHeight,
+			EndHeight:      request.EndHeight,
+			PromotedBlocks: prePromotedBlocks,
 		}, nil
 	}
 
@@ -311,18 +334,25 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	persistDuration := time.Since(persistStart)
 	logger.Info("persisted consolidation shadow placements", zap.Int("placements", len(shadowPlacements)), zap.Duration("duration", persistDuration))
 	sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.shadows_persisted", objectKey, len(shadowPlacements))
+	postPromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
+	if err != nil {
+		return nil, err
+	}
+	promotedBlocks := prePromotedBlocks + postPromotedBlocks
 
 	response := &BatchConsolidatorResponse{
 		StartHeight:        request.StartHeight,
 		EndHeight:          request.EndHeight,
 		ScannedBlocks:      uint64(len(records)),
 		ConsolidatedBlocks: uint64(len(shadowPlacements)),
+		PromotedBlocks:     promotedBlocks,
 		ObjectKey:          objectKey,
 	}
 	logger.Info(
 		"consolidated shadow blocks",
 		zap.Int("scanned_blocks", len(records)),
 		zap.Int("consolidated_blocks", len(shadowPlacements)),
+		zap.Uint64("promoted_blocks", promotedBlocks),
 		zap.String("object_key", objectKey),
 		zap.Uint64("raw_bytes", rawBytes),
 		zap.Duration("scan_duration", scanDuration),
@@ -356,6 +386,7 @@ func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request
 		request.StartHeight,
 		plan.EndHeight,
 		request.MaxBlocks,
+		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
@@ -375,7 +406,71 @@ func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request
 		EndHeight:          plan.EndHeight,
 		ScannedBlocks:      promotedBlocks,
 		ConsolidatedBlocks: promotedBlocks,
+		PromotedBlocks:     promotedBlocks,
 	}, nil
+}
+
+func (a *BatchConsolidator) promoteConsolidatedBlocks(ctx context.Context, mode config.ConsolidationMode, request *BatchConsolidatorRequest) (uint64, error) {
+	if mode != config.ConsolidationModeAutoConsolidate && mode != config.ConsolidationModeHistoricalBackfill {
+		return 0, nil
+	}
+	result, err := a.metaStorage.PromoteBlockConsolidationShadows(
+		ctx,
+		request.Tag,
+		request.StartHeight,
+		request.EndHeight,
+		request.MaxBlocks,
+		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
+	)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to promote consolidated block metadata: %w", err)
+	}
+	if result == nil {
+		return 0, nil
+	}
+	if result.Blocks > 0 {
+		sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.metadata_promoted", result.Blocks)
+	}
+	return result.Blocks, nil
+}
+
+func (a *BatchConsolidator) validateFullAutoConsolidationWindow(ctx context.Context, request *BatchConsolidatorRequest) error {
+	blocks, err := a.metaStorage.GetBlocksByHeightRange(ctx, request.Tag, request.StartHeight, request.EndHeight)
+	if err != nil {
+		return xerrors.Errorf("failed to verify auto_consolidate canonical window: %w", err)
+	}
+	if request.MaxBlocks == 0 || uint64(len(blocks)) != request.MaxBlocks {
+		return xerrors.Errorf(
+			"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d canonical_blocks=%d",
+			request.StartHeight,
+			request.EndHeight,
+			request.MaxBlocks,
+			len(blocks),
+		)
+	}
+	for i, block := range blocks {
+		if block == nil {
+			return xerrors.Errorf(
+				"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d nil_index=%d",
+				request.StartHeight,
+				request.EndHeight,
+				request.MaxBlocks,
+				i,
+			)
+		}
+		expectedHeight := request.StartHeight + uint64(i)
+		if expectedHeight < request.StartHeight || block.GetHeight() != expectedHeight {
+			return xerrors.Errorf(
+				"auto_consolidate requires a full canonical consolidation window: start_height=%d end_height=%d max_blocks=%d expected_height=%d actual_height=%d",
+				request.StartHeight,
+				request.EndHeight,
+				request.MaxBlocks,
+				expectedHeight,
+				block.GetHeight(),
+			)
+		}
+	}
+	return nil
 }
 
 func (a *BatchConsolidator) planPromoteFinalized(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (*BatchConsolidatorPlanResponse, error) {
@@ -469,6 +564,13 @@ func (a *BatchConsolidator) validateShadowWriteMode(mode config.ConsolidationMod
 
 func (a *BatchConsolidator) validateShadowStatsMode(mode config.ConsolidationMode) error {
 	return a.validateShadowWriteMode(mode)
+}
+
+func isFullAutoConsolidationRequest(request *BatchConsolidatorRequest) bool {
+	if request == nil || request.MaxBlocks == 0 || request.EndHeight <= request.StartHeight {
+		return false
+	}
+	return request.EndHeight-request.StartHeight == request.MaxBlocks
 }
 
 func (a *BatchConsolidator) validatePromoteFinalizedMode() error {
