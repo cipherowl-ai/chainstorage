@@ -60,13 +60,8 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 		}
 	}
 
-	// Always run migrations - goose will check which migrations have been applied
-	// and only run new ones. This ensures incremental migrations work properly.
-	logger.Debug("Running database migrations")
-	if err := runMigrations(ctx, db); err != nil {
-		return nil, xerrors.Errorf("failed to run migrations: %w", err)
-	}
-	logger.Debug("Migrations completed successfully")
-
+	// Do not run schema migrations from runtime service connections.
+	// Server pods may connect through read replicas, and worker users may not own
+	// existing tables. Run migrations explicitly through admin db-init/db-migrate.
 	return db, nil
 }
