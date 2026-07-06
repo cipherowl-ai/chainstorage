@@ -190,8 +190,43 @@ func (s *bitcoinNativeParserTestSuite) TestParseBitcoinBlockPubKey() {
 	nativeBlock, err := s.parser.ParseBlock(context.Background(), block)
 	require.NoError(err)
 	require.Equal(bitcoinScriptTypePubKey, nativeBlock.GetBitcoin().Transactions[0].Outputs[0].ScriptPublicKey.Type)
+	require.Equal("1ta5GhKyZCWdvYkzv3AM5YT55VGpgQU6p", nativeBlock.GetBitcoin().Transactions[0].Outputs[0].ScriptPublicKey.Address)
 	require.Equal(bitcoinScriptTypePubKeyHash, nativeBlock.GetBitcoin().Transactions[0].Outputs[1].ScriptPublicKey.Type)
 	require.Equal("1LVnx7af5JPzW41vVURfbmxs3ENEzPcEqF", nativeBlock.GetBitcoin().Transactions[0].Outputs[1].ScriptPublicKey.Address)
+}
+
+func TestParseDogecoinBlockPubKey(t *testing.T) {
+	require := testutil.Require(t)
+
+	var parser internal.NativeParser
+	app := testapp.New(t,
+		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_DOGECOIN, common.Network_NETWORK_DOGECOIN_MAINNET),
+		fx.Provide(NewBitcoinNativeParser),
+		fx.Populate(&parser),
+	)
+	defer app.Close()
+	require.NotNil(parser)
+
+	header, err := fixtures.ReadFile("parser/bitcoin/get_block_pubkey_case.json")
+	require.NoError(err)
+
+	block := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_DOGECOIN,
+		Network:    common.Network_NETWORK_DOGECOIN_MAINNET,
+		Metadata:   bitcoinMetadata,
+		Blobdata: &api.Block_Bitcoin{
+			Bitcoin: &api.BitcoinBlobdata{
+				Header: header,
+			},
+		},
+	}
+
+	nativeBlock, err := parser.ParseBlock(context.Background(), block)
+	require.NoError(err)
+	require.Equal(bitcoinScriptTypePubKey, nativeBlock.GetBitcoin().Transactions[0].Outputs[0].ScriptPublicKey.Type)
+	// The P2PK output has no address in the raw data, so the address is derived
+	// from the public key using Dogecoin's P2PKH version byte (0x1e).
+	require.Equal("D62fcXdyGy6oAvjMjW2itqi3xDDaFDhNS8", nativeBlock.GetBitcoin().Transactions[0].Outputs[0].ScriptPublicKey.Address)
 }
 
 func (s *bitcoinNativeParserTestSuite) TestParseBitcoinBlockPubKeyInputNonCoinbase() {

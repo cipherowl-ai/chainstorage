@@ -18,6 +18,7 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser/internal"
 	"github.com/coinbase/chainstorage/internal/utils/log"
+	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -262,10 +263,14 @@ func NewBitcoinNativeParser(params internal.ParserParams, opts ...internal.Parse
 	v := validator.New()
 	v.RegisterStructValidation(validateBitcoinScriptPubKey, BitcoinScriptPubKey{})
 	v.RegisterStructValidation(validateBitcoinTransactionVinVout, BitcoinTransaction{})
+	var p2pkhVersionByte byte = 0x00
+	if params.Config.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_DOGECOIN {
+		p2pkhVersionByte = 0x1e
+	}
 	return &bitcoinNativeParserImpl{
 		logger:           log.WithPackage(params.Logger),
 		validate:         v,
-		p2pkhVersionByte: 0x00,
+		p2pkhVersionByte: p2pkhVersionByte,
 	}, nil
 }
 
