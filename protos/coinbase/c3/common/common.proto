@@ -33,6 +33,7 @@ enum Blockchain {
     BLOCKCHAIN_DASH = 67; // Dash
     BLOCKCHAIN_ZCASH = 68; // Zcash
     BLOCKCHAIN_TEMPO = 69; // Tempo
+    BLOCKCHAIN_ROBINHOOD = 70; // Robinhood Chain
 }
 
 // Network defines an enumeration of supported networks.
@@ -112,5 +113,8 @@ enum Network {
 
     NETWORK_TEMPO_TESTNET = 152;
     NETWORK_TEMPO_MAINNET = 153;
+
+    NETWORK_ROBINHOOD_MAINNET = 154;
+    NETWORK_ROBINHOOD_TESTNET = 155;
 
 }
