@@ -16,6 +16,11 @@ import (
 type (
 	Parser = internal.Parser
 
+	// NativeParser is re-exported so callers outside this package can
+	// instantiate a chain-specific native parser directly without importing
+	// the internal subpackage.
+	NativeParser = internal.NativeParser
+
 	ParityCheckFailedError = internal.ParityCheckFailedError
 
 	// ParseOption is re-exported so callers outside this package (including

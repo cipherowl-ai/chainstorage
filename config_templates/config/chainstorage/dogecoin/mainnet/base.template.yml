@@ -3,12 +3,8 @@ chain:
   event_tag:
     latest: 0
     stable: 0
-  rosetta:
-    blockchain: dogecoin
-    network: mainnet
-    block_not_found_error_codes: 4
   feature:
-    rosetta_parser: true
+    rosetta_parser: false
   irreversible_distance: 60
 aws:
   dynamodb:
