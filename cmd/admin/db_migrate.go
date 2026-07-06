@@ -18,6 +18,8 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/log"
 )
 
+const maxMigrationVersion int64 = 1<<63 - 1
+
 func newDBMigrateCommand() *cobra.Command {
 	var (
 		masterUser     string
@@ -152,7 +154,7 @@ func runDBMigrate(masterUser, masterPassword, host string, port int, dbName, ssl
 
 		logger.Info("Current database version", zap.Int64("version", currentVersion))
 
-		migrations, err := goose.CollectMigrations("db/migrations", 0, 9999999)
+		migrations, err := collectDBMigrations()
 		if err != nil {
 			return xerrors.Errorf("failed to collect migrations: %w", err)
 		}
@@ -195,6 +197,10 @@ func runDBMigrate(masterUser, masterPassword, host string, port int, dbName, ssl
 	fmt.Printf("Current version: %d\n", currentVersion)
 
 	return nil
+}
+
+func collectDBMigrations() (goose.Migrations, error) {
+	return goose.CollectMigrations("db/migrations", 0, maxMigrationVersion)
 }
 
 func getEnvOrDefault(key, defaultValue string) string {
