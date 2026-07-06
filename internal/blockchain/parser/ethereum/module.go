@@ -63,5 +63,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("tempo", NewTempoNativeParser).
 		SetValidatorFactory(NewTempoValidator).
 		Build(),
+	internal.NewParserBuilder("robinhood", NewRobinhoodNativeParser).
+		SetValidatorFactory(NewRobinhoodValidator).
+		Build(),
 	beacon.Module,
 )
