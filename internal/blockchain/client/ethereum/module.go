@@ -75,5 +75,9 @@ var Module = fx.Options(
 		Name:   "tempo",
 		Target: NewTempoClientFactory,
 	}),
+	fx.Provide(fx.Annotated{
+		Name:   "robinhood",
+		Target: NewRobinhoodClientFactory,
+	}),
 	beacon.Module,
 )

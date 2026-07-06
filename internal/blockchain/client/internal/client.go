@@ -81,6 +81,7 @@ type (
 		Dash            ClientFactory `name:"dash" optional:"true"`
 		Zcash           ClientFactory `name:"zcash" optional:"true"`
 		Tempo           ClientFactory `name:"tempo" optional:"true"`
+		Robinhood       ClientFactory `name:"robinhood" optional:"true"`
 	}
 
 	ClientParams struct {
@@ -167,6 +168,8 @@ func NewClient(params Params) (Result, error) {
 			factory = params.Seismic
 		case common.Blockchain_BLOCKCHAIN_TEMPO:
 			factory = params.Tempo
+		case common.Blockchain_BLOCKCHAIN_ROBINHOOD:
+			factory = params.Robinhood
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
