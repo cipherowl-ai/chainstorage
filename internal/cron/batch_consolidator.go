@@ -106,16 +106,6 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	}
 
 	cronConfig := t.config.Cron.BatchConsolidator
-	if cronConfig.MaxRangeBlocks == 0 {
-		return xerrors.New("batch_consolidator cron max_range_blocks must be positive")
-	}
-	if cronConfig.MaxRangeBlocks < consolidation.MaxBlocks {
-		return xerrors.Errorf(
-			"batch_consolidator cron max_range_blocks(%d) must be at least consolidation max_blocks(%d)",
-			cronConfig.MaxRangeBlocks,
-			consolidation.MaxBlocks,
-		)
-	}
 	if cronConfig.WorkflowParallelism < 0 {
 		return xerrors.Errorf("batch_consolidator cron workflow_parallelism(%d) must be non-negative", cronConfig.WorkflowParallelism)
 	}
@@ -221,7 +211,6 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 			cursorEnd, cursorEndFound := batchConsolidatorCronRangeEnd(
 				cronConfig.StartHeight,
 				searchEnd,
-				cronConfig.MaxRangeBlocks,
 				consolidation.MaxBlocks,
 				consolidation.ShardSize,
 			)
@@ -233,7 +222,6 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 					zap.Uint64("safe_end_height", searchEnd),
 					zap.Uint64("latest_height", latest.GetHeight()),
 					zap.Uint64("safe_consolidation_height", safeHeight),
-					zap.Uint64("max_range_blocks", cronConfig.MaxRangeBlocks),
 					zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
 				)
 				return nil
@@ -282,7 +270,6 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 	endHeight, found := batchConsolidatorCronRangeEnd(
 		searchStart,
 		searchEnd,
-		cronConfig.MaxRangeBlocks,
 		consolidation.MaxBlocks,
 		consolidation.ShardSize,
 	)
@@ -297,7 +284,6 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 			zap.Uint64("end_height", searchEnd),
 			zap.Uint64("latest_height", latest.GetHeight()),
 			zap.Uint64("safe_consolidation_height", safeHeight),
-			zap.Uint64("max_range_blocks", cronConfig.MaxRangeBlocks),
 			zap.Uint64("consolidation_max_blocks", consolidation.MaxBlocks),
 		)
 		return nil
@@ -420,14 +406,11 @@ func batchConsolidatorCronSafeEndHeight(latestHeight uint64, irreversibleDistanc
 	return safeHeight + 1, safeHeight, true
 }
 
-func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, maxRangeBlocks uint64, consolidationWindowBlocks uint64, shardSize uint64) (uint64, bool) {
-	if safeEndHeight <= startHeight || maxRangeBlocks == 0 || consolidationWindowBlocks == 0 || shardSize == 0 {
+func batchConsolidatorCronRangeEnd(startHeight uint64, safeEndHeight uint64, consolidationWindowBlocks uint64, shardSize uint64) (uint64, bool) {
+	if safeEndHeight <= startHeight || consolidationWindowBlocks == 0 || shardSize == 0 {
 		return 0, false
 	}
 	rangeLimit := safeEndHeight
-	if maxRangeBlocks < safeEndHeight-startHeight {
-		rangeLimit = startHeight + maxRangeBlocks
-	}
 	endHeight := startHeight
 	for {
 		nextEnd := endHeight + consolidationWindowBlocks

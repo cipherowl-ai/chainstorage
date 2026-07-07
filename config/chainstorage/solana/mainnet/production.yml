@@ -12,7 +12,7 @@ cadence:
 cron:
   batch_consolidator:
     spec: '@every 15m'
-    workflow_parallelism: 2
+    workflow_parallelism: 4
 server:
   bind_address: 0.0.0.0:9090
 storage_type:
