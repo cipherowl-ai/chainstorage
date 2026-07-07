@@ -604,6 +604,21 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
 	s.mockAutoConsolidateCursorUpdate(200)
+	s.env.OnGetVersion(
+		batchConsolidatorAutoSerialChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoSerialVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoSerialVersion))
+	s.env.OnGetVersion(
+		batchConsolidatorAutoCursorChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoCursorVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoCursorVersion))
+	s.env.OnGetVersion(
+		batchConsolidatorAutoParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoParallelismVersion,
+	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -653,6 +668,11 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesP
 		batchConsolidatorAutoCursorChangeID,
 		temporalworkflow.DefaultVersion,
 		batchConsolidatorAutoCursorVersion,
+	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnGetVersion(
+		batchConsolidatorAutoParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoParallelismVersion,
 	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
@@ -728,6 +748,11 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateSerialVersionWithoutCurs
 		temporalworkflow.DefaultVersion,
 		batchConsolidatorAutoCursorVersion,
 	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnGetVersion(
+		batchConsolidatorAutoParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoParallelismVersion,
+	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
 			requests = append(requests, request)
@@ -759,6 +784,67 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateSerialVersionWithoutCurs
 		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 200, MaxBlocks: 25},
 		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 200, MaxBlocks: 25},
 	}, requests)
+}
+
+func (s *batchConsolidatorTestSuite) TestAutoConsolidateParallelismVersionRunsObjectWindowsConcurrently() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
+	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
+	var inFlight int64
+	var maxInFlight int64
+	s.mockAutoConsolidateLatestHeight(220)
+	s.mockEmptyShadowStats()
+	s.mockAutoConsolidateCursorUpdate(200)
+	s.env.OnGetVersion(
+		batchConsolidatorAutoSerialChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoSerialVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoSerialVersion))
+	s.env.OnGetVersion(
+		batchConsolidatorAutoCursorChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoCursorVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoCursorVersion))
+	s.env.OnGetVersion(
+		batchConsolidatorAutoParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		batchConsolidatorAutoParallelismVersion,
+	).Return(temporalworkflow.Version(batchConsolidatorAutoParallelismVersion))
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			current := atomic.AddInt64(&inFlight, 1)
+			for {
+				maxSeen := atomic.LoadInt64(&maxInFlight)
+				if current <= maxSeen || atomic.CompareAndSwapInt64(&maxInFlight, maxSeen, current) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt64(&inFlight, -1)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+		Parallelism: 2,
+	})
+	require.NoError(err)
+	observedMaxInFlight := atomic.LoadInt64(&maxInFlight)
+	s.T().Logf("max in-flight auto_consolidate activities: %d", observedMaxInFlight)
+	require.Greater(observedMaxInFlight, int64(1))
+	require.LessOrEqual(observedMaxInFlight, int64(2))
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateResumeAfterLostActivityCompletion() {

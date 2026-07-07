@@ -419,12 +419,13 @@ type (
 	}
 
 	BatchConsolidatorCronConfig struct {
-		Enabled            bool          `mapstructure:"enabled"`
-		Spec               string        `mapstructure:"spec"`
-		Parallelism        int64         `mapstructure:"parallelism"`
-		DelayStartDuration time.Duration `mapstructure:"delay_start_duration"`
-		StartHeight        uint64        `mapstructure:"start_height"`
-		MaxRangeBlocks     uint64        `mapstructure:"max_range_blocks"`
+		Enabled             bool          `mapstructure:"enabled"`
+		Spec                string        `mapstructure:"spec"`
+		Parallelism         int64         `mapstructure:"parallelism"`
+		WorkflowParallelism int           `mapstructure:"workflow_parallelism"`
+		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
+		StartHeight         uint64        `mapstructure:"start_height"`
+		MaxRangeBlocks      uint64        `mapstructure:"max_range_blocks"`
 	}
 
 	StorageConfig struct {

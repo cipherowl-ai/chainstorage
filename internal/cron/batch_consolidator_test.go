@@ -76,6 +76,35 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 	}, runtime.executions[0].request)
 }
 
+func TestBatchConsolidatorCronPassesWorkflowParallelism(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.StartHeight = 1_000
+	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 2_500
+	cfg.Cron.BatchConsolidator.WorkflowParallelism = 2
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 5_000}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(4_901)).
+		Return(uint64(3_500), true, nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         tag,
+		StartHeight: 3_000,
+		EndHeight:   4_000,
+		Parallelism: 2,
+	}, runtime.executions[0].request)
+}
+
 func TestBatchConsolidatorCronWaitsForFullConsolidationWindow(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
@@ -332,6 +361,21 @@ func TestBatchConsolidatorCronRequiresAutoConsolidateMode(t *testing.T) {
 	err := task.Run(context.Background())
 	require.Error(t, err)
 	require.Contains(t, err.Error(), `batch_consolidator cron requires consolidation mode "auto_consolidate", got "promote_finalized"`)
+	require.Empty(t, runtime.executions)
+}
+
+func TestBatchConsolidatorCronRejectsInvalidWorkflowParallelism(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.WorkflowParallelism = maxBatchConsolidatorWorkflowParallelism + 1
+
+	metaStorage.EXPECT().GetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	err := task.Run(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "workflow_parallelism(11) exceeds max(10)")
 	require.Empty(t, runtime.executions)
 }
 
