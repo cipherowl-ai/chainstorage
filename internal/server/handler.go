@@ -423,7 +423,7 @@ func (s *Server) GetBlockFile(ctx context.Context, req *api.GetBlockFileRequest)
 		return nil, xerrors.Errorf("failed to get block from meta storage: %w", err)
 	}
 
-	if shouldReadFromConsolidated(req.GetReadSource(), false) {
+	if shouldReadFromConsolidated(req.GetReadSource(), s.config.AWS.Storage.Consolidation.ReadShadowFirst) {
 		if consolidated, ok := s.getConsolidatedBlockMetadata(ctx, block); ok {
 			blockFile, err := s.newBlockFile(consolidated)
 			if err == nil {
@@ -470,7 +470,7 @@ func (s *Server) GetBlockFilesByRange(ctx context.Context, req *api.GetBlockFile
 
 	selectedBlocks := blocks
 	shadowCount := 0
-	if shouldReadFromConsolidated(req.GetReadSource(), false) {
+	if shouldReadFromConsolidated(req.GetReadSource(), s.config.AWS.Storage.Consolidation.ReadShadowFirst) {
 		selectedBlocks, shadowCount, _, _ = s.selectShadowBlockMetadata(ctx, blocks)
 	}
 

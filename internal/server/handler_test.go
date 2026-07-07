@@ -338,7 +338,54 @@ func (s *handlerTestSuite) TestGetBlockFile() {
 	require.Equal(expected, resp.File)
 }
 
-func (s *handlerTestSuite) TestGetBlockFile_DefaultIgnoresReadShadowFirst() {
+func (s *handlerTestSuite) TestGetBlockFile_DefaultUsesReadShadowFirst() {
+	const (
+		height        uint64 = 13193825
+		hash                 = "0xda5a0439434adf072394e0b94f78e56032c5409a2c58668995f306b171ff4ace"
+		parentHash           = "0xba6a6c85739b50384625e10718524fb2c1fcf88858eabf6db9bd851902b53546"
+		objectKeyMain        = "foo/bar"
+	)
+
+	require := testutil.Require(s.T())
+	s.server.config.AWS.Storage.Consolidation.ReadShadowFirst = true
+	tag := s.app.Config().Chain.BlockTag.Stable
+	blockMetadata := &api.BlockMetadata{
+		Tag:           tag,
+		Hash:          hash,
+		ParentHash:    parentHash,
+		Height:        height,
+		ObjectKeyMain: objectKeyMain,
+	}
+	shadowMetadata := makeShadowBlockMetadata(blockMetadata)
+	expected := &api.BlockFile{
+		Tag:                tag,
+		Hash:               hash,
+		ParentHash:         parentHash,
+		Height:             height,
+		FileUrl:            "http://endpoint/consolidated",
+		Compression:        api.Compression_ZSTD,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteOffset:         shadowMetadata.GetByteOffset(),
+		ByteLength:         shadowMetadata.GetByteLength(),
+		UncompressedLength: shadowMetadata.GetUncompressedLength(),
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, height, hash).Times(1).Return(blockMetadata, nil),
+		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata.GetObjectKeyMain()).Times(1).Return("http://endpoint/consolidated", nil),
+	)
+
+	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
+		Height: height,
+		Hash:   hash,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Equal(expected, resp.File)
+}
+
+func (s *handlerTestSuite) TestGetBlockFile_ReadSourceLegacyIgnoresReadShadowFirst() {
 	const (
 		height        uint64 = 13193825
 		hash                 = "0xda5a0439434adf072394e0b94f78e56032c5409a2c58668995f306b171ff4ace"
@@ -369,8 +416,9 @@ func (s *handlerTestSuite) TestGetBlockFile_DefaultIgnoresReadShadowFirst() {
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
-		Height: height,
-		Hash:   hash,
+		Height:     height,
+		Hash:       hash,
+		ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
 	})
 	require.NoError(err)
 	require.NotNil(resp)
@@ -835,6 +883,48 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_ReadSourceConsolidatedUsesSh
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
 		ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED,
+	})
+	require.NoError(err)
+	require.NotNil(resp)
+	require.Len(resp.GetFiles(), len(blockMetadatas))
+	require.Equal("http://endpoint/consolidated", resp.GetFiles()[0].GetFileUrl())
+	require.Equal(resp.GetFiles()[0].GetFileUrl(), resp.GetFiles()[1].GetFileUrl())
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, resp.GetFiles()[0].GetObjectFormat())
+	require.Equal(uint64(100), resp.GetFiles()[1].GetByteOffset())
+	require.Equal(uint64(100), resp.GetFiles()[1].GetByteLength())
+	require.Equal(uint64(200), resp.GetFiles()[1].GetUncompressedLength())
+}
+
+func (s *handlerTestSuite) TestGetBlockFilesByRange_DefaultUsesReadShadowFirst() {
+	require := testutil.Require(s.T())
+	s.server.config.AWS.Storage.Consolidation.ReadShadowFirst = true
+	stableTag := s.app.Config().Chain.BlockTag.Stable
+	const (
+		startHeight uint64 = 9000
+		endHeight   uint64 = 9002
+		objectKey          = "consolidated/v=1/shard=000000000000-000000010000/000000009000-000000009002-deadbeef.cscb.zstd"
+	)
+
+	blockMetadatas := testutil.MakeBlockMetadatasFromStartHeight(startHeight, int(endHeight-startHeight), stableTag)
+	shadowMetadatas := make([]*api.BlockMetadata, len(blockMetadatas))
+	for i, blockMetadata := range blockMetadatas {
+		shadowMetadatas[i] = makeShadowBlockMetadata(blockMetadata)
+		shadowMetadatas[i].ObjectKeyMain = objectKey
+		shadowMetadatas[i].ByteOffset = uint64(i * 100)
+		shadowMetadatas[i].ByteLength = 100
+		shadowMetadatas[i].UncompressedLength = 200
+	}
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), stableTag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
+		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Times(1).Return(testutil.MakeBlockMetadata(10000, stableTag), nil),
+		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("http://endpoint/consolidated", nil),
+	)
+
+	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
 	})
 	require.NoError(err)
 	require.NotNil(resp)
