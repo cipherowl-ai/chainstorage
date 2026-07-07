@@ -54,6 +54,7 @@ type (
 	ethereumClientMetrics struct {
 		traceBlockSuccessCounter          tally.Counter
 		traceBlockServerErrorCounter      tally.Counter
+		traceBlockFallbackCounter         tally.Counter
 		traceBlockExecutionTimeoutCounter tally.Counter
 		traceBlockFakeCounter             tally.Counter
 		traceTransactionFakeCounter       tally.Counter
@@ -111,6 +112,13 @@ const (
 	optimismWhitelistError    = "TypeError: cannot read property 'toString' of undefined    in server-side tracer function 'result'"
 	optimismFakeTraceError    = "Creating fake trace for failed transaction."
 	unfinalizedDataError      = "cannot query unfinalized data"
+
+	// On Arbitrum Nitro based chains, a transaction terminated by ArbOS before EVM execution
+	// (e.g. included by the sequencer but failed pre-checks) produces zero call frames, while
+	// go-ethereum's callTracer requires exactly one top-level frame per transaction.
+	// See https://github.com/OffchainLabs/go-ethereum/blob/master/eth/tracers/native/call.go
+	incorrectTopLevelCallsError = "incorrect number of top-level calls"
+	robinhoodFakeTraceError     = "Creating fake trace for transaction terminated by ArbOS before EVM execution."
 )
 
 var ethBlacklistedRanges = map[common.Network][]types.BlockRange{
@@ -319,6 +327,9 @@ func newEthereumClientMetrics(scope tally.Scope) *ethereumClientMetrics {
 	traceBlockFakeCounter := scope.
 		Tagged(map[string]string{resultType: "fake_trace"}).
 		Counter(traceBlockCounter)
+	traceBlockFallbackCounter := scope.
+		Tagged(map[string]string{resultType: "fallback"}).
+		Counter(traceBlockCounter)
 
 	traceTransactionSuccessCounter := scope.
 		Tagged(map[string]string{resultType: "success"}).
@@ -339,6 +350,7 @@ func newEthereumClientMetrics(scope tally.Scope) *ethereumClientMetrics {
 		traceTransactionSuccessCounter:    traceTransactionSuccessCounter,
 		traceTransactionIgnoredCounter:    traceTransactionIgnoredCounter,
 		traceBlockFakeCounter:             traceBlockFakeCounter,
+		traceBlockFallbackCounter:         traceBlockFallbackCounter,
 		traceTransactionFakeCounter:       traceTransactionFakeCounter,
 		transactionReceiptFakeCounter:     transactionReceiptFakeCounter,
 	}
@@ -879,6 +891,20 @@ func (c *EthereumClient) getBlockTraces(ctx context.Context, tag uint32, block *
 			return response, nil
 		})
 		if err != nil {
+			if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_ROBINHOOD && isIncorrectTopLevelCallsError(err) {
+				// A transaction terminated by ArbOS before EVM execution produces zero call
+				// frames, which fails the whole block-level callTracer request. Fall back to
+				// per-transaction tracing so the poisoned transaction gets a fake trace via
+				// processFailedTransactionTrace while the rest keep their real traces.
+				c.logger.Warn(
+					"block trace failed with incorrect number of top-level calls; falling back to transaction traces",
+					zap.Uint64("height", height),
+					zap.String("hash", hash),
+				)
+				c.metrics.traceBlockFallbackCounter.Inc(1)
+				return c.getTransactionTraces(ctx, tag, block)
+			}
+
 			c.metrics.traceBlockServerErrorCounter.Inc(1)
 			return nil, err
 		}
@@ -1378,8 +1404,27 @@ func (c *EthereumClient) isServerError(err error) bool {
 	return false
 }
 
+// isIncorrectTopLevelCallsError matches the deterministic go-ethereum callTracer error
+// returned when a transaction yields a number of top-level call frames other than one.
+func isIncorrectTopLevelCallsError(err error) bool {
+	var rpcErr *jsonrpc.RPCError
+	return xerrors.As(err, &rpcErr) && rpcErr.Code == -32000 && rpcErr.Message == incorrectTopLevelCallsError
+}
+
 func (c *EthereumClient) processFailedTransactionTrace(err error) ([]byte, bool, error) {
 	processed := false
+	if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_ROBINHOOD && isIncorrectTopLevelCallsError(err) {
+		// The transaction was terminated by ArbOS before EVM execution (e.g. included by the
+		// sequencer but failed pre-checks), so no call frames exist. Substitute a fake trace;
+		// the receipt already records the failed status.
+		byteTrace, processErr := json.Marshal(ethereum.EthereumTransactionTrace{Error: robinhoodFakeTraceError})
+		processed = true
+		if processErr != nil {
+			return nil, processed, xerrors.Errorf("failed to marshal fake trace for robinhood transaction: %w", processErr)
+		}
+		c.metrics.traceTransactionFakeCounter.Inc(1)
+		return byteTrace, processed, nil
+	}
 	if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_OPTIMISM {
 		// If an Optimism transaction is failed with the following error: "Fail with error
 		// 'deployer address not whitelisted:'", we need to create a fake trace
