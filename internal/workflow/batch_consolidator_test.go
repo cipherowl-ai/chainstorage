@@ -600,6 +600,8 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
 	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
 	var requests []*activity.BatchConsolidatorRequest
+	var inFlight int64
+	var maxInFlight int64
 	normalCalls := 0
 	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
@@ -621,6 +623,15 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			current := atomic.AddInt64(&inFlight, 1)
+			for {
+				maxSeen := atomic.LoadInt64(&maxInFlight)
+				if current <= maxSeen || atomic.CompareAndSwapInt64(&maxInFlight, maxSeen, current) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt64(&inFlight, -1)
 			requests = append(requests, request)
 			normalCalls++
 			return &activity.BatchConsolidatorResponse{
@@ -642,6 +653,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateIgnoresParallelism() {
 	})
 	require.NoError(err)
 	require.Equal(4, normalCalls)
+	require.Equal(int64(1), atomic.LoadInt64(&maxInFlight))
 	require.Equal([]*activity.BatchConsolidatorRequest{
 		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 100, EndHeight: 125, MaxBlocks: 25},
 		{Mode: config.ConsolidationModeAutoConsolidate, Tag: 2, StartHeight: 125, EndHeight: 150, MaxBlocks: 25},
