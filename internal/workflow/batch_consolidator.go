@@ -64,6 +64,8 @@ const (
 	batchConsolidatorAutoSerialVersion             = 1
 	batchConsolidatorAutoCursorChangeID            = "batch-consolidator-auto-cursor"
 	batchConsolidatorAutoCursorVersion             = 1
+	batchConsolidatorAutoParallelismChangeID       = "batch-consolidator-auto-parallelism"
+	batchConsolidatorAutoParallelismVersion        = 1
 	batchConsolidatorMaxParallelism                = 10
 	maxUint64                                      = ^uint64(0)
 )
@@ -194,6 +196,15 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				batchConsolidatorAutoCursorVersion,
 			)
 		}
+		autoConsolidateParallelismVersion := workflow.DefaultVersion
+		if mode.IsAutoConsolidate() {
+			autoConsolidateParallelismVersion = workflow.GetVersion(
+				ctx,
+				batchConsolidatorAutoParallelismChangeID,
+				workflow.DefaultVersion,
+				batchConsolidatorAutoParallelismVersion,
+			)
+		}
 
 		if historicalBackfillVersion != workflow.DefaultVersion {
 			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
@@ -291,7 +302,8 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			if mode.IsAutoConsolidate() &&
 				(autoConsolidateCursorVersion != workflow.DefaultVersion || autoConsolidateVersion == workflow.DefaultVersion) {
 				autoConsolidateParallelism := 1
-				if autoConsolidateCursorVersion == workflow.DefaultVersion {
+				if autoConsolidateCursorVersion == workflow.DefaultVersion ||
+					autoConsolidateParallelismVersion != workflow.DefaultVersion {
 					autoConsolidateParallelism = parallelism
 				}
 				objectsInBatch, blocksInBatch, err := w.processAutoConsolidateBatchParallel(

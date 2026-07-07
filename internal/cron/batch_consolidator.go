@@ -39,9 +39,10 @@ type (
 )
 
 const (
-	autoConsolidateSuffix            = "auto_consolidate"
-	batchConsolidatorOpenPageSize    = 1000
-	defaultBatchConsolidatorCronSpec = "@every 30m"
+	autoConsolidateSuffix                   = "auto_consolidate"
+	batchConsolidatorOpenPageSize           = 1000
+	defaultBatchConsolidatorCronSpec        = "@every 30m"
+	maxBatchConsolidatorWorkflowParallelism = 10
 )
 
 func NewBatchConsolidator(params BatchConsolidatorTaskParams) (Task, error) {
@@ -113,6 +114,16 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 			"batch_consolidator cron max_range_blocks(%d) must be at least consolidation max_blocks(%d)",
 			cronConfig.MaxRangeBlocks,
 			consolidation.MaxBlocks,
+		)
+	}
+	if cronConfig.WorkflowParallelism < 0 {
+		return xerrors.Errorf("batch_consolidator cron workflow_parallelism(%d) must be non-negative", cronConfig.WorkflowParallelism)
+	}
+	if cronConfig.WorkflowParallelism > maxBatchConsolidatorWorkflowParallelism {
+		return xerrors.Errorf(
+			"batch_consolidator cron workflow_parallelism(%d) exceeds max(%d)",
+			cronConfig.WorkflowParallelism,
+			maxBatchConsolidatorWorkflowParallelism,
 		)
 	}
 
@@ -298,6 +309,9 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		StartHeight: startHeight,
 		EndHeight:   endHeight,
 	}
+	if cronConfig.WorkflowParallelism > 0 {
+		request.Parallelism = cronConfig.WorkflowParallelism
+	}
 	workflowCtx := workflow.WithWorkflowID(ctx, workflowID)
 	run, err := t.batchConsolidator.Execute(workflowCtx, request)
 	if err != nil {
@@ -319,6 +333,7 @@ func (t *batchConsolidatorTask) Run(ctx context.Context) error {
 		zap.Uint64("cursor_height", cursorHeight),
 		zap.Uint64("latest_height", latest.GetHeight()),
 		zap.Uint64("safe_consolidation_height", safeHeight),
+		zap.Int("workflow_parallelism", request.Parallelism),
 	)
 	return nil
 }
