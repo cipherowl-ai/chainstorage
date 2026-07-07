@@ -154,6 +154,9 @@ func TestSolanaProductionCadenceKeepAliveConfig(t *testing.T) {
 	require.NoError(err)
 	require.Equal(10*time.Second, cfg.Cadence.KeepAliveTime)
 	require.Equal(30*time.Second, cfg.Cadence.KeepAliveTimeout)
+	require.True(cfg.AWS.Storage.Consolidation.ReadShadowFirst)
+	require.Equal(config.BlobStorageType_S3, cfg.StorageType.BlobStorageType)
+	require.Equal(config.MetaStorageType_POSTGRES, cfg.StorageType.MetaStorageType)
 }
 
 func TestDerivedConfigValues(t *testing.T) {
@@ -219,6 +222,11 @@ func TestDerivedConfigValues(t *testing.T) {
 			},
 			// Skip AWS account verification
 			AWSAccount: cfg.AWS.AWSAccount,
+		}
+		if cfg.Env() == config.EnvProduction &&
+			cfg.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_SOLANA &&
+			cfg.Chain.Network == common.Network_NETWORK_SOLANA_MAINNET {
+			expectedAWS.Storage.Consolidation.ReadShadowFirst = true
 		}
 		require.Equal(expectedAWS, cfg.AWS)
 	})

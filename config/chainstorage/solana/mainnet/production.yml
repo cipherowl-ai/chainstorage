@@ -2,6 +2,9 @@
 aws:
   aws_account: production
   bucket: example-chainstorage-solana-mainnet-prod
+  storage:
+    consolidation:
+      read_shadow_first: true
 cadence:
   address: temporal.example.com:7233
   keep_alive_time: 10s
@@ -12,6 +15,9 @@ cron:
     workflow_parallelism: 2
 server:
   bind_address: 0.0.0.0:9090
+storage_type:
+  blob: S3
+  meta: POSTGRES
 workflows:
   backfiller:
     num_concurrent_extractors: 150
