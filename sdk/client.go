@@ -240,15 +240,16 @@ func (c *clientImpl) GetBlockWithTag(ctx context.Context, tag uint32, height uin
 
 func (c *clientImpl) GetBlockWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error) {
 	block, err := c.downloadBlock(ctx, tag, height, hash, readSource)
-	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+	if err == nil || !shouldRetryLegacyRead(readSource) {
 		return block, err
 	}
 
 	c.logger.Warn(
-		"consolidated block download failed; retrying legacy",
+		"preferred block download failed; retrying legacy",
 		zap.Uint32("tag", tag),
 		zap.Uint64("height", height),
 		zap.String("hash", hash),
+		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
 	block, fallbackErr := c.downloadBlock(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
@@ -268,15 +269,16 @@ func (c *clientImpl) GetBlocksByRangeWithTagAndReadSource(ctx context.Context, t
 	}
 
 	blocks, err := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, readSource)
-	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+	if err == nil || !shouldRetryLegacyRead(readSource) {
 		return blocks, err
 	}
 
 	c.logger.Warn(
-		"consolidated block range download failed; retrying legacy",
+		"preferred block range download failed; retrying legacy",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
+		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
 	blocks, fallbackErr := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
@@ -346,15 +348,16 @@ func (c *clientImpl) OpenRawBlockPayloadWithTag(ctx context.Context, tag uint32,
 
 func (c *clientImpl) OpenRawBlockPayloadWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error) {
 	payload, err := c.openRawBlockPayload(ctx, tag, height, hash, readSource)
-	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+	if err == nil || !shouldRetryLegacyRead(readSource) {
 		return payload, err
 	}
 
 	c.logger.Warn(
-		"consolidated raw block payload open failed; retrying legacy",
+		"preferred raw block payload open failed; retrying legacy",
 		zap.Uint32("tag", tag),
 		zap.Uint64("height", height),
 		zap.String("hash", hash),
+		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
 	payload, fallbackErr := c.openRawBlockPayload(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
@@ -396,15 +399,16 @@ func (c *clientImpl) OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx context
 	}
 
 	iter, err := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, readSource)
-	if err == nil || readSource != api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED {
+	if err == nil || !shouldRetryLegacyRead(readSource) {
 		return iter, err
 	}
 
 	c.logger.Warn(
-		"consolidated raw block payload range open failed; retrying legacy",
+		"preferred raw block payload range open failed; retrying legacy",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
+		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
 	iter, fallbackErr := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
@@ -434,6 +438,16 @@ func (c *clientImpl) openRawBlockPayloadsByRange(ctx context.Context, tag uint32
 		return nil, xerrors.Errorf("failed to open raw block payload iterator: %w", err)
 	}
 	return &rawBlockPayloadIterator{inner: iter}, nil
+}
+
+func shouldRetryLegacyRead(readSource api.BlockReadSource) bool {
+	switch readSource {
+	case api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED:
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *clientImpl) StreamChainEvents(ctx context.Context, cfg StreamingConfiguration) (<-chan *ChainEventResult, error) {
@@ -532,7 +546,7 @@ func (c *clientImpl) streamBlocks(
 		if !cfg.EventOnly {
 			var err error
 			blockID := event.GetBlock()
-			block, err = c.downloadBlock(ctx, blockID.GetTag(), blockID.GetHeight(), blockID.GetHash(), api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+			block, err = c.GetBlockWithTagAndReadSource(ctx, blockID.GetTag(), blockID.GetHeight(), blockID.GetHash(), api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 			if err != nil {
 				c.sendBlockResult(ctx, ch, &ChainEventResult{
 					Error: xerrors.Errorf("failed to download block (cfg={%+v}, request={%+v}, event={%+v}): %w", cfg, request, event, err),
@@ -661,7 +675,7 @@ func (c *clientImpl) GetBlockByTransaction(ctx context.Context, tag uint32, tran
 	// because a transaction belongs to a single block in most cases.
 	blocks := make([]*api.Block, len(blockIds))
 	for i, blockId := range blockIds {
-		block, err := c.downloadBlock(ctx, blockId.Tag, blockId.Height, blockId.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+		block, err := c.GetBlockWithTagAndReadSource(ctx, blockId.Tag, blockId.Height, blockId.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to download block data: %w", err)
 		}
@@ -682,7 +696,7 @@ func (c *clientImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, timest
 	}
 
 	// Download the block data using the metadata from the response
-	block, err := c.downloadBlock(ctx, resp.Tag, resp.Height, resp.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+	block, err := c.GetBlockWithTagAndReadSource(ctx, resp.Tag, resp.Height, resp.Hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to download block data: %w", err)
 	}
@@ -704,18 +718,20 @@ func (c *clientImpl) StreamNativeBlock(
 	tag uint32, height uint64, hash string,
 	opts ...ParseOption,
 ) (NativeStreamedBlock, error) {
-	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
-		Tag:    tag,
-		Height: height,
-		Hash:   hash,
-	})
+	spooled, err := c.downloadBlockStream(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
-	}
-
-	spooled, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
-	if err != nil {
-		return nil, err
+		c.logger.Warn(
+			"preferred native block stream download failed; retrying legacy",
+			zap.Uint32("tag", tag),
+			zap.Uint64("height", height),
+			zap.String("hash", hash),
+			zap.Error(err),
+		)
+		var fallbackErr error
+		spooled, fallbackErr = c.downloadBlockStream(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+		if fallbackErr != nil {
+			return nil, xerrors.Errorf("failed to download preferred native block stream and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		}
 	}
 
 	sp, ok := c.parser.(streamingParser)
@@ -729,6 +745,24 @@ func (c *clientImpl) StreamNativeBlock(
 		return nil, xerrors.Errorf("failed to create native stream: %w", err)
 	}
 	return stream, nil
+}
+
+func (c *clientImpl) downloadBlockStream(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*downloader.SpooledBlock, error) {
+	blockFileResp, err := c.client.GetBlockFile(ctx, &api.GetBlockFileRequest{
+		Tag:        tag,
+		Height:     height,
+		Hash:       hash,
+		ReadSource: readSource,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to query block file (tag=%v, height=%v, hash=%v): %w", tag, height, hash, err)
+	}
+
+	spooled, err := c.blockDownloader.DownloadStream(ctx, blockFileResp.GetFile())
+	if err != nil {
+		return nil, err
+	}
+	return spooled, nil
 }
 
 func (c *clientImpl) validateBlock(ctx context.Context, rawBlock *api.Block) error {

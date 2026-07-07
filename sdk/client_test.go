@@ -195,6 +195,52 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDo
 	s.require.Equal(block, fetchedBlock)
 }
 
+func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          block.Metadata.Tag,
+		Height:       block.Metadata.Height,
+		Hash:         block.Metadata.Hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{
+		Tag:    block.Metadata.Tag,
+		Height: block.Metadata.Height,
+		Hash:   block.Metadata.Hash,
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{
+			File: consolidatedBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{
+			File: legacyBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+	)
+
+	fetchedBlock, err := s.client.GetBlockWithTag(context.Background(), tag, height, hash)
+	s.require.NoError(err)
+	s.require.Equal(block, fetchedBlock)
+}
+
 func (s *clientTestSuite) TestGetBlocksByRange() {
 	const (
 		tag         = uint32(0)
@@ -351,6 +397,59 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 	s.require.Equal(blocks, fetchedBlocks)
 }
 
+func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag         = uint32(2)
+		startHeight = uint64(12345)
+		endHeight   = uint64(12350)
+		numBlocks   = int(endHeight - startHeight)
+	)
+
+	blocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
+	consolidatedBlockFiles := make([]*api.BlockFile, numBlocks)
+	legacyBlockFiles := make([]*api.BlockFile, numBlocks)
+	for i := range blocks {
+		metadata := blocks[i].Metadata
+		consolidatedBlockFiles[i] = &api.BlockFile{
+			Tag:          metadata.Tag,
+			Height:       metadata.Height,
+			Hash:         metadata.Hash,
+			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		}
+		legacyBlockFiles[i] = &api.BlockFile{
+			Tag:    metadata.Tag,
+			Height: metadata.Height,
+			Hash:   metadata.Hash,
+		}
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
+			Tag:         tag,
+			StartHeight: startHeight,
+			EndHeight:   endHeight,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFilesByRangeResponse{
+			Files: consolidatedBlockFiles,
+		}, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), consolidatedBlockFiles).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
+			Tag:         tag,
+			StartHeight: startHeight,
+			EndHeight:   endHeight,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFilesByRangeResponse{
+			Files: legacyBlockFiles,
+		}, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), legacyBlockFiles).Return(blocks, nil),
+	)
+
+	fetchedBlocks, err := s.client.GetBlocksByRangeWithTag(context.Background(), tag, startHeight, endHeight)
+	s.require.NoError(err)
+	s.require.Equal(numBlocks, len(fetchedBlocks))
+	s.require.Equal(blocks, fetchedBlocks)
+}
+
 func TestClientOpenRawBlockPayloadWithTag(t *testing.T) {
 	require := testutil.Require(t)
 	ctrl := gomock.NewController(t)
@@ -452,6 +551,69 @@ func (s *clientTestSuite) TestStreamBlocks() {
 
 	// make sure all events are called
 	s.require.Equal(numberOfEvents, count)
+}
+
+func (s *clientTestSuite) TestStreamBlocks_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	event := &api.BlockchainEvent{
+		Block: &api.BlockIdentifier{
+			Tag:    tag,
+			Height: height,
+			Hash:   hash,
+		},
+	}
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          block.Metadata.Tag,
+		Height:       block.Metadata.Height,
+		Hash:         block.Metadata.Hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{
+		Tag:    block.Metadata.Tag,
+		Height: block.Metadata.Height,
+		Hash:   block.Metadata.Hash,
+	}
+
+	s.gatewayClient.EXPECT().StreamChainEvents(gomock.Any(), gomock.Any()).Return(s.streamClient, nil)
+	gomock.InOrder(
+		s.streamClient.EXPECT().Recv().Return(&api.ChainEventsResponse{Event: event}, nil),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{
+			File: consolidatedBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{
+			File: legacyBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+	)
+
+	ch, err := s.client.StreamChainEvents(context.Background(), StreamingConfiguration{
+		ChainEventsRequest: &api.ChainEventsRequest{},
+		NumberOfEvents:     1,
+	})
+	s.require.NoError(err)
+
+	result := <-ch
+	s.require.NotNil(result)
+	s.require.NoError(result.Error)
+	s.require.Equal(block, result.Block)
+	s.require.Equal(event, result.BlockchainEvent)
 }
 
 func (s *clientTestSuite) TestStreamBlocks_EventOnly() {
@@ -592,20 +754,86 @@ func (s *clientTestSuite) TestStreamNativeBlock_EthereumReturnsNilAccessors() {
 	s.require.Nil(native.GetEthereum(), "no ethereum streaming walker exists yet")
 }
 
+func (s *clientTestSuite) TestStreamNativeBlock_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          tag,
+		Height:       height,
+		Hash:         hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+	spooled := &downloader.SpooledBlock{
+		BlockFile: legacyBlockFile,
+		Open: func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(nil)), nil
+		},
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{File: consolidatedBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated stream download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{File: legacyBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), legacyBlockFile).Return(spooled, nil),
+	)
+
+	native, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
+	s.require.NoError(err)
+	defer native.Close()
+	s.require.Nil(native.GetBitcoin(), "ethereum config must not populate GetBitcoin()")
+	s.require.Nil(native.GetEthereum(), "no ethereum streaming walker exists yet")
+}
+
 func (s *clientTestSuite) TestStreamNativeBlock_DownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
 		hash   = "0xabcde"
 	)
-	bf := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          tag,
+		Height:       height,
+		Hash:         hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 
-	s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), gomock.Any()).Return(&api.GetBlockFileResponse{File: bf}, nil)
 	sentinel := xerrors.New("download exploded")
-	s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), bf).Return(nil, sentinel)
+	fallbackSentinel := xerrors.New("legacy download exploded")
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{File: consolidatedBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), consolidatedBlockFile).Return(nil, sentinel),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{File: legacyBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), legacyBlockFile).Return(nil, fallbackSentinel),
+	)
 
 	view, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
-	s.require.ErrorIs(err, sentinel)
+	s.require.ErrorIs(err, fallbackSentinel)
+	s.require.Contains(err.Error(), sentinel.Error())
 	s.require.Nil(view)
 }
 
@@ -873,4 +1101,112 @@ func (s *clientTestSuite) TestGetStaticChainMetadata() {
 	s.require.Equal(uint64(100), resp.BlockStartHeight)
 	s.require.Equal(uint64(10), resp.IrreversibleDistance)
 	s.require.Equal("3s", resp.BlockTime)
+}
+
+func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag             = uint32(2)
+		height          = uint64(12345)
+		hash            = "0xabcde"
+		transactionHash = "0xtx"
+	)
+
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          block.Metadata.Tag,
+		Height:       block.Metadata.Height,
+		Hash:         block.Metadata.Hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{
+		Tag:    block.Metadata.Tag,
+		Height: block.Metadata.Height,
+		Hash:   block.Metadata.Hash,
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockByTransaction(gomock.Any(), &api.GetBlockByTransactionRequest{
+			Tag:             tag,
+			TransactionHash: transactionHash,
+		}).Return(&api.GetBlockByTransactionResponse{
+			Blocks: []*api.BlockIdentifier{{Tag: tag, Height: height, Hash: hash}},
+		}, nil),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{
+			File: consolidatedBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{
+			File: legacyBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+	)
+
+	blocks, err := s.client.GetBlockByTransaction(context.Background(), tag, transactionHash)
+	s.require.NoError(err)
+	s.require.Equal([]*api.Block{block}, blocks)
+}
+
+func (s *clientTestSuite) TestGetBlockByTimestamp_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag       = uint32(2)
+		height    = uint64(12345)
+		hash      = "0xabcde"
+		timestamp = uint64(123456789)
+	)
+
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          block.Metadata.Tag,
+		Height:       block.Metadata.Height,
+		Hash:         block.Metadata.Hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{
+		Tag:    block.Metadata.Tag,
+		Height: block.Metadata.Height,
+		Hash:   block.Metadata.Hash,
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockByTimestamp(gomock.Any(), &api.GetBlockByTimestampRequest{
+			Tag:       tag,
+			Timestamp: timestamp,
+		}).Return(&api.GetBlockByTimestampResponse{
+			Tag:    tag,
+			Height: height,
+			Hash:   hash,
+		}, nil),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{
+			File: consolidatedBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{
+			File: legacyBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+	)
+
+	got, err := s.client.GetBlockByTimestamp(context.Background(), tag, timestamp)
+	s.require.NoError(err)
+	s.require.Equal(block, got)
 }
