@@ -425,7 +425,6 @@ type (
 		WorkflowParallelism int           `mapstructure:"workflow_parallelism"`
 		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
 		StartHeight         uint64        `mapstructure:"start_height"`
-		MaxRangeBlocks      uint64        `mapstructure:"max_range_blocks"`
 	}
 
 	StorageConfig struct {
@@ -705,7 +704,6 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("cron.batch_consolidator.spec", "@every 30m")
 	v.SetDefault("cron.batch_consolidator.parallelism", 1)
 	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
-	v.SetDefault("cron.batch_consolidator.max_range_blocks", 10000)
 	v.SetDefault("aws.storage.consolidation.enabled", false)
 	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeLegacyOnly))
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")

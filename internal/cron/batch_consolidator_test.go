@@ -51,7 +51,6 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 2_500
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -76,11 +75,37 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 	}, runtime.executions[0].request)
 }
 
+func TestBatchConsolidatorCronRunsToNearestSafeFullWindow(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.BatchConsolidator.StartHeight = 7_000
+	cfg.Chain.IrreversibleDistance = 32
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 20_500}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(7_000), uint64(20_469)).
+		Return(uint64(7_000), true, nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, &workflowpkg.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		Tag:         tag,
+		StartHeight: 7_000,
+		EndHeight:   20_000,
+	}, runtime.executions[0].request)
+}
+
 func TestBatchConsolidatorCronPassesWorkflowParallelism(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 2_500
 	cfg.Cron.BatchConsolidator.WorkflowParallelism = 2
 
 	tag := cfg.GetEffectiveBlockTag(0)
@@ -109,7 +134,6 @@ func TestBatchConsolidatorCronWaitsForFullConsolidationWindow(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -130,7 +154,6 @@ func TestBatchConsolidatorCronUsesPersistedCursor(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -157,7 +180,6 @@ func TestBatchConsolidatorCronNormalizesCursorShardTail(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -184,7 +206,6 @@ func TestBatchConsolidatorCronRepairsWithinCursorLookback(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -213,7 +234,6 @@ func TestBatchConsolidatorCronDoesNotCapAutoConsolidateAtPromotionGate(t *testin
 	gateHeight := uint64(1_600)
 	cfg.AWS.Storage.Consolidation.PromotionGateHeight = &gateHeight
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -387,7 +407,6 @@ func newBatchConsolidatorCronTask(t *testing.T) (*batchConsolidatorTask, *batchC
 	cfg.Chain.BlockTag.Latest = 2
 	cfg.Chain.IrreversibleDistance = 100
 	cfg.Cron.BatchConsolidator.Enabled = true
-	cfg.Cron.BatchConsolidator.MaxRangeBlocks = 10_000
 	cfg.AWS.Storage.Consolidation.Enabled = true
 	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModeAutoConsolidate
 	cfg.AWS.Storage.Consolidation.MaxBlocks = 1_000
