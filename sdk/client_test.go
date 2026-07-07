@@ -195,6 +195,52 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDo
 	s.require.Equal(block, fetchedBlock)
 }
 
+func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag    = uint32(2)
+		height = uint64(12345)
+		hash   = "0xabcde"
+	)
+
+	block := testutil.MakeBlocksFromStartHeight(height, 1, tag)[0]
+	consolidatedBlockFile := &api.BlockFile{
+		Tag:          block.Metadata.Tag,
+		Height:       block.Metadata.Height,
+		Hash:         block.Metadata.Hash,
+		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	}
+	legacyBlockFile := &api.BlockFile{
+		Tag:    block.Metadata.Tag,
+		Height: block.Metadata.Height,
+		Hash:   block.Metadata.Hash,
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFileResponse{
+			File: consolidatedBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), consolidatedBlockFile).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
+			Tag:        tag,
+			Height:     height,
+			Hash:       hash,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFileResponse{
+			File: legacyBlockFile,
+		}, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+	)
+
+	fetchedBlock, err := s.client.GetBlockWithTag(context.Background(), tag, height, hash)
+	s.require.NoError(err)
+	s.require.Equal(block, fetchedBlock)
+}
+
 func (s *clientTestSuite) TestGetBlocksByRange() {
 	const (
 		tag         = uint32(0)
@@ -346,6 +392,59 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 	readSourceClient, ok := s.client.(ReadSourceClient)
 	s.require.True(ok)
 	fetchedBlocks, err := readSourceClient.GetBlocksByRangeWithTagAndReadSource(context.Background(), tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED)
+	s.require.NoError(err)
+	s.require.Equal(numBlocks, len(fetchedBlocks))
+	s.require.Equal(blocks, fetchedBlocks)
+}
+
+func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+	const (
+		tag         = uint32(2)
+		startHeight = uint64(12345)
+		endHeight   = uint64(12350)
+		numBlocks   = int(endHeight - startHeight)
+	)
+
+	blocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
+	consolidatedBlockFiles := make([]*api.BlockFile, numBlocks)
+	legacyBlockFiles := make([]*api.BlockFile, numBlocks)
+	for i := range blocks {
+		metadata := blocks[i].Metadata
+		consolidatedBlockFiles[i] = &api.BlockFile{
+			Tag:          metadata.Tag,
+			Height:       metadata.Height,
+			Hash:         metadata.Hash,
+			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		}
+		legacyBlockFiles[i] = &api.BlockFile{
+			Tag:    metadata.Tag,
+			Height: metadata.Height,
+			Hash:   metadata.Hash,
+		}
+	}
+
+	gomock.InOrder(
+		s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
+			Tag:         tag,
+			StartHeight: startHeight,
+			EndHeight:   endHeight,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
+		}).Return(&api.GetBlockFilesByRangeResponse{
+			Files: consolidatedBlockFiles,
+		}, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), consolidatedBlockFiles).Return(nil, xerrors.New("consolidated download failed")),
+		s.gatewayClient.EXPECT().GetBlockFilesByRange(gomock.Any(), &api.GetBlockFilesByRangeRequest{
+			Tag:         tag,
+			StartHeight: startHeight,
+			EndHeight:   endHeight,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+		}).Return(&api.GetBlockFilesByRangeResponse{
+			Files: legacyBlockFiles,
+		}, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), legacyBlockFiles).Return(blocks, nil),
+	)
+
+	fetchedBlocks, err := s.client.GetBlocksByRangeWithTag(context.Background(), tag, startHeight, endHeight)
 	s.require.NoError(err)
 	s.require.Equal(numBlocks, len(fetchedBlocks))
 	s.require.Equal(blocks, fetchedBlocks)
