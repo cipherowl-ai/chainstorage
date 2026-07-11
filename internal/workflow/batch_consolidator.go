@@ -66,7 +66,7 @@ const (
 	batchConsolidatorAutoCursorVersion             = 1
 	batchConsolidatorAutoParallelismChangeID       = "batch-consolidator-auto-parallelism"
 	batchConsolidatorAutoParallelismVersion        = 1
-	batchConsolidatorMaxParallelism                = 10
+	batchConsolidatorMaxParallelism                = 20
 	maxUint64                                      = ^uint64(0)
 )
 

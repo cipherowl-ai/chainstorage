@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,7 +300,55 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRejectsExcessiveParall
 		Parallelism: batchConsolidatorMaxParallelism + 1,
 	})
 	require.Error(err)
-	require.Contains(err.Error(), "parallelism(11) exceeds max(10)")
+	require.Contains(err.Error(), "parallelism(21) exceeds max(20)")
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParallelism() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.BatchSize = 500
+	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 1000
+	var requests []*activity.BatchConsolidatorRequest
+	var requestsMu sync.Mutex
+	s.mockAutoConsolidateLatestHeight(620)
+	s.mockEmptyShadowStats()
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requestsMu.Lock()
+			requests = append(requests, request)
+			requestsMu.Unlock()
+			return &activity.BatchConsolidatorResponse{
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   600,
+		MaxBlocks:   25,
+		Parallelism: 20,
+	})
+	require.NoError(err)
+	require.Len(requests, 20)
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].StartHeight < requests[j].StartHeight
+	})
+	for i, request := range requests {
+		startHeight := uint64(100 + i*25)
+		require.Equal(&activity.BatchConsolidatorRequest{
+			Mode:        config.ConsolidationModeHistoricalBackfill,
+			Tag:         2,
+			StartHeight: startHeight,
+			EndHeight:   startHeight + 25,
+			MaxBlocks:   25,
+		}, request)
+	}
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateValidatesFinalizedRange() {

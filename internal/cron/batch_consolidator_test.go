@@ -106,7 +106,7 @@ func TestBatchConsolidatorCronPassesWorkflowParallelism(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.BatchConsolidator.StartHeight = 1_000
-	cfg.Cron.BatchConsolidator.WorkflowParallelism = 2
+	cfg.Cron.BatchConsolidator.WorkflowParallelism = 20
 
 	tag := cfg.GetEffectiveBlockTag(0)
 	metaStorage.EXPECT().
@@ -126,7 +126,7 @@ func TestBatchConsolidatorCronPassesWorkflowParallelism(t *testing.T) {
 		Tag:         tag,
 		StartHeight: 3_000,
 		EndHeight:   4_000,
-		Parallelism: 2,
+		Parallelism: 20,
 	}, runtime.executions[0].request)
 }
 
@@ -395,7 +395,7 @@ func TestBatchConsolidatorCronRejectsInvalidWorkflowParallelism(t *testing.T) {
 
 	err := task.Run(context.Background())
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "workflow_parallelism(11) exceeds max(10)")
+	require.Contains(t, err.Error(), "workflow_parallelism(21) exceeds max(20)")
 	require.Empty(t, runtime.executions)
 }
 
