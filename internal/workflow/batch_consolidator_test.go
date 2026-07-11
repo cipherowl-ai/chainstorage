@@ -308,6 +308,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 
 	s.cfg.Workflows.BatchConsolidator.BatchSize = 500
 	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 1000
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
 	var requests []*activity.BatchConsolidatorRequest
 	var requestsMu sync.Mutex
 	s.mockAutoConsolidateLatestHeight(620)
