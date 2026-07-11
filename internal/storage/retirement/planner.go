@@ -2,12 +2,21 @@ package retirement
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/xerrors"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
+)
+
+const (
+	cscbFormatMetadataKey             = "chainstorage-format"
+	cscbCompressionScopeMetadataKey   = "chainstorage-compression-scope"
+	cscbUncompressedLengthMetadataKey = "chainstorage-uncompressed-length"
+	cscbFormatMetadataValue           = "cscb"
+	cscbCompressionScopeMetadataValue = "batch-chunked"
 )
 
 type Planner struct {
@@ -203,7 +212,9 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipMissingCSCBObject
 		return item
 	}
-	if shadow.ByteOffset > head.Bytes || shadow.ByteLength > head.Bytes-shadow.ByteOffset {
+	// CSCB placements address the logical payload, not the compressed S3 object.
+	logicalBytes, ok := cscbLogicalPayloadBytes(head)
+	if head.Bytes == 0 || !ok || shadow.ByteOffset > logicalBytes || shadow.ByteLength > logicalBytes-shadow.ByteOffset {
 		item.SkipReason = SkipInvalidMetadataReference
 		return item
 	}
@@ -252,6 +263,40 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 		return false
 	}
 	return true
+}
+
+func cscbLogicalPayloadBytes(head ObjectHead) (uint64, bool) {
+	format, ok := objectMetadataValue(head.Metadata, cscbFormatMetadataKey)
+	if !ok || !strings.EqualFold(strings.TrimSpace(format), cscbFormatMetadataValue) {
+		return 0, false
+	}
+	scope, ok := objectMetadataValue(head.Metadata, cscbCompressionScopeMetadataKey)
+	if !ok || !strings.EqualFold(strings.TrimSpace(scope), cscbCompressionScopeMetadataValue) {
+		return 0, false
+	}
+	value, ok := objectMetadataValue(head.Metadata, cscbUncompressedLengthMetadataKey)
+	if !ok {
+		return 0, false
+	}
+
+	logicalBytes, err := strconv.ParseUint(strings.TrimSpace(value), 10, 64)
+	if err != nil || logicalBytes == 0 {
+		return 0, false
+	}
+	return logicalBytes, true
+}
+
+func objectMetadataValue(metadata map[string]string, name string) (string, bool) {
+	value, ok := metadata[name]
+	if ok {
+		return value, true
+	}
+	for key, candidate := range metadata {
+		if strings.EqualFold(key, name) {
+			return candidate, true
+		}
+	}
+	return "", false
 }
 
 func isPrimaryConsolidated(row MetadataRow) bool {

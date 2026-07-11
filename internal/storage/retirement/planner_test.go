@@ -137,7 +137,7 @@ func TestPlannerPlan_ActiveLegacyMetadataIsNeverRetired(t *testing.T) {
 	row := activeLegacyTestRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	store := newFakeStore()
 	store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
-	store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{Exists: true, Bytes: 1024}
+	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(1024, 1024)
 
 	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
@@ -240,7 +240,7 @@ func TestPlannerPlan_PromotedRowUsesShadowLegacyKeyAndRetireAfter(t *testing.T) 
 	row.Shadow.LegacyObjectRetireAfter = &retireAfter
 	store := newFakeStore()
 	store.versions[legacyKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
-	store.heads[cscbKey] = ObjectHead{Exists: true, Bytes: 1024}
+	store.heads[cscbKey] = cscbObjectHead(1024, 1024)
 
 	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
@@ -276,7 +276,7 @@ func TestPlannerPlan_DryRunOutput(t *testing.T) {
 	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	store := newFakeStore()
 	store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
-	store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{Exists: true, Bytes: 1024}
+	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(1024, 1024)
 	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 
@@ -310,7 +310,7 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 
 	rows := make([]MetadataRow, 0, endHeight-startHeight)
 	store := newFakeStore()
-	store.heads[cscbKey] = ObjectHead{Exists: true, Bytes: 2 << 20}
+	store.heads[cscbKey] = cscbObjectHead(512<<10, 2<<20)
 	for height := startHeight; height < endHeight; height++ {
 		hash := fmt.Sprintf("solana-hash-%d", height)
 		key := fmt.Sprintf("BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/0/%d/%s.zstd", height, hash)
@@ -378,6 +378,58 @@ func TestPlannerApply_ProductionDisabledAndNonProdDeletesVersionIDOnly(t *testin
 	require.Equal(ActionDeletedObjectVersion, report.Items[0].Action)
 }
 
+func TestPlannerPlan_UsesCSCBUncompressedLengthForPlacementBounds(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row.PrimaryByteOffset = 900
+	row.PrimaryByteLength = 100
+	row.Shadow.ByteOffset = 900
+	row.Shadow.ByteLength = 100
+	store := newFakeStore()
+	store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
+	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(100, 1000)
+
+	report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(ActionReportOnly, report.Items[0].Action)
+	require.Empty(report.Items[0].SkipReason)
+}
+
+func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+
+	for _, test := range []struct {
+		name     string
+		metadata map[string]string
+	}{
+		{name: "missing", metadata: nil},
+		{name: "wrong format", metadata: cscbObjectMetadata("100", "not-cscb", cscbCompressionScopeMetadataValue)},
+		{name: "wrong compression scope", metadata: cscbObjectMetadata("100", cscbFormatMetadataValue, "whole-object")},
+		{name: "malformed length", metadata: cscbObjectMetadata("invalid", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
+		{name: "zero length", metadata: cscbObjectMetadata("0", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+			store := newFakeStore()
+			store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
+			store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{
+				Exists:   true,
+				Bytes:    1024,
+				Metadata: test.metadata,
+			}
+
+			report, err := NewPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+			require.NoError(err)
+			require.Equal(ActionSkip, report.Items[0].Action)
+			require.Equal(SkipInvalidMetadataReference, report.Items[0].SkipReason)
+		})
+	}
+}
+
 func testRequest(now time.Time, execute bool) PlanRequest {
 	return PlanRequest{
 		Environment:             "production",
@@ -427,6 +479,26 @@ func testRow(height uint64, hash string, legacyKey string, cscbKey string, valid
 			LegacyObjectRetireAfter: &retireAfter,
 			FormatVersion:           1,
 		},
+	}
+}
+
+func cscbObjectHead(compressedBytes uint64, uncompressedBytes uint64) ObjectHead {
+	return ObjectHead{
+		Exists: true,
+		Bytes:  compressedBytes,
+		Metadata: cscbObjectMetadata(
+			fmt.Sprintf("%d", uncompressedBytes),
+			cscbFormatMetadataValue,
+			cscbCompressionScopeMetadataValue,
+		),
+	}
+}
+
+func cscbObjectMetadata(uncompressedLength string, format string, compressionScope string) map[string]string {
+	return map[string]string{
+		cscbFormatMetadataKey:             format,
+		cscbCompressionScopeMetadataKey:   compressionScope,
+		cscbUncompressedLengthMetadataKey: uncompressedLength,
 	}
 }
 
