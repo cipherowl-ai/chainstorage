@@ -402,14 +402,16 @@ func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
 	validatedAt := now.Add(-8 * 24 * time.Hour)
 
 	for _, test := range []struct {
-		name     string
-		metadata map[string]string
+		name            string
+		compressedBytes uint64
+		metadata        map[string]string
 	}{
-		{name: "missing", metadata: nil},
-		{name: "wrong format", metadata: cscbObjectMetadata("100", "not-cscb", cscbCompressionScopeMetadataValue)},
-		{name: "wrong compression scope", metadata: cscbObjectMetadata("100", cscbFormatMetadataValue, "whole-object")},
-		{name: "malformed length", metadata: cscbObjectMetadata("invalid", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
-		{name: "zero length", metadata: cscbObjectMetadata("0", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
+		{name: "missing", compressedBytes: 1024, metadata: nil},
+		{name: "zero compressed bytes", compressedBytes: 0, metadata: cscbObjectMetadata("100", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
+		{name: "wrong format", compressedBytes: 1024, metadata: cscbObjectMetadata("100", "not-cscb", cscbCompressionScopeMetadataValue)},
+		{name: "wrong compression scope", compressedBytes: 1024, metadata: cscbObjectMetadata("100", cscbFormatMetadataValue, "whole-object")},
+		{name: "malformed length", compressedBytes: 1024, metadata: cscbObjectMetadata("invalid", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
+		{name: "zero length", compressedBytes: 1024, metadata: cscbObjectMetadata("0", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			require := require.New(t)
@@ -418,7 +420,7 @@ func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
 			store.versions[row.LegacyObjectKey] = ObjectVersion{Exists: true, VersionID: "legacy-v1", Bytes: 42}
 			store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{
 				Exists:   true,
-				Bytes:    1024,
+				Bytes:    test.compressedBytes,
 				Metadata: test.metadata,
 			}
 
