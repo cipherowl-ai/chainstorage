@@ -66,7 +66,8 @@ const (
 	batchConsolidatorAutoCursorVersion             = 1
 	batchConsolidatorAutoParallelismChangeID       = "batch-consolidator-auto-parallelism"
 	batchConsolidatorAutoParallelismVersion        = 1
-	batchConsolidatorMaxParallelism                = 10
+	batchConsolidatorPreviousMaxParallelism        = 10
+	batchConsolidatorMaxParallelism                = 20
 	maxUint64                                      = ^uint64(0)
 )
 
@@ -266,6 +267,11 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			}
 
 			batchEnd := batchConsolidatorWindowEnd(batchStart, workflowEndHeight, batchSize, shardSize)
+			if mode == config.ConsolidationModeHistoricalBackfill && parallelism > batchConsolidatorPreviousMaxParallelism {
+				// Parallelism above the previous hard limit cannot exist in an old history.
+				// Queue work across shards while keeping each CSCB object shard-bounded below.
+				batchEnd = batchConsolidatorBatchEnd(batchStart, workflowEndHeight, batchSize)
+			}
 			if batchEnd <= batchStart {
 				return xerrors.Errorf("batch_consolidator made no height progress from %d to %d", batchStart, batchEnd)
 			}
@@ -281,6 +287,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 					batchStart,
 					batchEnd,
 					maxBlocks,
+					shardSize,
 					parallelism,
 					usePersistedShadowStats,
 				)
@@ -627,6 +634,7 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 	batchStart uint64,
 	batchEnd uint64,
 	maxBlocks uint64,
+	shardSize uint64,
 	parallelism int,
 	usePersistedShadowStats bool,
 ) (uint64, uint64, error) {
@@ -651,7 +659,7 @@ func (w *BatchConsolidator) processHistoricalBackfillBatchParallel(
 	for windowStart := batchStart; windowStart < batchEnd; {
 		pending := make([]batchConsolidatorPendingActivity, 0, parallelism)
 		for len(pending) < parallelism && windowStart < batchEnd {
-			windowEnd := batchConsolidatorObjectWindowEnd(windowStart, batchEnd, maxBlocks)
+			windowEnd := batchConsolidatorWindowEnd(windowStart, batchEnd, maxBlocks, shardSize)
 			if windowEnd <= windowStart {
 				return 0, 0, xerrors.Errorf("batch_consolidator made no parallel window progress from %d to %d", windowStart, windowEnd)
 			}
@@ -975,13 +983,18 @@ func (w *BatchConsolidator) getCursorActivityRetryPolicy(cfg *config.RetryPolicy
 }
 
 func batchConsolidatorWindowEnd(startHeight uint64, requestedEndHeight uint64, batchSize uint64, shardSize uint64) uint64 {
-	batchEnd := startHeight + batchSize
-	if batchEnd < startHeight || batchEnd > requestedEndHeight {
-		batchEnd = requestedEndHeight
-	}
+	batchEnd := batchConsolidatorBatchEnd(startHeight, requestedEndHeight, batchSize)
 	shardEnd := batchConsolidatorShardEnd(startHeight, shardSize)
 	if shardEnd < batchEnd {
 		return shardEnd
+	}
+	return batchEnd
+}
+
+func batchConsolidatorBatchEnd(startHeight uint64, requestedEndHeight uint64, batchSize uint64) uint64 {
+	batchEnd := startHeight + batchSize
+	if batchEnd < startHeight || batchEnd > requestedEndHeight {
+		batchEnd = requestedEndHeight
 	}
 	return batchEnd
 }

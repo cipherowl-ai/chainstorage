@@ -42,7 +42,7 @@ const (
 	autoConsolidateSuffix                   = "auto_consolidate"
 	batchConsolidatorOpenPageSize           = 1000
 	defaultBatchConsolidatorCronSpec        = "@every 30m"
-	maxBatchConsolidatorWorkflowParallelism = 10
+	maxBatchConsolidatorWorkflowParallelism = 20
 )
 
 func NewBatchConsolidator(params BatchConsolidatorTaskParams) (Task, error) {

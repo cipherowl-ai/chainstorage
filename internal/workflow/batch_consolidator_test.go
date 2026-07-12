@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -299,7 +300,60 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRejectsExcessiveParall
 		Parallelism: batchConsolidatorMaxParallelism + 1,
 	})
 	require.Error(err)
-	require.Contains(err.Error(), "parallelism(11) exceeds max(10)")
+	require.Contains(err.Error(), "parallelism(21) exceeds max(20)")
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParallelism() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.BatchConsolidator.BatchSize = 10000
+	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 100000
+	s.cfg.Workflows.BatchConsolidator.MaxBlocks = 1000
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.MaxBlocks = 1000
+	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.ShardSize = 10000
+	var requests []*activity.BatchConsolidatorRequest
+	var requestsMu sync.Mutex
+	s.mockAutoConsolidateLatestHeight(120010)
+	s.mockEmptyShadowStats()
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requestsMu.Lock()
+			requests = append(requests, request)
+			requestsMu.Unlock()
+			return &activity.BatchConsolidatorResponse{
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				ScannedBlocks:      request.EndHeight - request.StartHeight,
+				ConsolidatedBlocks: request.EndHeight - request.StartHeight,
+				ObjectKey:          "consolidated/object.zstd",
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100000,
+		EndHeight:   120000,
+		BatchSize:   20000,
+		MaxBlocks:   1000,
+		Parallelism: 20,
+	})
+	require.NoError(err)
+	require.Len(requests, 20)
+	sort.Slice(requests, func(i, j int) bool {
+		return requests[i].StartHeight < requests[j].StartHeight
+	})
+	for i, request := range requests {
+		startHeight := uint64(100000 + i*1000)
+		require.Equal(&activity.BatchConsolidatorRequest{
+			Mode:        config.ConsolidationModeHistoricalBackfill,
+			Tag:         2,
+			StartHeight: startHeight,
+			EndHeight:   startHeight + 1000,
+			MaxBlocks:   1000,
+		}, request)
+	}
 }
 
 func (s *batchConsolidatorTestSuite) TestAutoConsolidateValidatesFinalizedRange() {
@@ -492,11 +546,14 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillProcessesObjectWindow
 	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
 	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
 	var requests []*activity.BatchConsolidatorRequest
+	var requestsMu sync.Mutex
 	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requestsMu.Lock()
 			requests = append(requests, request)
+			requestsMu.Unlock()
 			return &activity.BatchConsolidatorResponse{
 				StartHeight:        request.StartHeight,
 				EndHeight:          request.EndHeight,
@@ -669,6 +726,7 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesP
 	s.cfg.Workflows.BatchConsolidator.BatchSize = 100
 	s.cfg.Workflows.BatchConsolidator.CheckpointSize = 500
 	var requests []*activity.BatchConsolidatorRequest
+	var requestsMu sync.Mutex
 	s.mockAutoConsolidateLatestHeight(220)
 	s.mockEmptyShadowStats()
 	s.env.OnGetVersion(
@@ -688,7 +746,9 @@ func (s *batchConsolidatorTestSuite) TestAutoConsolidateDefaultVersionPreservesP
 	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			requestsMu.Lock()
 			requests = append(requests, request)
+			requestsMu.Unlock()
 			return &activity.BatchConsolidatorResponse{
 				StartHeight:        request.StartHeight,
 				EndHeight:          request.EndHeight,
