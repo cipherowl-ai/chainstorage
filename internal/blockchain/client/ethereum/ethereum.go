@@ -719,8 +719,13 @@ func (c *EthereumClient) getBlockTransactionReceipts(ctx context.Context, block 
 	numTransactions := len(block.Transactions)
 	responses := make([]*jsonrpc.Response, numTransactions)
 
-	for batchStart := 0; batchStart < numTransactions; batchStart += ethBlockTransactionReceiptBatchSize {
-		batchEnd := batchStart + ethBlockTransactionReceiptBatchSize
+	receiptBatchSize := c.config.Chain.Client.TxBatchSize
+	if receiptBatchSize <= 0 {
+		receiptBatchSize = ethBlockTransactionReceiptBatchSize
+	}
+
+	for batchStart := 0; batchStart < numTransactions; batchStart += receiptBatchSize {
+		batchEnd := batchStart + receiptBatchSize
 		if batchEnd > numTransactions {
 			batchEnd = numTransactions
 		}
