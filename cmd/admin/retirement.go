@@ -31,10 +31,14 @@ type retirementFlags struct {
 	clientMigrationApproved bool
 	fallbackErrorCount      uint64
 	execute                 bool
+	confirmProductionDelete bool
 	reportFile              string
 }
 
-var legacyRetirementFlags retirementFlags
+var (
+	legacyRetirementFlags          retirementFlags
+	legacyRetirementReconcileFlags retirementFlags
+)
 
 func newRetirementCommand() *cobra.Command {
 	cmd := &cobra.Command{
@@ -42,6 +46,7 @@ func newRetirementCommand() *cobra.Command {
 		Short: "plan and execute guarded storage retirement operations",
 	}
 	cmd.AddCommand(newLegacyRetirementPlanCommand())
+	cmd.AddCommand(newLegacyRetirementReconcileCommand())
 	return cmd
 }
 
@@ -55,36 +60,60 @@ The command is dry-run by default. It emits one auditable JSON report containing
 legacy key, version id when available, height, hash, legacy bytes, consolidated key,
 validated_at, retired_at, eligible_at, action, and skip reason for every scanned canonical row.
 
-Production deletion is disabled. Non-production execution deletes only an explicit S3 object
-version; rows without a version id are skipped to avoid delete-marker-only cleanup.`,
+Execution persists a write-ahead manifest, independently parses and compares the pinned legacy
+version with the pinned CSCB payload, revalidates immediately before deleting exactly one S3
+version, verifies the key has no remaining versions, and transactionally clears the legacy path.
+Production execution requires both --execute and --confirm-production-delete.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLegacyRetirementPlan(cmd.Context(), legacyRetirementFlags)
 		},
 	}
 
-	cmd.Flags().Uint32Var(&legacyRetirementFlags.tag, "tag", 0, "block tag; default zero resolves to the configured stable tag")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.startHeight, "start-height", 0, "inclusive block start height")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.endHeight, "end-height", 0, "exclusive block end height")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.limit, "limit", 0, "maximum rows to scan; default scans the full range")
-	cmd.Flags().StringVar(&legacyRetirementFlags.approveChain, "approve-chain", "", "explicit chain approval, e.g. solana-mainnet")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
-	cmd.Flags().BoolVar(&legacyRetirementFlags.clientMigrationApproved, "client-migration-approved", false, "confirm known file clients are migrated or out of scope")
-	cmd.Flags().Uint64Var(&legacyRetirementFlags.fallbackErrorCount, "fallback-read-errors", 0, "active fallback/read error count from the operator's observation window")
-	cmd.Flags().BoolVar(&legacyRetirementFlags.execute, "execute", false, "non-production only: delete eligible legacy object versions")
-	cmd.Flags().StringVar(&legacyRetirementFlags.reportFile, "report-file", "", "write JSON report to this file instead of stdout")
+	addLegacyRetirementFlags(cmd, &legacyRetirementFlags)
+	return cmd
+}
+
+func newLegacyRetirementReconcileCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reconcile-legacy-single-blocks",
+		Short: "inspect or resume durable legacy object retirements",
+		Long: `Inspect write-ahead retirement manifests left in eligible or deleting state.
+
+The command is report-only by default. With explicit execution gates, it can safely resume a
+pre-delete manifest or finish the metadata transaction after verifying that S3 deletion already
+succeeded and the pinned CSCB payload still parses to the persisted digest.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runLegacyRetirementReconcile(cmd.Context(), legacyRetirementReconcileFlags)
+		},
+	}
+	addLegacyRetirementFlags(cmd, &legacyRetirementReconcileFlags)
+	return cmd
+}
+
+func addLegacyRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
+	cmd.Flags().Uint32Var(&flags.tag, "tag", 0, "block tag; default zero resolves to the configured stable tag")
+	cmd.Flags().Uint64Var(&flags.startHeight, "start-height", 0, "inclusive block start height")
+	cmd.Flags().Uint64Var(&flags.endHeight, "end-height", 0, "exclusive block end height")
+	cmd.Flags().Uint64Var(&flags.limit, "limit", 0, "maximum rows to scan; default scans the full range")
+	cmd.Flags().StringVar(&flags.approveChain, "approve-chain", "", "explicit chain approval, e.g. solana-mainnet")
+	cmd.Flags().Uint64Var(&flags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
+	cmd.Flags().Uint64Var(&flags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
+	cmd.Flags().BoolVar(&flags.clientMigrationApproved, "client-migration-approved", false, "confirm known file clients are migrated or out of scope")
+	cmd.Flags().Uint64Var(&flags.fallbackErrorCount, "fallback-read-errors", 0, "active fallback/read error count from the operator's observation window")
+	cmd.Flags().BoolVar(&flags.execute, "execute", false, "execute guarded retirement state transitions and exact-version deletion")
+	cmd.Flags().BoolVar(&flags.confirmProductionDelete, "confirm-production-delete", false, "second explicit gate required with --execute in production")
+	cmd.Flags().StringVar(&flags.reportFile, "report-file", "", "write JSON report to this file instead of stdout")
 
 	_ = cmd.MarkFlagRequired("start-height")
 	_ = cmd.MarkFlagRequired("end-height")
-	return cmd
 }
 
 func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 	if flags.endHeight <= flags.startHeight {
 		return xerrors.Errorf("end height must be greater than start height: start=%d end=%d", flags.startHeight, flags.endHeight)
 	}
-	if flags.execute && strings.EqualFold(commonFlags.env, string(config.EnvProduction)) {
-		return xerrors.New("production deletion is disabled; run without --execute for a dry-run report")
+	if flags.execute && isProductionEnvironment(commonFlags.env) && !flags.confirmProductionDelete {
+		return xerrors.New("production execution requires --execute and --confirm-production-delete")
 	}
 
 	var deps struct {
@@ -120,9 +149,9 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 		zap.Bool("execute", flags.execute),
 	)
 
-	db, err := openReadOnlyPostgres(ctx, cfg.AWS.Postgres)
+	db, err := openRetirementPostgres(ctx, cfg.AWS.Postgres, !flags.execute)
 	if err != nil {
-		return xerrors.Errorf("failed to open read-only postgres connection: %w", err)
+		return xerrors.Errorf("failed to open retirement postgres connection: %w", err)
 	}
 	defer func() {
 		_ = db.Close()
@@ -144,6 +173,7 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 		Limit:                   flags.limit,
 		Now:                     time.Now().UTC(),
 		Execute:                 flags.execute,
+		ProductionDeleteEnabled: flags.confirmProductionDelete,
 		ClientMigrationApproved: flags.clientMigrationApproved,
 		FallbackErrorCount:      flags.fallbackErrorCount,
 		Approval: retirement.Approval{
@@ -158,23 +188,96 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 		return xerrors.Errorf("failed to plan legacy retirement: %w", err)
 	}
 	if flags.execute {
-		if err := planner.Apply(ctx, req, report); err != nil {
-			return xerrors.Errorf("failed to execute legacy retirement: %w", err)
-		}
+		err = planner.Apply(ctx, req, report)
 	}
-	if err := writeRetirementReport(flags.reportFile, report); err != nil {
-		return err
+	if reportErr := writeRetirementReport(flags.reportFile, report); reportErr != nil {
+		if err != nil {
+			return xerrors.Errorf("legacy retirement failed (%v) and report write failed: %w", err, reportErr)
+		}
+		return reportErr
+	}
+	if err != nil {
+		return xerrors.Errorf("failed to execute one or more legacy retirements: %w", err)
 	}
 	return nil
 }
 
-func openReadOnlyPostgres(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {
+func runLegacyRetirementReconcile(ctx context.Context, flags retirementFlags) error {
+	if flags.endHeight <= flags.startHeight {
+		return xerrors.Errorf("end height must be greater than start height: start=%d end=%d", flags.startHeight, flags.endHeight)
+	}
+	if flags.execute && isProductionEnvironment(commonFlags.env) && !flags.confirmProductionDelete {
+		return xerrors.New("production reconciliation requires --execute and --confirm-production-delete")
+	}
+
+	var deps struct {
+		fx.In
+		S3Client s3.Client
+	}
+	app := startApp(aws.Module, s3.Module, fx.Populate(&deps))
+	defer app.Close()
+	cfg := app.Config()
+	if cfg.StorageType.MetaStorageType != config.MetaStorageType_POSTGRES || cfg.AWS.Postgres == nil {
+		return xerrors.New("legacy retirement reconciler requires Postgres meta storage")
+	}
+	if cfg.StorageType.BlobStorageType != config.BlobStorageType_UNSPECIFIED && cfg.StorageType.BlobStorageType != config.BlobStorageType_S3 {
+		return xerrors.Errorf("legacy retirement reconciler requires S3 blob storage, got %v", cfg.StorageType.BlobStorageType)
+	}
+
+	tag := cfg.GetEffectiveBlockTag(flags.tag)
+	db, err := openRetirementPostgres(ctx, cfg.AWS.Postgres, !flags.execute)
+	if err != nil {
+		return xerrors.Errorf("failed to open retirement postgres connection: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	planner := retirement.NewPlanner(retirement.NewPostgresRepository(db), retirement.NewS3ObjectStore(deps.S3Client))
+	req := retirement.PlanRequest{
+		Environment:             string(cfg.Env()),
+		Blockchain:              commonFlags.blockchain,
+		Network:                 commonFlags.network,
+		Sidechain:               commonFlags.sidechain,
+		Bucket:                  cfg.AWS.Bucket,
+		Tag:                     tag,
+		StartHeight:             flags.startHeight,
+		EndHeight:               flags.endHeight,
+		Limit:                   flags.limit,
+		Now:                     time.Now().UTC(),
+		Execute:                 flags.execute,
+		ProductionDeleteEnabled: flags.confirmProductionDelete,
+		ClientMigrationApproved: flags.clientMigrationApproved,
+		FallbackErrorCount:      flags.fallbackErrorCount,
+		Approval: retirement.Approval{
+			Chain:       flags.approveChain,
+			StartHeight: flags.approveStartHeight,
+			EndHeight:   flags.approveEndHeight,
+		},
+	}
+	report, reconcileErr := planner.Reconcile(ctx, req)
+	if report == nil {
+		return xerrors.Errorf("failed to reconcile legacy retirements: %w", reconcileErr)
+	}
+	if reportErr := writeRetirementReport(flags.reportFile, report); reportErr != nil {
+		if reconcileErr != nil {
+			return xerrors.Errorf("legacy retirement reconciliation failed (%v) and report write failed: %w", reconcileErr, reportErr)
+		}
+		return reportErr
+	}
+	if reconcileErr != nil {
+		return xerrors.Errorf("failed to reconcile one or more legacy retirements: %w", reconcileErr)
+	}
+	return nil
+}
+
+func openRetirementPostgres(ctx context.Context, cfg *config.PostgresConfig, readOnly bool) (*sql.DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode)
 	if cfg.ConnectTimeout > 0 {
 		dsn += fmt.Sprintf(" connect_timeout=%d", int(cfg.ConnectTimeout.Seconds()))
 	}
-	dsn += " options='-c default_transaction_read_only=on'"
+	if readOnly {
+		dsn += " options='-c default_transaction_read_only=on'"
+	}
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -218,6 +321,10 @@ func approvalChainFromFlags() string {
 		parts = append(parts, commonFlags.sidechain)
 	}
 	return strings.Join(parts, "-")
+}
+
+func isProductionEnvironment(value string) bool {
+	return strings.EqualFold(value, string(config.EnvProduction)) || strings.EqualFold(value, "prod")
 }
 
 func init() {
