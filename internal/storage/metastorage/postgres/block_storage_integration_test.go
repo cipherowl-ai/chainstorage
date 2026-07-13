@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"math/rand/v2"
 	"sort"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -25,6 +28,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
+	"github.com/coinbase/chainstorage/internal/storage/retirement"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -78,8 +82,18 @@ func (s *blockStorageTestSuite) TearDownTest() {
 	if s.db != nil {
 		ctx := context.Background()
 		s.T().Log("Clearing database tables after test")
+		_, err := s.db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement DISABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
+		if err != nil {
+			s.T().Errorf("Failed to disable retirement audit delete trigger for test cleanup: %v", err)
+			return
+		}
+		defer func() {
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement ENABLE TRIGGER block_legacy_object_retirement_delete_trigger`); err != nil {
+				s.T().Errorf("Failed to restore retirement audit delete trigger after test cleanup: %v", err)
+			}
+		}()
 		// Clear all tables in reverse order due to foreign key constraints
-		tables := []string{"block_events", "block_consolidation_shadow", "canonical_blocks", "block_metadata"}
+		tables := []string{"block_events", "block_legacy_object_retirement", "block_consolidation_shadow", "canonical_blocks", "block_metadata"}
 		for _, table := range tables {
 			_, err := s.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
 			if err != nil {
@@ -93,6 +107,255 @@ func (s *blockStorageTestSuite) TearDownSuite() {
 	if s.db != nil {
 		s.db.Close()
 	}
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCSCBPlacement() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	block := testutil.MakeBlockMetadatasFromStartHeight(s.config.Chain.BlockStartHeight, 1, tag)[0]
+	block.ObjectKeyMain = "legacy/fenced-block.gzip"
+	block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	block.ByteOffset = 0
+	block.ByteLength = 0
+	block.UncompressedLength = 0
+	guardStorage, ok := s.accessor.(internal.LegacyObjectUploadGuardStorage)
+	require.True(ok)
+	uploadContext, cancelUpload := context.WithCancel(ctx)
+	uploadGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(uploadContext, block.Tag, block.Height, block.Hash)
+	require.NoError(err)
+	require.NotNil(uploadGuard)
+	require.False(uploadGuard.RetirementFenced())
+	cancelUpload()
+	defer func() { _ = uploadGuard.Release() }()
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil))
+
+	const cscbKey = "consolidated/fenced-batch.cscb.gzip"
+	var blockMetadataID int64
+	err = s.db.QueryRowContext(ctx, `
+		UPDATE block_metadata
+		SET object_key_main = $1,
+			object_format = $2,
+			byte_offset = $3,
+			byte_length = $4,
+			uncompressed_length = $5
+		WHERE tag = $6 AND hash = $7
+		RETURNING id`,
+		cscbKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+		block.Tag,
+		block.Hash,
+	).Scan(&blockMetadataID)
+	require.NoError(err)
+
+	validatedAt := time.Now().UTC().Add(-96 * time.Hour)
+	retireAfter := validatedAt.Add(72 * time.Hour)
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, legacy_object_key_main,
+			consolidated_object_key_main, object_format, byte_offset, byte_length,
+			uncompressed_length, validated_at, legacy_object_retired_at, legacy_object_retire_after
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)`,
+		blockMetadataID,
+		block.Tag,
+		block.Height,
+		block.Hash,
+		block.ObjectKeyMain,
+		cscbKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+		validatedAt,
+		retireAfter,
+	)
+	require.NoError(err)
+
+	preparedAt := time.Now().UTC()
+	repo := retirement.NewPostgresRepository(s.db)
+	manifest := retirement.RetirementManifest{
+		BlockMetadataID:                blockMetadataID,
+		Tag:                            block.Tag,
+		Height:                         block.Height,
+		Hash:                           block.Hash,
+		State:                          retirement.RetirementStateEligible,
+		Bucket:                         "integration-bucket",
+		LegacyObjectKey:                block.ObjectKeyMain,
+		LegacyObjectKeySHA256:          sha256Hex(block.ObjectKeyMain),
+		LegacyObjectVersionIDs:         []string{"legacy-v1"},
+		LegacyObjectETag:               "legacy-etag",
+		LegacyObjectBytes:              512,
+		ConsolidatedObjectKey:          cscbKey,
+		ConsolidatedObjectVersionID:    "cscb-v1",
+		ConsolidatedObjectETag:         "cscb-etag",
+		ConsolidatedByteOffset:         64,
+		ConsolidatedByteLength:         128,
+		ConsolidatedUncompressedLength: 256,
+		PayloadSHA256:                  strings.Repeat("a", 64),
+		PreparedAt:                     preparedAt,
+	}
+	prepareDone := make(chan error, 1)
+	go func() {
+		prepareDone <- repo.PrepareRetirement(ctx, manifest)
+	}()
+	select {
+	case err := <-prepareDone:
+		require.Failf("retirement preparation bypassed upload guard", "unexpected result: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.NoError(uploadGuard.Release())
+	require.NoError(<-prepareDone)
+
+	fencedGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, block.Tag, block.Height, block.Hash)
+	require.NoError(err)
+	require.NotNil(fencedGuard)
+	require.True(fencedGuard.RetirementFenced())
+	require.NoError(fencedGuard.Release())
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET object_key_main = $2,
+			object_format = $3,
+			byte_offset = NULL,
+			byte_length = NULL,
+			uncompressed_length = NULL
+		WHERE id = $1`,
+		blockMetadataID,
+		"legacy/direct-sql-regression.gzip",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+	)
+	require.Error(err)
+	require.Contains(err.Error(), "cannot change CSCB placement after legacy object retirement is fenced")
+
+	replayedLegacy := proto.Clone(block).(*api.BlockMetadata)
+	replayedLegacy.ObjectKeyMain = "legacy/replayed-block.gzip"
+	replayedLegacy.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+
+	for _, fetched := range []*api.BlockMetadata{
+		mustGetBlockByHash(s.T(), s.accessor, block),
+		mustGetBlockByHeight(s.T(), s.accessor, block),
+	} {
+		require.Equal(cscbKey, fetched.ObjectKeyMain)
+		require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, fetched.ObjectFormat)
+		require.Equal(uint64(64), fetched.ByteOffset)
+		require.Equal(uint64(128), fetched.ByteLength)
+		require.Equal(uint64(256), fetched.UncompressedLength)
+	}
+
+	claimToken := "normal-read-path-claim"
+	claimedAt := time.Now().UTC()
+	require.NoError(repo.ClaimRetirement(ctx, blockMetadataID, claimToken, claimedAt, claimedAt.Add(time.Hour)))
+	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, retirement.ActionDeletedObjectVersion)
+	require.NoError(err)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+	for _, fetched := range []*api.BlockMetadata{
+		mustGetBlockByHash(s.T(), s.accessor, block),
+		mustGetBlockByHeight(s.T(), s.accessor, block),
+	} {
+		require.Equal(cscbKey, fetched.ObjectKeyMain)
+		require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, fetched.ObjectFormat)
+	}
+	_, err = repo.FinalizeRetirement(ctx, blockMetadataID, claimToken, retirement.ActionDeletedVerified)
+	require.NoError(err)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+
+	for _, fetched := range []*api.BlockMetadata{
+		mustGetBlockByHash(s.T(), s.accessor, block),
+		mustGetBlockByHeight(s.T(), s.accessor, block),
+	} {
+		require.Equal(cscbKey, fetched.ObjectKeyMain)
+		require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, fetched.ObjectFormat)
+		require.Equal(uint64(64), fetched.ByteOffset)
+		require.Equal(uint64(128), fetched.ByteLength)
+		require.Equal(uint64(256), fetched.UncompressedLength)
+	}
+
+	var clearedLegacyPath sql.NullString
+	var legacyDeletedAt sql.NullTime
+	err = s.db.QueryRowContext(ctx, `
+		SELECT legacy_object_key_main, legacy_object_deleted_at
+		FROM block_consolidation_shadow
+		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&clearedLegacyPath, &legacyDeletedAt)
+	require.NoError(err)
+	require.False(clearedLegacyPath.Valid)
+	require.True(legacyDeletedAt.Valid)
+
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET legacy_object_key_main = $2,
+			legacy_object_deleted_at = NULL
+		WHERE block_metadata_id = $1`, blockMetadataID, "legacy/direct-shadow-regression.gzip")
+	require.Error(err)
+	require.Contains(err.Error(), "cannot restore or rewrite deleted legacy object metadata")
+
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET legacy_object_deleted_at = legacy_object_deleted_at + INTERVAL '1 second'
+		WHERE block_metadata_id = $1`, blockMetadataID)
+	require.Error(err)
+	require.Contains(err.Error(), "cannot restore or rewrite deleted legacy object metadata")
+}
+
+func (s *blockStorageTestSuite) TestLegacyObjectUploadGuardMatchesNullableHash() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	height := s.config.Chain.BlockStartHeight + 1
+
+	var blockMetadataID int64
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO block_metadata (
+			height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+			object_format, byte_offset, byte_length, uncompressed_length
+		) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+		RETURNING id`,
+		height,
+		tag,
+		height-1,
+		"consolidated/null-hash.cscb.gzip",
+		time.Now().UTC().Unix(),
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	).Scan(&blockMetadataID)
+	require.NoError(err)
+
+	guardStorage, ok := s.accessor.(internal.LegacyObjectUploadGuardStorage)
+	require.True(ok)
+	guard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, tag, height, "")
+	require.NoError(err)
+	require.NotNil(guard)
+	require.False(guard.RetirementFenced())
+	require.NoError(guard.Release())
+
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET legacy_object_retirement_fenced_at = CURRENT_TIMESTAMP
+		WHERE id = $1`, blockMetadataID)
+	require.NoError(err)
+	fencedGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, tag, height, "")
+	require.NoError(err)
+	require.NotNil(fencedGuard)
+	require.True(fencedGuard.RetirementFenced())
+	require.NoError(fencedGuard.Release())
+}
+
+func sha256Hex(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func mustGetBlockByHash(t *testing.T, accessor internal.MetaStorage, block *api.BlockMetadata) *api.BlockMetadata {
+	t.Helper()
+	result, err := accessor.GetBlockByHash(context.Background(), block.Tag, block.Height, block.Hash)
+	require.NoError(t, err)
+	return result
+}
+
+func mustGetBlockByHeight(t *testing.T, accessor internal.MetaStorage, block *api.BlockMetadata) *api.BlockMetadata {
+	t.Helper()
+	result, err := accessor.GetBlockByHeight(context.Background(), block.Tag, block.Height)
+	require.NoError(t, err)
+	return result
 }
 
 func (s *blockStorageTestSuite) TestPersistBlockMetasByMaxWriteSize() {

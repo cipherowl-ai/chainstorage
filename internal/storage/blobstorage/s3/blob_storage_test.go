@@ -56,10 +56,10 @@ func TestBlobStorage_NoCompression(t *testing.T) {
 		})
 	client := s3mocks.NewMockClient(ctrl)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -126,11 +126,11 @@ func TestBlobStorage_NoCompression_WithSidechain(t *testing.T) {
 		})
 	client := s3mocks.NewMockClient(ctrl)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetworkSidechain(common.Blockchain_BLOCKCHAIN_ETHEREUM, common.Network_NETWORK_ETHEREUM_MAINNET, api.SideChain_SIDECHAIN_ETHEREUM_MAINNET_BEACON),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -166,10 +166,10 @@ func TestBlobStorage_NoCompression_WithSidechain(t *testing.T) {
 func TestBlobStorage_NoCompression_SkippedBlock(t *testing.T) {
 	require := testutil.Require(t)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return nil }),
 		fx.Provide(func() s3.Uploader { return nil }),
 		fx.Provide(func() s3.Client { return nil }),
@@ -218,10 +218,10 @@ func TestBlobStorage_DownloadErrRequestCanceled(t *testing.T) {
 			return 0, context.Canceled
 		})
 
-	var blobStorage internal.BlobStorage
+	var blobStorage internal.BlobStorageCore
 	app := testapp.New(
 		t,
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),

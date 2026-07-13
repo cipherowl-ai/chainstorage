@@ -9,6 +9,7 @@ import (
 	"github.com/lib/pq"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/storage/retirementlock"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -24,6 +25,7 @@ const metadataRowColumns = `
 	bm.byte_offset,
 	bm.byte_length,
 	bm.uncompressed_length,
+	bm.legacy_object_retirement_fenced_at,
 	shadow.block_metadata_id,
 	shadow.tag,
 	shadow.height,
@@ -56,10 +58,13 @@ const metadataRowColumns = `
 	retirement.payload_sha256,
 	retirement.outcome,
 	retirement.attempt_count,
+	retirement.claim_token,
+	retirement.claim_expires_at,
 	retirement.prepared_at,
 	retirement.delete_started_at,
 	retirement.last_attempt_at,
-	retirement.deleted_at`
+	retirement.deleted_at,
+	retirement.verified_at`
 
 const metadataRowFrom = `
 	FROM canonical_blocks cb
@@ -153,16 +158,25 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		return xerrors.Errorf("failed to begin retirement preparation: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := retirementlock.Acquire(ctx, tx, manifest.Tag, manifest.Height, manifest.Hash); err != nil {
+		return err
+	}
 
 	const lockMetadata = `
-		SELECT bm.id
+		SELECT bm.id, CURRENT_TIMESTAMP
 		FROM canonical_blocks cb
 		JOIN block_metadata bm ON bm.id = cb.block_metadata_id AND bm.tag = cb.tag AND bm.height = cb.height
 		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
 		WHERE bm.id = $1
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.legacy_object_retired_at IS NOT NULL
+			AND shadow.legacy_object_retire_after IS NOT NULL
+			AND shadow.legacy_object_retire_after <= CURRENT_TIMESTAMP
+			AND shadow.legacy_object_deleted_at IS NULL
 		FOR UPDATE OF cb, bm, shadow`
 	var lockedID int64
-	if err := tx.QueryRowContext(ctx, lockMetadata, manifest.BlockMetadataID).Scan(&lockedID); err != nil {
+	var databasePreparedAt time.Time
+	if err := tx.QueryRowContext(ctx, lockMetadata, manifest.BlockMetadataID).Scan(&lockedID, &databasePreparedAt); err != nil {
 		return xerrors.Errorf("failed to lock canonical retirement metadata: %w", err)
 	}
 	query := fmt.Sprintf(`
@@ -175,6 +189,32 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	}
 	if err := validateManifestMetadata(row, manifest); err != nil {
 		return err
+	}
+	const fenceMetadata = `
+		UPDATE block_metadata
+		SET legacy_object_retirement_fenced_at = COALESCE(legacy_object_retirement_fenced_at, $2)
+		WHERE id = $1
+			AND object_key_main = $3
+			AND object_format = $4
+			AND byte_offset = $5
+			AND byte_length = $6
+			AND uncompressed_length = $7`
+	result, err := tx.ExecContext(
+		ctx,
+		fenceMetadata,
+		manifest.BlockMetadataID,
+		databasePreparedAt,
+		manifest.ConsolidatedObjectKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		manifest.ConsolidatedByteOffset,
+		manifest.ConsolidatedByteLength,
+		manifest.ConsolidatedUncompressedLength,
+	)
+	if err != nil {
+		return xerrors.Errorf("failed to fence retired block metadata: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return xerrors.Errorf("retired block metadata fence guard failed: block_metadata_id=%d rows=%d err=%v", manifest.BlockMetadataID, rows, err)
 	}
 
 	const insert = `
@@ -209,7 +249,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		manifest.ConsolidatedUncompressedLength,
 		manifest.PayloadSHA256,
 		manifest.Outcome,
-		manifest.PreparedAt,
+		databasePreparedAt,
 	); err != nil {
 		return xerrors.Errorf("failed to persist retirement manifest: %w", err)
 	}
@@ -227,96 +267,255 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	return nil
 }
 
-func (r *PostgresRepository) MarkRetirementDeleting(ctx context.Context, blockMetadataID int64, startedAt time.Time) error {
+func (r *PostgresRepository) ObserveRetentionSafety(
+	ctx context.Context,
+	bucket string,
+	consolidatedObjectKey string,
+	configurationSHA256 string,
+) (time.Time, time.Time, error) {
+	if r.db == nil {
+		return time.Time{}, time.Time{}, xerrors.New("postgres db is required")
+	}
+	if bucket == "" || consolidatedObjectKey == "" || !isSHA256Hex(configurationSHA256) {
+		return time.Time{}, time.Time{}, xerrors.New("valid retirement safety observation is required")
+	}
+	const query = `
+		INSERT INTO cscb_retirement_safety_observation (
+			bucket, consolidated_object_key_main, configuration_sha256,
+			first_observed_at, last_observed_at
+		)
+		SELECT $1, $2, $3, database_now, database_now
+		FROM (SELECT clock_timestamp() AS database_now) clock
+		ON CONFLICT (bucket, consolidated_object_key_main) DO UPDATE
+		SET configuration_sha256 = EXCLUDED.configuration_sha256,
+			first_observed_at = CASE
+				WHEN cscb_retirement_safety_observation.configuration_sha256 = EXCLUDED.configuration_sha256
+					THEN cscb_retirement_safety_observation.first_observed_at
+				ELSE EXCLUDED.first_observed_at
+			END,
+			last_observed_at = EXCLUDED.last_observed_at
+		RETURNING first_observed_at, last_observed_at`
+	var firstObservedAt time.Time
+	var observedAt time.Time
+	if err := r.db.QueryRowContext(
+		ctx,
+		query,
+		bucket,
+		consolidatedObjectKey,
+		configurationSHA256,
+	).Scan(&firstObservedAt, &observedAt); err != nil {
+		return time.Time{}, time.Time{}, xerrors.Errorf("failed to persist CSCB retirement safety observation: %w", err)
+	}
+	return firstObservedAt, observedAt, nil
+}
+
+func (r *PostgresRepository) ClaimRetirement(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	claimedAt time.Time,
+	claimExpiresAt time.Time,
+) error {
 	if r.db == nil {
 		return xerrors.New("postgres db is required")
 	}
+	if claimToken == "" || claimedAt.IsZero() || !claimExpiresAt.After(claimedAt) {
+		return xerrors.New("valid retirement claim token and lease are required")
+	}
+	leaseMicros := claimExpiresAt.Sub(claimedAt).Microseconds()
+	if leaseMicros <= 0 {
+		return xerrors.New("retirement claim lease must be at least one microsecond")
+	}
 	const query = `
 		UPDATE block_legacy_object_retirement
-		SET state = $2,
-			delete_started_at = COALESCE(delete_started_at, $3),
-			last_attempt_at = $3,
+		SET state = CASE WHEN state = $2 THEN $3 ELSE state END,
+			claim_token = $4,
+			claim_expires_at = CURRENT_TIMESTAMP + ($5 * INTERVAL '1 microsecond'),
+			delete_started_at = CASE WHEN state = $2 THEN COALESCE(delete_started_at, CURRENT_TIMESTAMP) ELSE delete_started_at END,
+			last_attempt_at = CURRENT_TIMESTAMP,
 			attempt_count = attempt_count + 1,
-			outcome = 'delete_started',
-			updated_at = $3
+			outcome = CASE WHEN state = $6 THEN 'verification_started' ELSE 'delete_started' END,
+			updated_at = CURRENT_TIMESTAMP
 		WHERE block_metadata_id = $1
-			AND state IN ($4, $2)`
-	result, err := r.db.ExecContext(ctx, query, blockMetadataID, RetirementStateDeleting, startedAt, RetirementStateEligible)
+			AND (
+				(state = $2 AND claim_token IS NULL AND claim_expires_at IS NULL)
+				OR
+				(state IN ($3, $6) AND claim_expires_at <= CURRENT_TIMESTAMP)
+			)`
+	result, err := r.db.ExecContext(
+		ctx,
+		query,
+		blockMetadataID,
+		RetirementStateEligible,
+		RetirementStateDeleting,
+		claimToken,
+		leaseMicros,
+		RetirementStateDeletedPendingVerification,
+	)
 	if err != nil {
-		return xerrors.Errorf("failed to mark retirement deleting: %w", err)
+		return xerrors.Errorf("failed to claim retirement: %w", err)
 	}
 	rows, err := result.RowsAffected()
 	if err != nil {
-		return xerrors.Errorf("failed to inspect retirement deleting transition: %w", err)
+		return xerrors.Errorf("failed to inspect retirement claim transition: %w", err)
 	}
 	if rows == 1 {
 		return nil
 	}
-	return xerrors.Errorf("invalid retirement transition to deleting: block_metadata_id=%d", blockMetadataID)
+	return xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 }
 
-func (r *PostgresRepository) RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, outcome string, attemptedAt time.Time) error {
+func (r *PostgresRepository) RenewRetirementClaim(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	renewedAt time.Time,
+	claimExpiresAt time.Time,
+) error {
 	if r.db == nil {
 		return xerrors.New("postgres db is required")
 	}
-	if outcome == "" {
-		return xerrors.New("retirement outcome is required")
+	if claimToken == "" || renewedAt.IsZero() || !claimExpiresAt.After(renewedAt) {
+		return xerrors.New("valid retirement claim token and lease are required")
+	}
+	leaseMicros := claimExpiresAt.Sub(renewedAt).Microseconds()
+	if leaseMicros <= 0 {
+		return xerrors.New("retirement claim lease must be at least one microsecond")
 	}
 	const query = `
 		UPDATE block_legacy_object_retirement
-		SET outcome = $2,
-			last_attempt_at = $3,
-			updated_at = $3
+		SET claim_expires_at = CURRENT_TIMESTAMP + ($3 * INTERVAL '1 microsecond'),
+			last_attempt_at = CURRENT_TIMESTAMP,
+			updated_at = CURRENT_TIMESTAMP
 		WHERE block_metadata_id = $1
-			AND state IN ($4, $5)`
-	_, err := r.db.ExecContext(ctx, query, blockMetadataID, outcome, attemptedAt, RetirementStateEligible, RetirementStateDeleting)
+			AND state IN ($4, $5)
+			AND claim_token = $2
+			AND claim_expires_at > CURRENT_TIMESTAMP`
+	result, err := r.db.ExecContext(
+		ctx,
+		query,
+		blockMetadataID,
+		claimToken,
+		leaseMicros,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
+	)
 	if err != nil {
-		return xerrors.Errorf("failed to record retirement outcome: %w", err)
+		return xerrors.Errorf("failed to renew retirement claim: %w", err)
 	}
-	return nil
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return xerrors.Errorf("failed to inspect retirement claim renewal: %w", err)
+	}
+	if rows == 1 {
+		return nil
+	}
+	return xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 }
 
-func (r *PostgresRepository) FinalizeRetirement(ctx context.Context, blockMetadataID int64, deletedAt time.Time, outcome string) error {
+func (r *PostgresRepository) RecordRetirementOutcome(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+	attemptedAt time.Time,
+) error {
 	if r.db == nil {
 		return xerrors.New("postgres db is required")
 	}
-	if deletedAt.IsZero() || outcome == "" {
-		return xerrors.New("deleted timestamp and outcome are required for retirement finalization")
+	if claimToken == "" || outcome == "" {
+		return xerrors.New("retirement claim token and outcome are required")
+	}
+	const query = `
+		UPDATE block_legacy_object_retirement
+		SET outcome = $3,
+			last_attempt_at = CURRENT_TIMESTAMP,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE block_metadata_id = $1
+			AND state IN ($4, $5)
+			AND claim_token = $2`
+	result, err := r.db.ExecContext(
+		ctx,
+		query,
+		blockMetadataID,
+		claimToken,
+		outcome,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
+	)
+	if err != nil {
+		return xerrors.Errorf("failed to record retirement outcome: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return xerrors.Errorf("failed to inspect retirement outcome update: %w", err)
+	}
+	if rows == 1 {
+		return nil
+	}
+	return xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
+}
+
+func (r *PostgresRepository) RecordRetirementObjectDeleted(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+) (time.Time, error) {
+	if r.db == nil {
+		return time.Time{}, xerrors.New("postgres db is required")
+	}
+	if claimToken == "" || outcome == "" {
+		return time.Time{}, xerrors.New("claim token and outcome are required to record object deletion")
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return xerrors.Errorf("failed to begin retirement finalization: %w", err)
+		return time.Time{}, xerrors.Errorf("failed to begin recording retirement object deletion: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	metadata, err := lockFinalizationMetadata(ctx, tx, blockMetadataID)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	manifest, err := getManifestForUpdate(ctx, tx, blockMetadataID)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if !finalizationMetadataMatchesManifest(metadata, manifest) {
-		return xerrors.Errorf("active or shadow CSCB metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
+		return time.Time{}, xerrors.Errorf("active or shadow CSCB metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
 	}
-	if manifest.State == RetirementStateDeletedVerified {
+	if manifest.State == RetirementStateDeletedPendingVerification {
 		if manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" || manifest.Outcome == "" ||
 			manifest.DeleteStartedAt == nil || manifest.LastAttemptAt == nil || manifest.DeletedAt == nil ||
+			manifest.VerifiedAt != nil || manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil ||
 			metadata.shadowLegacyKey.Valid || !metadata.shadowDeletedAt.Valid ||
 			!metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt) {
-			return xerrors.Errorf("finalized retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
+			return time.Time{}, xerrors.Errorf("pending-verification retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
 		}
 		if err := tx.Commit(); err != nil {
-			return xerrors.Errorf("failed to commit idempotent retirement finalization: %w", err)
+			return time.Time{}, xerrors.Errorf("failed to commit idempotent retirement object deletion: %w", err)
 		}
-		return nil
+		return *manifest.DeletedAt, nil
 	}
 	if manifest.State != RetirementStateDeleting {
-		return xerrors.Errorf("retirement must be deleting before finalization: block_metadata_id=%d state=%s", blockMetadataID, manifest.State)
+		return time.Time{}, xerrors.Errorf("retirement must be deleting before recording object deletion: block_metadata_id=%d state=%s", blockMetadataID, manifest.State)
+	}
+	if manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
+		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 	}
 	if !metadata.shadowLegacyKey.Valid || metadata.shadowLegacyKey.String != manifest.LegacyObjectKey || metadata.shadowDeletedAt.Valid {
-		return xerrors.Errorf("legacy shadow metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
+		return time.Time{}, xerrors.Errorf("legacy shadow metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
+	}
+	var databaseDeletedAt time.Time
+	if err := tx.QueryRowContext(ctx, `
+		SELECT database_now
+		FROM (SELECT clock_timestamp() AS database_now) clock
+		WHERE database_now < $1`, *manifest.ClaimExpiresAt).Scan(&databaseDeletedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
+		}
+		return time.Time{}, xerrors.Errorf("failed to read database deletion timestamp: %w", err)
 	}
 
 	const clearShadow = `
@@ -326,38 +525,165 @@ func (r *PostgresRepository) FinalizeRetirement(ctx context.Context, blockMetada
 		WHERE block_metadata_id = $1
 			AND legacy_object_key_main = $2
 			AND legacy_object_deleted_at IS NULL`
-	result, err := tx.ExecContext(ctx, clearShadow, blockMetadataID, manifest.LegacyObjectKey, deletedAt)
+	result, err := tx.ExecContext(ctx, clearShadow, blockMetadataID, manifest.LegacyObjectKey, databaseDeletedAt)
 	if err != nil {
-		return xerrors.Errorf("failed to clear retired shadow path: %w", err)
+		return time.Time{}, xerrors.Errorf("failed to clear retired shadow path: %w", err)
 	}
 	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
-		return xerrors.Errorf("retired shadow path clear guard failed: block_metadata_id=%d rows=%d err=%v", blockMetadataID, rows, err)
+		return time.Time{}, xerrors.Errorf("retired shadow path clear guard failed: block_metadata_id=%d rows=%d err=%v", blockMetadataID, rows, err)
 	}
 
-	const finalize = `
+	const recordDeleted = `
 		UPDATE block_legacy_object_retirement
 		SET state = $2,
 			legacy_object_key_main = NULL,
 			legacy_object_etag = '',
 			outcome = $3,
 			deleted_at = $4,
+			last_attempt_at = $4,
 			updated_at = $4
 		WHERE block_metadata_id = $1
-			AND state = $5`
-	result, err = tx.ExecContext(ctx, finalize, blockMetadataID, RetirementStateDeletedVerified, outcome, deletedAt, RetirementStateDeleting)
+			AND state = $5
+			AND claim_token = $6
+			AND claim_expires_at > $7`
+	result, err = tx.ExecContext(
+		ctx,
+		recordDeleted,
+		blockMetadataID,
+		RetirementStateDeletedPendingVerification,
+		outcome,
+		databaseDeletedAt,
+		RetirementStateDeleting,
+		claimToken,
+		databaseDeletedAt,
+	)
 	if err != nil {
-		return xerrors.Errorf("failed to finalize retirement manifest: %w", err)
+		return time.Time{}, xerrors.Errorf("failed to record retirement object deletion: %w", err)
 	}
 	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
-		return xerrors.Errorf("retirement finalization guard failed: block_metadata_id=%d rows=%d err=%v", blockMetadataID, rows, err)
+		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d rows=%d err=%v", ErrRetirementClaimUnavailable, blockMetadataID, rows, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return xerrors.Errorf("failed to commit retirement finalization: %w", err)
+		return time.Time{}, xerrors.Errorf("failed to commit retirement object deletion: %w", err)
 	}
-	return nil
+	return databaseDeletedAt, nil
+}
+
+func (r *PostgresRepository) FinalizeRetirement(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+) (time.Time, error) {
+	if r.db == nil {
+		return time.Time{}, xerrors.New("postgres db is required")
+	}
+	if claimToken == "" || outcome == "" {
+		return time.Time{}, xerrors.New("claim token and outcome are required for retirement finalization")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, xerrors.Errorf("failed to begin retirement finalization: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	metadata, err := lockFinalizationMetadata(ctx, tx, blockMetadataID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	manifest, err := getManifestForUpdate(ctx, tx, blockMetadataID)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !finalizationMetadataMatchesManifest(metadata, manifest) {
+		return time.Time{}, xerrors.Errorf("active or shadow CSCB metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
+	}
+	if manifest.State == RetirementStateDeletedVerified {
+		if !finalizedMetadataIsConsistent(metadata, manifest) {
+			return time.Time{}, xerrors.Errorf("finalized retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
+		}
+		if err := tx.Commit(); err != nil {
+			return time.Time{}, xerrors.Errorf("failed to commit idempotent retirement finalization: %w", err)
+		}
+		return *manifest.VerifiedAt, nil
+	}
+	if manifest.State != RetirementStateDeletedPendingVerification {
+		return time.Time{}, xerrors.Errorf("retirement must be pending verification before finalization: block_metadata_id=%d state=%s", blockMetadataID, manifest.State)
+	}
+	if manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
+		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
+	}
+	if manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" || manifest.DeletedAt == nil || manifest.VerifiedAt != nil ||
+		metadata.shadowLegacyKey.Valid || !metadata.shadowDeletedAt.Valid ||
+		!metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt) {
+		return time.Time{}, xerrors.Errorf("pending-verification retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
+	}
+	var databaseVerifiedAt time.Time
+	if err := tx.QueryRowContext(ctx, `
+		SELECT database_now
+		FROM (SELECT clock_timestamp() AS database_now) clock
+		WHERE database_now < $1`, *manifest.ClaimExpiresAt).Scan(&databaseVerifiedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
+		}
+		return time.Time{}, xerrors.Errorf("failed to read database verification timestamp: %w", err)
+	}
+
+	const finalize = `
+		UPDATE block_legacy_object_retirement
+		SET state = $2,
+			claim_token = NULL,
+			claim_expires_at = NULL,
+			outcome = $3,
+			verified_at = $4,
+			last_attempt_at = $4,
+			updated_at = $4
+		WHERE block_metadata_id = $1
+			AND state = $5
+			AND claim_token = $6
+			AND claim_expires_at > $7`
+	result, err := tx.ExecContext(
+		ctx,
+		finalize,
+		blockMetadataID,
+		RetirementStateDeletedVerified,
+		outcome,
+		databaseVerifiedAt,
+		RetirementStateDeletedPendingVerification,
+		claimToken,
+		databaseVerifiedAt,
+	)
+	if err != nil {
+		return time.Time{}, xerrors.Errorf("failed to finalize retirement manifest: %w", err)
+	}
+	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
+		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d rows=%d err=%v", ErrRetirementClaimUnavailable, blockMetadataID, rows, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, xerrors.Errorf("failed to commit retirement finalization: %w", err)
+	}
+	return databaseVerifiedAt, nil
+}
+
+func finalizedMetadataIsConsistent(metadata finalizationMetadata, manifest RetirementManifest) bool {
+	return manifest.LegacyObjectKey == "" &&
+		manifest.LegacyObjectETag == "" &&
+		manifest.Outcome != "" &&
+		manifest.DeleteStartedAt != nil &&
+		manifest.LastAttemptAt != nil &&
+		manifest.DeletedAt != nil &&
+		manifest.VerifiedAt != nil &&
+		manifest.ClaimToken == "" &&
+		manifest.ClaimExpiresAt == nil &&
+		!metadata.shadowLegacyKey.Valid &&
+		metadata.shadowDeletedAt.Valid &&
+		metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt)
 }
 
 type finalizationMetadata struct {
+	shadowTag                int64
+	shadowHeight             int64
+	shadowHash               sql.NullString
 	shadowLegacyKey          sql.NullString
 	shadowDeletedAt          sql.NullTime
 	shadowConsolidatedKey    string
@@ -366,17 +692,24 @@ type finalizationMetadata struct {
 	shadowByteLength         int64
 	shadowUncompressedLength int64
 	shadowValidatedAt        sql.NullTime
+	primaryTag               int64
+	primaryHeight            int64
+	primaryHash              sql.NullString
 	primaryObjectKey         sql.NullString
 	primaryObjectFormat      int64
 	primaryByteOffset        sql.NullInt64
 	primaryByteLength        sql.NullInt64
 	primaryUncompressed      sql.NullInt64
 	primarySkipped           bool
+	primaryRetirementFenced  sql.NullTime
 }
 
 func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID int64) (finalizationMetadata, error) {
 	const query = `
 		SELECT
+			shadow.tag,
+			shadow.height,
+			shadow.hash,
 			shadow.legacy_object_key_main,
 			shadow.legacy_object_deleted_at,
 			shadow.consolidated_object_key_main,
@@ -385,18 +718,25 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 			shadow.byte_length,
 			shadow.uncompressed_length,
 			shadow.validated_at,
+			bm.tag,
+			bm.height,
+			bm.hash,
 			bm.object_key_main,
 			bm.object_format,
 			bm.byte_offset,
 			bm.byte_length,
 			bm.uncompressed_length,
-			bm.skipped
+			bm.skipped,
+			bm.legacy_object_retirement_fenced_at
 		FROM block_consolidation_shadow shadow
 		JOIN block_metadata bm ON bm.id = shadow.block_metadata_id
 		WHERE shadow.block_metadata_id = $1
 		FOR UPDATE OF shadow, bm`
 	var metadata finalizationMetadata
 	if err := tx.QueryRowContext(ctx, query, blockMetadataID).Scan(
+		&metadata.shadowTag,
+		&metadata.shadowHeight,
+		&metadata.shadowHash,
 		&metadata.shadowLegacyKey,
 		&metadata.shadowDeletedAt,
 		&metadata.shadowConsolidatedKey,
@@ -405,12 +745,16 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 		&metadata.shadowByteLength,
 		&metadata.shadowUncompressedLength,
 		&metadata.shadowValidatedAt,
+		&metadata.primaryTag,
+		&metadata.primaryHeight,
+		&metadata.primaryHash,
 		&metadata.primaryObjectKey,
 		&metadata.primaryObjectFormat,
 		&metadata.primaryByteOffset,
 		&metadata.primaryByteLength,
 		&metadata.primaryUncompressed,
 		&metadata.primarySkipped,
+		&metadata.primaryRetirementFenced,
 	); err != nil {
 		return finalizationMetadata{}, xerrors.Errorf("failed to lock retirement finalization metadata: %w", err)
 	}
@@ -419,6 +763,13 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 
 func finalizationMetadataMatchesManifest(metadata finalizationMetadata, manifest RetirementManifest) bool {
 	return metadata.shadowValidatedAt.Valid &&
+		metadata.primaryRetirementFenced.Valid &&
+		metadata.shadowTag >= 0 && uint32(metadata.shadowTag) == manifest.Tag &&
+		metadata.shadowHeight >= 0 && uint64(metadata.shadowHeight) == manifest.Height &&
+		nullableHashMatches(metadata.shadowHash, manifest.Hash) &&
+		metadata.primaryTag >= 0 && uint32(metadata.primaryTag) == manifest.Tag &&
+		metadata.primaryHeight >= 0 && uint64(metadata.primaryHeight) == manifest.Height &&
+		nullableHashMatches(metadata.primaryHash, manifest.Hash) &&
 		metadata.shadowConsolidatedKey == manifest.ConsolidatedObjectKey &&
 		metadata.shadowObjectFormat == int64(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH) &&
 		metadata.shadowByteOffset >= 0 && uint64(metadata.shadowByteOffset) == manifest.ConsolidatedByteOffset &&
@@ -430,6 +781,13 @@ func finalizationMetadataMatchesManifest(metadata finalizationMetadata, manifest
 		metadata.primaryByteOffset.Valid && metadata.primaryByteOffset.Int64 >= 0 && uint64(metadata.primaryByteOffset.Int64) == manifest.ConsolidatedByteOffset &&
 		metadata.primaryByteLength.Valid && metadata.primaryByteLength.Int64 > 0 && uint64(metadata.primaryByteLength.Int64) == manifest.ConsolidatedByteLength &&
 		metadata.primaryUncompressed.Valid && metadata.primaryUncompressed.Int64 > 0 && uint64(metadata.primaryUncompressed.Int64) == manifest.ConsolidatedUncompressedLength
+}
+
+func nullableHashMatches(value sql.NullString, expected string) bool {
+	if !value.Valid {
+		return expected == ""
+	}
+	return value.String == expected
 }
 
 func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error) {
@@ -449,15 +807,26 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 			legacy_object_etag, legacy_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
-			payload_sha256, outcome, attempt_count, prepared_at, delete_started_at, last_attempt_at, deleted_at
+			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
+			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
 		FROM block_legacy_object_retirement
 		WHERE tag = $1
 			AND height >= $2
 			AND height < $3
-			AND state IN ($4, $5)
+			AND state IN ($4, $5, $6)
 		ORDER BY height ASC
-		LIMIT $6`
-	rows, err := r.db.QueryContext(ctx, query, tag, startHeight, endHeight, RetirementStateEligible, RetirementStateDeleting, limit)
+		LIMIT $7`
+	rows, err := r.db.QueryContext(
+		ctx,
+		query,
+		tag,
+		startHeight,
+		endHeight,
+		RetirementStateEligible,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
+		limit,
+	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to list pending retirements: %w", err)
 	}
@@ -486,6 +855,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var primaryByteOffset sql.NullInt64
 	var primaryByteLength sql.NullInt64
 	var primaryUncompressedLength sql.NullInt64
+	var primaryRetirementFencedAt sql.NullTime
 	var shadowBlockMetadataID sql.NullInt64
 	var shadowTag sql.NullInt64
 	var shadowHeight sql.NullInt64
@@ -518,10 +888,13 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var retirementPayloadSHA256 sql.NullString
 	var retirementOutcome sql.NullString
 	var retirementAttemptCount sql.NullInt64
+	var retirementClaimToken sql.NullString
+	var retirementClaimExpiresAt sql.NullTime
 	var retirementPreparedAt sql.NullTime
 	var retirementDeleteStartedAt sql.NullTime
 	var retirementLastAttemptAt sql.NullTime
 	var retirementDeletedAt sql.NullTime
+	var retirementVerifiedAt sql.NullTime
 	if err := source.Scan(
 		&row.BlockMetadataID,
 		&row.Canonical,
@@ -534,6 +907,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&primaryByteOffset,
 		&primaryByteLength,
 		&primaryUncompressedLength,
+		&primaryRetirementFencedAt,
 		&shadowBlockMetadataID,
 		&shadowTag,
 		&shadowHeight,
@@ -566,10 +940,13 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&retirementPayloadSHA256,
 		&retirementOutcome,
 		&retirementAttemptCount,
+		&retirementClaimToken,
+		&retirementClaimExpiresAt,
 		&retirementPreparedAt,
 		&retirementDeleteStartedAt,
 		&retirementLastAttemptAt,
 		&retirementDeletedAt,
+		&retirementVerifiedAt,
 	); err != nil {
 		return MetadataRow{}, err
 	}
@@ -577,6 +954,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	row.PrimaryByteOffset = nullableUint64(primaryByteOffset)
 	row.PrimaryByteLength = nullableUint64(primaryByteLength)
 	row.PrimaryUncompressedLength = nullableUint64(primaryUncompressedLength)
+	row.RetirementFencedAt = nullableTime(primaryRetirementFencedAt)
 	if shadowBlockMetadataID.Valid {
 		row.LegacyObjectKey = shadowLegacyKey.String
 		row.Shadow = &ConsolidationShadow{
@@ -618,10 +996,13 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 			PayloadSHA256:                  retirementPayloadSHA256.String,
 			Outcome:                        retirementOutcome.String,
 			AttemptCount:                   int(retirementAttemptCount.Int64),
+			ClaimToken:                     retirementClaimToken.String,
+			ClaimExpiresAt:                 nullableTime(retirementClaimExpiresAt),
 			PreparedAt:                     retirementPreparedAt.Time,
 			DeleteStartedAt:                nullableTime(retirementDeleteStartedAt),
 			LastAttemptAt:                  nullableTime(retirementLastAttemptAt),
 			DeletedAt:                      nullableTime(retirementDeletedAt),
+			VerifiedAt:                     nullableTime(retirementVerifiedAt),
 		}
 	}
 	return row, nil
@@ -635,7 +1016,8 @@ func getManifestForUpdate(ctx context.Context, tx *sql.Tx, blockMetadataID int64
 			legacy_object_etag, legacy_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
-			payload_sha256, outcome, attempt_count, prepared_at, delete_started_at, last_attempt_at, deleted_at
+			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
+			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
 		FROM block_legacy_object_retirement
 		WHERE block_metadata_id = $1
 		FOR UPDATE`
@@ -656,9 +1038,12 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	var byteLength int64
 	var uncompressedLength int64
 	var attemptCount int
+	var claimToken sql.NullString
+	var claimExpiresAt sql.NullTime
 	var deleteStartedAt sql.NullTime
 	var lastAttemptAt sql.NullTime
 	var deletedAt sql.NullTime
+	var verifiedAt sql.NullTime
 	if err := source.Scan(
 		&manifest.BlockMetadataID,
 		&manifest.Tag,
@@ -680,10 +1065,13 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 		&manifest.PayloadSHA256,
 		&manifest.Outcome,
 		&attemptCount,
+		&claimToken,
+		&claimExpiresAt,
 		&manifest.PreparedAt,
 		&deleteStartedAt,
 		&lastAttemptAt,
 		&deletedAt,
+		&verifiedAt,
 	); err != nil {
 		return RetirementManifest{}, err
 	}
@@ -698,9 +1086,12 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	manifest.ConsolidatedByteLength = uint64(byteLength)
 	manifest.ConsolidatedUncompressedLength = uint64(uncompressedLength)
 	manifest.AttemptCount = attemptCount
+	manifest.ClaimToken = claimToken.String
+	manifest.ClaimExpiresAt = nullableTime(claimExpiresAt)
 	manifest.DeleteStartedAt = nullableTime(deleteStartedAt)
 	manifest.LastAttemptAt = nullableTime(lastAttemptAt)
 	manifest.DeletedAt = nullableTime(deletedAt)
+	manifest.VerifiedAt = nullableTime(verifiedAt)
 	return manifest, nil
 }
 
@@ -712,7 +1103,7 @@ func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) erro
 		return xerrors.Errorf("legacy shadow metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.Shadow.ValidatedAt == nil || row.Shadow.LegacyObjectRetiredAt == nil || row.Shadow.LegacyObjectRetireAfter == nil ||
-		row.Shadow.LegacyObjectDeletedAt != nil || manifest.PreparedAt.Before(*row.Shadow.LegacyObjectRetireAfter) {
+		row.Shadow.LegacyObjectDeletedAt != nil {
 		return xerrors.Errorf("retirement eligibility changed before manifest persistence: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.PrimaryObjectKey != manifest.ConsolidatedObjectKey ||
@@ -728,9 +1119,9 @@ func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) erro
 func validatePreparedManifest(manifest RetirementManifest) error {
 	if manifest.BlockMetadataID <= 0 || manifest.Bucket == "" || manifest.LegacyObjectKey == "" ||
 		manifest.LegacyObjectKeySHA256 != keySHA256(manifest.LegacyObjectKey) ||
-		len(manifest.LegacyObjectVersionIDs) != 1 || manifest.LegacyObjectVersionIDs[0] == "" ||
+		len(manifest.LegacyObjectVersionIDs) != 1 || !isImmutableVersionID(manifest.LegacyObjectVersionIDs[0]) ||
 		manifest.LegacyObjectETag == "" || manifest.LegacyObjectBytes == 0 ||
-		manifest.ConsolidatedObjectKey == "" || manifest.ConsolidatedObjectVersionID == "" || manifest.ConsolidatedObjectETag == "" ||
+		manifest.ConsolidatedObjectKey == "" || !isImmutableVersionID(manifest.ConsolidatedObjectVersionID) || manifest.ConsolidatedObjectETag == "" ||
 		manifest.ConsolidatedByteLength == 0 || manifest.ConsolidatedUncompressedLength == 0 ||
 		!isSHA256Hex(manifest.PayloadSHA256) || manifest.PreparedAt.IsZero() {
 		return xerrors.Errorf("retirement manifest is incomplete: block_metadata_id=%d", manifest.BlockMetadataID)

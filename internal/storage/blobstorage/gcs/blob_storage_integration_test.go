@@ -19,13 +19,13 @@ import (
 type gcpBlobStorageTestSuite struct {
 	suite.Suite
 	config  *config.Config
-	storage internal.BlobStorage
+	storage internal.BlobStorageCore
 }
 
 func (s *gcpBlobStorageTestSuite) SetupTest() {
 	require := testutil.Require(s.T())
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	cfg, err := config.New()
 	require.NoError(err)
 	cfg.StorageType.BlobStorageType = config.BlobStorageType_GCS
@@ -33,7 +33,7 @@ func (s *gcpBlobStorageTestSuite) SetupTest() {
 	s.config = cfg
 	app := testapp.New(
 		s.T(),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		testapp.WithIntegration(),
 		testapp.WithConfig(s.config),
 		fx.Populate(&storage),

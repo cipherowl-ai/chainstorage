@@ -35,6 +35,21 @@ func TestPayloadVerifier_ParsesAndMatchesExactPinnedVersions(t *testing.T) {
 	require.Equal(hex.EncodeToString(expected[:]), digest)
 }
 
+func TestPayloadVerifier_FreshInstanceDoesNotReuseCachedCSCBBytes(t *testing.T) {
+	require := require.New(t)
+	candidate, store, _ := retirementPayloadFixture(t)
+	verifier := newPayloadVerifier(store)
+
+	_, err := verifier.VerifyConsolidated(context.Background(), candidate)
+	require.NoError(err)
+	delete(store.objects, versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID))
+
+	_, err = verifier.VerifyConsolidated(context.Background(), candidate)
+	require.NoError(err, "the same verifier intentionally caches its parsed index and chunk")
+	_, err = newPayloadVerifier(store).VerifyConsolidated(context.Background(), candidate)
+	require.Error(err)
+}
+
 func TestPayloadVerifier_ParsesSupportedLegacyCompression(t *testing.T) {
 	tests := []struct {
 		name        string

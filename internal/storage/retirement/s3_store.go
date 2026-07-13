@@ -29,8 +29,8 @@ func (s *S3ObjectStore) HeadObject(ctx context.Context, bucket string, key strin
 }
 
 func (s *S3ObjectStore) HeadObjectVersion(ctx context.Context, bucket string, key string, versionID string) (ObjectHead, error) {
-	if versionID == "" {
-		return ObjectHead{}, xerrors.New("version id is required to head an object version")
+	if !isImmutableVersionID(versionID) {
+		return ObjectHead{}, xerrors.New("an immutable non-null version id is required to head an object version")
 	}
 	return s.headObject(ctx, bucket, key, versionID)
 }
@@ -56,6 +56,7 @@ func (s *S3ObjectStore) headObject(ctx context.Context, bucket string, key strin
 		ETag:       aws.ToString(out.ETag),
 		Metadata:   out.Metadata,
 		DeleteMark: aws.ToBool(out.DeleteMarker),
+		Expiration: aws.ToString(out.Expiration),
 	}
 	if out.ContentLength != nil && *out.ContentLength > 0 {
 		head.Bytes = uint64(*out.ContentLength)
@@ -130,8 +131,8 @@ func (s *S3ObjectStore) ReadObjectVersionRange(ctx context.Context, bucket strin
 }
 
 func (s *S3ObjectStore) readObject(ctx context.Context, bucket string, key string, versionID string, rangeHeader string) ([]byte, error) {
-	if versionID == "" {
-		return nil, xerrors.New("version id is required to read an object version")
+	if !isImmutableVersionID(versionID) {
+		return nil, xerrors.New("an immutable non-null version id is required to read an object version")
 	}
 	input := &awss3.GetObjectInput{
 		Bucket:    aws.String(bucket),
@@ -157,8 +158,8 @@ func (s *S3ObjectStore) readObject(ctx context.Context, bucket string, key strin
 }
 
 func (s *S3ObjectStore) DeleteObjectVersion(ctx context.Context, bucket string, key string, versionID string) error {
-	if versionID == "" {
-		return xerrors.New("version id is required for retirement delete")
+	if !isImmutableVersionID(versionID) {
+		return xerrors.New("an immutable non-null version id is required for retirement delete")
 	}
 	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket:    aws.String(bucket),

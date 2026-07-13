@@ -89,6 +89,7 @@ func TestS3ObjectStore_UsesPinnedVersionForHeadReadRangeAndDelete(t *testing.T) 
 				VersionId:     aws.String("cscb-v1"),
 				ETag:          aws.String("cscb-etag"),
 				Metadata:      map[string]string{"chainstorage-format": "cscb"},
+				Expiration:    aws.String(`expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`),
 			}, nil
 		},
 	)
@@ -98,6 +99,7 @@ func TestS3ObjectStore_UsesPinnedVersionForHeadReadRangeAndDelete(t *testing.T) 
 	require.Equal(uint64(123), head.Bytes)
 	require.Equal("cscb-v1", head.VersionID)
 	require.Equal("cscb-etag", head.ETag)
+	require.NotEmpty(head.Expiration)
 
 	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, input *awss3.GetObjectInput, options ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
@@ -132,15 +134,17 @@ func TestS3ObjectStore_UsesPinnedVersionForHeadReadRangeAndDelete(t *testing.T) 
 	require.NoError(store.DeleteObjectVersion(context.Background(), "bucket", "legacy/key", "legacy-v1"))
 }
 
-func TestS3ObjectStore_RejectsEmptyVersionIDs(t *testing.T) {
+func TestS3ObjectStore_RejectsMutableOrEmptyVersionIDs(t *testing.T) {
 	store := NewS3ObjectStore(nil)
-	require.Error(t, store.DeleteObjectVersion(context.Background(), "bucket", "key", ""))
-	require.Error(t, func() error {
-		_, err := store.HeadObjectVersion(context.Background(), "bucket", "key", "")
-		return err
-	}())
-	require.Error(t, func() error {
-		_, err := store.ReadObjectVersion(context.Background(), "bucket", "key", "")
-		return err
-	}())
+	for _, versionID := range []string{"", "null"} {
+		require.Error(t, store.DeleteObjectVersion(context.Background(), "bucket", "key", versionID))
+		require.Error(t, func() error {
+			_, err := store.HeadObjectVersion(context.Background(), "bucket", "key", versionID)
+			return err
+		}())
+		require.Error(t, func() error {
+			_, err := store.ReadObjectVersion(context.Background(), "bucket", "key", versionID)
+			return err
+		}())
+	}
 }

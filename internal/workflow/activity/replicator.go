@@ -45,7 +45,7 @@ type (
 		client          gateway.Client
 		blockDownloader downloader.BlockDownloader
 		metaStorage     metastorage.MetaStorage
-		blobStorage     blobstorage.BlobStorage
+		legacyUploader  blobstorage.LegacyBlockUploader
 		retry           retry.RetryWithResult[[]byte]
 		httpClient      *http.Client
 	}
@@ -57,7 +57,7 @@ type (
 		Client          gateway.Client
 		BlockDownloader downloader.BlockDownloader
 		MetaStorage     metastorage.MetaStorage
-		BlobStorage     blobstorage.BlobStorage
+		LegacyUploader  blobstorage.LegacyBlockUploader
 	}
 
 	ReplicatorRequest struct {
@@ -90,7 +90,7 @@ func NewReplicator(params ReplicatorParams) *Replicator {
 		client:          params.Client,
 		blockDownloader: params.BlockDownloader,
 		metaStorage:     params.MetaStorage,
-		blobStorage:     params.BlobStorage,
+		legacyUploader:  params.LegacyUploader,
 		httpClient:      httpClient,
 		retry:           retry.NewWithResult[[]byte](retry.WithLogger(params.Logger)),
 	}
@@ -270,7 +270,7 @@ func (a *Replicator) execute(ctx context.Context, request *ReplicatorRequest) (*
 			if err != nil {
 				return xerrors.Errorf("failed to prepare raw block data: %w", err)
 			}
-			objectKeyMain, err := a.blobStorage.UploadRaw(errgroupCtx, rawBlockData)
+			objectKeyMain, err := a.legacyUploader.UploadRaw(errgroupCtx, rawBlockData)
 			if err != nil {
 				return xerrors.Errorf("failed to upload raw block file: %w", err)
 			}

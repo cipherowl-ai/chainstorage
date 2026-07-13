@@ -66,6 +66,18 @@ type (
 		BlockStorage
 		EventStorage
 		TransactionStorage
+		LegacyObjectUploadGuardStorage
+	}
+
+	// LegacyObjectUploadGuard serializes a legacy single-block PUT with retirement
+	// preparation, including when its metadata row does not exist yet.
+	LegacyObjectUploadGuard interface {
+		RetirementFenced() bool
+		Release() error
+	}
+
+	LegacyObjectUploadGuardStorage interface {
+		AcquireLegacyObjectUploadGuard(ctx context.Context, tag uint32, height uint64, hash string) (LegacyObjectUploadGuard, error)
 	}
 
 	Result struct {
@@ -116,6 +128,20 @@ type (
 		Postgres  MetaStorageFactory `name:"metastorage/postgres"`
 	}
 )
+
+type unfencedLegacyObjectUploadGuard struct{}
+
+func NewUnfencedLegacyObjectUploadGuard() LegacyObjectUploadGuard {
+	return unfencedLegacyObjectUploadGuard{}
+}
+
+func (unfencedLegacyObjectUploadGuard) RetirementFenced() bool {
+	return false
+}
+
+func (unfencedLegacyObjectUploadGuard) Release() error {
+	return nil
+}
 
 const (
 	BatchConsolidatorAutoConsolidateCursor = "batch_consolidator_auto_consolidate_processed_exclusive"

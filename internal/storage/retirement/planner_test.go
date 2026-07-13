@@ -17,10 +17,19 @@ import (
 )
 
 type fakeRepo struct {
-	rows          []MetadataRow
-	manifests     map[int64]RetirementManifest
-	finalizeErr   error
-	finalizeCalls int
+	rows               []MetadataRow
+	manifests          map[int64]RetirementManifest
+	safetyObservations map[string]fakeSafetyObservation
+	safetyNow          time.Time
+	recordDeletedErr   error
+	recordDeletedCalls int
+	finalizeErr        error
+	finalizeCalls      int
+}
+
+type fakeSafetyObservation struct {
+	configurationSHA256 string
+	firstObservedAt     time.Time
 }
 
 func (r *fakeRepo) ListMetadataRows(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]MetadataRow, error) {
@@ -47,50 +56,143 @@ func (r *fakeRepo) PrepareRetirement(ctx context.Context, manifest RetirementMan
 		return errors.New("manifest conflict")
 	}
 	r.manifests[manifest.BlockMetadataID] = manifest
+	for i := range r.rows {
+		if r.rows[i].BlockMetadataID == manifest.BlockMetadataID {
+			preparedAt := manifest.PreparedAt
+			r.rows[i].RetirementFencedAt = &preparedAt
+			r.rows[i].Retirement = &manifest
+		}
+	}
 	return nil
 }
 
-func (r *fakeRepo) MarkRetirementDeleting(ctx context.Context, blockMetadataID int64, startedAt time.Time) error {
+func (r *fakeRepo) ObserveRetentionSafety(
+	ctx context.Context,
+	bucket string,
+	consolidatedObjectKey string,
+	configurationSHA256 string,
+) (time.Time, time.Time, error) {
+	if r.safetyObservations == nil {
+		r.safetyObservations = make(map[string]fakeSafetyObservation)
+	}
+	observedAt := r.safetyNow
+	if observedAt.IsZero() {
+		observedAt = time.Now().UTC()
+	}
+	key := bucket + "\x00" + consolidatedObjectKey
+	observation, ok := r.safetyObservations[key]
+	if !ok {
+		observation = fakeSafetyObservation{
+			configurationSHA256: configurationSHA256,
+			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+		}
+	} else if observation.configurationSHA256 != configurationSHA256 {
+		observation.configurationSHA256 = configurationSHA256
+		observation.firstObservedAt = observedAt
+	}
+	r.safetyObservations[key] = observation
+	return observation.firstObservedAt, observedAt, nil
+}
+
+func (r *fakeRepo) ClaimRetirement(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	claimedAt time.Time,
+	claimExpiresAt time.Time,
+) error {
 	manifest, ok := r.manifests[blockMetadataID]
 	if !ok {
 		return errors.New("manifest not found")
 	}
-	if manifest.State != RetirementStateEligible && manifest.State != RetirementStateDeleting {
-		return fmt.Errorf("invalid state: %s", manifest.State)
+	if (manifest.State == RetirementStateDeleting || manifest.State == RetirementStateDeletedPendingVerification) &&
+		manifest.ClaimExpiresAt != nil && manifest.ClaimExpiresAt.After(claimedAt) {
+		return ErrRetirementClaimUnavailable
 	}
-	manifest.State = RetirementStateDeleting
-	manifest.DeleteStartedAt = &startedAt
-	manifest.LastAttemptAt = &startedAt
+	if manifest.State != RetirementStateEligible &&
+		manifest.State != RetirementStateDeleting &&
+		manifest.State != RetirementStateDeletedPendingVerification {
+		return ErrRetirementClaimUnavailable
+	}
+	if manifest.State == RetirementStateEligible {
+		manifest.State = RetirementStateDeleting
+	}
+	manifest.ClaimToken = claimToken
+	manifest.ClaimExpiresAt = &claimExpiresAt
+	if manifest.DeleteStartedAt == nil {
+		manifest.DeleteStartedAt = &claimedAt
+	}
+	manifest.LastAttemptAt = &claimedAt
 	manifest.AttemptCount++
-	manifest.Outcome = "delete_started"
+	if manifest.State == RetirementStateDeletedPendingVerification {
+		manifest.Outcome = "verification_started"
+	} else {
+		manifest.Outcome = "delete_started"
+	}
 	r.manifests[blockMetadataID] = manifest
+	r.updateManifestRow(manifest)
 	return nil
 }
 
-func (r *fakeRepo) RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, outcome string, attemptedAt time.Time) error {
+func (r *fakeRepo) RenewRetirementClaim(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	renewedAt time.Time,
+	claimExpiresAt time.Time,
+) error {
 	manifest, ok := r.manifests[blockMetadataID]
-	if !ok || manifest.State == RetirementStateDeletedVerified {
-		return nil
+	if !ok || manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification ||
+		manifest.ClaimToken != claimToken ||
+		manifest.ClaimExpiresAt == nil || !manifest.ClaimExpiresAt.After(renewedAt) {
+		return ErrRetirementClaimUnavailable
+	}
+	manifest.ClaimExpiresAt = &claimExpiresAt
+	manifest.LastAttemptAt = &renewedAt
+	r.manifests[blockMetadataID] = manifest
+	r.updateManifestRow(manifest)
+	return nil
+}
+
+func (r *fakeRepo) RecordRetirementOutcome(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+	attemptedAt time.Time,
+) error {
+	manifest, ok := r.manifests[blockMetadataID]
+	if !ok || manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification ||
+		manifest.ClaimToken != claimToken {
+		return ErrRetirementClaimUnavailable
 	}
 	manifest.Outcome = outcome
 	manifest.LastAttemptAt = &attemptedAt
 	r.manifests[blockMetadataID] = manifest
+	r.updateManifestRow(manifest)
 	return nil
 }
 
-func (r *fakeRepo) FinalizeRetirement(ctx context.Context, blockMetadataID int64, deletedAt time.Time, outcome string) error {
-	r.finalizeCalls++
-	if r.finalizeErr != nil {
-		return r.finalizeErr
+func (r *fakeRepo) RecordRetirementObjectDeleted(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+) (time.Time, error) {
+	r.recordDeletedCalls++
+	if r.recordDeletedErr != nil {
+		return time.Time{}, r.recordDeletedErr
 	}
 	manifest, ok := r.manifests[blockMetadataID]
-	if !ok || manifest.State != RetirementStateDeleting {
-		return errors.New("manifest is not deleting")
+	if !ok || manifest.State != RetirementStateDeleting || manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
+		return time.Time{}, errors.New("manifest is not deleting")
 	}
-	manifest.State = RetirementStateDeletedVerified
+	deletedAt := time.Now().UTC()
+	manifest.State = RetirementStateDeletedPendingVerification
 	manifest.LegacyObjectKey = ""
 	manifest.LegacyObjectETag = ""
 	manifest.DeletedAt = &deletedAt
+	manifest.LastAttemptAt = &deletedAt
 	manifest.Outcome = outcome
 	r.manifests[blockMetadataID] = manifest
 	for i := range r.rows {
@@ -104,14 +206,56 @@ func (r *fakeRepo) FinalizeRetirement(ctx context.Context, blockMetadataID int64
 		}
 		r.rows[i].Retirement = &manifest
 	}
-	return nil
+	return deletedAt, nil
+}
+
+func (r *fakeRepo) FinalizeRetirement(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+	outcome string,
+) (time.Time, error) {
+	r.finalizeCalls++
+	if r.finalizeErr != nil {
+		return time.Time{}, r.finalizeErr
+	}
+	manifest, ok := r.manifests[blockMetadataID]
+	if !ok || manifest.State != RetirementStateDeletedPendingVerification || manifest.ClaimToken != claimToken ||
+		manifest.ClaimExpiresAt == nil || manifest.DeletedAt == nil {
+		return time.Time{}, errors.New("manifest is not pending verification")
+	}
+	verifiedAt := time.Now().UTC()
+	manifest.State = RetirementStateDeletedVerified
+	manifest.ClaimToken = ""
+	manifest.ClaimExpiresAt = nil
+	manifest.VerifiedAt = &verifiedAt
+	manifest.LastAttemptAt = &verifiedAt
+	manifest.Outcome = outcome
+	r.manifests[blockMetadataID] = manifest
+	for i := range r.rows {
+		if r.rows[i].BlockMetadataID != blockMetadataID {
+			continue
+		}
+		r.rows[i].Retirement = &manifest
+	}
+	return verifiedAt, nil
+}
+
+func (r *fakeRepo) updateManifestRow(manifest RetirementManifest) {
+	for i := range r.rows {
+		if r.rows[i].BlockMetadataID == manifest.BlockMetadataID {
+			copy := manifest
+			r.rows[i].Retirement = &copy
+		}
+	}
 }
 
 func (r *fakeRepo) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error) {
 	var manifests []RetirementManifest
 	for _, manifest := range r.manifests {
 		if manifest.Tag == tag && manifest.Height >= startHeight && manifest.Height < endHeight &&
-			(manifest.State == RetirementStateEligible || manifest.State == RetirementStateDeleting) {
+			(manifest.State == RetirementStateEligible || manifest.State == RetirementStateDeleting ||
+				manifest.State == RetirementStateDeletedPendingVerification) {
 			manifests = append(manifests, manifest)
 		}
 	}
@@ -129,6 +273,10 @@ type fakeStore struct {
 	objects       map[string][]byte
 	headCalls     map[string]int
 	versionCalls  map[string]int
+	policyCalls   map[string]int
+	policyErrors  map[string]error
+	policyHashes  map[string]string
+	policyHook    func(key string, call int) (RetentionSafetySnapshot, error)
 	deleted       []Candidate
 	deleteMutates bool
 	listHook      func(key string, call int) ObjectVersionTopology
@@ -143,7 +291,22 @@ func newFakeStore() *fakeStore {
 		objects:      make(map[string][]byte),
 		headCalls:    make(map[string]int),
 		versionCalls: make(map[string]int),
+		policyCalls:  make(map[string]int),
+		policyErrors: make(map[string]error),
+		policyHashes: make(map[string]string),
 	}
+}
+
+func (s *fakeStore) InspectObjectRetentionSafety(ctx context.Context, bucket string, key string) (RetentionSafetySnapshot, error) {
+	s.policyCalls[key]++
+	if s.policyHook != nil {
+		return s.policyHook(key, s.policyCalls[key])
+	}
+	configurationSHA256 := s.policyHashes[key]
+	if configurationSHA256 == "" {
+		configurationSHA256 = keySHA256("safe:" + key)
+	}
+	return RetentionSafetySnapshot{ConfigurationSHA256: configurationSHA256}, s.policyErrors[key]
 }
 
 func (s *fakeStore) HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error) {
@@ -295,6 +458,25 @@ func TestPlannerPlan_MissingCSCBObject(t *testing.T) {
 	require.Equal(SkipMissingCSCBObject, report.Items[0].SkipReason)
 	require.Equal("legacy-v1", report.Items[0].VersionID)
 	require.Equal(uint64(42), report.Items[0].LegacyBytes)
+}
+
+func TestPlannerPlan_RequiresLiveCSCBWriteOncePolicy(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+	store.policyErrors[row.PrimaryObjectKey] = errors.New("bucket policy is missing")
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipCSCBWriteOncePolicyUnverified, report.Items[0].SkipReason)
+	require.False(report.Items[0].CSCBWriteOncePolicy)
+	require.False(report.SafetyGates.CSCBWriteOncePolicyVerified)
+	require.Equal(1, store.policyCalls[row.PrimaryObjectKey])
 }
 
 func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
@@ -491,6 +673,27 @@ func TestPlannerPlan_RejectsNonSingletonLegacyTopology(t *testing.T) {
 	}
 }
 
+func TestPlannerPlan_RejectsMutableNullVersionIDs(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.LegacyObjectKey] = safeTopology("null", "legacy-etag", 42)
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(SkipLegacyVersionIDUnavailable, report.Items[0].SkipReason)
+
+	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	head := cscbObjectHead(1024, 1024)
+	head.VersionID = "null"
+	store.heads[row.PrimaryObjectKey] = head
+	report, err = testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(SkipMissingCSCBObject, report.Items[0].SkipReason)
+}
+
 func TestPlannerPlan_RequiresIndependentPayloadComparison(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -577,6 +780,8 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	require.Equal(uint64(1000)*legacyBytesEach, report.Summary.LegacyBytes)
 	require.Equal(uint64(1000)*legacyBytesEach, report.Summary.EligibleBytes)
 	require.Equal(1, store.headCalls[cscbKey])
+	require.Equal(1, store.policyCalls[cscbKey])
+	require.True(report.SafetyGates.CSCBWriteOncePolicyVerified)
 
 	first := report.Items[0]
 	require.Equal(startHeight, first.Height)
@@ -593,6 +798,120 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	require.Equal("legacy-version-428058999", last.VersionID)
 	require.Equal(cscbKey, last.ConsolidatedKey)
 	require.Equal(ActionReportOnly, last.Action)
+}
+
+func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyImmediatelyBeforeDelete(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	key := report.Items[0].ConsolidatedKey
+	require.Equal(1, store.policyCalls[key])
+	store.policyHook = func(hookKey string, call int) (RetentionSafetySnapshot, error) {
+		snapshot := RetentionSafetySnapshot{ConfigurationSHA256: keySHA256("safe:" + hookKey)}
+		if call >= 3 {
+			return snapshot, errors.New("bucket policy was removed")
+		}
+		return snapshot, nil
+	}
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Empty(store.deleted)
+	require.Equal(SkipCSCBWriteOncePolicyUnverified, report.Items[0].SkipReason)
+	require.False(report.SafetyGates.CSCBWriteOncePolicyVerified)
+	require.Equal(3, store.policyCalls[key])
+	manifest := repo.manifests[report.Items[0].BlockMetadataID]
+	require.Equal(RetirementStateDeleting, manifest.State)
+	require.Equal(SkipCSCBWriteOncePolicyUnverified, manifest.Outcome)
+}
+
+func TestPlannerApply_RequiresStableRetentionSafetyConfigurationBeforeDelete(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	key := report.Items[0].ConsolidatedKey
+	observedAt := req.Now
+	repo.safetyNow = observedAt
+	repo.safetyObservations = map[string]fakeSafetyObservation{
+		req.Bucket + "\x00" + key: {
+			configurationSHA256: keySHA256("previous-safe-configuration"),
+			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+		},
+	}
+	newConfigurationSHA256 := keySHA256("new-safe-configuration")
+	store.policyHashes[key] = newConfigurationSHA256
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Empty(store.deleted)
+	require.Equal(SkipCSCBSafetyQuiescenceActive, report.Items[0].SkipReason)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	_, prepared := repo.manifests[report.Items[0].BlockMetadataID]
+	require.False(prepared)
+	observation := repo.safetyObservations[req.Bucket+"\x00"+key]
+	require.Equal(newConfigurationSHA256, observation.configurationSHA256)
+	require.Equal(observedAt, observation.firstObservedAt)
+}
+
+func TestVerifyRetentionSafetyDoesNotCreditFailedInspectionTime(t *testing.T) {
+	require := require.New(t)
+	observedAt := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	key := "consolidated/canary.cscb.zstd"
+	item := Candidate{Bucket: "integration-bucket", ConsolidatedKey: key}
+	observationKey := item.Bucket + "\x00" + key
+	repo := &fakeRepo{
+		safetyNow: observedAt,
+		safetyObservations: map[string]fakeSafetyObservation{
+			observationKey: {
+				configurationSHA256: keySHA256("previous-safe-configuration"),
+				firstObservedAt:     observedAt.Add(-time.Hour),
+			},
+		},
+	}
+	store := newFakeStore()
+	store.policyErrors[key] = errors.New("GetBucketLifecycleConfiguration temporarily unavailable")
+	planner := testPlanner(repo, store)
+
+	reason, err := planner.verifyCSCBRetentionSafety(context.Background(), &item)
+	require.Error(err)
+	require.Equal(SkipCSCBWriteOncePolicyUnverified, reason)
+	observation := repo.safetyObservations[observationKey]
+	require.Equal(unverifiedRetentionSafetySHA256, observation.configurationSHA256)
+	require.Equal(observedAt, observation.firstObservedAt)
+
+	repo.safetyNow = observedAt.Add(20 * time.Minute)
+	delete(store.policyErrors, key)
+	reason, err = planner.verifyCSCBRetentionSafety(context.Background(), &item)
+	require.Error(err)
+	require.Equal(SkipCSCBSafetyQuiescenceActive, reason)
+	observation = repo.safetyObservations[observationKey]
+	require.Equal(keySHA256("safe:"+key), observation.configurationSHA256)
+	require.Equal(repo.safetyNow, observation.firstObservedAt)
+}
+
+func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cscbKey := "consolidated/shared.cscb.zstd"
+	first := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	second := testRow(428058001, "hash-428058001", "legacy/428058001.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{first, second}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	for _, row := range repo.rows {
+		store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	}
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[cscbKey] = cscbHead
+	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	planner := testPlanner(repo, store)
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Equal(1, store.policyCalls[cscbKey])
+
+	require.NoError(planner.Apply(context.Background(), req, report))
+	require.Len(store.deleted, 2)
+	require.Equal(4, store.policyCalls[cscbKey])
 }
 
 func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
@@ -625,6 +944,8 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	require.Equal("legacy-v1", store.deleted[0].VersionID)
 	require.Equal(ActionDeletedVerified, report.Items[0].Action)
 	require.Empty(report.Items[0].Key)
+	require.NotNil(report.Items[0].LegacyDeletedAt)
+	require.NotNil(report.Items[0].RetirementVerifiedAt)
 	manifest := repo.manifests[row.BlockMetadataID]
 	require.Equal(RetirementStateDeletedVerified, manifest.State)
 	require.Empty(manifest.LegacyObjectKey)
@@ -639,6 +960,8 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	finalReport, err := planner.Plan(context.Background(), dryRunReq)
 	require.NoError(err)
 	require.Equal(ActionAlreadyDeleted, finalReport.Items[0].Action)
+	require.NotNil(finalReport.Items[0].LegacyDeletedAt)
+	require.NotNil(finalReport.Items[0].RetirementVerifiedAt)
 	require.Empty(finalReport.Items[0].Key)
 	require.Equal(keySHA256(row.LegacyObjectKey), manifest.LegacyObjectKeySHA256)
 }
@@ -670,6 +993,12 @@ func TestPlannerApply_RejectsTamperedReportBeforeManifestWrite(t *testing.T) {
 			name: "production gate mismatch",
 			mutate: func(req PlanRequest, report *Report) {
 				report.SafetyGates.ProductionDeleteEnabled = false
+			},
+		},
+		{
+			name: "write-once policy gate mismatch",
+			mutate: func(req PlanRequest, report *Report) {
+				report.SafetyGates.CSCBWriteOncePolicyVerified = false
 			},
 		},
 	} {
@@ -766,9 +1095,41 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterLegacyDelete(t *testing
 	err := planner.Apply(context.Background(), req, report)
 	require.Error(err)
 	require.Len(store.deleted, 1)
+	require.Equal(ActionDeletedObjectVersion, report.Items[0].Action)
+	require.Equal(1, report.Summary.DeletedRows)
 	require.Equal(SkipCSCBObjectChanged, report.Items[0].SkipReason)
-	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
-	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
+	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
+	require.Empty(repo.manifests[row.BlockMetadataID].LegacyObjectKey)
+	require.Empty(repo.rows[0].LegacyObjectKey)
+	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
+	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	require.Equal(1, repo.recordDeletedCalls)
+	require.Zero(repo.finalizeCalls)
+}
+
+func TestPlannerApply_UsesFreshVerifierAfterRecordingDeletion(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	digest := strings.Repeat("a", sha256HexLength)
+	created := 0
+	planner.verifierFactory = func() blockPayloadVerifier {
+		created++
+		verifier := &fakePayloadVerifier{digest: digest, consolidatedDigest: digest}
+		if created == 2 {
+			verifier.consolidatedErr = errors.New("fresh ranged read failed")
+		}
+		return verifier
+	}
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Contains(err.Error(), "fresh ranged read failed")
+	require.Equal(2, created)
+	require.Len(store.deleted, 1)
+	require.Equal(ActionDeletedObjectVersion, report.Items[0].Action)
+	require.Equal(1, report.Summary.DeletedRows)
+	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
+	require.Empty(repo.rows[0].LegacyObjectKey)
 	require.Zero(repo.finalizeCalls)
 }
 
@@ -784,20 +1145,68 @@ func TestPlannerApply_RejectsBlockThatIsNoLongerCanonical(t *testing.T) {
 	require.Empty(store.deleted)
 }
 
-func TestPlannerReconcile_CompletesCrashAfterS3Deletion(t *testing.T) {
+func TestPlannerReconcile_CompletesCrashBeforeDeletionRecord(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	repo.recordDeletedErr = errors.New("database unavailable")
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipPostDeleteVerificationFailed, report.Items[0].SkipReason)
+	require.Len(store.deleted, 1)
+	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
+	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
+
+	repo.recordDeletedErr = nil
+	manifest := repo.manifests[row.BlockMetadataID]
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	manifest.ClaimExpiresAt = &expiredAt
+	repo.manifests[row.BlockMetadataID] = manifest
+	repo.updateManifestRow(manifest)
+	repo.rows[0].Canonical = false
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Len(reconcileReport.Items, 1)
+	require.Equal(ActionDeletedVerified, reconcileReport.Items[0].Action)
+	require.Len(store.deleted, 1)
+	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
+	require.Empty(repo.rows[0].LegacyObjectKey)
+	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
+}
+
+func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, verifier, req, report := newExecutableTestFixture(t)
 	repo.finalizeErr = errors.New("database unavailable")
 
 	err := planner.Apply(context.Background(), req, report)
 	require.Error(err)
+	require.Equal(ActionDeletedObjectVersion, report.Items[0].Action)
 	require.Equal(SkipPostDeleteVerificationFailed, report.Items[0].SkipReason)
 	require.Len(store.deleted, 1)
-	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
+	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
 	require.Equal(SkipPostDeleteVerificationFailed, repo.manifests[row.BlockMetadataID].Outcome)
-	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
+	require.Empty(repo.rows[0].LegacyObjectKey)
+	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
+	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	dryRunReq := req
+	dryRunReq.Execute = false
+	dryRunReq.ProductionDeleteEnabled = false
+	dryRunReport, err := planner.Reconcile(context.Background(), dryRunReq)
+	require.NoError(err)
+	require.Equal(ActionDeletedObjectVersion, dryRunReport.Items[0].Action)
+	require.Equal(SkipRetirementVerificationPending, dryRunReport.Items[0].SkipReason)
+	require.Equal(1, dryRunReport.Summary.DeletedRows)
+	require.NotNil(dryRunReport.Items[0].LegacyDeletedAt)
+	require.Nil(dryRunReport.Items[0].RetirementVerifiedAt)
 
 	repo.finalizeErr = nil
+	manifest := repo.manifests[row.BlockMetadataID]
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	manifest.ClaimExpiresAt = &expiredAt
+	repo.manifests[row.BlockMetadataID] = manifest
+	repo.updateManifestRow(manifest)
 	repo.rows[0].Canonical = false
 	reconcileReport, err := planner.Reconcile(context.Background(), req)
 	require.NoError(err)
@@ -827,6 +1236,84 @@ func TestPlannerReconcile_DoesNotFinalizeExternallyMissingEligibleObject(t *test
 	require.Equal(RetirementStateEligible, repo.manifests[row.BlockMetadataID].State)
 	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
 	require.Zero(repo.finalizeCalls)
+}
+
+func TestPlannerReconcile_SkipsActiveRetirementClaim(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	manifest := manifestFromCandidate(report.Items[0], req.Now)
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	claimedAt := time.Now().UTC()
+	require.NoError(repo.ClaimRetirement(
+		context.Background(),
+		row.BlockMetadataID,
+		"active-claim",
+		claimedAt,
+		claimedAt.Add(time.Hour),
+	))
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Len(reconcileReport.Items, 1)
+	require.Equal(ActionSkip, reconcileReport.Items[0].Action)
+	require.Equal(SkipRetirementClaimActive, reconcileReport.Items[0].SkipReason)
+	require.Empty(store.deleted)
+	require.Equal(1, repo.manifests[row.BlockMetadataID].AttemptCount)
+}
+
+func TestPlannerReconcile_TakesOverExpiredRetirementClaim(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	manifest := manifestFromCandidate(report.Items[0], req.Now)
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	claimedAt := time.Now().UTC().Add(-2 * time.Hour)
+	require.NoError(repo.ClaimRetirement(
+		context.Background(),
+		row.BlockMetadataID,
+		"expired-claim",
+		claimedAt,
+		claimedAt.Add(time.Hour),
+	))
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Len(reconcileReport.Items, 1)
+	require.Equal(ActionDeletedVerified, reconcileReport.Items[0].Action)
+	require.Len(store.deleted, 1)
+	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
+	require.Equal(2, repo.manifests[row.BlockMetadataID].AttemptCount)
+}
+
+func TestPlannerReconcile_ReturnsLiveCSCBWriteOncePolicyFailure(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	manifest := manifestFromCandidate(report.Items[0], req.Now)
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	store.policyErrors[manifest.ConsolidatedObjectKey] = errors.New("GetBucketPolicy temporarily unavailable")
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.Error(err)
+	require.Len(reconcileReport.Items, 1)
+	require.Equal(SkipCSCBWriteOncePolicyUnverified, reconcileReport.Items[0].SkipReason)
+	require.Empty(store.deleted)
+	require.Equal(RetirementStateEligible, repo.manifests[row.BlockMetadataID].State)
+	require.Empty(repo.manifests[row.BlockMetadataID].Outcome)
+}
+
+func TestPlannerPlan_RejectsInconsistentFinalizedRetirement(t *testing.T) {
+	require := require.New(t)
+	_, repo, _, planner, _, req, report := newExecutableTestFixture(t)
+	require.NoError(planner.Apply(context.Background(), req, report))
+
+	finalReport, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Equal(ActionAlreadyDeleted, finalReport.Items[0].Action)
+
+	repo.rows[0].PrimaryObjectKey = "legacy/regressed.gzip"
+	inconsistentReport, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Equal(ActionSkip, inconsistentReport.Items[0].Action)
+	require.Equal(SkipMetadataChanged, inconsistentReport.Items[0].SkipReason)
 }
 
 func TestPlannerPlan_UsesCSCBUncompressedLengthForPlacementBounds(t *testing.T) {
@@ -883,6 +1370,41 @@ func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
 			require.Equal(SkipInvalidMetadataReference, report.Items[0].SkipReason)
 		})
 	}
+}
+
+func TestPlannerPlan_CSCBLifecycleExpirationFailsClosed(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	head := cscbObjectHead(1024, 1024)
+	head.Expiration = `expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`
+	store.heads[row.PrimaryObjectKey] = head
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipCSCBLifecycleExpirationActive, report.Items[0].SkipReason)
+	require.Zero(store.policyCalls[row.PrimaryObjectKey])
+}
+
+func TestPlannerApply_DoesNotDeleteWhenCSCBLifecycleExpirationAppears(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	store.headHook = func(key string, call int) ObjectHead {
+		head := store.heads[key]
+		if key == row.PrimaryObjectKey && call >= 3 {
+			head.Expiration = `expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`
+		}
+		return head
+	}
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Empty(store.deleted)
+	require.Equal(SkipCSCBLifecycleExpirationActive, report.Items[0].SkipReason)
+	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
 }
 
 func newExecutableTestFixture(t *testing.T) (

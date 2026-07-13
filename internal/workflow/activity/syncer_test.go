@@ -41,6 +41,7 @@ type SyncerTestSuite struct {
 	ctrl                      *gomock.Controller
 	metaStorage               *metastoragemocks.MockMetaStorage
 	blobStorage               *blobstoragemocks.MockBlobStorage
+	legacyUploader            *blobstoragemocks.MockLegacyBlockUploader
 	masterBlockchainClient    *clientmocks.MockClient
 	slaveBlockchainClient     *clientmocks.MockClient
 	validatorBlockchainClient *clientmocks.MockClient
@@ -67,6 +68,17 @@ func (s *SyncerTestSuite) TestNoOp() {
 	require.NoError(err)
 	require.Equal(uint64(120), result.forkHeight)
 	require.Equal(uint64(100), result.canonicalChainTipHeight)
+}
+
+func (s *SyncerTestSuite) TestRetirementFenceFailsBeforeLegacyUpload() {
+	require := testutil.Require(s.T())
+	block := testutil.MakeBlocksFromStartHeight(123456, 1, tag)[0]
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).
+		Return("", metastorage.ErrLegacyObjectRetirementFenced)
+
+	err := s.syncer.uploadBlockToBlobStorage(context.Background(), block, api.Compression_NONE)
+	require.Error(err)
+	require.Contains(err.Error(), metastorage.ErrLegacyObjectRetirementFenced.Error())
 }
 
 func (s *SyncerTestSuite) TestNoReorg() {
@@ -99,7 +111,7 @@ func (s *SyncerTestSuite) TestNoReorg() {
 			require.False(s.slaveEndpointProvider.HasFailoverContext(ctx))
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -143,7 +155,7 @@ func (s *SyncerTestSuite) TestNoReorg_Failover() {
 			require.True(s.slaveEndpointProvider.HasFailoverContext(ctx))
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -403,7 +415,7 @@ func (s *SyncerTestSuite) TestNextMasterBlockSkipped() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(3)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(3)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(3)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -445,7 +457,7 @@ func (s *SyncerTestSuite) TestLatestBlockNotSkipped() {
 			}
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(100)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -473,7 +485,7 @@ func (s *SyncerTestSuite) TestFastSync() {
 		func(ctx context.Context, tag uint32, height uint64, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlock(height, tag), nil
 		}).Times(100)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), forkBlock).Return(nil)
 
 	request := &SyncerRequest{
@@ -504,7 +516,7 @@ func (s *SyncerTestSuite) TestFastSync_UnexpectedReorg() {
 		func(ctx context.Context, tag uint32, height uint64, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlock(height, tag), nil
 		}).Times(100)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(100)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), forkBlock).Return(parser.ErrInvalidChain)
 
 	request := &SyncerRequest{
@@ -776,7 +788,7 @@ func (s *SyncerTestSuite) TestAddOrUpdateTransactionsInParallel() {
 		}).Times(2)
 
 	s.metaStorage.EXPECT().AddTransactions(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -823,7 +835,7 @@ func (s *SyncerTestSuite) TestAddOrUpdateTransactionsInParallel_WithBatches() {
 		}).Times(2)
 
 	s.metaStorage.EXPECT().AddTransactions(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -879,7 +891,7 @@ func (s *SyncerTestSuite) TestAddOrUpdateTransactionsInParallel_CheckOnTransacti
 			return nil
 		})
 
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -931,7 +943,7 @@ func (s *SyncerTestSuite) TestAddOrUpdateTransactionsInParallel_Err() {
 		})
 
 	s.metaStorage.EXPECT().AddTransactions(gomock.Any(), gomock.Any(), gomock.Any()).Return(xerrors.New("failed to add or update transaction")).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	request := &SyncerRequest{
 		Tag:                          stableTag,
@@ -996,7 +1008,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_Success() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.metaStorage.EXPECT().
@@ -1049,7 +1061,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_ConsensusClientFailure() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.metaStorage.EXPECT().
@@ -1099,7 +1111,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_Muted() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.metaStorage.EXPECT().
@@ -1153,7 +1165,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_BlockHashMismatch() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.metaStorage.EXPECT().
@@ -1209,7 +1221,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_NoFinalizedBlock() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 	s.metaStorage.EXPECT().PersistBlockMetas(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil)
 
 	request := &SyncerRequest{
@@ -1260,7 +1272,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_FinalizedBlock_Skipped() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(2)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(2)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.metaStorage.EXPECT().
@@ -1326,7 +1338,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_NoMetadataInMetaStorage() {
 		func(ctx context.Context, tag uint32, height uint64, hash string, opts ...client.ClientOption) (*api.Block, error) {
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag)[0], nil
 		}).Times(4)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(4)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(4)
 
 	latestFinalizedHeight := latestHeight - irreversibleDistance + 1
 	s.consensusBlockchainClient.EXPECT().
@@ -1393,7 +1405,7 @@ func (s *SyncerTestSuite) TestConsensusValidation_NoMetadataInMetaStorage_Skippe
 			}
 			return testutil.MakeBlocksFromStartHeight(height, 1, tag, blockSkippedOption)[0], nil
 		}).Times(5)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(5)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).Times(5)
 
 	s.consensusBlockchainClient.EXPECT().
 		BatchGetBlockMetadata(gomock.Any(), tag, gomock.Any(), gomock.Any()).DoAndReturn(
@@ -1454,7 +1466,12 @@ func (s *SyncerTestSuite) SetupTest() {
 
 	s.ctrl = gomock.NewController(s.T())
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.legacyUploader = blobstoragemocks.NewMockLegacyBlockUploader(s.ctrl)
 	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
+	s.metaStorage.EXPECT().
+		AcquireLegacyObjectUploadGuard(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(metastorage.NewUnfencedLegacyObjectUploadGuard(), nil).
+		AnyTimes()
 	s.masterBlockchainClient = clientmocks.NewMockClient(s.ctrl)
 	s.slaveBlockchainClient = clientmocks.NewMockClient(s.ctrl)
 	s.validatorBlockchainClient = clientmocks.NewMockClient(s.ctrl)
@@ -1473,6 +1490,9 @@ func (s *SyncerTestSuite) SetupTest() {
 		testapp.WithConfig(cfg),
 		fx.Provide(func() blobstorage.BlobStorage {
 			return s.blobStorage
+		}),
+		fx.Provide(func() blobstorage.LegacyBlockUploader {
+			return s.legacyUploader
 		}),
 		fx.Provide(func() metastorage.MetaStorage {
 			return s.metaStorage

@@ -3,10 +3,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -16,6 +18,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
+	"github.com/coinbase/chainstorage/internal/storage/retirementlock"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	"github.com/coinbase/chainstorage/internal/utils/utils"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -32,6 +35,14 @@ type (
 		instrumentGetBlocksByHeightRange instrument.InstrumentWithResult[[]*api.BlockMetadata]
 		instrumentGetBlocksByHeights     instrument.InstrumentWithResult[[]*api.BlockMetadata]
 		instrumentGetBlockByTimestamp    instrument.InstrumentWithResult[*api.BlockMetadata]
+	}
+
+	legacyObjectUploadGuard struct {
+		conn       *sql.Conn
+		tx         *sql.Tx
+		fenced     bool
+		once       sync.Once
+		releaseErr error
 	}
 )
 
@@ -68,6 +79,67 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 		instrumentGetBlockByTimestamp:    instrument.NewWithResult[*api.BlockMetadata](metrics, "get_block_by_timestamp"),
 	}
 	return &accessor, nil
+}
+
+func (b *blockStorageImpl) AcquireLegacyObjectUploadGuard(
+	ctx context.Context,
+	tag uint32,
+	height uint64,
+	hash string,
+) (internal.LegacyObjectUploadGuard, error) {
+	conn, err := b.db.Conn(ctx)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to acquire legacy object upload connection: %w", err)
+	}
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, xerrors.Errorf("failed to begin legacy object upload guard: %w", err)
+	}
+	if err := retirementlock.Acquire(ctx, tx, tag, height, hash); err != nil {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		return nil, err
+	}
+	var retirementFencedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT legacy_object_retirement_fenced_at
+		FROM block_metadata
+		WHERE tag = $1
+			AND height = $2
+			AND hash IS NOT DISTINCT FROM NULLIF($3, '')
+			AND skipped = FALSE
+		FOR UPDATE`, tag, height, hash).Scan(&retirementFencedAt)
+	if err != nil && err != sql.ErrNoRows {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		return nil, xerrors.Errorf("failed to acquire legacy object upload guard: %w", err)
+	}
+	return &legacyObjectUploadGuard{
+		conn:   conn,
+		tx:     tx,
+		fenced: err == nil && retirementFencedAt.Valid,
+	}, nil
+}
+
+func (g *legacyObjectUploadGuard) RetirementFenced() bool {
+	return g != nil && g.fenced
+}
+
+func (g *legacyObjectUploadGuard) Release() error {
+	if g == nil || g.tx == nil {
+		return nil
+	}
+	g.once.Do(func() {
+		g.releaseErr = g.tx.Rollback()
+		if g.releaseErr == sql.ErrTxDone {
+			g.releaseErr = nil
+		}
+		if g.conn != nil {
+			g.releaseErr = stderrors.Join(g.releaseErr, g.conn.Close())
+		}
+	})
+	return g.releaseErr
 }
 
 func (b *blockStorageImpl) PersistBlockMetas(
@@ -149,13 +221,28 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
 				parent_hash = EXCLUDED.parent_hash,
 				parent_height = EXCLUDED.parent_height,
-				object_key_main = EXCLUDED.object_key_main,
+				object_key_main = CASE
+					WHEN block_metadata.legacy_object_retirement_fenced_at IS NOT NULL THEN block_metadata.object_key_main
+					ELSE EXCLUDED.object_key_main
+				END,
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped,
-				object_format = EXCLUDED.object_format,
-				byte_offset = EXCLUDED.byte_offset,
-				byte_length = EXCLUDED.byte_length,
-				uncompressed_length = EXCLUDED.uncompressed_length
+				object_format = CASE
+					WHEN block_metadata.legacy_object_retirement_fenced_at IS NOT NULL THEN block_metadata.object_format
+					ELSE EXCLUDED.object_format
+				END,
+				byte_offset = CASE
+					WHEN block_metadata.legacy_object_retirement_fenced_at IS NOT NULL THEN block_metadata.byte_offset
+					ELSE EXCLUDED.byte_offset
+				END,
+				byte_length = CASE
+					WHEN block_metadata.legacy_object_retirement_fenced_at IS NOT NULL THEN block_metadata.byte_length
+					ELSE EXCLUDED.byte_length
+				END,
+				uncompressed_length = CASE
+					WHEN block_metadata.legacy_object_retirement_fenced_at IS NOT NULL THEN block_metadata.uncompressed_length
+					ELSE EXCLUDED.uncompressed_length
+				END
 			RETURNING id`
 
 		// Simply insert or update canonical blocks like DynamoDB does

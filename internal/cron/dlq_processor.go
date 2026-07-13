@@ -24,7 +24,7 @@ type (
 		fxparams.Params
 		DLQ              dlq.DLQ
 		BlockchainClient client.Client `name:"slave"`
-		BlobStorage      blobstorage.BlobStorage
+		LegacyUploader   blobstorage.LegacyBlockUploader
 		MetaStorage      metastorage.MetaStorage
 	}
 
@@ -33,7 +33,7 @@ type (
 		logger           *zap.Logger
 		dlq              dlq.DLQ
 		blockchainClient client.Client
-		blobStorage      blobstorage.BlobStorage
+		legacyUploader   blobstorage.LegacyBlockUploader
 		metaStorage      metastorage.MetaStorage
 	}
 )
@@ -48,7 +48,7 @@ func NewDLQProcessor(params DLQProcessorTaskParams) Task {
 		logger:           log.WithPackage(params.Logger),
 		dlq:              params.DLQ,
 		blockchainClient: params.BlockchainClient,
-		blobStorage:      params.BlobStorage,
+		legacyUploader:   params.LegacyUploader,
 		metaStorage:      params.MetaStorage,
 	}
 }
@@ -146,11 +146,10 @@ func (t *dlqProcessorTask) processFailedTransactionTrace(ctx context.Context, me
 	objectKey := metadata.ObjectKeyMain
 
 	compression := storage_utils.GetCompressionType(objectKey)
-	_, err = t.blobStorage.Upload(ctx, block, compression)
+	_, err = t.legacyUploader.Upload(ctx, block, compression)
 	if err != nil {
 		return xerrors.Errorf("failed to upload to blob store with compression type %v: %w", compression.String(), err)
 	}
-
 	// Note that the block is already persisted in meta storage.
 	// Since the S3 object key stays the same, we don't need to persist the block in meta storage again.
 

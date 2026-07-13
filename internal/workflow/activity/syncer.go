@@ -49,7 +49,7 @@ type (
 		baseActivity
 		heartbeater               Heartbeater
 		metaStorage               metastorage.MetaStorage
-		blobStorage               blobstorage.BlobStorage
+		legacyUploader            blobstorage.LegacyBlockUploader
 		masterBlockchainClient    client.Client // Used as the source-of-truth for resolving the canonical chain. It should be connected to a single-node cluster.
 		slaveBlockchainClient     client.Client // Used to ingest data concurrently. It may be connected to multiple clusters for load balancing purposes.
 		consensusBlockchainClient client.Client // Used to run consensus validation. It may be connected to multiple clusters for load balancing purposes.
@@ -64,7 +64,7 @@ type (
 		Runtime          cadence.Runtime
 		Heartbeater      Heartbeater
 		MetaStorage      metastorage.MetaStorage
-		BlobStorage      blobstorage.BlobStorage
+		LegacyUploader   blobstorage.LegacyBlockUploader
 		BlockchainClient client.ClientParams
 		FailoverManager  endpoints.FailoverManager
 	}
@@ -119,7 +119,7 @@ func NewSyncer(params SyncerParams) *Syncer {
 		baseActivity:              newBaseActivity(ActivitySyncer, params.Runtime),
 		heartbeater:               params.Heartbeater,
 		metaStorage:               params.MetaStorage,
-		blobStorage:               params.BlobStorage,
+		legacyUploader:            params.LegacyUploader,
 		masterBlockchainClient:    params.BlockchainClient.Master,
 		slaveBlockchainClient:     params.BlockchainClient.Slave,
 		consensusBlockchainClient: params.BlockchainClient.Consensus,
@@ -734,7 +734,7 @@ func (a *Syncer) safeGetBlock(
 }
 
 func (a *Syncer) uploadBlockToBlobStorage(ctx context.Context, outBlock *api.Block, dataCompression api.Compression) error {
-	objectKey, err := a.blobStorage.Upload(ctx, outBlock, dataCompression)
+	objectKey, err := a.legacyUploader.Upload(ctx, outBlock, dataCompression)
 	if err != nil {
 		return xerrors.Errorf("failed to upload block hash %s to blob storage: %w", outBlock.Metadata.Hash, err)
 	}

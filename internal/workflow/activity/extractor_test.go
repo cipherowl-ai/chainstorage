@@ -31,6 +31,7 @@ type ExtractorTestSuite struct {
 	blockchainClient *clientmocks.MockClient
 	metaStorage      *metastoragemocks.MockMetaStorage
 	blobStorage      *blobstoragemocks.MockBlobStorage
+	legacyUploader   *blobstoragemocks.MockLegacyBlockUploader
 	app              testapp.TestApp
 	extractor        *Extractor
 }
@@ -44,13 +45,21 @@ func (s *ExtractorTestSuite) SetupTest() {
 	s.ctrl = gomock.NewController(s.T())
 	s.blockchainClient = clientmocks.NewMockClient(s.ctrl)
 	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
+	s.metaStorage.EXPECT().
+		AcquireLegacyObjectUploadGuard(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(metastorage.NewUnfencedLegacyObjectUploadGuard(), nil).
+		AnyTimes()
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.legacyUploader = blobstoragemocks.NewMockLegacyBlockUploader(s.ctrl)
 	s.app = testapp.New(
 		s.T(),
 		Module,
 		cadence.WithTestEnv(s.env),
 		fx.Provide(func() blobstorage.BlobStorage {
 			return s.blobStorage
+		}),
+		fx.Provide(func() blobstorage.LegacyBlockUploader {
+			return s.legacyUploader
 		}),
 		fx.Provide(fx.Annotated{
 			Name: "slave",
@@ -90,7 +99,7 @@ func (s *ExtractorTestSuite) TestSuccess() {
 		},
 	}
 	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height, gomock.Any()).Return(block, nil)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey, nil)
 
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
 		Tag:     tag,
@@ -103,6 +112,26 @@ func (s *ExtractorTestSuite) TestSuccess() {
 	require.Equal(height, metadata.Height)
 	require.Equal(hash, metadata.Hash)
 	require.Equal(objectKey, metadata.ObjectKeyMain)
+}
+
+func (s *ExtractorTestSuite) TestRetirementFenceFailsBeforeLegacyUpload() {
+	const (
+		tag    uint32 = 1
+		height uint64 = 123456
+		hash          = "0xabcd"
+	)
+	require := testutil.Require(s.T())
+	block := &api.Block{Metadata: &api.BlockMetadata{Tag: tag, Hash: hash, Height: height}}
+	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height, gomock.Any()).Return(block, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).
+		Return("", metastorage.ErrLegacyObjectRetirementFenced)
+
+	_, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
+		Tag:     tag,
+		Heights: []uint64{height},
+	})
+	require.Error(err)
+	require.Contains(err.Error(), metastorage.ErrLegacyObjectRetirementFenced.Error())
 }
 
 func (s *ExtractorTestSuite) TestMiniBatch() {
@@ -126,7 +155,7 @@ func (s *ExtractorTestSuite) TestMiniBatch() {
 			},
 		}
 		s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height+i, gomock.Any()).Return(block, nil)
-		s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey+strconv.Itoa(int(i)), nil)
+		s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey+strconv.Itoa(int(i)), nil)
 		heights[i] = height + i
 	}
 
@@ -163,7 +192,7 @@ func (s *ExtractorTestSuite) TestWithBestEffort() {
 		},
 	}
 	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height, gomock.Any()).Return(block, nil)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).Return(objectKey, nil)
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
 		Tag:            tag,
 		Heights:        []uint64{height},
@@ -229,7 +258,7 @@ func (s *ExtractorTestSuite) TestUpgradeSuccess() {
 	s.metaStorage.EXPECT().GetBlockByHeight(gomock.Any(), oldTag, height).Return(metadata, nil)
 	s.blobStorage.EXPECT().Download(gomock.Any(), block.Metadata).Return(block, nil)
 	s.blockchainClient.EXPECT().UpgradeBlock(gomock.Any(), block, newTag).Return(newBlock, nil)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), newBlock, api.Compression_NONE).Return(objectKey, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), newBlock, api.Compression_NONE).Return(objectKey, nil)
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
 		Tag:            newTag,
 		Heights:        []uint64{height},
@@ -275,7 +304,7 @@ func (s *ExtractorTestSuite) TestRehydrateSuccess() {
 	}
 	s.metaStorage.EXPECT().GetBlockByHeight(gomock.Any(), oldTag, height).Return(metadata, nil)
 	s.blobStorage.EXPECT().Download(gomock.Any(), block.Metadata).Return(block, nil)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), newBlock, api.Compression_NONE).Return(objectKey, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), newBlock, api.Compression_NONE).Return(objectKey, nil)
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
 		Tag:              newTag,
 		Heights:          []uint64{height},
@@ -309,7 +338,7 @@ func (s *ExtractorTestSuite) TestWithDataCompression() {
 		},
 	}
 	s.blockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, height, gomock.Any()).Return(block, nil)
-	s.blobStorage.EXPECT().Upload(gomock.Any(), block, api.Compression_GZIP).Return(objectKey, nil)
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_GZIP).Return(objectKey, nil)
 	response, err := s.extractor.Execute(s.env.BackgroundContext(), &ExtractorRequest{
 		Tag:             tag,
 		Heights:         []uint64{height},

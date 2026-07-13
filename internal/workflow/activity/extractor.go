@@ -24,6 +24,7 @@ type (
 		baseActivity
 		blockchainClient client.Client
 		blobStorage      blobstorage.BlobStorage
+		legacyUploader   blobstorage.LegacyBlockUploader
 		metaStorage      metastorage.MetaStorage
 		failoverManager  endpoints.FailoverManager
 	}
@@ -33,6 +34,7 @@ type (
 		Runtime          cadence.Runtime
 		BlockchainClient client.Client `name:"slave"`
 		BlobStorage      blobstorage.BlobStorage
+		LegacyUploader   blobstorage.LegacyBlockUploader
 		MetaStorage      metastorage.MetaStorage
 		FailoverManager  endpoints.FailoverManager
 	}
@@ -57,6 +59,7 @@ func NewExtractor(params ExtractorParams) *Extractor {
 		baseActivity:     newBaseActivity(ActivityExtractor, params.Runtime),
 		blockchainClient: params.BlockchainClient,
 		blobStorage:      params.BlobStorage,
+		legacyUploader:   params.LegacyUploader,
 		metaStorage:      params.MetaStorage,
 		failoverManager:  params.FailoverManager,
 	}
@@ -135,7 +138,7 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 
 			activity.RecordHeartbeat(ctx, "extractor.block.fetched", height)
 
-			objectKey, err := a.blobStorage.Upload(ctx, block, request.DataCompression)
+			objectKey, err := a.legacyUploader.Upload(ctx, block, request.DataCompression)
 			if err != nil {
 				logger.Error("failed to upload to blob store", zap.Error(err))
 				return xerrors.Errorf("failed to upload to blob store: %w", err)

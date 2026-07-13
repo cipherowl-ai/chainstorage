@@ -62,7 +62,10 @@ validated_at, retired_at, eligible_at, action, and skip reason for every scanned
 
 Execution persists a write-ahead manifest, independently parses and compares the pinned legacy
 version with the pinned CSCB payload, revalidates immediately before deleting exactly one S3
-version, verifies the key has no remaining versions, and transactionally clears the legacy path.
+version, verifies the key has no remaining versions, transactionally clears the legacy path,
+then performs a fresh CSCB range read before marking the retirement verified.
+The command also verifies the live bucket policy denies every unconditional write and every API
+delete to each CSCB key, so no newer version or delete marker can replace the pinned payload.
 Production execution requires both --execute and --confirm-production-delete.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLegacyRetirementPlan(cmd.Context(), legacyRetirementFlags)
@@ -77,11 +80,12 @@ func newLegacyRetirementReconcileCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "reconcile-legacy-single-blocks",
 		Short: "inspect or resume durable legacy object retirements",
-		Long: `Inspect write-ahead retirement manifests left in eligible or deleting state.
+		Long: `Inspect write-ahead retirement manifests left in eligible, deleting, or deleted-pending-verification state.
 
 The command is report-only by default. With explicit execution gates, it can safely resume a
-pre-delete manifest or finish the metadata transaction after verifying that S3 deletion already
-succeeded and the pinned CSCB payload still parses to the persisted digest.`,
+pre-delete manifest, record an already-completed S3 deletion while clearing the legacy path, or
+finish fresh CSCB verification against the persisted digest after the path has been cleared.
+Execution remains blocked unless the live CSCB write-once bucket policy is verifiable.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runLegacyRetirementReconcile(cmd.Context(), legacyRetirementReconcileFlags)
 		},

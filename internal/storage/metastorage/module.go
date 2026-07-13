@@ -11,15 +11,17 @@ import (
 )
 
 type (
-	MetaStorage                  = internal.MetaStorage
-	BlockStorage                 = internal.BlockStorage
-	EventStorage                 = internal.EventStorage
-	TransactionStorage           = internal.TransactionStorage
-	EventsToChainAdaptor         = internal.EventsToChainAdaptor
-	BlockMetadataRecord          = internal.BlockMetadataRecord
-	ConsolidationShadowPlacement = internal.ConsolidationShadowPlacement
-	ConsolidationShadowStats     = internal.ConsolidationShadowStats
-	ConsolidationPromotionResult = internal.ConsolidationPromotionResult
+	MetaStorage                    = internal.MetaStorage
+	BlockStorage                   = internal.BlockStorage
+	EventStorage                   = internal.EventStorage
+	TransactionStorage             = internal.TransactionStorage
+	EventsToChainAdaptor           = internal.EventsToChainAdaptor
+	BlockMetadataRecord            = internal.BlockMetadataRecord
+	ConsolidationShadowPlacement   = internal.ConsolidationShadowPlacement
+	ConsolidationShadowStats       = internal.ConsolidationShadowStats
+	ConsolidationPromotionResult   = internal.ConsolidationPromotionResult
+	LegacyObjectUploadGuard        = internal.LegacyObjectUploadGuard
+	LegacyObjectUploadGuardStorage = internal.LegacyObjectUploadGuardStorage
 )
 
 const (
@@ -28,6 +30,10 @@ const (
 
 	BatchConsolidatorAutoConsolidateCursor = internal.BatchConsolidatorAutoConsolidateCursor
 )
+
+func NewUnfencedLegacyObjectUploadGuard() LegacyObjectUploadGuard {
+	return internal.NewUnfencedLegacyObjectUploadGuard()
+}
 
 func NewEventsToChainAdaptor() *EventsToChainAdaptor {
 	return internal.NewEventsToChainAdaptor()

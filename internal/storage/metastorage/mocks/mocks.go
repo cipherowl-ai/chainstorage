@@ -43,6 +43,21 @@ func (m *MockMetaStorage) EXPECT() *MockMetaStorageMockRecorder {
 	return m.recorder
 }
 
+// AcquireLegacyObjectUploadGuard mocks base method.
+func (m *MockMetaStorage) AcquireLegacyObjectUploadGuard(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string) (internal.LegacyObjectUploadGuard, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AcquireLegacyObjectUploadGuard", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(internal.LegacyObjectUploadGuard)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AcquireLegacyObjectUploadGuard indicates an expected call of AcquireLegacyObjectUploadGuard.
+func (mr *MockMetaStorageMockRecorder) AcquireLegacyObjectUploadGuard(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AcquireLegacyObjectUploadGuard", reflect.TypeOf((*MockMetaStorage)(nil).AcquireLegacyObjectUploadGuard), arg0, arg1, arg2, arg3)
+}
+
 // AddEventEntries mocks base method.
 func (m *MockMetaStorage) AddEventEntries(arg0 context.Context, arg1 uint32, arg2 []*model.EventEntry) error {
 	m.ctrl.T.Helper()

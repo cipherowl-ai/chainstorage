@@ -47,6 +47,7 @@ type backfillerTestSuite struct {
 	blockchainClient       *clientmocks.MockClient
 	metadataAccessor       *metastoragemocks.MockMetaStorage
 	blobStorage            *blobstoragemocks.MockBlobStorage
+	legacyUploader         *blobstoragemocks.MockLegacyBlockUploader
 	masterEndpointProvider endpoints.EndpointProvider
 	slaveEndpointProvider  endpoints.EndpointProvider
 	backfiller             *Backfiller
@@ -95,7 +96,12 @@ func (s *backfillerTestSuite) SetupTest() {
 	s.ctrl = gomock.NewController(s.T())
 	s.blockchainClient = clientmocks.NewMockClient(s.ctrl)
 	s.metadataAccessor = metastoragemocks.NewMockMetaStorage(s.ctrl)
+	s.metadataAccessor.EXPECT().
+		AcquireLegacyObjectUploadGuard(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(nil, nil).
+		AnyTimes()
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.legacyUploader = blobstoragemocks.NewMockLegacyBlockUploader(s.ctrl)
 	s.app = testapp.New(
 		s.T(),
 		Module,
@@ -103,6 +109,9 @@ func (s *backfillerTestSuite) SetupTest() {
 		cadence.WithTestEnv(s.env),
 		fx.Provide(func() blobstorage.BlobStorage {
 			return s.blobStorage
+		}),
+		fx.Provide(func() blobstorage.LegacyBlockUploader {
+			return s.legacyUploader
 		}),
 		fx.Provide(fx.Annotated{
 			Name: "slave",
@@ -156,7 +165,7 @@ func (s *backfillerTestSuite) TestBackfiller() {
 			}, nil
 		})
 
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
 		DoAndReturn(func(ctx context.Context, block *api.Block, compression api.Compression) (string, error) {
 			require.Equal(api.Compression_GZIP, compression)
@@ -224,7 +233,7 @@ func (s *backfillerTestSuite) TestBackfiller_MiniBatch() {
 			}, nil
 		})
 
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
 		DoAndReturn(func(ctx context.Context, block *api.Block, compression api.Compression) (string, error) {
 			require.Equal(api.Compression_GZIP, compression)
@@ -294,7 +303,7 @@ func (s *backfillerTestSuite) TestBackfiller_Failover() {
 			}, nil
 		})
 
-	s.blobStorage.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
+	s.legacyUploader.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).
 		Times(int(endHeight - startHeight)).
 		DoAndReturn(func(ctx context.Context, block *api.Block, compression api.Compression) (string, error) {
 			require.Equal(api.Compression_GZIP, compression)

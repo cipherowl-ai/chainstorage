@@ -11,6 +11,16 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 )
 
+func (m *metaStorageImpl) AcquireLegacyObjectUploadGuard(
+	ctx context.Context,
+	tag uint32,
+	height uint64,
+	hash string,
+) (internal.LegacyObjectUploadGuard, error) {
+	// Durable retirement is Postgres-only, so Firestore has no retirement fence.
+	return internal.NewUnfencedLegacyObjectUploadGuard(), nil
+}
+
 type (
 	metaStorageImpl struct {
 		internal.BlockStorage

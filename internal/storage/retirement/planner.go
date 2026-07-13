@@ -2,6 +2,7 @@ package retirement
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -21,7 +22,13 @@ const (
 	cscbUncompressedLengthMetadataKey = "chainstorage-uncompressed-length"
 	cscbFormatMetadataValue           = "cscb"
 	cscbCompressionScopeMetadataValue = "batch-chunked"
+	retirementClaimTokenBytes         = 16
+	retirementClaimLease              = 15 * time.Minute
+	retirementSafetyQuiescencePeriod  = 15 * time.Minute
+	s3MutableNullVersionID            = "null"
 )
+
+var unverifiedRetentionSafetySHA256 = keySHA256("unverified-retention-safety-configuration")
 
 type Planner struct {
 	repo            Repository
@@ -51,11 +58,13 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	report := newReport(req)
 	cscbHeads := make(map[string]ObjectHead)
 	legacyTopologies := make(map[string]ObjectVersionTopology)
+	writeOncePolicies := make(map[string]bool)
 	verifier := p.verifierFactory()
 	for _, row := range rows {
-		item := p.planRow(ctx, req, row, cscbHeads, legacyTopologies, verifier)
+		item := p.planRow(ctx, req, row, cscbHeads, legacyTopologies, writeOncePolicies, verifier)
 		report.Items = append(report.Items, item)
 	}
+	report.SafetyGates.CSCBWriteOncePolicyVerified = writeOncePolicyGateVerified(report.Items)
 	report.Summary = summarize(report.Items)
 	return report, nil
 }
@@ -76,6 +85,11 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 	if err := validateApplyReport(req, report); err != nil {
 		return err
 	}
+	if err := p.preflightApplyRetentionSafety(ctx, report); err != nil {
+		report.SafetyGates.CSCBWriteOncePolicyVerified = writeOncePolicyGateVerified(report.Items)
+		report.Summary = summarize(report.Items)
+		return err
+	}
 
 	verifier := p.verifierFactory()
 	var firstErr error
@@ -90,19 +104,22 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			continue
 		}
-		if reason, err := p.applyCandidate(ctx, req, item, verifier); err != nil {
-			item.Action = ActionSkip
+		reason, err := p.applyCandidate(ctx, req, item, verifier)
+		if reason != "" {
+			if item.RetirementState != RetirementStateDeletedPendingVerification {
+				item.Action = ActionSkip
+			}
 			item.SkipReason = reason
 			item.RetirementOutcome = reason
-			if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, reason, time.Now().UTC()); outcomeErr != nil {
-				err = errors.Join(err, outcomeErr)
-			}
+		}
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			halted = true
 		}
 	}
+	report.SafetyGates.CSCBWriteOncePolicyVerified = writeOncePolicyGateVerified(report.Items)
 	report.Summary = summarize(report.Items)
 	return firstErr
 }
@@ -119,7 +136,6 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 		return nil, err
 	}
 	report := newReport(req)
-	verifier := p.verifierFactory()
 	var firstErr error
 	halted := false
 	for _, manifest := range manifests {
@@ -131,43 +147,65 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			continue
 		}
 		if manifest.Bucket != req.Bucket || !requestAllowsCandidate(req, item) ||
-			manifest.State != RetirementStateEligible && manifest.State != RetirementStateDeleting ||
+			manifest.State != RetirementStateEligible &&
+				manifest.State != RetirementStateDeleting &&
+				manifest.State != RetirementStateDeletedPendingVerification ||
 			!isSHA256Hex(manifest.LegacyObjectKeySHA256) || !isSHA256Hex(manifest.PayloadSHA256) {
-			item.Action = ActionSkip
-			item.SkipReason = SkipMetadataChanged
+			markCandidateBlocked(&item, SkipMetadataChanged)
 			report.Items = append(report.Items, item)
 			continue
 		}
 		if !approvalMatches(req) {
-			item.Action = ActionSkip
-			item.SkipReason = SkipChainRangeNotApproved
+			markCandidateBlocked(&item, SkipChainRangeNotApproved)
 			report.Items = append(report.Items, item)
 			continue
 		}
 		if req.FallbackErrorCount > 0 {
-			item.Action = ActionSkip
-			item.SkipReason = SkipActiveFallbackOrReadErrors
+			markCandidateBlocked(&item, SkipActiveFallbackOrReadErrors)
 			report.Items = append(report.Items, item)
 			continue
 		}
 		if !req.ClientMigrationApproved {
-			item.Action = ActionSkip
-			item.SkipReason = SkipFileClientsNotApproved
+			markCandidateBlocked(&item, SkipFileClientsNotApproved)
 			report.Items = append(report.Items, item)
 			continue
 		}
 		if !req.Execute {
-			item.Action = ActionReportOnly
+			if reason, err := p.inspectCSCBRetentionSafety(ctx, &item); err != nil {
+				markCandidateBlocked(&item, reason)
+				report.Items = append(report.Items, item)
+				continue
+			}
+			if item.RetirementState == RetirementStateDeletedPendingVerification {
+				item.Action = ActionDeletedObjectVersion
+				item.SkipReason = SkipRetirementVerificationPending
+			} else {
+				item.Action = ActionReportOnly
+			}
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if reason, err := p.reconcileManifest(ctx, req, &item, manifest, verifier); err != nil {
-			item.Action = ActionSkip
+		if reason, err := p.verifyCSCBRetentionSafety(ctx, &item); err != nil {
+			markCandidateBlocked(&item, reason)
+			item.RetirementOutcome = reason
+			report.Items = append(report.Items, item)
+			if firstErr == nil {
+				firstErr = err
+			}
+			if reason != SkipCSCBSafetyQuiescenceActive {
+				halted = true
+			}
+			continue
+		}
+		reason, err := p.reconcileManifest(ctx, req, &item, manifest)
+		if reason != "" {
+			if item.RetirementState != RetirementStateDeletedPendingVerification {
+				item.Action = ActionSkip
+			}
 			item.SkipReason = reason
 			item.RetirementOutcome = reason
-			if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, reason, time.Now().UTC()); outcomeErr != nil {
-				err = errors.Join(err, outcomeErr)
-			}
+		}
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -175,6 +213,7 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 		}
 		report.Items = append(report.Items, item)
 	}
+	report.SafetyGates.CSCBWriteOncePolicyVerified = writeOncePolicyGateVerified(report.Items)
 	report.Summary = summarize(report.Items)
 	return report, firstErr
 }
@@ -185,6 +224,7 @@ func (p *Planner) planRow(
 	row MetadataRow,
 	cscbHeads map[string]ObjectHead,
 	legacyTopologies map[string]ObjectVersionTopology,
+	writeOncePolicies map[string]bool,
 	verifier blockPayloadVerifier,
 ) Candidate {
 	item := Candidate{
@@ -204,6 +244,10 @@ func (p *Planner) planRow(
 		item.RetirementAttempts = row.Retirement.AttemptCount
 		item.RetirementOutcome = row.Retirement.Outcome
 		if row.Retirement.State == RetirementStateDeletedVerified {
+			if !finalizedRetirementMatchesRow(row) {
+				item.SkipReason = SkipMetadataChanged
+				return item
+			}
 			item.Key = ""
 			item.VersionID = firstString(row.Retirement.LegacyObjectVersionIDs)
 			item.LegacyETag = row.Retirement.LegacyObjectETag
@@ -212,8 +256,27 @@ func (p *Planner) planRow(
 			item.CSCBVersionID = row.Retirement.ConsolidatedObjectVersionID
 			item.CSCBETag = row.Retirement.ConsolidatedObjectETag
 			item.PayloadSHA256 = row.Retirement.PayloadSHA256
+			item.LegacyDeletedAt = row.Retirement.DeletedAt
+			item.RetirementVerifiedAt = row.Retirement.VerifiedAt
 			item.Action = ActionAlreadyDeleted
 			item.SkipReason = SkipRetirementAlreadyFinalized
+			return item
+		}
+		if row.Retirement.State == RetirementStateDeletedPendingVerification {
+			if !pendingVerificationRetirementMatchesRow(row) {
+				item.SkipReason = SkipMetadataChanged
+				return item
+			}
+			item.Key = ""
+			item.VersionID = firstString(row.Retirement.LegacyObjectVersionIDs)
+			item.LegacyBytes = row.Retirement.LegacyObjectBytes
+			item.ConsolidatedKey = row.Retirement.ConsolidatedObjectKey
+			item.CSCBVersionID = row.Retirement.ConsolidatedObjectVersionID
+			item.CSCBETag = row.Retirement.ConsolidatedObjectETag
+			item.PayloadSHA256 = row.Retirement.PayloadSHA256
+			item.LegacyDeletedAt = row.Retirement.DeletedAt
+			item.Action = ActionDeletedObjectVersion
+			item.SkipReason = SkipRetirementVerificationPending
 			return item
 		}
 	}
@@ -294,7 +357,7 @@ func (p *Planner) planRow(
 	item.VersionID = version.VersionID
 	item.LegacyETag = version.ETag
 	item.LegacyBytes = version.Bytes
-	if item.VersionID == "" || item.LegacyETag == "" {
+	if !isImmutableVersionID(item.VersionID) || item.LegacyETag == "" {
 		item.SkipReason = SkipLegacyVersionIDUnavailable
 		return item
 	}
@@ -309,8 +372,12 @@ func (p *Planner) planRow(
 		}
 		cscbHeads[shadow.ConsolidatedObjectKey] = head
 	}
-	if !head.Exists || head.DeleteMark || head.VersionID == "" || head.ETag == "" {
+	if !head.Exists || head.DeleteMark || !isImmutableVersionID(head.VersionID) || head.ETag == "" {
 		item.SkipReason = SkipMissingCSCBObject
+		return item
+	}
+	if head.Expiration != "" {
+		item.SkipReason = SkipCSCBLifecycleExpirationActive
 		return item
 	}
 	item.CSCBVersionID = head.VersionID
@@ -327,6 +394,17 @@ func (p *Planner) planRow(
 		return item
 	}
 	item.PayloadSHA256 = payloadSHA256
+	writeOncePolicyVerified, checked := writeOncePolicies[shadow.ConsolidatedObjectKey]
+	if !checked {
+		_, policyErr := p.store.InspectObjectRetentionSafety(ctx, req.Bucket, shadow.ConsolidatedObjectKey)
+		writeOncePolicyVerified = policyErr == nil
+		writeOncePolicies[shadow.ConsolidatedObjectKey] = writeOncePolicyVerified
+	}
+	item.CSCBWriteOncePolicy = writeOncePolicyVerified
+	if !writeOncePolicyVerified {
+		item.SkipReason = SkipCSCBWriteOncePolicyUnverified
+		return item
+	}
 
 	if req.Execute {
 		if isProduction(req.Environment) && !req.ProductionDeleteEnabled {
@@ -353,23 +431,25 @@ func (p *Planner) applyCandidate(ctx context.Context, req PlanRequest, item *Can
 	if err := p.repo.PrepareRetirement(ctx, manifest); err != nil {
 		return SkipMetadataChanged, err
 	}
-	if err := p.repo.MarkRetirementDeleting(ctx, item.BlockMetadataID, time.Now().UTC()); err != nil {
-		return SkipMetadataChanged, err
-	}
-	item.RetirementState = RetirementStateDeleting
-	item.RetirementAttempts++
-	item.RetirementOutcome = "delete_started"
-	preDeleteSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
-	if err != nil {
-		return reason, err
-	}
-	if preDeleteSHA256 != item.PayloadSHA256 {
-		return SkipLegacyPayloadMismatch, xerrors.Errorf("payload digest changed immediately before retirement: block_metadata_id=%d", item.BlockMetadataID)
-	}
-	if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
-		return SkipVersionedDeleteFailed, err
-	}
-	return p.finalizeVerifiedDeletion(ctx, req, item, item.PayloadSHA256, verifier)
+	return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
+		preDeleteSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
+		if err != nil {
+			return reason, err
+		}
+		if preDeleteSHA256 != item.PayloadSHA256 {
+			return SkipLegacyPayloadMismatch, xerrors.Errorf("payload digest changed immediately before retirement: block_metadata_id=%d", item.BlockMetadataID)
+		}
+		if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
+			return SkipRetirementClaimActive, err
+		}
+		if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
+			return reason, err
+		}
+		if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
+			return SkipVersionedDeleteFailed, err
+		}
+		return p.completeObjectDeletion(ctx, req, item, claimToken, item.PayloadSHA256)
+	})
 }
 
 func (p *Planner) reconcileManifest(
@@ -377,60 +457,239 @@ func (p *Planner) reconcileManifest(
 	req PlanRequest,
 	item *Candidate,
 	manifest RetirementManifest,
-	verifier blockPayloadVerifier,
 ) (string, error) {
+	if manifest.State == RetirementStateDeletedPendingVerification {
+		if manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" || manifest.DeletedAt == nil || manifest.VerifiedAt != nil {
+			return SkipMetadataChanged, xerrors.Errorf("pending-verification retirement manifest is inconsistent: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
+		return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
+			if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
+				return reason, err
+			}
+			return p.finalizeRecordedDeletion(ctx, req, item, claimToken, manifest.PayloadSHA256)
+		})
+	}
 	if manifest.LegacyObjectKey == "" || keySHA256(manifest.LegacyObjectKey) != manifest.LegacyObjectKeySHA256 {
 		return SkipMetadataChanged, xerrors.Errorf("retirement manifest legacy key hash mismatch: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
-	topology, err := p.store.ListObjectVersions(ctx, manifest.Bucket, manifest.LegacyObjectKey)
-	if err != nil {
-		return SkipObjectInspectionFailed, err
-	}
-	if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
-		if manifest.State != RetirementStateDeleting {
-			return SkipMetadataChanged, xerrors.Errorf("legacy object is absent while retirement state is %s", manifest.State)
+	if manifest.State == RetirementStateEligible {
+		topology, err := p.store.ListObjectVersions(ctx, manifest.Bucket, manifest.LegacyObjectKey)
+		if err != nil {
+			return SkipObjectInspectionFailed, err
 		}
-		return p.finalizeVerifiedDeletion(ctx, req, item, manifest.PayloadSHA256, verifier)
+		if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
+			return SkipMetadataChanged, xerrors.Errorf("legacy object is absent before any delete attempt: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
 	}
-	if !topologyMatchesManifest(topology, manifest) {
-		return SkipUnsafeLegacyVersionTopology, xerrors.Errorf("pending retirement topology changed: block_metadata_id=%d", manifest.BlockMetadataID)
-	}
-	payloadSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
-	if err != nil {
-		return reason, err
-	}
-	if payloadSHA256 != manifest.PayloadSHA256 {
-		return SkipLegacyPayloadMismatch, xerrors.Errorf("pending retirement payload digest changed: block_metadata_id=%d", manifest.BlockMetadataID)
-	}
-	if err := p.repo.MarkRetirementDeleting(ctx, manifest.BlockMetadataID, time.Now().UTC()); err != nil {
-		return SkipMetadataChanged, err
-	}
-	item.RetirementState = RetirementStateDeleting
-	item.RetirementAttempts++
-	item.RetirementOutcome = "delete_started"
-	preDeleteSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
-	if err != nil {
-		return reason, err
-	}
-	if preDeleteSHA256 != manifest.PayloadSHA256 {
-		return SkipLegacyPayloadMismatch, xerrors.Errorf("pending retirement payload digest changed immediately before deletion: block_metadata_id=%d", manifest.BlockMetadataID)
-	}
-	if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
-		return SkipVersionedDeleteFailed, err
-	}
-	return p.finalizeVerifiedDeletion(ctx, req, item, manifest.PayloadSHA256, verifier)
+	return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
+		topology, err := p.store.ListObjectVersions(ctx, manifest.Bucket, manifest.LegacyObjectKey)
+		if err != nil {
+			return SkipObjectInspectionFailed, err
+		}
+		if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
+			if manifest.State != RetirementStateDeleting {
+				return SkipMetadataChanged, xerrors.Errorf("legacy object is absent while retirement state is %s", manifest.State)
+			}
+			if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
+				return reason, err
+			}
+			return p.completeObjectDeletion(ctx, req, item, claimToken, manifest.PayloadSHA256)
+		}
+		if !topologyMatchesManifest(topology, manifest) {
+			return SkipUnsafeLegacyVersionTopology, xerrors.Errorf("pending retirement topology changed: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
+		verifier := p.verifierFactory()
+		payloadSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
+		if err != nil {
+			return reason, err
+		}
+		if payloadSHA256 != manifest.PayloadSHA256 {
+			return SkipLegacyPayloadMismatch, xerrors.Errorf("pending retirement payload digest changed: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
+		preDeleteSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
+		if err != nil {
+			return reason, err
+		}
+		if preDeleteSHA256 != manifest.PayloadSHA256 {
+			return SkipLegacyPayloadMismatch, xerrors.Errorf("pending retirement payload digest changed immediately before deletion: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
+		if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
+			return SkipRetirementClaimActive, err
+		}
+		if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
+			return reason, err
+		}
+		if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
+			return SkipVersionedDeleteFailed, err
+		}
+		return p.completeObjectDeletion(ctx, req, item, claimToken, manifest.PayloadSHA256)
+	})
 }
 
-func (p *Planner) finalizeVerifiedDeletion(
+func (p *Planner) verifyCSCBRetentionSafety(ctx context.Context, item *Candidate) (string, error) {
+	item.CSCBWriteOncePolicy = false
+	snapshot, inspectionErr := p.store.InspectObjectRetentionSafety(ctx, item.Bucket, item.ConsolidatedKey)
+	configurationSHA256 := snapshot.ConfigurationSHA256
+	if inspectionErr != nil || !isSHA256Hex(configurationSHA256) {
+		configurationSHA256 = unverifiedRetentionSafetySHA256
+	}
+	firstObservedAt, observedAt, observationErr := p.repo.ObserveRetentionSafety(
+		ctx,
+		item.Bucket,
+		item.ConsolidatedKey,
+		configurationSHA256,
+	)
+	if observationErr != nil {
+		return SkipCSCBWriteOncePolicyUnverified, errors.Join(inspectionErr, observationErr)
+	}
+	if inspectionErr != nil {
+		return SkipCSCBWriteOncePolicyUnverified, inspectionErr
+	}
+	item.CSCBWriteOncePolicy = true
+	if observedAt.Sub(firstObservedAt) < retirementSafetyQuiescencePeriod {
+		return SkipCSCBSafetyQuiescenceActive, xerrors.Errorf(
+			"CSCB retention safety configuration has not remained stable for %s: bucket=%s key=%s first_observed_at=%s observed_at=%s",
+			retirementSafetyQuiescencePeriod,
+			item.Bucket,
+			item.ConsolidatedKey,
+			firstObservedAt.Format(time.RFC3339Nano),
+			observedAt.Format(time.RFC3339Nano),
+		)
+	}
+	return "", nil
+}
+
+func (p *Planner) inspectCSCBRetentionSafety(ctx context.Context, item *Candidate) (string, error) {
+	item.CSCBWriteOncePolicy = false
+	if _, err := p.store.InspectObjectRetentionSafety(ctx, item.Bucket, item.ConsolidatedKey); err != nil {
+		return SkipCSCBWriteOncePolicyUnverified, err
+	}
+	item.CSCBWriteOncePolicy = true
+	return "", nil
+}
+
+func (p *Planner) preflightApplyRetentionSafety(ctx context.Context, report *Report) error {
+	type safetyResult struct {
+		reason string
+		err    error
+	}
+	results := make(map[string]safetyResult)
+	var firstErr error
+	for i := range report.Items {
+		item := &report.Items[i]
+		if item.Action != ActionDeleteObjectVersion {
+			continue
+		}
+		result, ok := results[item.ConsolidatedKey]
+		if !ok {
+			result.reason, result.err = p.verifyCSCBRetentionSafety(ctx, item)
+			results[item.ConsolidatedKey] = result
+		} else if result.err == nil {
+			item.CSCBWriteOncePolicy = true
+		}
+		if result.err == nil {
+			continue
+		}
+		item.Action = ActionSkip
+		item.SkipReason = result.reason
+		item.RetirementOutcome = result.reason
+		if firstErr == nil {
+			firstErr = result.err
+		}
+	}
+	return firstErr
+}
+
+func (p *Planner) withRetirementClaim(
+	ctx context.Context,
+	item *Candidate,
+	operation func(claimToken string) (string, error),
+) (reason string, err error) {
+	claimToken, err := newRetirementClaimToken()
+	if err != nil {
+		return SkipMetadataChanged, err
+	}
+	claimedAt := time.Now().UTC()
+	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(retirementClaimLease)); err != nil {
+		if errors.Is(err, ErrRetirementClaimUnavailable) {
+			return SkipRetirementClaimActive, nil
+		}
+		return SkipMetadataChanged, err
+	}
+	if item.RetirementState == RetirementStateDeletedPendingVerification {
+		item.RetirementOutcome = "verification_started"
+	} else {
+		item.RetirementState = RetirementStateDeleting
+		item.RetirementOutcome = "delete_started"
+	}
+	item.RetirementAttempts++
+
+	claimOwned := true
+	defer func() {
+		if err == nil || !claimOwned {
+			return
+		}
+		outcome := reason
+		if outcome == "" {
+			outcome = SkipMetadataChanged
+		}
+		if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+			err = errors.Join(err, outcomeErr)
+		}
+	}()
+
+	reason, err = operation(claimToken)
+	if err == nil {
+		claimOwned = false
+	}
+	return reason, err
+}
+
+func (p *Planner) renewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
+	renewedAt := time.Now().UTC()
+	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(retirementClaimLease))
+}
+
+func (p *Planner) completeObjectDeletion(
 	ctx context.Context,
 	req PlanRequest,
 	item *Candidate,
+	claimToken string,
 	expectedPayloadSHA256 string,
-	verifier blockPayloadVerifier,
 ) (string, error) {
 	if err := p.verifyLegacyDeleted(ctx, item.Bucket, item.Key); err != nil {
 		return SkipPostDeleteVerificationFailed, err
 	}
+	deletedAt, err := p.repo.RecordRetirementObjectDeleted(
+		ctx,
+		item.BlockMetadataID,
+		claimToken,
+		ActionDeletedObjectVersion,
+	)
+	if err != nil {
+		return SkipPostDeleteVerificationFailed, err
+	}
+	item.Action = ActionDeletedObjectVersion
+	item.SkipReason = ""
+	item.RetirementState = RetirementStateDeletedPendingVerification
+	item.RetirementOutcome = ActionDeletedObjectVersion
+	item.LegacyDeletedAt = &deletedAt
+	item.Key = ""
+	item.LegacyETag = ""
+	return p.finalizeRecordedDeletion(ctx, req, item, claimToken, expectedPayloadSHA256)
+}
+
+func (p *Planner) finalizeRecordedDeletion(
+	ctx context.Context,
+	req PlanRequest,
+	item *Candidate,
+	claimToken string,
+	expectedPayloadSHA256 string,
+) (string, error) {
+	if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
+		return SkipRetirementClaimActive, err
+	}
+	verifier := p.verifierFactory()
 	payloadSHA256, reason, err := p.revalidateConsolidatedCandidate(ctx, req, *item, verifier)
 	if err != nil {
 		return reason, err
@@ -438,16 +697,15 @@ func (p *Planner) finalizeVerifiedDeletion(
 	if payloadSHA256 != expectedPayloadSHA256 {
 		return SkipLegacyPayloadMismatch, xerrors.Errorf("pinned CSCB payload digest changed after legacy deletion: block_metadata_id=%d", item.BlockMetadataID)
 	}
-	deletedAt := time.Now().UTC()
-	if err := p.repo.FinalizeRetirement(ctx, item.BlockMetadataID, deletedAt, ActionDeletedVerified); err != nil {
+	verifiedAt, err := p.repo.FinalizeRetirement(ctx, item.BlockMetadataID, claimToken, ActionDeletedVerified)
+	if err != nil {
 		return SkipPostDeleteVerificationFailed, err
 	}
 	item.Action = ActionDeletedVerified
 	item.SkipReason = ""
 	item.RetirementState = RetirementStateDeletedVerified
 	item.RetirementOutcome = ActionDeletedVerified
-	item.Key = ""
-	item.LegacyETag = ""
+	item.RetirementVerifiedAt = &verifiedAt
 	return "", nil
 }
 
@@ -496,9 +754,12 @@ func (p *Planner) revalidateMetadataAndCSCB(ctx context.Context, req PlanRequest
 	if err != nil {
 		return MetadataRow{}, SkipObjectInspectionFailed, err
 	}
-	if !current.Exists || current.DeleteMark || current.VersionID != candidate.CSCBVersionID || current.ETag != candidate.CSCBETag ||
+	if !current.Exists || current.DeleteMark || !isImmutableVersionID(current.VersionID) || current.VersionID != candidate.CSCBVersionID || current.ETag != candidate.CSCBETag ||
 		!pinned.Exists || pinned.DeleteMark || pinned.VersionID != candidate.CSCBVersionID || pinned.ETag != candidate.CSCBETag {
 		return MetadataRow{}, SkipCSCBObjectChanged, xerrors.Errorf("pinned CSCB object changed before retirement: block_metadata_id=%d", candidate.BlockMetadataID)
+	}
+	if current.Expiration != "" || pinned.Expiration != "" {
+		return MetadataRow{}, SkipCSCBLifecycleExpirationActive, xerrors.Errorf("pinned CSCB object has active lifecycle expiration: block_metadata_id=%d", candidate.BlockMetadataID)
 	}
 	logicalBytes, ok := cscbLogicalPayloadBytes(pinned)
 	if pinned.Bytes == 0 || !ok || candidate.ByteOffset > logicalBytes || candidate.ByteLength > logicalBytes-candidate.ByteOffset {
@@ -526,11 +787,15 @@ func (p *Planner) verifyLegacyDeleted(ctx context.Context, bucket string, key st
 }
 
 func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
+	if candidate.RetirementState == RetirementStateDeletedPendingVerification {
+		return pendingVerificationCandidateMatchesRow(req, candidate, row, requireCanonical)
+	}
 	if row.Shadow == nil || row.Shadow.ValidatedAt == nil || row.Shadow.LegacyObjectRetiredAt == nil ||
 		row.Shadow.LegacyObjectRetireAfter == nil || row.Shadow.LegacyObjectDeletedAt != nil ||
 		req.Now.Before(*row.Shadow.LegacyObjectRetireAfter) {
 		return false
 	}
+	retirementMatches := row.Retirement == nil || pendingRetirementMatchesCandidate(row, candidate)
 	return (!requireCanonical || row.Canonical) &&
 		!row.Skipped &&
 		approvalMatches(req) &&
@@ -547,6 +812,114 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		row.PrimaryByteOffset == candidate.ByteOffset &&
 		row.PrimaryByteLength == candidate.ByteLength &&
 		row.PrimaryUncompressedLength == candidate.UncompressedLength &&
+		retirementMatches &&
+		validShadowReference(row, row.Shadow)
+}
+
+func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
+	manifest := row.Retirement
+	if manifest == nil || manifest.State != RetirementStateDeletedPendingVerification ||
+		row.Shadow == nil || row.RetirementFencedAt == nil ||
+		row.LegacyObjectKey != "" || row.Shadow.LegacyObjectKey != "" ||
+		row.Shadow.ValidatedAt == nil || row.Shadow.LegacyObjectRetiredAt == nil ||
+		row.Shadow.LegacyObjectRetireAfter == nil || row.Shadow.LegacyObjectDeletedAt == nil ||
+		manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" ||
+		manifest.DeletedAt == nil || manifest.VerifiedAt != nil ||
+		!row.Shadow.LegacyObjectDeletedAt.Equal(*manifest.DeletedAt) {
+		return false
+	}
+	return (!requireCanonical || row.Canonical) &&
+		!row.Skipped &&
+		approvalMatches(req) &&
+		req.FallbackErrorCount == 0 &&
+		req.ClientMigrationApproved &&
+		requestAllowsCandidate(req, candidate) &&
+		row.BlockMetadataID == candidate.BlockMetadataID &&
+		row.Tag == candidate.Tag &&
+		row.Height == candidate.Height &&
+		row.Hash == candidate.Hash &&
+		row.PrimaryObjectKey == candidate.ConsolidatedKey &&
+		row.PrimaryObjectFormat == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH &&
+		row.PrimaryByteOffset == candidate.ByteOffset &&
+		row.PrimaryByteLength == candidate.ByteLength &&
+		row.PrimaryUncompressedLength == candidate.UncompressedLength &&
+		pendingRetirementMatchesCandidate(row, candidate) &&
+		validShadowReference(row, row.Shadow)
+}
+
+func pendingRetirementMatchesCandidate(row MetadataRow, candidate Candidate) bool {
+	manifest := row.Retirement
+	if manifest == nil || row.RetirementFencedAt == nil ||
+		manifest.State != RetirementStateEligible && manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification {
+		return false
+	}
+	return manifest.BlockMetadataID == candidate.BlockMetadataID &&
+		manifest.Tag == candidate.Tag &&
+		manifest.Height == candidate.Height &&
+		manifest.Hash == candidate.Hash &&
+		manifest.Bucket == candidate.Bucket &&
+		manifest.LegacyObjectKey == candidate.Key &&
+		manifest.LegacyObjectKeySHA256 == candidate.LegacyKeySHA256 &&
+		len(manifest.LegacyObjectVersionIDs) == 1 &&
+		manifest.LegacyObjectVersionIDs[0] == candidate.VersionID &&
+		manifest.LegacyObjectETag == candidate.LegacyETag &&
+		manifest.LegacyObjectBytes == candidate.LegacyBytes &&
+		manifest.ConsolidatedObjectKey == candidate.ConsolidatedKey &&
+		manifest.ConsolidatedObjectVersionID == candidate.CSCBVersionID &&
+		manifest.ConsolidatedObjectETag == candidate.CSCBETag &&
+		manifest.ConsolidatedByteOffset == candidate.ByteOffset &&
+		manifest.ConsolidatedByteLength == candidate.ByteLength &&
+		manifest.ConsolidatedUncompressedLength == candidate.UncompressedLength &&
+		manifest.PayloadSHA256 == candidate.PayloadSHA256
+}
+
+func pendingVerificationRetirementMatchesRow(row MetadataRow) bool {
+	manifest := row.Retirement
+	return manifest != nil &&
+		manifest.State == RetirementStateDeletedPendingVerification &&
+		manifest.LegacyObjectKey == "" &&
+		manifest.LegacyObjectETag == "" &&
+		manifest.DeletedAt != nil &&
+		manifest.VerifiedAt == nil &&
+		manifest.ClaimToken != "" &&
+		manifest.ClaimExpiresAt != nil &&
+		row.Shadow != nil &&
+		row.RetirementFencedAt != nil &&
+		row.LegacyObjectKey == "" &&
+		row.Shadow.LegacyObjectKey == "" &&
+		row.Shadow.LegacyObjectDeletedAt != nil &&
+		row.Shadow.LegacyObjectDeletedAt.Equal(*manifest.DeletedAt) &&
+		manifest.BlockMetadataID == row.BlockMetadataID &&
+		manifest.Tag == row.Tag &&
+		manifest.Height == row.Height &&
+		manifest.Hash == row.Hash &&
+		manifest.ConsolidatedObjectKey == row.PrimaryObjectKey &&
+		manifest.ConsolidatedByteOffset == row.PrimaryByteOffset &&
+		manifest.ConsolidatedByteLength == row.PrimaryByteLength &&
+		manifest.ConsolidatedUncompressedLength == row.PrimaryUncompressedLength &&
+		validShadowReference(row, row.Shadow)
+}
+
+func finalizedRetirementMatchesRow(row MetadataRow) bool {
+	manifest := row.Retirement
+	if manifest == nil || row.Shadow == nil || row.RetirementFencedAt == nil ||
+		manifest.State != RetirementStateDeletedVerified ||
+		manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" ||
+		manifest.ClaimToken != "" || manifest.ClaimExpiresAt != nil ||
+		manifest.DeletedAt == nil || manifest.VerifiedAt == nil || manifest.Outcome == "" ||
+		row.LegacyObjectKey != "" || row.Shadow.LegacyObjectKey != "" ||
+		row.Shadow.LegacyObjectDeletedAt == nil ||
+		!row.Shadow.LegacyObjectDeletedAt.Equal(*manifest.DeletedAt) {
+		return false
+	}
+	return manifest.BlockMetadataID == row.BlockMetadataID &&
+		manifest.Tag == row.Tag &&
+		manifest.Height == row.Height &&
+		manifest.Hash == row.Hash &&
+		manifest.ConsolidatedObjectKey == row.PrimaryObjectKey &&
+		manifest.ConsolidatedByteOffset == row.PrimaryByteOffset &&
+		manifest.ConsolidatedByteLength == row.PrimaryByteLength &&
+		manifest.ConsolidatedUncompressedLength == row.PrimaryUncompressedLength &&
 		validShadowReference(row, row.Shadow)
 }
 
@@ -571,7 +944,9 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		report.SafetyGates.ClientMigrationApproved != req.ClientMigrationApproved ||
 		report.SafetyGates.FallbackReadErrors != req.FallbackErrorCount ||
 		report.SafetyGates.ProductionDeleteEnabled != req.ProductionDeleteEnabled ||
-		report.SafetyGates.VersionedDeleteMode != "exact_single_object_version_only" {
+		report.SafetyGates.VersionedDeleteMode != "exact_single_object_version_only" ||
+		report.SafetyGates.CSCBWriteOncePolicyMode != cscbWriteOncePolicyMode ||
+		!report.SafetyGates.CSCBWriteOncePolicyVerified {
 		return xerrors.New("retirement report does not match the execution request")
 	}
 	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved {
@@ -582,9 +957,10 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 			continue
 		}
 		if !requestAllowsCandidate(req, item) || item.BlockMetadataID <= 0 || item.Key == "" ||
-			item.LegacyKeySHA256 != keySHA256(item.Key) || item.VersionID == "" || item.LegacyETag == "" ||
+			item.LegacyKeySHA256 != keySHA256(item.Key) || !isImmutableVersionID(item.VersionID) || item.LegacyETag == "" ||
 			item.LegacyBytes == 0 || item.LegacyVersions != 1 || item.DeleteMarkers != 0 ||
-			item.ConsolidatedKey == "" || item.CSCBVersionID == "" || item.CSCBETag == "" ||
+			item.ConsolidatedKey == "" || !isImmutableVersionID(item.CSCBVersionID) || item.CSCBETag == "" ||
+			!item.CSCBWriteOncePolicy ||
 			item.ByteLength == 0 || item.UncompressedLength == 0 || !isSHA256Hex(item.PayloadSHA256) {
 			return xerrors.Errorf("retirement report contains an invalid delete candidate: block_metadata_id=%d", item.BlockMetadataID)
 		}
@@ -596,6 +972,7 @@ func topologyMatchesCandidate(topology ObjectVersionTopology, candidate Candidat
 	return len(topology.Versions) == 1 &&
 		len(topology.DeleteMarkers) == 0 &&
 		topology.Versions[0].IsLatest &&
+		isImmutableVersionID(topology.Versions[0].VersionID) &&
 		topology.Versions[0].VersionID == candidate.VersionID &&
 		topology.Versions[0].ETag == candidate.LegacyETag &&
 		topology.Versions[0].Bytes == candidate.LegacyBytes
@@ -603,12 +980,17 @@ func topologyMatchesCandidate(topology ObjectVersionTopology, candidate Candidat
 
 func topologyMatchesManifest(topology ObjectVersionTopology, manifest RetirementManifest) bool {
 	return len(manifest.LegacyObjectVersionIDs) == 1 &&
+		isImmutableVersionID(manifest.LegacyObjectVersionIDs[0]) &&
 		len(topology.Versions) == 1 &&
 		len(topology.DeleteMarkers) == 0 &&
 		topology.Versions[0].IsLatest &&
 		topology.Versions[0].VersionID == manifest.LegacyObjectVersionIDs[0] &&
 		topology.Versions[0].ETag == manifest.LegacyObjectETag &&
 		topology.Versions[0].Bytes == manifest.LegacyObjectBytes
+}
+
+func isImmutableVersionID(versionID string) bool {
+	return versionID != "" && versionID != s3MutableNullVersionID
 }
 
 func manifestFromCandidate(candidate Candidate, preparedAt time.Time) RetirementManifest {
@@ -636,30 +1018,53 @@ func manifestFromCandidate(candidate Candidate, preparedAt time.Time) Retirement
 }
 
 func candidateFromManifest(manifest RetirementManifest) Candidate {
-	return Candidate{
-		Bucket:             manifest.Bucket,
-		Key:                manifest.LegacyObjectKey,
-		VersionID:          firstString(manifest.LegacyObjectVersionIDs),
-		BlockMetadataID:    manifest.BlockMetadataID,
-		Tag:                manifest.Tag,
-		Height:             manifest.Height,
-		Hash:               manifest.Hash,
-		LegacyBytes:        manifest.LegacyObjectBytes,
-		LegacyETag:         manifest.LegacyObjectETag,
-		LegacyKeySHA256:    manifest.LegacyObjectKeySHA256,
-		LegacyVersions:     len(manifest.LegacyObjectVersionIDs),
-		ConsolidatedKey:    manifest.ConsolidatedObjectKey,
-		CSCBVersionID:      manifest.ConsolidatedObjectVersionID,
-		CSCBETag:           manifest.ConsolidatedObjectETag,
-		ByteOffset:         manifest.ConsolidatedByteOffset,
-		ByteLength:         manifest.ConsolidatedByteLength,
-		UncompressedLength: manifest.ConsolidatedUncompressedLength,
-		PayloadSHA256:      manifest.PayloadSHA256,
-		RetirementState:    manifest.State,
-		RetirementAttempts: manifest.AttemptCount,
-		RetirementOutcome:  manifest.Outcome,
-		Action:             ActionDeleteObjectVersion,
+	candidate := Candidate{
+		Bucket:               manifest.Bucket,
+		Key:                  manifest.LegacyObjectKey,
+		VersionID:            firstString(manifest.LegacyObjectVersionIDs),
+		BlockMetadataID:      manifest.BlockMetadataID,
+		Tag:                  manifest.Tag,
+		Height:               manifest.Height,
+		Hash:                 manifest.Hash,
+		LegacyBytes:          manifest.LegacyObjectBytes,
+		LegacyETag:           manifest.LegacyObjectETag,
+		LegacyKeySHA256:      manifest.LegacyObjectKeySHA256,
+		LegacyVersions:       len(manifest.LegacyObjectVersionIDs),
+		ConsolidatedKey:      manifest.ConsolidatedObjectKey,
+		CSCBVersionID:        manifest.ConsolidatedObjectVersionID,
+		CSCBETag:             manifest.ConsolidatedObjectETag,
+		ByteOffset:           manifest.ConsolidatedByteOffset,
+		ByteLength:           manifest.ConsolidatedByteLength,
+		UncompressedLength:   manifest.ConsolidatedUncompressedLength,
+		PayloadSHA256:        manifest.PayloadSHA256,
+		RetirementState:      manifest.State,
+		RetirementAttempts:   manifest.AttemptCount,
+		RetirementOutcome:    manifest.Outcome,
+		LegacyDeletedAt:      manifest.DeletedAt,
+		RetirementVerifiedAt: manifest.VerifiedAt,
+		Action:               ActionDeleteObjectVersion,
 	}
+	if manifest.State == RetirementStateDeletedPendingVerification {
+		candidate.Action = ActionDeletedObjectVersion
+	}
+	return candidate
+}
+
+func markCandidateBlocked(candidate *Candidate, reason string) {
+	if candidate.RetirementState == RetirementStateDeletedPendingVerification {
+		candidate.Action = ActionDeletedObjectVersion
+	} else {
+		candidate.Action = ActionSkip
+	}
+	candidate.SkipReason = reason
+}
+
+func newRetirementClaimToken() (string, error) {
+	value := make([]byte, retirementClaimTokenBytes)
+	if _, err := cryptorand.Read(value); err != nil {
+		return "", xerrors.Errorf("failed to generate retirement claim token: %w", err)
+	}
+	return hex.EncodeToString(value), nil
 }
 
 func keySHA256(key string) string {
@@ -699,10 +1104,26 @@ func newReport(req PlanRequest) *Report {
 			ClientMigrationApproved: req.ClientMigrationApproved,
 			FallbackReadErrors:      req.FallbackErrorCount,
 			VersionedDeleteMode:     "exact_single_object_version_only",
+			CSCBWriteOncePolicyMode: cscbWriteOncePolicyMode,
 			ProductionDeleteEnabled: req.ProductionDeleteEnabled,
 		},
 		Items: make([]Candidate, 0),
 	}
+}
+
+func writeOncePolicyGateVerified(items []Candidate) bool {
+	eligible := false
+	for _, item := range items {
+		if item.Action != ActionReportOnly && item.Action != ActionDeleteObjectVersion &&
+			item.Action != ActionDeletedObjectVersion && item.Action != ActionDeletedVerified {
+			continue
+		}
+		eligible = true
+		if !item.CSCBWriteOncePolicy {
+			return false
+		}
+	}
+	return eligible
 }
 
 func normalizeRequest(req *PlanRequest) error {

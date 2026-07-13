@@ -108,11 +108,11 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 			}),
 	)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -172,11 +172,11 @@ func TestBlobStorage_UploadConsolidated_AcceptsExistingExactObject(t *testing.T)
 			}, nil
 		})
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -212,11 +212,11 @@ func TestBlobStorage_UploadConsolidated_RejectsExistingDifferentObject(t *testin
 			}, nil
 		})
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -259,11 +259,11 @@ func TestBlobStorage_UploadConsolidated_AcceptsConcurrentExactObject(t *testing.
 			}),
 	)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -298,11 +298,11 @@ func TestBlobStorage_DownloadConsolidatedBlock_RangeReadsChunk(t *testing.T) {
 	}
 	expectRangeReads(t, client, objectData, expectedRanges)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -339,11 +339,11 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_GroupsByObjectAndChunk(t *te
 	}
 	expectRangeReads(t, client, objectData, expectedRanges)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -384,11 +384,11 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_AllowsDuplicateInputs(t *tes
 	}
 	expectRangeReads(t, client, objectData, expectedRanges)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
@@ -464,11 +464,11 @@ func TestBlobStorage_DownloadConsolidatedMetadataWithZeroLengthUsesLegacy(t *tes
 	client := s3mocks.NewMockClient(ctrl)
 	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).Times(0)
 
-	var storage internal.BlobStorage
+	var storage internal.BlobStorageCore
 	app := testapp.New(
 		t,
 		testapp.WithBlockchainNetwork(common.Blockchain_BLOCKCHAIN_SOLANA, common.Network_NETWORK_SOLANA_MAINNET),
-		fx.Provide(New),
+		fx.Provide(newBlobStorage),
 		fx.Provide(func() s3.Downloader { return downloader }),
 		fx.Provide(func() s3.Uploader { return uploader }),
 		fx.Provide(func() s3.Client { return client }),
