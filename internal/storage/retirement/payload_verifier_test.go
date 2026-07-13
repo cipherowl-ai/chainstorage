@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"hash/crc32"
 	"testing"
 
@@ -26,13 +25,48 @@ func TestPayloadVerifier_ParsesAndMatchesExactPinnedVersions(t *testing.T) {
 
 	digest, err := verifier.Verify(context.Background(), candidate)
 	require.NoError(err)
-	expected := sha256.Sum256(payload)
-	require.Equal(hex.EncodeToString(expected[:]), digest)
+	var block api.Block
+	require.NoError(proto.Unmarshal(payload, &block))
+	expected, err := canonicalBlockDigest(normalizeStoragePlacement(&block))
+	require.NoError(err)
+	require.Equal(expected, digest)
 
 	delete(store.objects, versionObjectKey(candidate.Key, candidate.VersionID))
 	digest, err = verifier.VerifyConsolidated(context.Background(), candidate)
 	require.NoError(err)
-	require.Equal(hex.EncodeToString(expected[:]), digest)
+	require.Equal(expected, digest)
+}
+
+func TestPayloadVerifier_NormalizesOnlyStoragePlacementMetadata(t *testing.T) {
+	require := require.New(t)
+	candidate, store, payload := retirementPayloadFixture(t)
+
+	var consolidated api.Block
+	require.NoError(proto.Unmarshal(payload, &consolidated))
+	consolidated.Metadata.ObjectKeyMain = candidate.Key
+	consolidated.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
+	consolidated.Metadata.ByteOffset = 123
+	consolidated.Metadata.ByteLength = 456
+	consolidated.Metadata.UncompressedLength = 789
+	consolidatedPayload, err := proto.Marshal(&consolidated)
+	require.NoError(err)
+	candidate.ByteLength = uint64(len(consolidatedPayload))
+	candidate.UncompressedLength = uint64(len(consolidatedPayload))
+	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, consolidatedPayload)
+
+	_, err = newPayloadVerifier(store).Verify(context.Background(), candidate)
+	require.NoError(err)
+
+	consolidated.Metadata.ParentHash = "different-parent"
+	consolidatedPayload, err = proto.Marshal(&consolidated)
+	require.NoError(err)
+	candidate.ByteLength = uint64(len(consolidatedPayload))
+	candidate.UncompressedLength = uint64(len(consolidatedPayload))
+	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, consolidatedPayload)
+
+	_, err = newPayloadVerifier(store).Verify(context.Background(), candidate)
+	require.Error(err)
+	require.Contains(err.Error(), "payloads differ")
 }
 
 func TestPayloadVerifier_FreshInstanceDoesNotReuseCachedCSCBBytes(t *testing.T) {

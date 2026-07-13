@@ -54,27 +54,60 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 		return "", xerrors.Errorf("pinned legacy block identity mismatch: %w", err)
 	}
 
-	cscbPayload, cscbBlock, err := v.readConsolidatedPayload(ctx, candidate)
+	_, cscbBlock, err := v.readConsolidatedPayload(ctx, candidate)
 	if err != nil {
 		return "", err
 	}
-	if !proto.Equal(&legacyBlock, cscbBlock) {
+	if err := validatePayloadIdentity(cscbBlock, candidate); err != nil {
+		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
+	}
+	legacyComparable := normalizeStoragePlacement(&legacyBlock)
+	cscbComparable := normalizeStoragePlacement(cscbBlock)
+	if !proto.Equal(legacyComparable, cscbComparable) {
 		return "", xerrors.Errorf("legacy and CSCB block payloads differ at height %d", candidate.Height)
 	}
-	if !bytes.Equal(legacyPayload, cscbPayload) {
-		return "", xerrors.Errorf("legacy and CSCB serialized payloads differ at height %d", candidate.Height)
+	legacyDigest, err := canonicalBlockDigest(legacyComparable)
+	if err != nil {
+		return "", err
 	}
-	digest := sha256.Sum256(legacyPayload)
-	return hex.EncodeToString(digest[:]), nil
+	cscbDigest, err := canonicalBlockDigest(cscbComparable)
+	if err != nil {
+		return "", err
+	}
+	if legacyDigest != cscbDigest {
+		return "", xerrors.Errorf("legacy and CSCB canonical payload digests differ at height %d", candidate.Height)
+	}
+	return legacyDigest, nil
 }
 
 func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Candidate) (string, error) {
-	payload, block, err := v.readConsolidatedPayload(ctx, candidate)
+	_, block, err := v.readConsolidatedPayload(ctx, candidate)
 	if err != nil {
 		return "", err
 	}
 	if err := validatePayloadIdentity(block, candidate); err != nil {
 		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
+	}
+	return canonicalBlockDigest(normalizeStoragePlacement(block))
+}
+
+func normalizeStoragePlacement(block *api.Block) *api.Block {
+	clone := proto.Clone(block).(*api.Block)
+	if clone.Metadata == nil {
+		return clone
+	}
+	clone.Metadata.ObjectKeyMain = ""
+	clone.Metadata.ByteOffset = 0
+	clone.Metadata.ByteLength = 0
+	clone.Metadata.UncompressedLength = 0
+	clone.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	return clone
+}
+
+func canonicalBlockDigest(block *api.Block) (string, error) {
+	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(block)
+	if err != nil {
+		return "", xerrors.Errorf("failed to marshal canonical block payload: %w", err)
 	}
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:]), nil
