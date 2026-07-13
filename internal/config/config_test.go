@@ -632,6 +632,45 @@ func TestEndpointGroupWithExtraUrls(t *testing.T) {
 	require.Equal(expectedEndpointGroup, endpointGroup)
 }
 
+func TestEndpointGroupWithRPSCountBatch(t *testing.T) {
+	require := testutil.Require(t)
+
+	text := `
+	{
+		"endpoints": [
+			{
+				"name": "quicknode",
+				"url": "testUrl",
+				"weight": 1,
+				"rps": 300,
+				"rps_count_batch": true
+			}
+		]
+	}`
+
+	var endpointGroup config.EndpointGroup
+	require.NoError(endpointGroup.UnmarshalText([]byte(text)))
+	require.Equal(300, endpointGroup.Endpoints[0].RPS)
+	require.True(endpointGroup.Endpoints[0].RPSCountBatch)
+
+	// Defaults to false when unset.
+	text = `
+	{
+		"endpoints": [
+			{
+				"name": "quicknode",
+				"url": "testUrl",
+				"weight": 1,
+				"rps": 300
+			}
+		]
+	}`
+
+	var endpointGroupDefault config.EndpointGroup
+	require.NoError(endpointGroupDefault.UnmarshalText([]byte(text)))
+	require.False(endpointGroupDefault.Endpoints[0].RPSCountBatch)
+}
+
 func TestEndpointGroup(t *testing.T) {
 	tests := []struct {
 		fixture  string

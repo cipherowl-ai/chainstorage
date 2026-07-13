@@ -14,6 +14,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/blockchain/endpoints"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
 	jsonrpcmocks "github.com/coinbase/chainstorage/internal/blockchain/jsonrpc/mocks"
 	"github.com/coinbase/chainstorage/internal/config"
@@ -673,6 +674,111 @@ func TestBatchCall_DuplicateID(t *testing.T) {
 		batchParams)
 	require.Error(err)
 	require.Contains(err.Error(), "missing response")
+}
+
+func TestBatchCall_RequestWeight(t *testing.T) {
+	require := testutil.Require(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	httpClient := jsonrpcmocks.NewMockHTTPClient(ctrl)
+
+	// Capture the request weight seen by the transport on every attempt,
+	// including the first one and the retry.
+	var weights []int
+	attempts := 0
+	httpClient.EXPECT().Do(gomock.Any()).Times(2).
+		DoAndReturn(func(req *http.Request) (*http.Response, error) {
+			weights = append(weights, endpoints.RequestWeightFromContext(req.Context()))
+			attempts += 1
+			body := `
+			[
+				{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcd"}},
+				{"jsonrpc":"2.0","id":1,"result":{"hash": "0xabce"}},
+				{"jsonrpc":"2.0","id":2,"result":{"hash": "0xabcf"}}
+			]`
+			if attempts == 1 {
+				// Return a null response to trigger a retry.
+				body = `
+				[
+					{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcd"}},
+					{"jsonrpc":"2.0","id":1,"result":{"hash": "0xabce"}},
+					{"jsonrpc":"2.0","id":2,"result":null}
+				]`
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       ioutil.NopCloser(strings.NewReader(body)),
+			}, nil
+		})
+
+	var params clientParams
+	app := testapp.New(
+		t,
+		withDummyEndpoints(),
+		fx.Provide(jsonrpc.New),
+		fx.Provide(func() jsonrpc.HTTPClient {
+			return httpClient
+		}),
+		fx.Populate(&params),
+	)
+	defer app.Close()
+
+	client := params.Master
+	require.NotNil(client)
+	batchParams := []jsonrpc.Params{
+		{"0x1234"},
+		{"0x1235"},
+		{"0x1236"},
+	}
+	_, err := client.BatchCall(context.Background(),
+		&jsonrpc.RequestMethod{Name: "hello", Timeout: time.Duration(5)},
+		batchParams)
+	require.NoError(err)
+	require.Equal([]int{3, 3}, weights)
+}
+
+func TestCall_RequestWeightDefault(t *testing.T) {
+	require := testutil.Require(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	httpClient := jsonrpcmocks.NewMockHTTPClient(ctrl)
+
+	// A single call must not carry a batch weight: the transport sees the
+	// default weight of 1.
+	var weight int
+	httpClient.EXPECT().Do(gomock.Any()).
+		DoAndReturn(func(req *http.Request) (*http.Response, error) {
+			weight = endpoints.RequestWeightFromContext(req.Context())
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       ioutil.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":0,"result":{"hash": "0xabcd"}}`)),
+			}, nil
+		})
+
+	var params clientParams
+	app := testapp.New(
+		t,
+		withDummyEndpoints(),
+		fx.Provide(jsonrpc.New),
+		fx.Provide(func() jsonrpc.HTTPClient {
+			return httpClient
+		}),
+		fx.Populate(&params),
+	)
+	defer app.Close()
+
+	client := params.Master
+	require.NotNil(client)
+	_, err := client.Call(context.Background(),
+		&jsonrpc.RequestMethod{Name: "hello", Timeout: time.Duration(5)},
+		jsonrpc.Params{"0x1234"})
+	require.NoError(err)
+	require.Equal(1, weight)
 }
 
 func TestBatchCall_RetryNullResponse(t *testing.T) {

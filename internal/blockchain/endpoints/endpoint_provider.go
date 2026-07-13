@@ -281,6 +281,10 @@ func newEndpoint(
 		opts = append(opts, withRPS(endpoint.RPS))
 	}
 
+	if endpoint.RPSCountBatch {
+		opts = append(opts, withRPSCountBatch(true))
+	}
+
 	client, err := newHTTPClient(opts...)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create http client for %v: %w", endpoint.Name, err)
