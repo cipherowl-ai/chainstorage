@@ -230,6 +230,11 @@ func (c *clientImpl) BatchCall(ctx context.Context, method *RequestMethod, batch
 		opt(&options)
 	}
 
+	// Annotate the context before entering the retry wrapper so that every
+	// attempt's HTTP request carries the batch size, allowing endpoints with
+	// rps_count_batch to charge one rate-limit token per batched call.
+	ctx = endpoints.WithRequestWeight(ctx, len(batchParams))
+
 	endpoint, err := c.endpointProvider.GetEndpoint(ctx)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get endpoint for request: %w", err)

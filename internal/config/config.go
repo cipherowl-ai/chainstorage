@@ -367,6 +367,10 @@ type (
 		Weight     uint8             `json:"weight"`
 		ExtraUrls  map[string]string `json:"extra_urls"`
 		RPS        int               `json:"rps"`
+		// RPSCountBatch makes the rate limiter charge one token per call inside
+		// a JSON-RPC batch request, for providers whose rate limit counts each
+		// batched call individually. Has no effect unless RPS is set.
+		RPSCountBatch bool `json:"rps_count_batch"`
 	}
 
 	EndpointConfig struct {
