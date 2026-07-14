@@ -62,18 +62,18 @@ const (
 	blobSizeMetricName      = "blob_size"
 )
 
-var _ internal.BlobStorage = (*blobStorageImpl)(nil)
+var _ internal.BlobStorageCore = (*blobStorageImpl)(nil)
 
-func NewFactory(params BlobStorageParams) internal.BlobStorageFactory {
+func newFactory(params BlobStorageParams) internal.BlobStorageFactory {
 	return &blobStorageFactory{params}
 }
 
 // Create implements BlobStorageFactory.
-func (f *blobStorageFactory) Create() (internal.BlobStorage, error) {
-	return New(f.params)
+func (f *blobStorageFactory) Create() (internal.BlobStorageCore, error) {
+	return newBlobStorage(f.params)
 }
 
-func New(params BlobStorageParams) (internal.BlobStorage, error) {
+func newBlobStorage(params BlobStorageParams) (internal.BlobStorageCore, error) {
 	metrics := params.Metrics.SubScope("blob_storage").Tagged(map[string]string{
 		"storage_type": "gcs",
 	})

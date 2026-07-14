@@ -43,6 +43,21 @@ func (m *MockMetaStorage) EXPECT() *MockMetaStorageMockRecorder {
 	return m.recorder
 }
 
+// AcquireSingleBlockUploadGuard mocks base method.
+func (m *MockMetaStorage) AcquireSingleBlockUploadGuard(arg0 context.Context, arg1 uint32, arg2 uint64, arg3 string) (internal.SingleBlockUploadGuard, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AcquireSingleBlockUploadGuard", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(internal.SingleBlockUploadGuard)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// AcquireSingleBlockUploadGuard indicates an expected call of AcquireSingleBlockUploadGuard.
+func (mr *MockMetaStorageMockRecorder) AcquireSingleBlockUploadGuard(arg0, arg1, arg2, arg3 any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AcquireSingleBlockUploadGuard", reflect.TypeOf((*MockMetaStorage)(nil).AcquireSingleBlockUploadGuard), arg0, arg1, arg2, arg3)
+}
+
 // AddEventEntries mocks base method.
 func (m *MockMetaStorage) AddEventEntries(arg0 context.Context, arg1 uint32, arg2 []*model.EventEntry) error {
 	m.ctrl.T.Helper()

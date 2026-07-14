@@ -3,10 +3,12 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	stderrors "errors"
 	"fmt"
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -16,6 +18,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
+	"github.com/coinbase/chainstorage/internal/storage/retirementlock"
 	"github.com/coinbase/chainstorage/internal/utils/instrument"
 	"github.com/coinbase/chainstorage/internal/utils/utils"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -32,6 +35,14 @@ type (
 		instrumentGetBlocksByHeightRange instrument.InstrumentWithResult[[]*api.BlockMetadata]
 		instrumentGetBlocksByHeights     instrument.InstrumentWithResult[[]*api.BlockMetadata]
 		instrumentGetBlockByTimestamp    instrument.InstrumentWithResult[*api.BlockMetadata]
+	}
+
+	singleBlockUploadGuard struct {
+		conn       *sql.Conn
+		tx         *sql.Tx
+		fenced     bool
+		once       sync.Once
+		releaseErr error
 	}
 )
 
@@ -68,6 +79,67 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 		instrumentGetBlockByTimestamp:    instrument.NewWithResult[*api.BlockMetadata](metrics, "get_block_by_timestamp"),
 	}
 	return &accessor, nil
+}
+
+func (b *blockStorageImpl) AcquireSingleBlockUploadGuard(
+	ctx context.Context,
+	tag uint32,
+	height uint64,
+	hash string,
+) (internal.SingleBlockUploadGuard, error) {
+	conn, err := b.db.Conn(ctx)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to acquire single-block upload connection: %w", err)
+	}
+	tx, err := conn.BeginTx(context.Background(), nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, xerrors.Errorf("failed to begin single-block upload guard: %w", err)
+	}
+	if err := retirementlock.Acquire(ctx, tx, tag, height, hash); err != nil {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		return nil, err
+	}
+	var retirementFencedAt sql.NullTime
+	err = tx.QueryRowContext(ctx, `
+		SELECT single_block_retention_fenced_at
+		FROM block_metadata
+		WHERE tag = $1
+			AND height = $2
+			AND hash IS NOT DISTINCT FROM NULLIF($3, '')
+			AND skipped = FALSE
+		FOR UPDATE`, tag, height, hash).Scan(&retirementFencedAt)
+	if err != nil && err != sql.ErrNoRows {
+		_ = tx.Rollback()
+		_ = conn.Close()
+		return nil, xerrors.Errorf("failed to acquire single-block upload guard: %w", err)
+	}
+	return &singleBlockUploadGuard{
+		conn:   conn,
+		tx:     tx,
+		fenced: err == nil && retirementFencedAt.Valid,
+	}, nil
+}
+
+func (g *singleBlockUploadGuard) RetirementFenced() bool {
+	return g != nil && g.fenced
+}
+
+func (g *singleBlockUploadGuard) Release() error {
+	if g == nil || g.tx == nil {
+		return nil
+	}
+	g.once.Do(func() {
+		g.releaseErr = g.tx.Rollback()
+		if g.releaseErr == sql.ErrTxDone {
+			g.releaseErr = nil
+		}
+		if g.conn != nil {
+			g.releaseErr = stderrors.Join(g.releaseErr, g.conn.Close())
+		}
+	})
+	return g.releaseErr
 }
 
 func (b *blockStorageImpl) PersistBlockMetas(
@@ -149,13 +221,28 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
 				parent_hash = EXCLUDED.parent_hash,
 				parent_height = EXCLUDED.parent_height,
-				object_key_main = EXCLUDED.object_key_main,
+				object_key_main = CASE
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.object_key_main
+					ELSE EXCLUDED.object_key_main
+				END,
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped,
-				object_format = EXCLUDED.object_format,
-				byte_offset = EXCLUDED.byte_offset,
-				byte_length = EXCLUDED.byte_length,
-				uncompressed_length = EXCLUDED.uncompressed_length
+				object_format = CASE
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.object_format
+					ELSE EXCLUDED.object_format
+				END,
+				byte_offset = CASE
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.byte_offset
+					ELSE EXCLUDED.byte_offset
+				END,
+				byte_length = CASE
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.byte_length
+					ELSE EXCLUDED.byte_length
+				END,
+				uncompressed_length = CASE
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.uncompressed_length
+					ELSE EXCLUDED.uncompressed_length
+				END
 			RETURNING id`
 
 		// Simply insert or update canonical blocks like DynamoDB does
@@ -578,7 +665,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 	}
 
 	query := fmt.Sprintf(`
-		WITH input(ord, tag, height, hash, legacy_object_key_main) AS (
+		WITH input(ord, tag, height, hash, single_block_object_key_main) AS (
 			VALUES %s
 		)
 		SELECT
@@ -595,7 +682,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 			WHERE tag = input.tag
 				AND height = input.height
 				AND hash = input.hash
-				AND legacy_object_key_main = input.legacy_object_key_main
+				AND single_block_object_key_main = input.single_block_object_key_main
 				AND validated_at IS NOT NULL
 			ORDER BY created_at DESC
 			LIMIT 1
@@ -670,7 +757,7 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 				SELECT 1
 				FROM block_consolidation_shadow shadow
 				WHERE shadow.block_metadata_id = bm.id
-					AND shadow.legacy_object_key_main = bm.object_key_main
+					AND shadow.single_block_object_key_main = bm.object_key_main
 					AND shadow.validated_at IS NOT NULL
 			)
 		ORDER BY bm.height ASC
@@ -757,7 +844,7 @@ func (b *blockStorageImpl) GetFirstBlockMissingConsolidationShadow(ctx context.C
 				SELECT 1
 				FROM block_consolidation_shadow shadow
 				WHERE shadow.block_metadata_id = bm.id
-					AND shadow.legacy_object_key_main = bm.object_key_main
+					AND shadow.single_block_object_key_main = bm.object_key_main
 					AND shadow.validated_at IS NOT NULL
 			)
 		ORDER BY bm.height ASC
@@ -811,7 +898,7 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND shadow.height < $3
 			AND (
 				(
-					shadow.legacy_object_key_main = eligible.object_key_main
+					shadow.single_block_object_key_main = eligible.object_key_main
 					AND eligible.byte_length IS NULL
 					AND shadow.object_format = $4
 					AND shadow.byte_offset >= 0
@@ -857,7 +944,7 @@ func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 			AND shadow.tag = bm.tag
 			AND shadow.height = bm.height
 			AND shadow.hash = bm.hash
-			AND shadow.legacy_object_key_main = bm.object_key_main
+			AND shadow.single_block_object_key_main = bm.object_key_main
 		JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id
 			AND cb.tag = bm.tag
 			AND cb.height = bm.height
@@ -946,7 +1033,7 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 
 	const query = `
 		INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			block_metadata_id, tag, height, hash, single_block_object_key_main, consolidated_object_key_main,
 			object_format, byte_offset, byte_length, uncompressed_length, validated_at
 		)
 		SELECT
@@ -963,14 +1050,14 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			tag = EXCLUDED.tag,
 			height = EXCLUDED.height,
 			hash = EXCLUDED.hash,
-			legacy_object_key_main = EXCLUDED.legacy_object_key_main,
+			single_block_object_key_main = EXCLUDED.single_block_object_key_main,
 			consolidated_object_key_main = EXCLUDED.consolidated_object_key_main,
 			object_format = EXCLUDED.object_format,
 			byte_offset = EXCLUDED.byte_offset,
 			byte_length = EXCLUDED.byte_length,
 			uncompressed_length = EXCLUDED.uncompressed_length,
 			validated_at = EXCLUDED.validated_at
-		WHERE block_consolidation_shadow.legacy_object_key_main = EXCLUDED.legacy_object_key_main
+		WHERE block_consolidation_shadow.single_block_object_key_main = EXCLUDED.single_block_object_key_main
 		RETURNING block_metadata_id`
 
 	for _, placement := range placements {
@@ -985,7 +1072,7 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			placement.Tag,
 			placement.Height,
 			placement.Hash,
-			placement.LegacyObjectKeyMain,
+			placement.SingleBlockObjectKeyMain,
 			placement.ConsolidatedObjectKeyMain,
 			int32(placement.ObjectFormat),
 			placement.ByteOffset,
@@ -1012,7 +1099,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 	startHeight uint64,
 	endHeight uint64,
 	limit uint64,
-	legacyObjectRetention time.Duration,
+	singleBlockObjectRetention time.Duration,
 ) (*internal.ConsolidationPromotionResult, error) {
 	if endHeight <= startHeight {
 		return &internal.ConsolidationPromotionResult{}, nil
@@ -1020,14 +1107,14 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 	if limit == 0 {
 		return nil, xerrors.New("consolidation promotion limit must be positive")
 	}
-	if legacyObjectRetention <= 0 {
-		return nil, xerrors.New("legacy object retention must be positive")
+	if singleBlockObjectRetention <= 0 {
+		return nil, xerrors.New("single-block object retention must be positive")
 	}
 	if err := b.validateHeight(startHeight); err != nil {
 		return nil, err
 	}
-	legacyObjectRetiredAt := time.Now().UTC()
-	legacyObjectRetireAfter := legacyObjectRetiredAt.Add(legacyObjectRetention)
+	singleBlockObjectRetiredAt := time.Now().UTC()
+	singleBlockObjectRetireAfter := singleBlockObjectRetiredAt.Add(singleBlockObjectRetention)
 
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1048,7 +1135,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 			AND shadow.tag = bm.tag
 			AND shadow.height = bm.height
 			AND shadow.hash = bm.hash
-			AND shadow.legacy_object_key_main = bm.object_key_main
+			AND shadow.single_block_object_key_main = bm.object_key_main
 		WHERE cb.tag = $1
 			AND cb.height >= $2
 			AND cb.height < $3
@@ -1092,7 +1179,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				bm.tag,
 				bm.height,
 				bm.hash,
-				bm.object_key_main AS legacy_object_key_main,
+				bm.object_key_main AS single_block_object_key_main,
 				shadow.consolidated_object_key_main,
 				shadow.object_format,
 				shadow.byte_offset,
@@ -1104,7 +1191,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				AND shadow.tag = bm.tag
 				AND shadow.height = bm.height
 				AND shadow.hash = bm.hash
-				AND shadow.legacy_object_key_main = bm.object_key_main
+				AND shadow.single_block_object_key_main = bm.object_key_main
 			WHERE cb.tag = $1
 				AND cb.height >= $2
 				AND cb.height < $3
@@ -1137,7 +1224,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				AND bm.tag = candidates.tag
 				AND bm.height = candidates.height
 				AND bm.hash = candidates.hash
-				AND bm.object_key_main = candidates.legacy_object_key_main
+				AND bm.object_key_main = candidates.single_block_object_key_main
 				AND bm.skipped = false
 				AND bm.byte_length IS NULL
 			RETURNING bm.id
@@ -1145,14 +1232,14 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		retired AS (
 			UPDATE block_consolidation_shadow shadow
 			SET
-				legacy_object_retired_at = $6,
-				legacy_object_retire_after = $7
+				single_block_retention_started_at = $6,
+				single_block_delete_after = $7
 			FROM candidates
 			WHERE shadow.block_metadata_id = candidates.block_metadata_id
 				AND shadow.tag = candidates.tag
 				AND shadow.height = candidates.height
 				AND shadow.hash = candidates.hash
-				AND shadow.legacy_object_key_main = candidates.legacy_object_key_main
+				AND shadow.single_block_object_key_main = candidates.single_block_object_key_main
 			RETURNING shadow.block_metadata_id
 		)
 		SELECT
@@ -1169,8 +1256,8 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		endHeight,
 		limit,
 		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
-		legacyObjectRetiredAt,
-		legacyObjectRetireAfter,
+		singleBlockObjectRetiredAt,
+		singleBlockObjectRetireAfter,
 	).Scan(&candidates, &promoted, &retired); err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
 	}

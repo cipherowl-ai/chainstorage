@@ -26,8 +26,8 @@ var (
 	WithConsolidatedUploadProgress   = internal.WithConsolidatedUploadProgress
 	RecordConsolidatedUploadProgress = internal.RecordConsolidatedUploadProgress
 
-	Module = fx.Options(
-		fx.Provide(internal.WithBlobStorageFactory),
+	Module = fx.Module("blobstorage",
+		fx.Provide(withBlobStorageFactory),
 		s3.Module,
 		gcs.Module,
 	)

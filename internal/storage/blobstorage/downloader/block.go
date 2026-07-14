@@ -231,7 +231,7 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 	defer d.logDuration(time.Now())
 
 	result := make([]*api.Block, len(blockFiles))
-	legacyRefs := make([]downloadRef, 0, len(blockFiles))
+	singleBlockRefs := make([]downloadRef, 0, len(blockFiles))
 	cscbRefsByURL := make(map[string][]downloadRef)
 	for i, blockFile := range blockFiles {
 		if blockFile.GetSkipped() {
@@ -243,7 +243,7 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 			blockFile: blockFile,
 		}
 		if !isCSCBBlockFile(blockFile) {
-			legacyRefs = append(legacyRefs, ref)
+			singleBlockRefs = append(singleBlockRefs, ref)
 			continue
 		}
 		fileURL := blockFile.GetFileUrl()
@@ -255,7 +255,7 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 
 	limiter := newDownloadLimiter(d.downloadWorkerLimit())
 	group, ctx := syncgroup.New(ctx)
-	for _, ref := range legacyRefs {
+	for _, ref := range singleBlockRefs {
 		ref := ref
 		group.Go(func() error {
 			var block *api.Block
@@ -265,7 +265,7 @@ func (d *blockDownloaderImpl) DownloadMany(ctx context.Context, blockFiles []*ap
 				return err
 			})
 			if err != nil {
-				return xerrors.Errorf("failed to download legacy block file (height=%d): %w", ref.blockFile.GetHeight(), err)
+				return xerrors.Errorf("failed to download single-block file (height=%d): %w", ref.blockFile.GetHeight(), err)
 			}
 			result[ref.index] = block
 			return nil
@@ -294,8 +294,8 @@ func (c *blockDownloaderImpl) logDuration(start time.Time) {
 }
 
 // DownloadStream spools decompressed block bytes to a local file and
-// returns a chain-agnostic SpooledBlock handle over that file. Legacy
-// block objects stream the compressed HTTP body through a decompressor
+// returns a chain-agnostic SpooledBlock handle over that file. Single-block
+// objects stream the compressed HTTP body through a decompressor
 // directly into the spool. CSCB objects range-read the target
 // compressed chunk, decode and validate that one chunk in memory, and
 // spool only the requested block payload. The spool persists until
@@ -379,7 +379,7 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 
 // spoolDecompressedToFile performs a (retryable) HTTP GET, wraps the
 // response body in the appropriate decompressor, and writes the
-// decompressed block payload to dst. Legacy objects are streamed into
+// decompressed block payload to dst. Single-block objects are streamed into
 // dst. CSCB objects buffer one decompressed chunk in memory for chunk
 // CRC validation, then write only the requested block payload to dst.
 // The file is truncated + rewound on each retry attempt. This combines

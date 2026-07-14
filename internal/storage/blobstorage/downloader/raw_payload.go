@@ -76,7 +76,7 @@ func (d *blockDownloaderImpl) OpenRawBlockPayload(ctx context.Context, blockFile
 		return d.openRawCSCBBlockPayload(ctx, blockFile)
 	}
 	return d.retryRaw.Retry(ctx, func(ctx context.Context) (*RawBlockPayload, error) {
-		payload, err := d.openRawLegacyBlockPayload(ctx, blockFile)
+		payload, err := d.openRawSingleBlockPayload(ctx, blockFile)
 		if err != nil && (xerrors.Is(err, io.EOF) || xerrors.Is(err, io.ErrUnexpectedEOF)) {
 			return nil, retry.Retryable(err)
 		}
@@ -237,7 +237,7 @@ func (i *rawBlockPayloadIteratorImpl) getCSCBIndex(ctx context.Context, fileURL 
 	return index, nil
 }
 
-func (d *blockDownloaderImpl) openRawLegacyBlockPayload(ctx context.Context, blockFile *api.BlockFile) (*RawBlockPayload, error) {
+func (d *blockDownloaderImpl) openRawSingleBlockPayload(ctx context.Context, blockFile *api.BlockFile) (*RawBlockPayload, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, blockFile.GetFileUrl(), nil)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to create download request: %w", err)
@@ -344,7 +344,7 @@ func (r *multiCloserReadCloser) Close() error {
 
 func (r *exactLengthReadCloser) Read(buf []byte) (int, error) {
 	if r.closed {
-		return 0, xerrors.New("legacy raw block payload reader is closed")
+		return 0, xerrors.New("single-block raw payload reader is closed")
 	}
 	if r.remaining == 0 {
 		return 0, r.validateEOF()
@@ -365,7 +365,7 @@ func (r *exactLengthReadCloser) Read(buf []byte) (int, error) {
 			if err == io.EOF {
 				err = io.ErrUnexpectedEOF
 			}
-			return n, xerrors.Errorf("legacy raw block payload length mismatch at height %d: missing %d bytes: %w", r.height, r.remaining, err)
+			return n, xerrors.Errorf("single-block raw payload length mismatch at height %d: missing %d bytes: %w", r.height, r.remaining, err)
 		}
 		if err == io.EOF {
 			r.validated = true
@@ -400,7 +400,7 @@ func (r *exactLengthReadCloser) validateEOF() error {
 	n, err := r.reader.Read(extra[:])
 	if n > 0 {
 		r.validated = true
-		return xerrors.Errorf("legacy raw block payload length mismatch at height %d: payload exceeds expected length", r.height)
+		return xerrors.Errorf("single-block raw payload length mismatch at height %d: payload exceeds expected length", r.height)
 	}
 	if err == nil {
 		return nil

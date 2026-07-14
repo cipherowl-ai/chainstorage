@@ -34,7 +34,7 @@ type (
 		GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error)
 		SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
-		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, legacyObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
+		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, singleBlockObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
 	}
 
 	EventStorage interface {
@@ -66,6 +66,18 @@ type (
 		BlockStorage
 		EventStorage
 		TransactionStorage
+		SingleBlockUploadGuardStorage
+	}
+
+	// SingleBlockUploadGuard serializes a single-block PUT with retirement
+	// preparation, including when its metadata row does not exist yet.
+	SingleBlockUploadGuard interface {
+		RetirementFenced() bool
+		Release() error
+	}
+
+	SingleBlockUploadGuardStorage interface {
+		AcquireSingleBlockUploadGuard(ctx context.Context, tag uint32, height uint64, hash string) (SingleBlockUploadGuard, error)
 	}
 
 	Result struct {
@@ -86,7 +98,7 @@ type (
 		Tag                       uint32
 		Height                    uint64
 		Hash                      string
-		LegacyObjectKeyMain       string
+		SingleBlockObjectKeyMain  string
 		ConsolidatedObjectKeyMain string
 		ObjectFormat              api.BlockObjectFormat
 		ByteOffset                uint64
@@ -116,6 +128,20 @@ type (
 		Postgres  MetaStorageFactory `name:"metastorage/postgres"`
 	}
 )
+
+type unfencedSingleBlockUploadGuard struct{}
+
+func NewUnfencedSingleBlockUploadGuard() SingleBlockUploadGuard {
+	return unfencedSingleBlockUploadGuard{}
+}
+
+func (unfencedSingleBlockUploadGuard) RetirementFenced() bool {
+	return false
+}
+
+func (unfencedSingleBlockUploadGuard) Release() error {
+	return nil
+}
 
 const (
 	BatchConsolidatorAutoConsolidateCursor = "batch_consolidator_auto_consolidate_processed_exclusive"

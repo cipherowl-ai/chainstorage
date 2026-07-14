@@ -56,16 +56,26 @@ type (
 	}
 
 	BlobStorage interface {
-		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
-		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
 		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
 		DownloadMany(ctx context.Context, metadata []*api.BlockMetadata) ([]*api.Block, error)
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}
 
+	// SingleBlockUploader is deliberately confined to the blobstorage package
+	// tree. Production consumers receive only the guarded public uploader.
+	SingleBlockUploader interface {
+		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
+		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
+	}
+
+	BlobStorageCore interface {
+		BlobStorage
+		SingleBlockUploader
+	}
+
 	BlobStorageFactory interface {
-		Create() (BlobStorage, error)
+		Create() (BlobStorageCore, error)
 	}
 
 	BlobStorageFactoryParams struct {
@@ -106,7 +116,7 @@ func (s FilePayloadSource) Path() string {
 	return s.path
 }
 
-func WithBlobStorageFactory(params BlobStorageFactoryParams) (BlobStorage, error) {
+func WithBlobStorageFactory(params BlobStorageFactoryParams) (BlobStorageCore, error) {
 	var factory BlobStorageFactory
 	storageType := params.Config.StorageType.BlobStorageType
 	switch storageType {

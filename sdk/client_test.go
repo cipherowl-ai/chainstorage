@@ -147,7 +147,7 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource() {
 	s.require.Equal(block, fetchedBlock)
 }
 
-func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -161,7 +161,7 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDo
 		Hash:         block.Metadata.Hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{
+	singleBlockBlockFile := &api.BlockFile{
 		Tag:    block.Metadata.Tag,
 		Height: block.Metadata.Height,
 		Hash:   block.Metadata.Hash,
@@ -181,11 +181,11 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDo
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFileResponse{
-			File: legacyBlockFile,
+			File: singleBlockBlockFile,
 		}, nil),
-		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), singleBlockBlockFile).Return(block, nil),
 	)
 
 	readSourceClient, ok := s.client.(ReadSourceClient)
@@ -195,7 +195,7 @@ func (s *clientTestSuite) TestGetBlockWithTagAndReadSource_FallsBackToLegacyOnDo
 	s.require.Equal(block, fetchedBlock)
 }
 
-func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -209,7 +209,7 @@ func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToLegacyOnDownload
 		Hash:         block.Metadata.Hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{
+	singleBlockBlockFile := &api.BlockFile{
 		Tag:    block.Metadata.Tag,
 		Height: block.Metadata.Height,
 		Hash:   block.Metadata.Hash,
@@ -229,11 +229,11 @@ func (s *clientTestSuite) TestGetBlockWithTag_DefaultFallsBackToLegacyOnDownload
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFileResponse{
-			File: legacyBlockFile,
+			File: singleBlockBlockFile,
 		}, nil),
-		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), singleBlockBlockFile).Return(block, nil),
 	)
 
 	fetchedBlock, err := s.client.GetBlockWithTag(context.Background(), tag, height, hash)
@@ -342,7 +342,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource() {
 	s.require.Equal(blocks, fetchedBlocks)
 }
 
-func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag         = uint32(2)
 		startHeight = uint64(12345)
@@ -352,7 +352,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 
 	blocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
 	consolidatedBlockFiles := make([]*api.BlockFile, numBlocks)
-	legacyBlockFiles := make([]*api.BlockFile, numBlocks)
+	singleBlockBlockFiles := make([]*api.BlockFile, numBlocks)
 	for i := range blocks {
 		metadata := blocks[i].Metadata
 		consolidatedBlockFiles[i] = &api.BlockFile{
@@ -361,7 +361,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 			Hash:         metadata.Hash,
 			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		}
-		legacyBlockFiles[i] = &api.BlockFile{
+		singleBlockBlockFiles[i] = &api.BlockFile{
 			Tag:    metadata.Tag,
 			Height: metadata.Height,
 			Hash:   metadata.Hash,
@@ -382,11 +382,11 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 			Tag:         tag,
 			StartHeight: startHeight,
 			EndHeight:   endHeight,
-			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFilesByRangeResponse{
-			Files: legacyBlockFiles,
+			Files: singleBlockBlockFiles,
 		}, nil),
-		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), legacyBlockFiles).Return(blocks, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), singleBlockBlockFiles).Return(blocks, nil),
 	)
 
 	readSourceClient, ok := s.client.(ReadSourceClient)
@@ -397,7 +397,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackToLe
 	s.require.Equal(blocks, fetchedBlocks)
 }
 
-func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag         = uint32(2)
 		startHeight = uint64(12345)
@@ -407,7 +407,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOn
 
 	blocks := testutil.MakeBlocksFromStartHeight(startHeight, numBlocks, tag)
 	consolidatedBlockFiles := make([]*api.BlockFile, numBlocks)
-	legacyBlockFiles := make([]*api.BlockFile, numBlocks)
+	singleBlockBlockFiles := make([]*api.BlockFile, numBlocks)
 	for i := range blocks {
 		metadata := blocks[i].Metadata
 		consolidatedBlockFiles[i] = &api.BlockFile{
@@ -416,7 +416,7 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOn
 			Hash:         metadata.Hash,
 			ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		}
-		legacyBlockFiles[i] = &api.BlockFile{
+		singleBlockBlockFiles[i] = &api.BlockFile{
 			Tag:    metadata.Tag,
 			Height: metadata.Height,
 			Hash:   metadata.Hash,
@@ -437,11 +437,11 @@ func (s *clientTestSuite) TestGetBlocksByRangeWithTag_DefaultFallsBackToLegacyOn
 			Tag:         tag,
 			StartHeight: startHeight,
 			EndHeight:   endHeight,
-			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource:  api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFilesByRangeResponse{
-			Files: legacyBlockFiles,
+			Files: singleBlockBlockFiles,
 		}, nil),
-		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), legacyBlockFiles).Return(blocks, nil),
+		s.downloaderClient.EXPECT().DownloadMany(gomock.Any(), singleBlockBlockFiles).Return(blocks, nil),
 	)
 
 	fetchedBlocks, err := s.client.GetBlocksByRangeWithTag(context.Background(), tag, startHeight, endHeight)
@@ -553,7 +553,7 @@ func (s *clientTestSuite) TestStreamBlocks() {
 	s.require.Equal(numberOfEvents, count)
 }
 
-func (s *clientTestSuite) TestStreamBlocks_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestStreamBlocks_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -574,7 +574,7 @@ func (s *clientTestSuite) TestStreamBlocks_DefaultFallsBackToLegacyOnDownloadErr
 		Hash:         block.Metadata.Hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{
+	singleBlockBlockFile := &api.BlockFile{
 		Tag:    block.Metadata.Tag,
 		Height: block.Metadata.Height,
 		Hash:   block.Metadata.Hash,
@@ -596,11 +596,11 @@ func (s *clientTestSuite) TestStreamBlocks_DefaultFallsBackToLegacyOnDownloadErr
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFileResponse{
-			File: legacyBlockFile,
+			File: singleBlockBlockFile,
 		}, nil),
-		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), singleBlockBlockFile).Return(block, nil),
 	)
 
 	ch, err := s.client.StreamChainEvents(context.Background(), StreamingConfiguration{
@@ -754,7 +754,7 @@ func (s *clientTestSuite) TestStreamNativeBlock_EthereumReturnsNilAccessors() {
 	s.require.Nil(native.GetEthereum(), "no ethereum streaming walker exists yet")
 }
 
-func (s *clientTestSuite) TestStreamNativeBlock_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestStreamNativeBlock_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag    = uint32(2)
 		height = uint64(12345)
@@ -766,9 +766,9 @@ func (s *clientTestSuite) TestStreamNativeBlock_DefaultFallsBackToLegacyOnDownlo
 		Hash:         hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+	singleBlockBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 	spooled := &downloader.SpooledBlock{
-		BlockFile: legacyBlockFile,
+		BlockFile: singleBlockBlockFile,
 		Open: func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(nil)), nil
 		},
@@ -786,9 +786,9 @@ func (s *clientTestSuite) TestStreamNativeBlock_DefaultFallsBackToLegacyOnDownlo
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
-		}).Return(&api.GetBlockFileResponse{File: legacyBlockFile}, nil),
-		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), legacyBlockFile).Return(spooled, nil),
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
+		}).Return(&api.GetBlockFileResponse{File: singleBlockBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), singleBlockBlockFile).Return(spooled, nil),
 	)
 
 	native, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
@@ -810,10 +810,10 @@ func (s *clientTestSuite) TestStreamNativeBlock_DownloadError() {
 		Hash:         hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
+	singleBlockBlockFile := &api.BlockFile{Tag: tag, Height: height, Hash: hash}
 
 	sentinel := xerrors.New("download exploded")
-	fallbackSentinel := xerrors.New("legacy download exploded")
+	fallbackSentinel := xerrors.New("single-block download exploded")
 	gomock.InOrder(
 		s.gatewayClient.EXPECT().GetBlockFile(gomock.Any(), &api.GetBlockFileRequest{
 			Tag:        tag,
@@ -826,9 +826,9 @@ func (s *clientTestSuite) TestStreamNativeBlock_DownloadError() {
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
-		}).Return(&api.GetBlockFileResponse{File: legacyBlockFile}, nil),
-		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), legacyBlockFile).Return(nil, fallbackSentinel),
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
+		}).Return(&api.GetBlockFileResponse{File: singleBlockBlockFile}, nil),
+		s.downloaderClient.EXPECT().DownloadStream(gomock.Any(), singleBlockBlockFile).Return(nil, fallbackSentinel),
 	)
 
 	view, err := s.client.StreamNativeBlock(context.Background(), tag, height, hash)
@@ -1103,7 +1103,7 @@ func (s *clientTestSuite) TestGetStaticChainMetadata() {
 	s.require.Equal("3s", resp.BlockTime)
 }
 
-func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag             = uint32(2)
 		height          = uint64(12345)
@@ -1118,7 +1118,7 @@ func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToLegacyOnDo
 		Hash:         block.Metadata.Hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{
+	singleBlockBlockFile := &api.BlockFile{
 		Tag:    block.Metadata.Tag,
 		Height: block.Metadata.Height,
 		Hash:   block.Metadata.Hash,
@@ -1144,11 +1144,11 @@ func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToLegacyOnDo
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFileResponse{
-			File: legacyBlockFile,
+			File: singleBlockBlockFile,
 		}, nil),
-		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), singleBlockBlockFile).Return(block, nil),
 	)
 
 	blocks, err := s.client.GetBlockByTransaction(context.Background(), tag, transactionHash)
@@ -1156,7 +1156,7 @@ func (s *clientTestSuite) TestGetBlockByTransaction_DefaultFallsBackToLegacyOnDo
 	s.require.Equal([]*api.Block{block}, blocks)
 }
 
-func (s *clientTestSuite) TestGetBlockByTimestamp_DefaultFallsBackToLegacyOnDownloadError() {
+func (s *clientTestSuite) TestGetBlockByTimestamp_DefaultFallsBackToSingleBlockOnDownloadError() {
 	const (
 		tag       = uint32(2)
 		height    = uint64(12345)
@@ -1171,7 +1171,7 @@ func (s *clientTestSuite) TestGetBlockByTimestamp_DefaultFallsBackToLegacyOnDown
 		Hash:         block.Metadata.Hash,
 		ObjectFormat: api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	}
-	legacyBlockFile := &api.BlockFile{
+	singleBlockBlockFile := &api.BlockFile{
 		Tag:    block.Metadata.Tag,
 		Height: block.Metadata.Height,
 		Hash:   block.Metadata.Hash,
@@ -1199,11 +1199,11 @@ func (s *clientTestSuite) TestGetBlockByTimestamp_DefaultFallsBackToLegacyOnDown
 			Tag:        tag,
 			Height:     height,
 			Hash:       hash,
-			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+			ReadSource: api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
 		}).Return(&api.GetBlockFileResponse{
-			File: legacyBlockFile,
+			File: singleBlockBlockFile,
 		}, nil),
-		s.downloaderClient.EXPECT().Download(gomock.Any(), legacyBlockFile).Return(block, nil),
+		s.downloaderClient.EXPECT().Download(gomock.Any(), singleBlockBlockFile).Return(block, nil),
 	)
 
 	got, err := s.client.GetBlockByTimestamp(context.Background(), tag, timestamp)

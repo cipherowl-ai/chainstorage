@@ -18,6 +18,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -386,7 +387,7 @@ func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request
 		request.StartHeight,
 		plan.EndHeight,
 		request.MaxBlocks,
-		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
+		a.config.AWS.Storage.Consolidation.SingleBlockObjectRetention,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
@@ -420,7 +421,7 @@ func (a *BatchConsolidator) promoteConsolidatedBlocks(ctx context.Context, mode 
 		request.StartHeight,
 		request.EndHeight,
 		request.MaxBlocks,
-		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
+		a.config.AWS.Storage.Consolidation.SingleBlockObjectRetention,
 	)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to promote consolidated block metadata: %w", err)
@@ -635,12 +636,13 @@ func (a *BatchConsolidator) buildPayloads(
 			metadata := record.Metadata
 			block, err := a.blobStorage.Download(groupCtx, metadata)
 			if err != nil {
-				return xerrors.Errorf("failed to download legacy block (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
+				return xerrors.Errorf("failed to download single-block object (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
 			if err := validateDownloadedBlock(metadata, block); err != nil {
 				return err
 			}
-			rawBlockPayload, err := proto.Marshal(block)
+			storageNeutralBlock := storageutils.CloneBlockWithoutStoragePlacement(block)
+			rawBlockPayload, err := proto.Marshal(storageNeutralBlock)
 			if err != nil {
 				return xerrors.Errorf("failed to marshal block (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
@@ -759,7 +761,7 @@ func makeShadowPlacements(
 			Tag:                       metadata.GetTag(),
 			Height:                    metadata.GetHeight(),
 			Hash:                      metadata.GetHash(),
-			LegacyObjectKeyMain:       metadata.GetObjectKeyMain(),
+			SingleBlockObjectKeyMain:  metadata.GetObjectKeyMain(),
 			ConsolidatedObjectKeyMain: objectKey,
 			ObjectFormat:              placement.ObjectFormat,
 			ByteOffset:                placement.ByteOffset,

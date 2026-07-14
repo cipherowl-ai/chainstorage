@@ -37,12 +37,12 @@ type MigratorIntegrationTestSuite struct {
 
 type testDependencies struct {
 	fx.In
-	Migrator      *workflow.Migrator
-	BlobStorage   blobstorage.BlobStorage
-	MetaStorage   metastorage.MetaStorage // DynamoDB
-	MetaStoragePG metastorage.MetaStorage `name:"pg"` // PostgreSQL
-	Parser        parser.Parser
-	Client        client.Client `name:"slave"`
+	Migrator            *workflow.Migrator
+	SingleBlockUploader blobstorage.SingleBlockUploader
+	MetaStorage         metastorage.MetaStorage // DynamoDB
+	MetaStoragePG       metastorage.MetaStorage `name:"pg"` // PostgreSQL
+	Parser              parser.Parser
+	Client              client.Client `name:"slave"`
 }
 
 func TestIntegrationMigratorTestSuite(t *testing.T) {
@@ -177,7 +177,7 @@ func (s *MigratorIntegrationTestSuite) createTestEvents(
 			}
 
 			// Upload to blob storage
-			objectKey, err := deps.BlobStorage.Upload(ctx, block, api.Compression_GZIP)
+			objectKey, err := deps.SingleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 			require.NoError(err, "Failed to upload block at height %d", event.BlockHeight)
 
 			// Update metadata with object key

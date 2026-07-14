@@ -240,21 +240,21 @@ func (c *clientImpl) GetBlockWithTag(ctx context.Context, tag uint32, height uin
 
 func (c *clientImpl) GetBlockWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*api.Block, error) {
 	block, err := c.downloadBlock(ctx, tag, height, hash, readSource)
-	if err == nil || !shouldRetryLegacyRead(readSource) {
+	if err == nil || !shouldRetrySingleBlockRead(readSource) {
 		return block, err
 	}
 
 	c.logger.Warn(
-		"preferred block download failed; retrying legacy",
+		"preferred block download failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("height", height),
 		zap.String("hash", hash),
 		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
-	block, fallbackErr := c.downloadBlock(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	block, fallbackErr := c.downloadBlock(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to download consolidated block and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to download consolidated block and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return block, nil
 }
@@ -269,21 +269,21 @@ func (c *clientImpl) GetBlocksByRangeWithTagAndReadSource(ctx context.Context, t
 	}
 
 	blocks, err := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, readSource)
-	if err == nil || !shouldRetryLegacyRead(readSource) {
+	if err == nil || !shouldRetrySingleBlockRead(readSource) {
 		return blocks, err
 	}
 
 	c.logger.Warn(
-		"preferred block range download failed; retrying legacy",
+		"preferred block range download failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
 		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
-	blocks, fallbackErr := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	blocks, fallbackErr := c.downloadBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to download consolidated block range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to download consolidated block range and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return blocks, nil
 }
@@ -348,21 +348,21 @@ func (c *clientImpl) OpenRawBlockPayloadWithTag(ctx context.Context, tag uint32,
 
 func (c *clientImpl) OpenRawBlockPayloadWithTagAndReadSource(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*RawBlockPayload, error) {
 	payload, err := c.openRawBlockPayload(ctx, tag, height, hash, readSource)
-	if err == nil || !shouldRetryLegacyRead(readSource) {
+	if err == nil || !shouldRetrySingleBlockRead(readSource) {
 		return payload, err
 	}
 
 	c.logger.Warn(
-		"preferred raw block payload open failed; retrying legacy",
+		"preferred raw block payload open failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("height", height),
 		zap.String("hash", hash),
 		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
-	payload, fallbackErr := c.openRawBlockPayload(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	payload, fallbackErr := c.openRawBlockPayload(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to open consolidated raw block payload and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to open consolidated raw block payload and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return payload, nil
 }
@@ -399,21 +399,21 @@ func (c *clientImpl) OpenRawBlockPayloadsByRangeWithTagAndReadSource(ctx context
 	}
 
 	iter, err := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, readSource)
-	if err == nil || !shouldRetryLegacyRead(readSource) {
+	if err == nil || !shouldRetrySingleBlockRead(readSource) {
 		return iter, err
 	}
 
 	c.logger.Warn(
-		"preferred raw block payload range open failed; retrying legacy",
+		"preferred raw block payload range open failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
 		zap.String("read_source", readSource.String()),
 		zap.Error(err),
 	)
-	iter, fallbackErr := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	iter, fallbackErr := c.openRawBlockPayloadsByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to open consolidated raw block payload range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to open consolidated raw block payload range and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return iter, nil
 }
@@ -440,7 +440,7 @@ func (c *clientImpl) openRawBlockPayloadsByRange(ctx context.Context, tag uint32
 	return &rawBlockPayloadIterator{inner: iter}, nil
 }
 
-func shouldRetryLegacyRead(readSource api.BlockReadSource) bool {
+func shouldRetrySingleBlockRead(readSource api.BlockReadSource) bool {
 	switch readSource {
 	case api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT,
 		api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED:
@@ -721,16 +721,16 @@ func (c *clientImpl) StreamNativeBlock(
 	spooled, err := c.downloadBlockStream(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
 	if err != nil {
 		c.logger.Warn(
-			"preferred native block stream download failed; retrying legacy",
+			"preferred native block stream download failed; retrying single-block",
 			zap.Uint32("tag", tag),
 			zap.Uint64("height", height),
 			zap.String("hash", hash),
 			zap.Error(err),
 		)
 		var fallbackErr error
-		spooled, fallbackErr = c.downloadBlockStream(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+		spooled, fallbackErr = c.downloadBlockStream(ctx, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 		if fallbackErr != nil {
-			return nil, xerrors.Errorf("failed to download preferred native block stream and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+			return nil, xerrors.Errorf("failed to download preferred native block stream and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 		}
 	}
 

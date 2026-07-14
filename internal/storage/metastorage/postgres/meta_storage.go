@@ -69,6 +69,19 @@ func NewMetaStorage(params Params) (internal.Result, error) {
 	}, nil
 }
 
+func (m *metaStorageImpl) AcquireSingleBlockUploadGuard(
+	ctx context.Context,
+	tag uint32,
+	height uint64,
+	hash string,
+) (internal.SingleBlockUploadGuard, error) {
+	storage, ok := m.BlockStorage.(internal.SingleBlockUploadGuardStorage)
+	if !ok {
+		return nil, xerrors.New("postgres block storage does not support single-block upload guards")
+	}
+	return storage.AcquireSingleBlockUploadGuard(ctx, tag, height, hash)
+}
+
 func (f *metaStorageFactory) Create() (internal.Result, error) {
 	return NewMetaStorage(f.params)
 }

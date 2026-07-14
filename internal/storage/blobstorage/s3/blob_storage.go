@@ -96,18 +96,18 @@ const (
 	cscbInitialIndexReadSize = 64 * 1024
 )
 
-var _ internal.BlobStorage = (*blobStorageImpl)(nil)
+var _ internal.BlobStorageCore = (*blobStorageImpl)(nil)
 
-func NewFactory(params BlobStorageParams) internal.BlobStorageFactory {
+func newFactory(params BlobStorageParams) internal.BlobStorageFactory {
 	return &blobStorageFactory{params}
 }
 
 // Create implements BlobStorageFactory.
-func (f *blobStorageFactory) Create() (internal.BlobStorage, error) {
-	return New(f.params)
+func (f *blobStorageFactory) Create() (internal.BlobStorageCore, error) {
+	return newBlobStorage(f.params)
 }
 
-func New(params BlobStorageParams) (internal.BlobStorage, error) {
+func newBlobStorage(params BlobStorageParams) (internal.BlobStorageCore, error) {
 	metrics := params.Metrics.SubScope("blob_storage").Tagged(map[string]string{
 		"storage_type": "s3",
 	})
@@ -507,8 +507,8 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 		if metadata.Skipped {
 			return s.skippedBlock(metadata), nil
 		}
-		if isLegacyBlockObject(metadata) {
-			return s.downloadLegacy(ctx, metadata)
+		if isSingleBlockObject(metadata) {
+			return s.downloadSingleBlock(ctx, metadata)
 		}
 		return s.downloadCSCBBlock(ctx, metadata)
 	})
@@ -519,7 +519,7 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 		defer s.logDuration("download_many", time.Now())
 
 		result := make([]*api.Block, len(metadatas))
-		legacyRefs := make([]downloadRef, 0, len(metadatas))
+		singleBlockRefs := make([]downloadRef, 0, len(metadatas))
 		cscbRefsByObject := make(map[string][]downloadRef)
 		for i, metadata := range metadatas {
 			if metadata.GetSkipped() {
@@ -530,8 +530,8 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 				index:    i,
 				metadata: metadata,
 			}
-			if isLegacyBlockObject(metadata) {
-				legacyRefs = append(legacyRefs, ref)
+			if isSingleBlockObject(metadata) {
+				singleBlockRefs = append(singleBlockRefs, ref)
 				continue
 			}
 			key := metadata.GetObjectKeyMain()
@@ -542,12 +542,12 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 		}
 
 		group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(s.downloadWorkerLimit()))
-		for _, ref := range legacyRefs {
+		for _, ref := range singleBlockRefs {
 			ref := ref
 			group.Go(func() error {
 				block, err := s.Download(ctx, ref.metadata)
 				if err != nil {
-					return xerrors.Errorf("failed to download legacy block (input={%+v}): %w", ref.metadata, err)
+					return xerrors.Errorf("failed to download single-block object (input={%+v}): %w", ref.metadata, err)
 				}
 				result[ref.index] = block
 				return nil
@@ -579,7 +579,7 @@ func (s *blobStorageImpl) skippedBlock(metadata *api.BlockMetadata) *api.Block {
 	}
 }
 
-func isLegacyBlockObject(metadata *api.BlockMetadata) bool {
+func isSingleBlockObject(metadata *api.BlockMetadata) bool {
 	return metadata.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH || metadata.GetByteLength() == 0
 }
 
@@ -591,7 +591,7 @@ func (s *blobStorageImpl) downloadWorkerLimit() int {
 	return limit
 }
 
-func (s *blobStorageImpl) downloadLegacy(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+func (s *blobStorageImpl) downloadSingleBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
 	key := metadata.ObjectKeyMain
 	buf := manager.NewWriteAtBuffer([]byte{})
 

@@ -3,6 +3,8 @@ package retirement
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,10 +25,25 @@ func NewS3ObjectStore(client s3.Client) *S3ObjectStore {
 }
 
 func (s *S3ObjectStore) HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error) {
-	out, err := s.client.HeadObject(ctx, &awss3.HeadObjectInput{
+	return s.headObject(ctx, bucket, key, "")
+}
+
+func (s *S3ObjectStore) HeadObjectVersion(ctx context.Context, bucket string, key string, versionID string) (ObjectHead, error) {
+	if !isImmutableVersionID(versionID) {
+		return ObjectHead{}, xerrors.New("an immutable non-null version id is required to head an object version")
+	}
+	return s.headObject(ctx, bucket, key, versionID)
+}
+
+func (s *S3ObjectStore) headObject(ctx context.Context, bucket string, key string, versionID string) (ObjectHead, error) {
+	input := &awss3.HeadObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	})
+	}
+	if versionID != "" {
+		input.VersionId = aws.String(versionID)
+	}
+	out, err := s.client.HeadObject(ctx, input)
 	if err != nil {
 		if isObjectNotFound(err) {
 			return ObjectHead{}, nil
@@ -36,8 +53,10 @@ func (s *S3ObjectStore) HeadObject(ctx context.Context, bucket string, key strin
 	head := ObjectHead{
 		Exists:     true,
 		VersionID:  aws.ToString(out.VersionId),
+		ETag:       aws.ToString(out.ETag),
 		Metadata:   out.Metadata,
 		DeleteMark: aws.ToBool(out.DeleteMarker),
+		Expiration: aws.ToString(out.Expiration),
 	}
 	if out.ContentLength != nil && *out.ContentLength > 0 {
 		head.Bytes = uint64(*out.ContentLength)
@@ -45,58 +64,102 @@ func (s *S3ObjectStore) HeadObject(ctx context.Context, bucket string, key strin
 	return head, nil
 }
 
-func (s *S3ObjectStore) CurrentObjectVersion(ctx context.Context, bucket string, key string) (ObjectVersion, error) {
-	out, err := s.client.ListObjectVersions(ctx, &awss3.ListObjectVersionsInput{
+func (s *S3ObjectStore) ListObjectVersions(ctx context.Context, bucket string, key string) (ObjectVersionTopology, error) {
+	input := &awss3.ListObjectVersionsInput{
 		Bucket:  aws.String(bucket),
 		Prefix:  aws.String(key),
-		MaxKeys: aws.Int32(10),
-	})
-	if err != nil {
-		return ObjectVersion{}, xerrors.Errorf("failed to list object versions (bucket=%s key=%s): %w", bucket, key, err)
+		MaxKeys: aws.Int32(1000),
 	}
-
-	for _, marker := range out.DeleteMarkers {
-		if aws.ToString(marker.Key) == key && aws.ToBool(marker.IsLatest) {
-			return ObjectVersion{
-				Exists:              true,
-				CurrentDeleteMarker: true,
-				VersionID:           aws.ToString(marker.VersionId),
-				LastModified:        cloneTime(marker.LastModified),
-			}, nil
+	var topology ObjectVersionTopology
+	for {
+		out, err := s.client.ListObjectVersions(ctx, input)
+		if err != nil {
+			return ObjectVersionTopology{}, xerrors.Errorf("failed to list object versions (bucket=%s key=%s): %w", bucket, key, err)
 		}
-	}
-	for _, version := range out.Versions {
-		if aws.ToString(version.Key) == key && aws.ToBool(version.IsLatest) {
-			result := ObjectVersion{
-				Exists:       true,
+		for _, version := range out.Versions {
+			if aws.ToString(version.Key) != key {
+				continue
+			}
+			item := ObjectVersion{
 				VersionID:    aws.ToString(version.VersionId),
+				ETag:         aws.ToString(version.ETag),
+				IsLatest:     aws.ToBool(version.IsLatest),
 				LastModified: cloneTime(version.LastModified),
 			}
 			if version.Size != nil && *version.Size > 0 {
-				result.Bytes = uint64(*version.Size)
+				item.Bytes = uint64(*version.Size)
 			}
-			return result, nil
+			topology.Versions = append(topology.Versions, item)
 		}
+		for _, marker := range out.DeleteMarkers {
+			if aws.ToString(marker.Key) != key {
+				continue
+			}
+			topology.DeleteMarkers = append(topology.DeleteMarkers, ObjectDeleteMarker{
+				VersionID:    aws.ToString(marker.VersionId),
+				IsLatest:     aws.ToBool(marker.IsLatest),
+				LastModified: cloneTime(marker.LastModified),
+			})
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			break
+		}
+		nextKeyMarker := aws.ToString(out.NextKeyMarker)
+		nextVersionIDMarker := aws.ToString(out.NextVersionIdMarker)
+		if nextKeyMarker == "" || (nextKeyMarker == aws.ToString(input.KeyMarker) && nextVersionIDMarker == aws.ToString(input.VersionIdMarker)) {
+			return ObjectVersionTopology{}, xerrors.Errorf("invalid object-version pagination cursor (bucket=%s key=%s)", bucket, key)
+		}
+		input.KeyMarker = aws.String(nextKeyMarker)
+		input.VersionIdMarker = aws.String(nextVersionIDMarker)
 	}
+	return topology, nil
+}
 
-	head, err := s.HeadObject(ctx, bucket, key)
+func (s *S3ObjectStore) ReadObjectVersion(ctx context.Context, bucket string, key string, versionID string) ([]byte, error) {
+	return s.readObject(ctx, bucket, key, versionID, "")
+}
+
+func (s *S3ObjectStore) ReadObjectVersionRange(ctx context.Context, bucket string, key string, versionID string, offset uint64, length uint64) ([]byte, error) {
+	if length == 0 {
+		return nil, xerrors.New("object range length must be positive")
+	}
+	if offset > ^uint64(0)-(length-1) {
+		return nil, xerrors.Errorf("object range overflow: offset=%d length=%d", offset, length)
+	}
+	rangeHeader := fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+	return s.readObject(ctx, bucket, key, versionID, rangeHeader)
+}
+
+func (s *S3ObjectStore) readObject(ctx context.Context, bucket string, key string, versionID string, rangeHeader string) ([]byte, error) {
+	if !isImmutableVersionID(versionID) {
+		return nil, xerrors.New("an immutable non-null version id is required to read an object version")
+	}
+	input := &awss3.GetObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(key),
+		VersionId: aws.String(versionID),
+	}
+	if rangeHeader != "" {
+		input.Range = aws.String(rangeHeader)
+	}
+	out, err := s.client.GetObject(ctx, input)
 	if err != nil {
-		return ObjectVersion{}, err
+		return nil, xerrors.Errorf("failed to read object version (bucket=%s key=%s version_id=%s range=%s): %w", bucket, key, versionID, rangeHeader, err)
 	}
-	if !head.Exists {
-		return ObjectVersion{}, nil
+	if out.Body == nil {
+		return nil, xerrors.Errorf("object version returned an empty body (bucket=%s key=%s version_id=%s)", bucket, key, versionID)
 	}
-	return ObjectVersion{
-		Exists:              true,
-		CurrentDeleteMarker: head.DeleteMark,
-		VersionID:           head.VersionID,
-		Bytes:               head.Bytes,
-	}, nil
+	defer func() { _ = out.Body.Close() }()
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to read object-version body (bucket=%s key=%s version_id=%s): %w", bucket, key, versionID, err)
+	}
+	return body, nil
 }
 
 func (s *S3ObjectStore) DeleteObjectVersion(ctx context.Context, bucket string, key string, versionID string) error {
-	if versionID == "" {
-		return xerrors.New("version id is required for retirement delete")
+	if !isImmutableVersionID(versionID) {
+		return xerrors.New("an immutable non-null version id is required for retirement delete")
 	}
 	_, err := s.client.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket:    aws.String(bucket),

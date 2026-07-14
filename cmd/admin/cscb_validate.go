@@ -62,7 +62,7 @@ var (
 
 	cscbValidateCmd = &cobra.Command{
 		Use:   "validate",
-		Short: "Compare legacy and consolidated CSCB reads and write a validation report.",
+		Short: "Compare single-block and consolidated CSCB reads and write a validation report.",
 		RunE:  runCSCBValidate,
 	}
 )
@@ -106,26 +106,26 @@ type (
 	}
 
 	cscbValidationCaseResult struct {
-		Name                     string            `json:"name"`
-		Kind                     string            `json:"kind"`
-		StartHeight              uint64            `json:"start_height"`
-		EndHeight                uint64            `json:"end_height"`
-		Heights                  []uint64          `json:"heights,omitempty"`
-		Iterations               int               `json:"iterations"`
-		ExpectFallback           bool              `json:"expect_fallback"`
-		ObservedFallback         bool              `json:"observed_fallback"`
-		ObservedFallbackBlocks   int               `json:"observed_fallback_blocks"`
-		Correct                  bool              `json:"correct"`
-		Passed                   bool              `json:"passed"`
-		Error                    string            `json:"error,omitempty"`
-		MismatchHeights          []uint64          `json:"mismatch_heights,omitempty"`
-		Legacy                   cscbSourceSummary `json:"legacy"`
-		Consolidated             cscbSourceSummary `json:"consolidated"`
-		LatencyRatioConsolidated float64           `json:"latency_ratio_consolidated_vs_legacy,omitempty"`
-		BytesRatioConsolidated   float64           `json:"bytes_ratio_consolidated_vs_legacy,omitempty"`
-		CanonicalHashesCompared  int               `json:"canonical_hashes_compared"`
-		FirstCanonicalHashLegacy string            `json:"first_canonical_hash_legacy,omitempty"`
-		FirstCanonicalHashCSCB   string            `json:"first_canonical_hash_consolidated,omitempty"`
+		Name                          string            `json:"name"`
+		Kind                          string            `json:"kind"`
+		StartHeight                   uint64            `json:"start_height"`
+		EndHeight                     uint64            `json:"end_height"`
+		Heights                       []uint64          `json:"heights,omitempty"`
+		Iterations                    int               `json:"iterations"`
+		ExpectFallback                bool              `json:"expect_fallback"`
+		ObservedFallback              bool              `json:"observed_fallback"`
+		ObservedFallbackBlocks        int               `json:"observed_fallback_blocks"`
+		Correct                       bool              `json:"correct"`
+		Passed                        bool              `json:"passed"`
+		Error                         string            `json:"error,omitempty"`
+		MismatchHeights               []uint64          `json:"mismatch_heights,omitempty"`
+		SingleBlock                   cscbSourceSummary `json:"single_block"`
+		Consolidated                  cscbSourceSummary `json:"consolidated"`
+		LatencyRatioConsolidated      float64           `json:"latency_ratio_consolidated_vs_single_block,omitempty"`
+		BytesRatioConsolidated        float64           `json:"bytes_ratio_consolidated_vs_single_block,omitempty"`
+		CanonicalHashesCompared       int               `json:"canonical_hashes_compared"`
+		FirstCanonicalHashSingleBlock string            `json:"first_canonical_hash_single_block,omitempty"`
+		FirstCanonicalHashCSCB        string            `json:"first_canonical_hash_consolidated,omitempty"`
 	}
 
 	cscbSourceSummary struct {
@@ -150,7 +150,7 @@ type (
 
 	cscbFileSummary struct {
 		Count                     int      `json:"count"`
-		LegacyObjectCount         int      `json:"legacy_object_count"`
+		SingleBlockObjectCount    int      `json:"single_block_object_count"`
 		ConsolidatedObjectCount   int      `json:"consolidated_object_count"`
 		SkippedCount              int      `json:"skipped_count"`
 		MetadataByteLength        uint64   `json:"metadata_byte_length"`
@@ -550,26 +550,26 @@ func (v *cscbValidator) runCase(ctx context.Context, validationCase cscbValidati
 		Passed:         true,
 	}
 
-	var legacyDurations []time.Duration
+	var singleBlockDurations []time.Duration
 	var consolidatedDurations []time.Duration
-	var legacyRequests int64
-	var legacyBytes int64
+	var singleBlockRequests int64
+	var singleBlockBytes int64
 	var consolidatedRequests int64
 	var consolidatedBytes int64
 
 	for i := 0; i < validationCase.Iterations; i++ {
-		legacy := v.fetch(ctx, validationCase, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+		singleBlock := v.fetch(ctx, validationCase, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 		consolidated := v.fetch(ctx, validationCase, api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED)
 
-		if legacy.err != nil {
-			result.Legacy.ErrorCount++
-			result.Error = appendResultError(result.Error, "legacy", legacy.err)
+		if singleBlock.err != nil {
+			result.SingleBlock.ErrorCount++
+			result.Error = appendResultError(result.Error, "single-block", singleBlock.err)
 		} else {
-			legacyDurations = append(legacyDurations, legacy.duration)
-			legacyRequests += legacy.http.requests
-			legacyBytes += legacy.http.bytes
-			if result.Legacy.Files.Count == 0 {
-				result.Legacy.Files = summarizeCSCBFiles(legacy.files)
+			singleBlockDurations = append(singleBlockDurations, singleBlock.duration)
+			singleBlockRequests += singleBlock.http.requests
+			singleBlockBytes += singleBlock.http.bytes
+			if result.SingleBlock.Files.Count == 0 {
+				result.SingleBlock.Files = summarizeCSCBFiles(singleBlock.files)
 			}
 		}
 
@@ -585,13 +585,13 @@ func (v *cscbValidator) runCase(ctx context.Context, validationCase cscbValidati
 			}
 		}
 
-		if legacy.err != nil || consolidated.err != nil {
+		if singleBlock.err != nil || consolidated.err != nil {
 			result.Correct = false
 			result.Passed = false
 			continue
 		}
 
-		comparison := compareCSCBDigests(legacy.digests, consolidated.digests)
+		comparison := compareCSCBDigests(singleBlock.digests, consolidated.digests)
 		if !comparison.correct {
 			result.Correct = false
 			result.Passed = false
@@ -599,27 +599,27 @@ func (v *cscbValidator) runCase(ctx context.Context, validationCase cscbValidati
 		}
 		if result.CanonicalHashesCompared == 0 && comparison.hashesCompared > 0 {
 			result.CanonicalHashesCompared = comparison.hashesCompared
-			result.FirstCanonicalHashLegacy = comparison.firstLegacyHash
+			result.FirstCanonicalHashSingleBlock = comparison.firstSingleBlockHash
 			result.FirstCanonicalHashCSCB = comparison.firstConsolidatedHash
 		}
 	}
 
-	result.Legacy.Latency = summarizeDurations(legacyDurations)
+	result.SingleBlock.Latency = summarizeDurations(singleBlockDurations)
 	result.Consolidated.Latency = summarizeDurations(consolidatedDurations)
-	result.Legacy.HTTP = cscbHTTPSummary{Requests: legacyRequests, Bytes: legacyBytes}
+	result.SingleBlock.HTTP = cscbHTTPSummary{Requests: singleBlockRequests, Bytes: singleBlockBytes}
 	result.Consolidated.HTTP = cscbHTTPSummary{Requests: consolidatedRequests, Bytes: consolidatedBytes}
-	result.ObservedFallbackBlocks = result.Consolidated.Files.LegacyObjectCount
+	result.ObservedFallbackBlocks = result.Consolidated.Files.SingleBlockObjectCount
 	result.ObservedFallback = result.ObservedFallbackBlocks > 0
 	if validationCase.ExpectFallback && !result.ObservedFallback {
 		result.Passed = false
-		result.Error = appendResultErrorString(result.Error, "expected consolidated read to fall back to legacy metadata")
+		result.Error = appendResultErrorString(result.Error, "expected consolidated read to fall back to single-block metadata")
 	}
 	if !validationCase.ExpectFallback && result.ObservedFallback {
 		result.Passed = false
-		result.Error = appendResultErrorString(result.Error, "unexpected consolidated fallback to legacy metadata")
+		result.Error = appendResultErrorString(result.Error, "unexpected consolidated fallback to single-block metadata")
 	}
-	result.LatencyRatioConsolidated = ratio(result.Consolidated.Latency.P50Ms, result.Legacy.Latency.P50Ms)
-	result.BytesRatioConsolidated = ratio(float64(result.Consolidated.HTTP.Bytes), float64(result.Legacy.HTTP.Bytes))
+	result.LatencyRatioConsolidated = ratio(result.Consolidated.Latency.P50Ms, result.SingleBlock.Latency.P50Ms)
+	result.BytesRatioConsolidated = ratio(float64(result.Consolidated.HTTP.Bytes), float64(result.SingleBlock.HTTP.Bytes))
 	return result
 }
 
@@ -715,29 +715,29 @@ type cscbBlockComparison struct {
 	correct               bool
 	mismatchHeights       []uint64
 	hashesCompared        int
-	firstLegacyHash       string
+	firstSingleBlockHash  string
 	firstConsolidatedHash string
 }
 
-func compareCSCBBlocks(legacy []*api.Block, consolidated []*api.Block) cscbBlockComparison {
+func compareCSCBBlocks(singleBlock []*api.Block, consolidated []*api.Block) cscbBlockComparison {
 	comparison := cscbBlockComparison{correct: true}
-	if len(legacy) != len(consolidated) {
+	if len(singleBlock) != len(consolidated) {
 		comparison.correct = false
-		comparison.mismatchHeights = append(comparison.mismatchHeights, collectBlockHeights(legacy)...)
+		comparison.mismatchHeights = append(comparison.mismatchHeights, collectBlockHeights(singleBlock)...)
 		comparison.mismatchHeights = append(comparison.mismatchHeights, collectBlockHeights(consolidated)...)
 		comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
 		return comparison
 	}
-	for i := range legacy {
-		legacyHash, legacyErr := canonicalBlockHash(legacy[i])
+	for i := range singleBlock {
+		singleBlockHash, singleBlockErr := canonicalBlockHash(singleBlock[i])
 		consolidatedHash, consolidatedErr := canonicalBlockHash(consolidated[i])
-		height := firstNonZeroHeight(legacy[i], consolidated[i])
+		height := firstNonZeroHeight(singleBlock[i], consolidated[i])
 		if comparison.hashesCompared == 0 {
-			comparison.firstLegacyHash = legacyHash
+			comparison.firstSingleBlockHash = singleBlockHash
 			comparison.firstConsolidatedHash = consolidatedHash
 		}
 		comparison.hashesCompared++
-		if legacyErr != nil || consolidatedErr != nil || legacyHash != consolidatedHash {
+		if singleBlockErr != nil || consolidatedErr != nil || singleBlockHash != consolidatedHash {
 			comparison.correct = false
 			comparison.mismatchHeights = append(comparison.mismatchHeights, height)
 		}
@@ -746,26 +746,26 @@ func compareCSCBBlocks(legacy []*api.Block, consolidated []*api.Block) cscbBlock
 	return comparison
 }
 
-func compareCSCBDigests(legacy []cscbBlockDigest, consolidated []cscbBlockDigest) cscbBlockComparison {
+func compareCSCBDigests(singleBlock []cscbBlockDigest, consolidated []cscbBlockDigest) cscbBlockComparison {
 	comparison := cscbBlockComparison{correct: true}
-	if len(legacy) != len(consolidated) {
+	if len(singleBlock) != len(consolidated) {
 		comparison.correct = false
-		comparison.mismatchHeights = append(comparison.mismatchHeights, collectDigestHeights(legacy)...)
+		comparison.mismatchHeights = append(comparison.mismatchHeights, collectDigestHeights(singleBlock)...)
 		comparison.mismatchHeights = append(comparison.mismatchHeights, collectDigestHeights(consolidated)...)
 		comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
 		return comparison
 	}
 
-	for i := range legacy {
+	for i := range singleBlock {
 		if comparison.hashesCompared == 0 {
-			comparison.firstLegacyHash = legacy[i].hash
+			comparison.firstSingleBlockHash = singleBlock[i].hash
 			comparison.firstConsolidatedHash = consolidated[i].hash
 		}
 		comparison.hashesCompared++
 
-		if legacy[i].height != consolidated[i].height || legacy[i].hash != consolidated[i].hash {
+		if singleBlock[i].height != consolidated[i].height || singleBlock[i].hash != consolidated[i].hash {
 			comparison.correct = false
-			comparison.mismatchHeights = append(comparison.mismatchHeights, legacy[i].height, consolidated[i].height)
+			comparison.mismatchHeights = append(comparison.mismatchHeights, singleBlock[i].height, consolidated[i].height)
 		}
 	}
 	comparison.mismatchHeights = uniqueSortedHeights(comparison.mismatchHeights, 0, ^uint64(0))
@@ -814,7 +814,7 @@ func canonicalBlockHash(block *api.Block) (string, error) {
 		originalUncompressedLength := block.Metadata.UncompressedLength
 
 		block.Metadata.ObjectKeyMain = ""
-		block.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+		block.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
 		block.Metadata.ByteOffset = 0
 		block.Metadata.ByteLength = 0
 		block.Metadata.UncompressedLength = 0
@@ -941,10 +941,10 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 			summary.SkippedCount++
 		} else if isCSCBFile(file) {
 			summary.ConsolidatedObjectCount++
-			formats[file.GetObjectFormat().String()] = struct{}{}
+			formats[cscbBlockObjectFormatName(file.GetObjectFormat())] = struct{}{}
 		} else {
-			summary.LegacyObjectCount++
-			formats[file.GetObjectFormat().String()] = struct{}{}
+			summary.SingleBlockObjectCount++
+			formats[cscbBlockObjectFormatName(file.GetObjectFormat())] = struct{}{}
 		}
 		summary.MetadataByteLength += file.GetByteLength()
 		summary.MetadataUncompressedBytes += file.GetUncompressedLength()
@@ -954,6 +954,13 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 	}
 	sort.Strings(summary.Formats)
 	return summary
+}
+
+func cscbBlockObjectFormatName(format api.BlockObjectFormat) string {
+	if format == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK {
+		return "BLOCK_OBJECT_FORMAT_SINGLE_BLOCK"
+	}
+	return format.String()
 }
 
 func isCSCBFile(file *api.BlockFile) bool {
@@ -1082,7 +1089,7 @@ func writeCSCBMarkdownReport(path string, report *cscbValidationReport) error {
 	fmt.Fprintf(&b, "- observed_fallback_blocks: `%d`\n\n", report.ObservedFallbackBlocks)
 
 	fmt.Fprintf(&b, "## Case Results\n\n")
-	fmt.Fprintf(&b, "| case | range | pass | fallback | legacy p50/p95 ms | consolidated p50/p95 ms | legacy bytes | consolidated bytes | mismatches |\n")
+	fmt.Fprintf(&b, "| case | range | pass | fallback | single-block p50/p95 ms | consolidated p50/p95 ms | single-block bytes | consolidated bytes | mismatches |\n")
 	fmt.Fprintf(&b, "|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
 	for _, c := range report.Cases {
 		fmt.Fprintf(
@@ -1093,11 +1100,11 @@ func writeCSCBMarkdownReport(path string, report *cscbValidationReport) error {
 			c.EndHeight,
 			c.Passed,
 			c.ObservedFallback,
-			c.Legacy.Latency.P50Ms,
-			c.Legacy.Latency.P95Ms,
+			c.SingleBlock.Latency.P50Ms,
+			c.SingleBlock.Latency.P95Ms,
 			c.Consolidated.Latency.P50Ms,
 			c.Consolidated.Latency.P95Ms,
-			c.Legacy.HTTP.Bytes,
+			c.SingleBlock.HTTP.Bytes,
 			c.Consolidated.HTTP.Bytes,
 			formatHeights(c.MismatchHeights),
 		)
@@ -1110,19 +1117,19 @@ func writeCSCBMarkdownReport(path string, report *cscbValidationReport) error {
 			continue
 		}
 		fmt.Fprintf(&b, "### %s\n\n", c.Name)
-		fmt.Fprintf(&b, "- legacy files: `%d`, skipped: `%d`, legacy_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
-			c.Legacy.Files.Count,
-			c.Legacy.Files.SkippedCount,
-			c.Legacy.Files.LegacyObjectCount,
-			c.Legacy.Files.ConsolidatedObjectCount,
-			strings.Join(c.Legacy.Files.Formats, ","),
-			c.Legacy.HTTP.Requests,
-			c.Legacy.HTTP.Bytes,
+		fmt.Fprintf(&b, "- single-block files: `%d`, skipped: `%d`, single_block_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
+			c.SingleBlock.Files.Count,
+			c.SingleBlock.Files.SkippedCount,
+			c.SingleBlock.Files.SingleBlockObjectCount,
+			c.SingleBlock.Files.ConsolidatedObjectCount,
+			strings.Join(c.SingleBlock.Files.Formats, ","),
+			c.SingleBlock.HTTP.Requests,
+			c.SingleBlock.HTTP.Bytes,
 		)
-		fmt.Fprintf(&b, "- consolidated files: `%d`, skipped: `%d`, legacy_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
+		fmt.Fprintf(&b, "- consolidated files: `%d`, skipped: `%d`, single_block_objects: `%d`, consolidated_objects: `%d`, formats: `%s`, HTTP requests: `%d`, bytes: `%d`\n",
 			c.Consolidated.Files.Count,
 			c.Consolidated.Files.SkippedCount,
-			c.Consolidated.Files.LegacyObjectCount,
+			c.Consolidated.Files.SingleBlockObjectCount,
 			c.Consolidated.Files.ConsolidatedObjectCount,
 			strings.Join(c.Consolidated.Files.Formats, ","),
 			c.Consolidated.HTTP.Requests,

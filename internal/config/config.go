@@ -437,30 +437,30 @@ type (
 	}
 
 	ConsolidationConfig struct {
-		Enabled                             bool              `mapstructure:"enabled"`
-		Mode                                ConsolidationMode `mapstructure:"mode"`
-		Codec                               api.Compression   `mapstructure:"codec"`
-		CodecLevel                          int               `mapstructure:"codec_level"`
-		ZstdLongDistanceWindowLog           *int              `mapstructure:"zstd_long_distance_window_log"`
-		MaxCompressedBytes                  uint64            `mapstructure:"max_compressed_bytes"`
-		MaxUncompressedBytes                uint64            `mapstructure:"max_uncompressed_bytes"`
-		MaxBlocks                           uint64            `mapstructure:"max_blocks"`
-		CompressionChunkBlocks              uint64            `mapstructure:"compression_chunk_blocks"`
-		MaxChunkCompressedBytes             *uint64           `mapstructure:"max_chunk_compressed_bytes"`
-		MaxChunkUncompressedBytes           *uint64           `mapstructure:"max_chunk_uncompressed_bytes"`
-		FlushInterval                       time.Duration     `mapstructure:"flush_interval"`
-		ShadowTimeout                       time.Duration     `mapstructure:"shadow_timeout"`
-		MaxInflightRawBlocks                uint64            `mapstructure:"max_inflight_raw_blocks"`
-		MemoryBudgetBytes                   *uint64           `mapstructure:"memory_budget_bytes"`
-		LocalSpillDir                       string            `mapstructure:"local_spill_dir"`
-		LocalSpillMaxBytes                  *uint64           `mapstructure:"local_spill_max_bytes"`
-		ShardSize                           uint64            `mapstructure:"shard_size"`
-		MultipartThreshold                  uint64            `mapstructure:"multipart_threshold"`
-		ReadShadowFirst                     bool              `mapstructure:"read_shadow_first"`
-		PromotionGateHeight                 *uint64           `mapstructure:"promotion_gate_height"`
-		SafePromotionLag                    *uint64           `mapstructure:"safe_promotion_lag"`
-		LegacyObjectRetention               time.Duration     `mapstructure:"legacy_object_retention"`
-		LegacyShadowWriteAfterSyncerCutover bool              `mapstructure:"legacy_shadow_write_after_syncer_cutover"`
+		Enabled                                  bool              `mapstructure:"enabled"`
+		Mode                                     ConsolidationMode `mapstructure:"mode"`
+		Codec                                    api.Compression   `mapstructure:"codec"`
+		CodecLevel                               int               `mapstructure:"codec_level"`
+		ZstdLongDistanceWindowLog                *int              `mapstructure:"zstd_long_distance_window_log"`
+		MaxCompressedBytes                       uint64            `mapstructure:"max_compressed_bytes"`
+		MaxUncompressedBytes                     uint64            `mapstructure:"max_uncompressed_bytes"`
+		MaxBlocks                                uint64            `mapstructure:"max_blocks"`
+		CompressionChunkBlocks                   uint64            `mapstructure:"compression_chunk_blocks"`
+		MaxChunkCompressedBytes                  *uint64           `mapstructure:"max_chunk_compressed_bytes"`
+		MaxChunkUncompressedBytes                *uint64           `mapstructure:"max_chunk_uncompressed_bytes"`
+		FlushInterval                            time.Duration     `mapstructure:"flush_interval"`
+		ShadowTimeout                            time.Duration     `mapstructure:"shadow_timeout"`
+		MaxInflightRawBlocks                     uint64            `mapstructure:"max_inflight_raw_blocks"`
+		MemoryBudgetBytes                        *uint64           `mapstructure:"memory_budget_bytes"`
+		LocalSpillDir                            string            `mapstructure:"local_spill_dir"`
+		LocalSpillMaxBytes                       *uint64           `mapstructure:"local_spill_max_bytes"`
+		ShardSize                                uint64            `mapstructure:"shard_size"`
+		MultipartThreshold                       uint64            `mapstructure:"multipart_threshold"`
+		ReadShadowFirst                          bool              `mapstructure:"read_shadow_first"`
+		PromotionGateHeight                      *uint64           `mapstructure:"promotion_gate_height"`
+		SafePromotionLag                         *uint64           `mapstructure:"safe_promotion_lag"`
+		SingleBlockObjectRetention               time.Duration     `mapstructure:"single_block_object_retention"`
+		SingleBlockShadowWriteAfterSyncerCutover bool              `mapstructure:"single_block_shadow_write_after_syncer_cutover"`
 	}
 
 	SLAConfig struct {
@@ -624,7 +624,7 @@ const (
 	DLQType_SQS         DLQType = 1
 	DLQType_FIRESTORE   DLQType = 2
 
-	ConsolidationModeLegacyOnly      ConsolidationMode = "legacy_only"
+	ConsolidationModeSingleBlockOnly ConsolidationMode = "single_block_only"
 	ConsolidationModeShadowDualWrite ConsolidationMode = "shadow_dual_write"
 	ConsolidationModeAutoConsolidate ConsolidationMode = "auto_consolidate"
 	// Historical backfill is the manual catch-up mode. It remains separate from
@@ -632,7 +632,7 @@ const (
 	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
-	DefaultLegacyObjectRetention                                 = 72 * time.Hour
+	DefaultSingleBlockObjectRetention                            = 72 * time.Hour
 
 	AWSAccountDevelopment AWSAccount = "development"
 	AWSAccountProduction  AWSAccount = "production"
@@ -709,7 +709,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("cron.batch_consolidator.parallelism", 1)
 	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
 	v.SetDefault("aws.storage.consolidation.enabled", false)
-	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeLegacyOnly))
+	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeSingleBlockOnly))
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
 	v.SetDefault("aws.storage.consolidation.codec_level", 6)
 	v.SetDefault("aws.storage.consolidation.max_compressed_bytes", 2147483648)
@@ -724,7 +724,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.shard_size", 10000)
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
 	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
-	v.SetDefault("aws.storage.consolidation.legacy_object_retention", DefaultLegacyObjectRetention.String())
+	v.SetDefault("aws.storage.consolidation.single_block_object_retention", DefaultSingleBlockObjectRetention.String())
 	if err := v.BindEnv("aws.storage.consolidation.promotion_gate_height"); err != nil {
 		return nil, xerrors.Errorf("failed to bind promotion_gate_height env: %w", err)
 	}
@@ -746,6 +746,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	if err := mergeInConfig(v, configOpts, envSecrets); err != nil {
 		return nil, xerrors.Errorf("failed to merge in %v config: %w", envSecrets, err)
 	}
+	applyDeprecatedConsolidationAliases(v)
 
 	if err := v.Unmarshal(&cfg, viper.DecodeHook(mapstructure.ComposeDecodeHookFunc(
 		mapstructure.TextUnmarshallerHookFunc(),
@@ -760,6 +761,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 		stringToSidechainHookFunc(),
 	))); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal config: %w", err)
+	}
+	if cfg.AWS.Storage.Consolidation.Mode == deprecatedConsolidationModeBeforeSingleBlockRename {
+		cfg.AWS.Storage.Consolidation.Mode = ConsolidationModeSingleBlockOnly
 	}
 
 	cfg.setDerivedConfigs(reflect.ValueOf(&cfg))
@@ -786,10 +790,51 @@ func New(opts ...ConfigOption) (*Config, error) {
 	return &cfg, nil
 }
 
+const (
+	consolidationSingleBlockObjectRetentionKey               = "aws.storage.consolidation.single_block_object_retention"
+	consolidationSingleBlockShadowWriteAfterSyncerCutoverKey = "aws.storage.consolidation.single_block_shadow_write_after_syncer_cutover"
+
+	// Deprecated aliases are accepted only at the configuration boundary so a
+	// rolling deployment can consume the previous production configuration.
+	deprecatedConsolidationModeBeforeSingleBlockRename               ConsolidationMode = "legacy_only"
+	deprecatedConsolidationObjectRetentionKeyBeforeSingleBlockRename                   = "aws.storage.consolidation.legacy_object_retention"
+	deprecatedConsolidationShadowWriteKeyBeforeSingleBlockRename                       = "aws.storage.consolidation.legacy_shadow_write_after_syncer_cutover"
+)
+
+func applyDeprecatedConsolidationAliases(v *viper.Viper) {
+	applyDeprecatedConfigAlias(
+		v,
+		consolidationSingleBlockObjectRetentionKey,
+		deprecatedConsolidationObjectRetentionKeyBeforeSingleBlockRename,
+	)
+	applyDeprecatedConfigAlias(
+		v,
+		consolidationSingleBlockShadowWriteAfterSyncerCutoverKey,
+		deprecatedConsolidationShadowWriteKeyBeforeSingleBlockRename,
+	)
+}
+
+func applyDeprecatedConfigAlias(v *viper.Viper, canonicalKey string, deprecatedKey string) {
+	canonicalEnv := "CHAINSTORAGE_" + strings.ToUpper(strings.ReplaceAll(canonicalKey, ".", "_"))
+	if _, ok := os.LookupEnv(canonicalEnv); ok {
+		return
+	}
+
+	deprecatedEnv := "CHAINSTORAGE_" + strings.ToUpper(strings.ReplaceAll(deprecatedKey, ".", "_"))
+	if value, ok := os.LookupEnv(deprecatedEnv); ok {
+		v.Set(canonicalKey, value)
+		return
+	}
+
+	if !v.InConfig(canonicalKey) && v.InConfig(deprecatedKey) {
+		v.Set(canonicalKey, v.Get(deprecatedKey))
+	}
+}
+
 func (c *Config) validateConsolidationConfig() error {
 	consolidation := c.AWS.Storage.Consolidation
 	switch consolidation.Mode {
-	case ConsolidationModeLegacyOnly,
+	case ConsolidationModeSingleBlockOnly,
 		ConsolidationModeShadowDualWrite,
 		ConsolidationModeAutoConsolidate,
 		ConsolidationModeHistoricalBackfill,
@@ -858,8 +903,8 @@ func (c *Config) validateConsolidationConfig() error {
 	if consolidation.ShadowTimeout <= 0 {
 		return xerrors.New("consolidation shadow_timeout must be positive")
 	}
-	if consolidation.LegacyObjectRetention <= 0 {
-		return xerrors.New("consolidation legacy_object_retention must be positive")
+	if consolidation.SingleBlockObjectRetention <= 0 {
+		return xerrors.New("consolidation single_block_object_retention must be positive")
 	}
 	if consolidation.Mode == ConsolidationModePromoteFinalized && consolidation.SafePromotionLag == nil {
 		return xerrors.New("consolidation promote_finalized requires safe_promotion_lag")

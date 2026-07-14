@@ -22,19 +22,21 @@ import (
 type (
 	Extractor struct {
 		baseActivity
-		blockchainClient client.Client
-		blobStorage      blobstorage.BlobStorage
-		metaStorage      metastorage.MetaStorage
-		failoverManager  endpoints.FailoverManager
+		blockchainClient    client.Client
+		blobStorage         blobstorage.BlobStorage
+		singleBlockUploader blobstorage.SingleBlockUploader
+		metaStorage         metastorage.MetaStorage
+		failoverManager     endpoints.FailoverManager
 	}
 
 	ExtractorParams struct {
 		fx.In
-		Runtime          cadence.Runtime
-		BlockchainClient client.Client `name:"slave"`
-		BlobStorage      blobstorage.BlobStorage
-		MetaStorage      metastorage.MetaStorage
-		FailoverManager  endpoints.FailoverManager
+		Runtime             cadence.Runtime
+		BlockchainClient    client.Client `name:"slave"`
+		BlobStorage         blobstorage.BlobStorage
+		SingleBlockUploader blobstorage.SingleBlockUploader
+		MetaStorage         metastorage.MetaStorage
+		FailoverManager     endpoints.FailoverManager
 	}
 
 	ExtractorRequest struct {
@@ -54,11 +56,12 @@ type (
 
 func NewExtractor(params ExtractorParams) *Extractor {
 	a := &Extractor{
-		baseActivity:     newBaseActivity(ActivityExtractor, params.Runtime),
-		blockchainClient: params.BlockchainClient,
-		blobStorage:      params.BlobStorage,
-		metaStorage:      params.MetaStorage,
-		failoverManager:  params.FailoverManager,
+		baseActivity:        newBaseActivity(ActivityExtractor, params.Runtime),
+		blockchainClient:    params.BlockchainClient,
+		blobStorage:         params.BlobStorage,
+		singleBlockUploader: params.SingleBlockUploader,
+		metaStorage:         params.MetaStorage,
+		failoverManager:     params.FailoverManager,
 	}
 	a.register(a.execute)
 
@@ -135,7 +138,7 @@ func (a *Extractor) execute(ctx context.Context, request *ExtractorRequest) (*Ex
 
 			activity.RecordHeartbeat(ctx, "extractor.block.fetched", height)
 
-			objectKey, err := a.blobStorage.Upload(ctx, block, request.DataCompression)
+			objectKey, err := a.singleBlockUploader.Upload(ctx, block, request.DataCompression)
 			if err != nil {
 				logger.Error("failed to upload to blob store", zap.Error(err))
 				return xerrors.Errorf("failed to upload to blob store: %w", err)

@@ -208,6 +208,46 @@ func (mr *MockClientMockRecorder) DeleteObjects(arg0, arg1 any, arg2 ...any) *go
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DeleteObjects", reflect.TypeOf((*MockClient)(nil).DeleteObjects), varargs...)
 }
 
+// GetBucketLifecycleConfiguration mocks base method.
+func (m *MockClient) GetBucketLifecycleConfiguration(arg0 context.Context, arg1 *s3.GetBucketLifecycleConfigurationInput, arg2 ...func(*s3.Options)) (*s3.GetBucketLifecycleConfigurationOutput, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetBucketLifecycleConfiguration", varargs...)
+	ret0, _ := ret[0].(*s3.GetBucketLifecycleConfigurationOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBucketLifecycleConfiguration indicates an expected call of GetBucketLifecycleConfiguration.
+func (mr *MockClientMockRecorder) GetBucketLifecycleConfiguration(arg0, arg1 any, arg2 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBucketLifecycleConfiguration", reflect.TypeOf((*MockClient)(nil).GetBucketLifecycleConfiguration), varargs...)
+}
+
+// GetBucketPolicy mocks base method.
+func (m *MockClient) GetBucketPolicy(arg0 context.Context, arg1 *s3.GetBucketPolicyInput, arg2 ...func(*s3.Options)) (*s3.GetBucketPolicyOutput, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetBucketPolicy", varargs...)
+	ret0, _ := ret[0].(*s3.GetBucketPolicyOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetBucketPolicy indicates an expected call of GetBucketPolicy.
+func (mr *MockClientMockRecorder) GetBucketPolicy(arg0, arg1 any, arg2 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBucketPolicy", reflect.TypeOf((*MockClient)(nil).GetBucketPolicy), varargs...)
+}
+
 // GetObject mocks base method.
 func (m *MockClient) GetObject(arg0 context.Context, arg1 *s3.GetObjectInput, arg2 ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
 	m.ctrl.T.Helper()
@@ -268,26 +308,6 @@ func (mr *MockClientMockRecorder) HeadObject(arg0, arg1 any, arg2 ...any) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HeadObject", reflect.TypeOf((*MockClient)(nil).HeadObject), varargs...)
 }
 
-// ListObjectsV2 mocks base method.
-func (m *MockClient) ListObjectsV2(arg0 context.Context, arg1 *s3.ListObjectsV2Input, arg2 ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
-	m.ctrl.T.Helper()
-	varargs := []any{arg0, arg1}
-	for _, a := range arg2 {
-		varargs = append(varargs, a)
-	}
-	ret := m.ctrl.Call(m, "ListObjectsV2", varargs...)
-	ret0, _ := ret[0].(*s3.ListObjectsV2Output)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// ListObjectsV2 indicates an expected call of ListObjectsV2.
-func (mr *MockClientMockRecorder) ListObjectsV2(arg0, arg1 any, arg2 ...any) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	varargs := append([]any{arg0, arg1}, arg2...)
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListObjectsV2", reflect.TypeOf((*MockClient)(nil).ListObjectsV2), varargs...)
-}
-
 // ListObjectVersions mocks base method.
 func (m *MockClient) ListObjectVersions(arg0 context.Context, arg1 *s3.ListObjectVersionsInput, arg2 ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
 	m.ctrl.T.Helper()
@@ -306,6 +326,26 @@ func (mr *MockClientMockRecorder) ListObjectVersions(arg0, arg1 any, arg2 ...any
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{arg0, arg1}, arg2...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListObjectVersions", reflect.TypeOf((*MockClient)(nil).ListObjectVersions), varargs...)
+}
+
+// ListObjectsV2 mocks base method.
+func (m *MockClient) ListObjectsV2(arg0 context.Context, arg1 *s3.ListObjectsV2Input, arg2 ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "ListObjectsV2", varargs...)
+	ret0, _ := ret[0].(*s3.ListObjectsV2Output)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListObjectsV2 indicates an expected call of ListObjectsV2.
+func (mr *MockClientMockRecorder) ListObjectsV2(arg0, arg1 any, arg2 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListObjectsV2", reflect.TypeOf((*MockClient)(nil).ListObjectsV2), varargs...)
 }
 
 // PutObject mocks base method.

@@ -40,24 +40,24 @@ var (
 type (
 	Replicator struct {
 		baseActivity
-		config          *config.Config
-		logger          *zap.Logger
-		client          gateway.Client
-		blockDownloader downloader.BlockDownloader
-		metaStorage     metastorage.MetaStorage
-		blobStorage     blobstorage.BlobStorage
-		retry           retry.RetryWithResult[[]byte]
-		httpClient      *http.Client
+		config              *config.Config
+		logger              *zap.Logger
+		client              gateway.Client
+		blockDownloader     downloader.BlockDownloader
+		metaStorage         metastorage.MetaStorage
+		singleBlockUploader blobstorage.SingleBlockUploader
+		retry               retry.RetryWithResult[[]byte]
+		httpClient          *http.Client
 	}
 
 	ReplicatorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime         cadence.Runtime
-		Client          gateway.Client
-		BlockDownloader downloader.BlockDownloader
-		MetaStorage     metastorage.MetaStorage
-		BlobStorage     blobstorage.BlobStorage
+		Runtime             cadence.Runtime
+		Client              gateway.Client
+		BlockDownloader     downloader.BlockDownloader
+		MetaStorage         metastorage.MetaStorage
+		SingleBlockUploader blobstorage.SingleBlockUploader
 	}
 
 	ReplicatorRequest struct {
@@ -84,15 +84,15 @@ func NewReplicator(params ReplicatorParams) *Replicator {
 		return "/workflow/activity/replicator"
 	}))
 	a := &Replicator{
-		baseActivity:    newBaseActivity(ActivityReplicator, params.Runtime),
-		config:          params.Config,
-		logger:          params.Logger,
-		client:          params.Client,
-		blockDownloader: params.BlockDownloader,
-		metaStorage:     params.MetaStorage,
-		blobStorage:     params.BlobStorage,
-		httpClient:      httpClient,
-		retry:           retry.NewWithResult[[]byte](retry.WithLogger(params.Logger)),
+		baseActivity:        newBaseActivity(ActivityReplicator, params.Runtime),
+		config:              params.Config,
+		logger:              params.Logger,
+		client:              params.Client,
+		blockDownloader:     params.BlockDownloader,
+		metaStorage:         params.MetaStorage,
+		singleBlockUploader: params.SingleBlockUploader,
+		httpClient:          httpClient,
+		retry:               retry.NewWithResult[[]byte](retry.WithLogger(params.Logger)),
 	}
 	a.register(a.execute)
 	return a
@@ -270,7 +270,7 @@ func (a *Replicator) execute(ctx context.Context, request *ReplicatorRequest) (*
 			if err != nil {
 				return xerrors.Errorf("failed to prepare raw block data: %w", err)
 			}
-			objectKeyMain, err := a.blobStorage.UploadRaw(errgroupCtx, rawBlockData)
+			objectKeyMain, err := a.singleBlockUploader.UploadRaw(errgroupCtx, rawBlockData)
 			if err != nil {
 				return xerrors.Errorf("failed to upload raw block file: %w", err)
 			}
