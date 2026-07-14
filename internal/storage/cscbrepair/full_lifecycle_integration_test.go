@@ -2,7 +2,9 @@ package cscbrepair_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"testing"
@@ -57,14 +59,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	cfg.AWS.Bucket = bucket
 	cfg.AWS.IsLocalStack = true
 	cfg.AWS.IsResetLocal = true
-	// Pin the Docker test credentials so shell-level environment overrides cannot
-	// silently redirect or skip this destructive lifecycle test.
-	cfg.AWS.Postgres.Host = "localhost"
-	cfg.AWS.Postgres.Port = 5433
-	cfg.AWS.Postgres.Database = "chainstorage_solana_mainnet"
-	cfg.AWS.Postgres.User = "cs_solana_mainnet_worker"
-	cfg.AWS.Postgres.Password = "worker_password"
-	cfg.AWS.Postgres.SSLMode = "require"
+	localStackEndpoint := configureRepairTestEnvironment(t, cfg.AWS.Postgres)
 	cfg.Chain.BlockStartHeight = height
 	cfg.AWS.Storage.Consolidation.Enabled = true
 	cfg.AWS.Storage.Consolidation.Mode = config.ConsolidationModeHistoricalBackfill
@@ -89,7 +84,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 		chains3.Module,
 		metastorage.Module,
 		blobstorage.Module,
-		fx.Replace(newRepairLocalStackConfig(ctx)),
+		fx.Replace(newRepairLocalStackConfig(ctx, localStackEndpoint)),
 		fx.Populate(&meta, &blob, &singleBlockUploader, &s3Session),
 	)
 	defer app.Close()
@@ -170,7 +165,8 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	store := retirement.NewS3ObjectStore(rawS3)
 	repairer := cscbrepair.NewRepairer(cscbrepair.NewPostgresRepository(db), store, bucket)
-	manifest, err := repairer.PrepareNext(ctx, tag, height, height+1, 1, nil)
+	executionKey := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	manifest, err := repairer.PrepareNext(ctx, executionKey, tag, height, height+1, 1, nil)
 	require.NoError(err)
 	require.NotNil(manifest)
 	repairID = manifest.ID
@@ -178,6 +174,38 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
+
+	uploadGuard, err := meta.AcquireSingleBlockUploadGuard(ctx, tag, height, block.Metadata.Hash)
+	require.NoError(err)
+	require.True(uploadGuard.RetirementFenced(), "active repair must fence single-block uploads")
+	require.NoError(uploadGuard.Release())
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_delete_after = clock_timestamp() - INTERVAL '1 second'
+		WHERE block_metadata_id = $1`, blockMetadataID)
+	require.NoError(err)
+	err = retirement.NewPostgresRepository(db).PrepareRetirement(ctx, retirement.RetirementManifest{
+		BlockMetadataID:                blockMetadataID,
+		Tag:                            tag,
+		Height:                         height,
+		Hash:                           block.Metadata.Hash,
+		State:                          retirement.RetirementStateEligible,
+		Bucket:                         bucket,
+		SingleBlockObjectKey:           singleBlockKey,
+		SingleBlockObjectKeySHA256:     repairSHA256(singleBlockKey),
+		SingleBlockObjectVersionIDs:    []string{manifest.Blocks[0].SingleBlockObjectVersion.VersionID},
+		SingleBlockObjectETag:          manifest.Blocks[0].SingleBlockObjectVersion.ETag,
+		SingleBlockObjectBytes:         manifest.Blocks[0].SingleBlockObjectVersion.Bytes,
+		ConsolidatedObjectKey:          dirtyKey,
+		ConsolidatedObjectVersionID:    manifest.OldConsolidatedObjectVersion.VersionID,
+		ConsolidatedObjectETag:         manifest.OldConsolidatedObjectVersion.ETag,
+		ConsolidatedByteOffset:         manifest.Blocks[0].OldByteOffset,
+		ConsolidatedByteLength:         manifest.Blocks[0].OldByteLength,
+		ConsolidatedUncompressedLength: manifest.Blocks[0].OldUncompressedLength,
+		PayloadSHA256:                  manifest.Blocks[0].PayloadSHA256,
+		PreparedAt:                     time.Now().UTC(),
+	})
+	require.ErrorContains(err, "failed to lock canonical retirement metadata")
 
 	manifest, err = repairer.Restore(ctx, manifest.ID, nil)
 	require.NoError(err)
@@ -191,6 +219,26 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	restoredBlock, err := blob.Download(ctx, activeSingleBlock)
 	require.NoError(err)
 	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(restoredBlock)))
+	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET object_key_main = $2 WHERE id = $1`, blockMetadataID, dirtyKey)
+	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, single_block_object_key_main,
+			consolidated_object_key_main, object_format, byte_offset, byte_length,
+			uncompressed_length, validated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())`,
+		blockMetadataID,
+		tag,
+		height,
+		block.Metadata.Hash,
+		singleBlockKey,
+		dirtyKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		manifest.Blocks[0].OldByteOffset,
+		manifest.Blocks[0].OldByteLength,
+		manifest.Blocks[0].OldUncompressedLength,
+	)
+	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
 
 	records, err = meta.GetBlocksMissingConsolidationShadow(ctx, tag, height, height+1, 1)
 	require.NoError(err)
@@ -284,19 +332,53 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	resumed, err := repairer.DeleteOldObject(ctx, manifest.ID)
 	require.NoError(err)
 	require.Equal(cscbrepair.StateCompleted, resumed.State)
-	next, err := repairer.PrepareNext(ctx, tag, height, height+1, 1, nil)
+	retried, err := repairer.PrepareNext(ctx, executionKey, tag, height, height+1, 1, nil)
+	require.NoError(err)
+	require.Equal(manifest.ID, retried.ID)
+	require.Equal(cscbrepair.StateCompleted, retried.State)
+	noCandidateExecutionKey := "123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"
+	next, err := repairer.PrepareNext(
+		ctx,
+		noCandidateExecutionKey,
+		tag,
+		height,
+		height+1,
+		1,
+		nil,
+	)
+	require.NoError(err)
+	require.Nil(next)
+	next, err = repairer.PrepareNext(ctx, noCandidateExecutionKey, tag, height, height+1, 1, nil)
 	require.NoError(err)
 	require.Nil(next)
 }
 
-func newRepairLocalStackConfig(ctx context.Context) aws.Config {
+func configureRepairTestEnvironment(t *testing.T, postgres *config.PostgresConfig) string {
+	t.Helper()
+	switch postgres.Host {
+	case "localhost", "127.0.0.1", "::1":
+		postgres.Port = 5433
+		postgres.Database = "chainstorage_solana_mainnet"
+		postgres.User = "cs_solana_mainnet_worker"
+		postgres.Password = "worker_password"
+		postgres.SSLMode = "require"
+		return "http://localhost:4566"
+	case "postgres":
+		return "http://localstack:4566"
+	default:
+		t.Fatalf("refusing to run CSCB repair lifecycle test against PostgreSQL host %q", postgres.Host)
+		return ""
+	}
+}
+
+func newRepairLocalStackConfig(ctx context.Context, endpoint string) aws.Config {
 	cfg, err := awsconfig.LoadDefaultConfig(
 		ctx,
 		awsconfig.WithRegion("us-east-1"),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
 		awsconfig.WithEndpointResolverWithOptions(
 			aws.EndpointResolverWithOptionsFunc(func(string, string, ...interface{}) (aws.Endpoint, error) {
-				return aws.Endpoint{URL: "http://localhost:4566", HostnameImmutable: true}, nil
+				return aws.Endpoint{URL: endpoint, HostnameImmutable: true}, nil
 			}),
 		),
 	)
@@ -304,6 +386,11 @@ func newRepairLocalStackConfig(ctx context.Context) aws.Config {
 		panic(fmt.Sprintf("failed to configure LocalStack: %v", err))
 	}
 	return cfg
+}
+
+func repairSHA256(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
 }
 
 func openRepairDB(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {
@@ -331,12 +418,15 @@ func cleanupRepairMetadata(t *testing.T, db *sql.DB, blockMetadataID int64, repa
 	t.Helper()
 	ctx := context.Background()
 	if repairID != nil && *repairID != 0 {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_execution DISABLE TRIGGER cscb_repair_execution_delete_trigger`)
 		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_block DISABLE TRIGGER cscb_repair_block_delete_trigger`)
 		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest DISABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_execution WHERE repair_id = $1`, *repairID)
 		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_block WHERE repair_id = $1`, *repairID)
 		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_manifest WHERE id = $1`, *repairID)
 		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest ENABLE TRIGGER cscb_repair_manifest_delete_trigger`)
 		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_block ENABLE TRIGGER cscb_repair_block_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_execution ENABLE TRIGGER cscb_repair_execution_delete_trigger`)
 	}
 	_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE block_metadata_id = $1`, blockMetadataID)
 	_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE block_metadata_id = $1`, blockMetadataID)

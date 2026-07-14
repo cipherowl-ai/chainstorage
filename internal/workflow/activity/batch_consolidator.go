@@ -53,12 +53,13 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode             config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
-		Tag              uint32
-		StartHeight      uint64
-		EndHeight        uint64 `validate:"gtfield=StartHeight"`
-		MaxBlocks        uint64 `validate:"required"`
-		DeleteOldObjects bool
+		Mode               config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
+		Tag                uint32
+		StartHeight        uint64
+		EndHeight          uint64 `validate:"gtfield=StartHeight"`
+		MaxBlocks          uint64 `validate:"required"`
+		DeleteOldObjects   bool
+		RepairExecutionKey string
 	}
 
 	BatchConsolidatorResponse struct {
@@ -290,6 +291,7 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 	}
 	manifest, err := repairer.PrepareNext(
 		ctx,
+		request.RepairExecutionKey,
 		request.Tag,
 		request.StartHeight,
 		request.EndHeight,

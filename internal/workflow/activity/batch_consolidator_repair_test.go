@@ -15,11 +15,12 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 	require := testutil.Require(s.T())
 	records, blocks := makeConsolidatorFixture(1, 1000)
 	request := &BatchConsolidatorRequest{
-		Mode:        config.ConsolidationModeRepairExistingCSCB,
-		Tag:         2,
-		StartHeight: 900,
-		EndHeight:   1200,
-		MaxBlocks:   100,
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		RepairExecutionKey: testRepairExecutionKey,
 	}
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
@@ -65,6 +66,7 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 		PendingOldDeletion: true,
 	}, response)
 	require.Equal([]string{"prepare", "restore", "verify"}, fake.calls)
+	require.Equal(testRepairExecutionKey, fake.executionKey)
 }
 
 func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBDeletesOnlyAfterVerified() {
@@ -77,17 +79,19 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBDeletesOnlyAfterVerif
 	s.batchConsolidator.repairer = fake
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
-		Mode:             config.ConsolidationModeRepairExistingCSCB,
-		Tag:              2,
-		StartHeight:      900,
-		EndHeight:        1200,
-		MaxBlocks:        100,
-		DeleteOldObjects: true,
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		DeleteOldObjects:   true,
+		RepairExecutionKey: testRepairExecutionKey,
 	})
 	require.NoError(err)
 	require.Equal(uint64(1), response.RepairedObjects)
 	require.False(response.PendingOldDeletion)
 	require.Equal([]string{"prepare", "delete"}, fake.calls)
+	require.Equal(testRepairExecutionKey, fake.executionKey)
 }
 
 func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string) *cscbrepair.Manifest {
@@ -106,15 +110,17 @@ func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string
 
 type repairActivityFake struct {
 	cscbrepair.Repairer
-	prepared  *cscbrepair.Manifest
-	restored  *cscbrepair.Manifest
-	verified  *cscbrepair.Manifest
-	completed *cscbrepair.Manifest
-	calls     []string
+	prepared     *cscbrepair.Manifest
+	restored     *cscbrepair.Manifest
+	verified     *cscbrepair.Manifest
+	completed    *cscbrepair.Manifest
+	calls        []string
+	executionKey string
 }
 
-func (f *repairActivityFake) PrepareNext(context.Context, uint32, uint64, uint64, uint64, cscbrepair.Progress) (*cscbrepair.Manifest, error) {
+func (f *repairActivityFake) PrepareNext(_ context.Context, executionKey string, _ uint32, _ uint64, _ uint64, _ uint64, _ cscbrepair.Progress) (*cscbrepair.Manifest, error) {
 	f.calls = append(f.calls, "prepare")
+	f.executionKey = executionKey
 	return f.prepared, nil
 }
 
@@ -132,3 +138,5 @@ func (f *repairActivityFake) DeleteOldObject(context.Context, int64) (*cscbrepai
 	f.calls = append(f.calls, "delete")
 	return f.completed, nil
 }
+
+const testRepairExecutionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"

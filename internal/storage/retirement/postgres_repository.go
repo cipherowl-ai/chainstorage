@@ -173,6 +173,13 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 			AND shadow.single_block_delete_after IS NOT NULL
 			AND shadow.single_block_delete_after <= CURRENT_TIMESTAMP
 			AND shadow.single_block_object_deleted_at IS NULL
+			AND NOT EXISTS (
+				SELECT 1
+				FROM cscb_repair_block repair_block
+				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
+				WHERE repair_block.block_metadata_id = bm.id
+					AND repair.state <> 'completed'
+			)
 		FOR UPDATE OF cb, bm, shadow`
 	var lockedID int64
 	var databasePreparedAt time.Time

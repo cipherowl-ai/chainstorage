@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 
 	"go.temporal.io/sdk/client"
@@ -494,14 +496,16 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 	maxBlocks uint64,
 ) error {
 	processedBlocks := uint64(0)
+	repairIteration := uint64(0)
 	for {
 		response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
-			Mode:             config.ConsolidationModeRepairExistingCSCB,
-			Tag:              tag,
-			StartHeight:      request.StartHeight,
-			EndHeight:        request.EndHeight,
-			MaxBlocks:        maxBlocks,
-			DeleteOldObjects: request.DeleteOldObjects,
+			Mode:               config.ConsolidationModeRepairExistingCSCB,
+			Tag:                tag,
+			StartHeight:        request.StartHeight,
+			EndHeight:          request.EndHeight,
+			MaxBlocks:          maxBlocks,
+			DeleteOldObjects:   request.DeleteOldObjects,
+			RepairExecutionKey: makeRepairExecutionKey(ctx, repairIteration),
 		})
 		if err != nil {
 			return xerrors.Errorf(
@@ -540,6 +544,7 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			logger.Info("CSCB repair stopped after verification because old-object deletion was not enabled")
 			return nil
 		}
+		repairIteration++
 		if processedBlocks >= checkpointSize {
 			newRequest := *request
 			logger.Info(
@@ -550,6 +555,15 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			return w.continueAsNew(ctx, &newRequest)
 		}
 	}
+}
+
+func makeRepairExecutionKey(ctx workflow.Context, iteration uint64) string {
+	info := workflow.GetInfo(ctx)
+	payload := info.WorkflowExecution.ID + "\x00" +
+		info.WorkflowExecution.RunID + "\x00" +
+		strconv.FormatUint(iteration, 10)
+	digest := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(digest[:])
 }
 
 func (w *BatchConsolidator) processAutoConsolidateBatchParallel(

@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"encoding/hex"
 
 	"github.com/stretchr/testify/mock"
 
@@ -38,13 +39,13 @@ func (s *batchConsolidatorTestSuite) TestRepairExistingCSCBStopsAfterVerifiedCan
 		MaxBlocks:   100,
 	})
 	require.NoError(err)
-	require.Equal([]*activity.BatchConsolidatorRequest{{
-		Mode:        config.ConsolidationModeRepairExistingCSCB,
-		Tag:         2,
-		StartHeight: 1000,
-		EndHeight:   1100,
-		MaxBlocks:   100,
-	}}, requests)
+	require.Len(requests, 1)
+	require.Equal(config.ConsolidationModeRepairExistingCSCB, requests[0].Mode)
+	require.Equal(uint32(2), requests[0].Tag)
+	require.Equal(uint64(1000), requests[0].StartHeight)
+	require.Equal(uint64(1100), requests[0].EndHeight)
+	require.Equal(uint64(100), requests[0].MaxBlocks)
+	require.True(isRepairExecutionKey(requests[0].RepairExecutionKey))
 }
 
 func (s *batchConsolidatorTestSuite) TestRepairExistingCSCBDeletesThenFindsNextExactObject() {
@@ -83,15 +84,20 @@ func (s *batchConsolidatorTestSuite) TestRepairExistingCSCBDeletesThenFindsNextE
 	require.NoError(err)
 	require.Len(requests, 2)
 	for _, request := range requests {
-		require.Equal(&activity.BatchConsolidatorRequest{
-			Mode:             config.ConsolidationModeRepairExistingCSCB,
-			Tag:              2,
-			StartHeight:      900,
-			EndHeight:        1200,
-			MaxBlocks:        100,
-			DeleteOldObjects: true,
-		}, request)
+		require.Equal(config.ConsolidationModeRepairExistingCSCB, request.Mode)
+		require.Equal(uint32(2), request.Tag)
+		require.Equal(uint64(900), request.StartHeight)
+		require.Equal(uint64(1200), request.EndHeight)
+		require.Equal(uint64(100), request.MaxBlocks)
+		require.True(request.DeleteOldObjects)
+		require.True(isRepairExecutionKey(request.RepairExecutionKey))
 	}
+	require.NotEqual(requests[0].RepairExecutionKey, requests[1].RepairExecutionKey)
+}
+
+func isRepairExecutionKey(value string) bool {
+	decoded, err := hex.DecodeString(value)
+	return err == nil && len(decoded) == 32
 }
 
 func (s *batchConsolidatorTestSuite) TestRepairExistingCSCBRequiresSerialExecution() {

@@ -63,7 +63,8 @@ func TestDeleteOldObjectRejectsVersionTopologyDrift(t *testing.T) {
 	_, err := repairer.DeleteOldObject(context.Background(), manifest.ID)
 	require.ErrorContains(t, err, "topology changed before deletion")
 	require.Zero(t, store.deleteCalls)
-	require.Zero(t, repository.completeCalls)
+	require.Equal(t, 1, repository.completeCalls)
+	require.Equal(t, StateVerified, repository.manifest.State)
 }
 
 func TestDeleteOldObjectRejectsRebuiltVersionTopologyDrift(t *testing.T) {
@@ -85,7 +86,24 @@ func TestDeleteOldObjectRejectsRebuiltVersionTopologyDrift(t *testing.T) {
 	_, err := repairer.DeleteOldObject(context.Background(), manifest.ID)
 	require.ErrorContains(t, err, "rebuilt CSCB changed before old-object deletion")
 	require.Zero(t, store.deleteCalls)
-	require.Zero(t, repository.completeCalls)
+	require.Equal(t, 1, repository.completeCalls)
+	require.Equal(t, StateVerified, repository.manifest.State)
+}
+
+func TestDeleteOldObjectRejectsMissingRebuiltObjectDuringDeletionRecovery(t *testing.T) {
+	manifest := verifiedRepairManifest()
+	repository := &deleteResumeRepository{manifest: manifest}
+	store := &deleteResumeObjectStore{
+		oldKey: manifest.OldConsolidatedObjectKey,
+		newKey: manifest.NewConsolidatedObjectKey,
+	}
+	repairer := NewRepairer(repository, store, manifest.Bucket)
+
+	_, err := repairer.DeleteOldObject(context.Background(), manifest.ID)
+	require.ErrorContains(t, err, "rebuilt CSCB changed before old-object deletion")
+	require.Zero(t, store.deleteCalls)
+	require.Equal(t, 1, repository.completeCalls)
+	require.Equal(t, StateVerified, repository.manifest.State)
 }
 
 func TestValidateCandidateRejectsUnsafeSingleBlockState(t *testing.T) {
@@ -113,7 +131,7 @@ func TestPrepareNextRejectsPendingRepairOutsideApprovedRange(t *testing.T) {
 	repository := &pendingRepairRepository{pending: pending}
 	repairer := NewRepairer(repository, &deleteResumeObjectStore{}, "repair-bucket")
 
-	_, err := repairer.PrepareNext(context.Background(), 2, 2000, 2001, 1, nil)
+	_, err := repairer.PrepareNext(context.Background(), executionKey("outside-range"), 2, 2000, 2001, 1, nil)
 	require.ErrorContains(t, err, "pending CSCB repair does not fit the approved request")
 	require.ErrorContains(t, err, "exceeds approved range")
 }
@@ -221,12 +239,24 @@ func (r *pendingRepairRepository) FindPending(context.Context, uint32) (*Manifes
 	return r.pending, nil
 }
 
+func (r *pendingRepairRepository) FindByExecutionKey(context.Context, string) (*Manifest, bool, error) {
+	return nil, false, nil
+}
+
 func (r *deleteResumeRepository) Get(context.Context, int64) (*Manifest, error) {
 	return r.manifest, nil
 }
 
-func (r *deleteResumeRepository) Complete(_ context.Context, _ int64, outcome string) (*Manifest, error) {
+func (r *deleteResumeRepository) CompleteWithOldObjectDeletion(
+	_ context.Context,
+	_ int64,
+	outcome string,
+	deleteObject DeleteOldObject,
+) (*Manifest, error) {
 	r.completeCalls++
+	if err := deleteObject(r.manifest); err != nil {
+		return nil, err
+	}
 	if r.failNextComplete {
 		r.failNextComplete = false
 		return nil, xerrors.New("database completion unavailable")
@@ -234,6 +264,14 @@ func (r *deleteResumeRepository) Complete(_ context.Context, _ int64, outcome st
 	r.manifest.State = StateCompleted
 	r.manifest.Outcome = outcome
 	return r.manifest, nil
+}
+
+func executionKey(seed string) string {
+	value := make([]byte, 64)
+	for i := range value {
+		value[i] = "0123456789abcdef"[(i+len(seed))%16]
+	}
+	return string(value)
 }
 
 type deleteResumeObjectStore struct {

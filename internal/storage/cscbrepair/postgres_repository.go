@@ -43,6 +43,36 @@ func NewPostgresRepository(db *sql.DB) *PostgresRepository {
 	return &PostgresRepository{db: db}
 }
 
+func (r *PostgresRepository) FindByExecutionKey(
+	ctx context.Context,
+	executionKey string,
+) (*Manifest, bool, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, false, err
+	}
+	if !validExecutionKey(executionKey) {
+		return nil, false, xerrors.New("valid CSCB repair execution key is required")
+	}
+	var repairID sql.NullInt64
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT repair_id
+		FROM cscb_repair_execution
+		WHERE execution_key = $1`, executionKey).Scan(&repairID); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, false, nil
+		}
+		return nil, false, xerrors.Errorf("failed to find CSCB repair execution binding: %w", err)
+	}
+	if !repairID.Valid {
+		return nil, true, nil
+	}
+	manifest, err := loadManifest(ctx, r.db, repairID.Int64, false)
+	if err != nil {
+		return nil, false, err
+	}
+	return manifest, true, nil
+}
+
 func (r *PostgresRepository) FindPending(
 	ctx context.Context,
 	tag uint32,
@@ -144,6 +174,9 @@ func (r *PostgresRepository) Prepare(ctx context.Context, manifest *Manifest) (*
 	if err := lockCandidateRows(ctx, tx, manifest.Blocks); err != nil {
 		return nil, err
 	}
+	if err := lockConsolidatedObjectKey(ctx, tx, manifest.OldConsolidatedObjectKey); err != nil {
+		return nil, err
+	}
 	current, err := loadCandidateByKey(ctx, tx, manifest.Tag, manifest.OldConsolidatedObjectKey)
 	if err != nil {
 		return nil, err
@@ -234,6 +267,104 @@ func (r *PostgresRepository) Prepare(ctx context.Context, manifest *Manifest) (*
 		return nil, xerrors.Errorf("failed to commit CSCB repair preparation: %w", err)
 	}
 	return prepared, nil
+}
+
+func (r *PostgresRepository) BindExecutionKey(
+	ctx context.Context,
+	executionKey string,
+	repairID int64,
+) (*Manifest, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if !validExecutionKey(executionKey) || repairID <= 0 {
+		return nil, xerrors.New("valid CSCB repair execution binding is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to begin CSCB repair execution binding: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const insert = `
+		INSERT INTO cscb_repair_execution (execution_key, repair_id)
+		VALUES ($1, $2)
+		ON CONFLICT (execution_key) DO NOTHING`
+	if _, err := tx.ExecContext(ctx, insert, executionKey, repairID); err != nil {
+		return nil, xerrors.Errorf("failed to bind CSCB repair execution: %w", err)
+	}
+	var boundRepairID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT repair_id
+		FROM cscb_repair_execution
+		WHERE execution_key = $1
+		FOR UPDATE`, executionKey).Scan(&boundRepairID); err != nil {
+		return nil, xerrors.Errorf("failed to load CSCB repair execution binding: %w", err)
+	}
+	if !boundRepairID.Valid {
+		if err := tx.Commit(); err != nil {
+			return nil, xerrors.Errorf("failed to commit CSCB repair no-candidate execution binding: %w", err)
+		}
+		return nil, nil
+	}
+	if boundRepairID.Int64 != repairID {
+		return nil, xerrors.Errorf(
+			"CSCB repair execution key is already bound to repair id %d, requested %d",
+			boundRepairID.Int64,
+			repairID,
+		)
+	}
+	manifest, err := loadManifest(ctx, tx, boundRepairID.Int64, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, xerrors.Errorf("failed to commit CSCB repair execution binding: %w", err)
+	}
+	return manifest, nil
+}
+
+func (r *PostgresRepository) BindNoCandidateExecution(
+	ctx context.Context,
+	executionKey string,
+) (*Manifest, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if !validExecutionKey(executionKey) {
+		return nil, xerrors.New("valid CSCB repair execution key is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to begin CSCB repair no-candidate execution binding: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO cscb_repair_execution (execution_key, repair_id)
+		VALUES ($1, NULL)
+		ON CONFLICT (execution_key) DO NOTHING`, executionKey); err != nil {
+		return nil, xerrors.Errorf("failed to bind CSCB repair no-candidate execution: %w", err)
+	}
+	var boundRepairID sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT repair_id
+		FROM cscb_repair_execution
+		WHERE execution_key = $1
+		FOR UPDATE`, executionKey).Scan(&boundRepairID); err != nil {
+		return nil, xerrors.Errorf("failed to load CSCB repair no-candidate execution binding: %w", err)
+	}
+	var manifest *Manifest
+	if boundRepairID.Valid {
+		manifest, err = loadManifest(ctx, tx, boundRepairID.Int64, false)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, xerrors.Errorf("failed to commit CSCB repair no-candidate execution binding: %w", err)
+	}
+	return manifest, nil
 }
 
 func (r *PostgresRepository) Get(ctx context.Context, repairID int64) (*Manifest, error) {
@@ -464,7 +595,10 @@ func (r *PostgresRepository) RecordVerified(
 	if manifest.State != StateRestored {
 		return nil, xerrors.Errorf("CSCB repair must be restored before verification: id=%d state=%s", manifest.ID, manifest.State)
 	}
-	if err := lockRebuiltRows(ctx, tx, manifest.Blocks); err != nil {
+	if err := lockRepairRows(ctx, tx, manifest.Blocks); err != nil {
+		return nil, err
+	}
+	if err := lockConsolidatedObjectKey(ctx, tx, manifest.OldConsolidatedObjectKey); err != nil {
 		return nil, err
 	}
 	if err := loadRebuiltBlocks(ctx, tx, manifest); err != nil {
@@ -514,12 +648,17 @@ func (r *PostgresRepository) RecordVerified(
 	return verified, nil
 }
 
-func (r *PostgresRepository) Complete(ctx context.Context, repairID int64, outcome string) (*Manifest, error) {
+func (r *PostgresRepository) CompleteWithOldObjectDeletion(
+	ctx context.Context,
+	repairID int64,
+	outcome string,
+	deleteObject DeleteOldObject,
+) (*Manifest, error) {
 	if err := r.validateDB(); err != nil {
 		return nil, err
 	}
-	if outcome == "" {
-		return nil, xerrors.New("CSCB repair completion outcome is required")
+	if outcome == "" || deleteObject == nil {
+		return nil, xerrors.New("CSCB repair completion outcome and old-object deletion are required")
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -539,7 +678,16 @@ func (r *PostgresRepository) Complete(ctx context.Context, repairID int64, outco
 	if manifest.State != StateVerified {
 		return nil, xerrors.Errorf("CSCB repair must be verified before completion: id=%d state=%s", manifest.ID, manifest.State)
 	}
+	if err := lockRepairRows(ctx, tx, manifest.Blocks); err != nil {
+		return nil, err
+	}
+	if err := lockConsolidatedObjectKey(ctx, tx, manifest.OldConsolidatedObjectKey); err != nil {
+		return nil, err
+	}
 	if err := requireNoOldReferences(ctx, tx, manifest.OldConsolidatedObjectKey); err != nil {
+		return nil, err
+	}
+	if err := deleteObject(manifest); err != nil {
 		return nil, err
 	}
 	const update = `
@@ -908,9 +1056,39 @@ func lockCandidateRows(ctx context.Context, tx *sql.Tx, blocks []Block) error {
 	return nil
 }
 
-func lockRebuiltRows(ctx context.Context, tx *sql.Tx, blocks []Block) error {
-	ids := make([]int64, 0, len(blocks))
-	for _, block := range blocks {
+func lockConsolidatedObjectKey(ctx context.Context, tx *sql.Tx, objectKey string) error {
+	if objectKey == "" {
+		return xerrors.New("consolidated object key is required for CSCB repair lock")
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`,
+		objectKey,
+	); err != nil {
+		return xerrors.Errorf("failed to acquire CSCB repair object lock: %w", err)
+	}
+	return nil
+}
+
+func lockRepairRows(ctx context.Context, tx *sql.Tx, blocks []Block) error {
+	ordered := append([]Block(nil), blocks...)
+	sort.Slice(ordered, func(i, j int) bool {
+		if ordered[i].Tag != ordered[j].Tag {
+			return ordered[i].Tag < ordered[j].Tag
+		}
+		if ordered[i].Height != ordered[j].Height {
+			return ordered[i].Height < ordered[j].Height
+		}
+		if ordered[i].Hash != ordered[j].Hash {
+			return ordered[i].Hash < ordered[j].Hash
+		}
+		return ordered[i].BlockMetadataID < ordered[j].BlockMetadataID
+	})
+	ids := make([]int64, 0, len(ordered))
+	for _, block := range ordered {
+		if err := retirementlock.Acquire(ctx, tx, block.Tag, block.Height, block.Hash); err != nil {
+			return err
+		}
 		ids = append(ids, block.BlockMetadataID)
 	}
 	rows, err := tx.QueryContext(ctx, `

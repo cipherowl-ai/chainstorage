@@ -8,7 +8,8 @@ import (
 type (
 	State string
 
-	Progress func(stage string, completed int, total int, height uint64)
+	Progress        func(stage string, completed int, total int, height uint64)
+	DeleteOldObject func(manifest *Manifest) error
 
 	ObjectVersion struct {
 		VersionID string
@@ -68,18 +69,21 @@ type (
 	}
 
 	Repository interface {
+		FindByExecutionKey(ctx context.Context, executionKey string) (*Manifest, bool, error)
 		FindPending(ctx context.Context, tag uint32) (*Manifest, error)
 		FindNextCandidate(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (*Manifest, error)
 		Prepare(ctx context.Context, manifest *Manifest) (*Manifest, error)
+		BindExecutionKey(ctx context.Context, executionKey string, repairID int64) (*Manifest, error)
+		BindNoCandidateExecution(ctx context.Context, executionKey string) (*Manifest, error)
 		Get(ctx context.Context, repairID int64) (*Manifest, error)
 		RestoreToSingleBlock(ctx context.Context, repairID int64, validate func(*Manifest) error) (*Manifest, error)
 		GetRebuilt(ctx context.Context, repairID int64) (*Manifest, error)
 		RecordVerified(ctx context.Context, repairID int64, objectKey string, object ObjectVersion) (*Manifest, error)
-		Complete(ctx context.Context, repairID int64, outcome string) (*Manifest, error)
+		CompleteWithOldObjectDeletion(ctx context.Context, repairID int64, outcome string, deleteObject DeleteOldObject) (*Manifest, error)
 	}
 
 	Repairer interface {
-		PrepareNext(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, maxBlocks uint64, progress Progress) (*Manifest, error)
+		PrepareNext(ctx context.Context, executionKey string, tag uint32, startHeight uint64, endHeight uint64, maxBlocks uint64, progress Progress) (*Manifest, error)
 		Restore(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)
 		Get(ctx context.Context, repairID int64) (*Manifest, error)
 		VerifyRebuilt(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)

@@ -101,15 +101,23 @@ func (b *blockStorageImpl) AcquireSingleBlockUploadGuard(
 		_ = conn.Close()
 		return nil, err
 	}
-	var retirementFencedAt sql.NullTime
+	var singleBlockWriteFenced bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT single_block_retention_fenced_at
-		FROM block_metadata
-		WHERE tag = $1
-			AND height = $2
-			AND hash IS NOT DISTINCT FROM NULLIF($3, '')
-			AND skipped = FALSE
-		FOR UPDATE`, tag, height, hash).Scan(&retirementFencedAt)
+		SELECT
+			bm.single_block_retention_fenced_at IS NOT NULL
+			OR EXISTS (
+				SELECT 1
+				FROM cscb_repair_block repair_block
+				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
+				WHERE repair_block.block_metadata_id = bm.id
+					AND repair.state <> 'completed'
+			)
+		FROM block_metadata bm
+		WHERE bm.tag = $1
+			AND bm.height = $2
+			AND bm.hash IS NOT DISTINCT FROM NULLIF($3, '')
+			AND bm.skipped = FALSE
+		FOR UPDATE`, tag, height, hash).Scan(&singleBlockWriteFenced)
 	if err != nil && err != sql.ErrNoRows {
 		_ = tx.Rollback()
 		_ = conn.Close()
@@ -118,7 +126,7 @@ func (b *blockStorageImpl) AcquireSingleBlockUploadGuard(
 	return &singleBlockUploadGuard{
 		conn:   conn,
 		tx:     tx,
-		fenced: err == nil && retirementFencedAt.Valid,
+		fenced: err == nil && singleBlockWriteFenced,
 	}, nil
 }
 
@@ -1113,9 +1121,6 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 	if err := b.validateHeight(startHeight); err != nil {
 		return nil, err
 	}
-	singleBlockObjectRetiredAt := time.Now().UTC()
-	singleBlockObjectRetireAfter := singleBlockObjectRetiredAt.Add(singleBlockObjectRetention)
-
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to begin consolidation promotion transaction: %w", err)
@@ -1173,7 +1178,9 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 	}
 
 	const promoteQuery = `
-		WITH candidates AS (
+		WITH database_clock AS (
+			SELECT clock_timestamp() AS retention_started_at
+		), candidates AS (
 			SELECT
 				bm.id AS block_metadata_id,
 				bm.tag,
@@ -1232,9 +1239,9 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		retired AS (
 			UPDATE block_consolidation_shadow shadow
 			SET
-				single_block_retention_started_at = $6,
-				single_block_delete_after = $7
-			FROM candidates
+				single_block_retention_started_at = database_clock.retention_started_at,
+				single_block_delete_after = database_clock.retention_started_at + ($6 * INTERVAL '1 microsecond')
+			FROM candidates, database_clock
 			WHERE shadow.block_metadata_id = candidates.block_metadata_id
 				AND shadow.tag = candidates.tag
 				AND shadow.height = candidates.height
@@ -1256,8 +1263,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		endHeight,
 		limit,
 		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
-		singleBlockObjectRetiredAt,
-		singleBlockObjectRetireAfter,
+		singleBlockObjectRetention.Microseconds(),
 	).Scan(&candidates, &promoted, &retired); err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
 	}

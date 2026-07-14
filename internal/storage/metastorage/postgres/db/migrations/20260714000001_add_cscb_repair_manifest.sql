@@ -115,12 +115,77 @@ CREATE TABLE cscb_repair_block (
     UNIQUE (block_metadata_id)
 );
 
+CREATE TABLE cscb_repair_execution (
+    execution_key CHAR(64) PRIMARY KEY CHECK (execution_key ~ '^[0-9a-f]{64}$'),
+    -- NULL is a durable "no candidate" result. This prevents a lost Temporal
+    -- activity response from selecting newly appeared work on retry.
+    repair_id BIGINT REFERENCES cscb_repair_manifest (id) ON DELETE RESTRICT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX idx_cscb_repair_manifest_pending
     ON cscb_repair_manifest (tag, end_height DESC, id)
     WHERE state <> 'completed';
 
 CREATE INDEX idx_cscb_repair_block_repair_height
     ON cscb_repair_block (repair_id, height, block_metadata_id);
+
+CREATE INDEX idx_cscb_repair_execution_repair
+    ON cscb_repair_execution (repair_id);
+
+-- Once a repair pins an old consolidated object, no database writer may
+-- reintroduce that object key. Existing references are removed by the repair
+-- transaction; these triggers close the race between the final reference
+-- check and exact-version deletion from S3.
+-- +goose StatementBegin
+CREATE FUNCTION prevent_cscb_repair_old_block_metadata_reference()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.object_key_main IS NOT NULL AND NEW.object_format = 1 THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended(NEW.object_key_main, 1));
+    END IF;
+    IF NEW.object_key_main IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM cscb_repair_manifest repair
+            WHERE repair.old_consolidated_object_key_main = NEW.object_key_main
+        ) THEN
+        RAISE EXCEPTION 'cannot reference a pinned old CSCB object from block_metadata id %', NEW.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+CREATE TRIGGER cscb_repair_old_block_metadata_reference_trigger
+BEFORE INSERT OR UPDATE OF object_key_main ON block_metadata
+FOR EACH ROW
+EXECUTE FUNCTION prevent_cscb_repair_old_block_metadata_reference();
+
+-- +goose StatementBegin
+CREATE FUNCTION prevent_cscb_repair_old_shadow_reference()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.consolidated_object_key_main IS NOT NULL AND NEW.object_format = 1 THEN
+        PERFORM pg_advisory_xact_lock(hashtextextended(NEW.consolidated_object_key_main, 1));
+    END IF;
+    IF NEW.consolidated_object_key_main IS NOT NULL
+        AND EXISTS (
+            SELECT 1
+            FROM cscb_repair_manifest repair
+            WHERE repair.old_consolidated_object_key_main = NEW.consolidated_object_key_main
+        ) THEN
+        RAISE EXCEPTION 'cannot reference a pinned old CSCB object from consolidation shadow for block_metadata id %', NEW.block_metadata_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+-- +goose StatementEnd
+
+CREATE TRIGGER cscb_repair_old_shadow_reference_trigger
+BEFORE INSERT OR UPDATE OF consolidated_object_key_main ON block_consolidation_shadow
+FOR EACH ROW
+EXECUTE FUNCTION prevent_cscb_repair_old_shadow_reference();
 
 -- +goose StatementBegin
 CREATE FUNCTION enforce_cscb_repair_manifest_transition()
@@ -213,6 +278,16 @@ BEFORE DELETE ON cscb_repair_block
 FOR EACH ROW
 EXECUTE FUNCTION prevent_cscb_repair_audit_mutation();
 
+CREATE TRIGGER cscb_repair_execution_update_trigger
+BEFORE UPDATE ON cscb_repair_execution
+FOR EACH ROW
+EXECUTE FUNCTION prevent_cscb_repair_audit_mutation();
+
+CREATE TRIGGER cscb_repair_execution_delete_trigger
+BEFORE DELETE ON cscb_repair_execution
+FOR EACH ROW
+EXECUTE FUNCTION prevent_cscb_repair_audit_mutation();
+
 CREATE TRIGGER cscb_repair_manifest_delete_trigger
 BEFORE DELETE ON cscb_repair_manifest
 FOR EACH ROW
@@ -229,14 +304,24 @@ END $$;
 -- +goose StatementEnd
 
 DROP TRIGGER IF EXISTS cscb_repair_manifest_delete_trigger ON cscb_repair_manifest;
+DROP TRIGGER IF EXISTS cscb_repair_execution_delete_trigger ON cscb_repair_execution;
+DROP TRIGGER IF EXISTS cscb_repair_execution_update_trigger ON cscb_repair_execution;
 DROP TRIGGER IF EXISTS cscb_repair_block_delete_trigger ON cscb_repair_block;
 DROP TRIGGER IF EXISTS cscb_repair_block_update_trigger ON cscb_repair_block;
 DROP FUNCTION IF EXISTS prevent_cscb_repair_audit_mutation();
 
+DROP TRIGGER IF EXISTS cscb_repair_old_shadow_reference_trigger ON block_consolidation_shadow;
+DROP FUNCTION IF EXISTS prevent_cscb_repair_old_shadow_reference();
+
+DROP TRIGGER IF EXISTS cscb_repair_old_block_metadata_reference_trigger ON block_metadata;
+DROP FUNCTION IF EXISTS prevent_cscb_repair_old_block_metadata_reference();
+
 DROP TRIGGER IF EXISTS cscb_repair_manifest_transition_trigger ON cscb_repair_manifest;
 DROP FUNCTION IF EXISTS enforce_cscb_repair_manifest_transition();
 
+DROP INDEX IF EXISTS idx_cscb_repair_execution_repair;
 DROP INDEX IF EXISTS idx_cscb_repair_block_repair_height;
 DROP INDEX IF EXISTS idx_cscb_repair_manifest_pending;
+DROP TABLE IF EXISTS cscb_repair_execution;
 DROP TABLE IF EXISTS cscb_repair_block;
 DROP TABLE IF EXISTS cscb_repair_manifest;

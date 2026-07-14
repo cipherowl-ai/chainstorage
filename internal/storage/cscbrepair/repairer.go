@@ -30,6 +30,7 @@ func NewRepairer(repository Repository, store retirement.ObjectStore, bucket str
 
 func (r *repairerImpl) PrepareNext(
 	ctx context.Context,
+	executionKey string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -39,6 +40,25 @@ func (r *repairerImpl) PrepareNext(
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
+	if !validExecutionKey(executionKey) {
+		return nil, xerrors.New("valid CSCB repair execution key is required")
+	}
+	bound, found, err := r.repository.FindByExecutionKey(ctx, executionKey)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		if bound == nil {
+			return nil, nil
+		}
+		if bound.Tag != tag {
+			return nil, xerrors.Errorf("bound CSCB repair tag changed: expected=%d actual=%d", tag, bound.Tag)
+		}
+		if err := validateCandidate(bound, startHeight, endHeight, maxBlocks); err != nil {
+			return nil, xerrors.Errorf("bound CSCB repair does not fit the approved request: %w", err)
+		}
+		return bound, nil
+	}
 	pending, err := r.repository.FindPending(ctx, tag)
 	if err != nil {
 		return nil, err
@@ -47,11 +67,14 @@ func (r *repairerImpl) PrepareNext(
 		if err := validateCandidate(pending, startHeight, endHeight, maxBlocks); err != nil {
 			return nil, xerrors.Errorf("pending CSCB repair does not fit the approved request: %w", err)
 		}
-		return pending, nil
+		return r.repository.BindExecutionKey(ctx, executionKey, pending.ID)
 	}
 	candidate, err := r.repository.FindNextCandidate(ctx, tag, startHeight, endHeight)
-	if err != nil || candidate == nil {
-		return candidate, err
+	if err != nil {
+		return nil, err
+	}
+	if candidate == nil {
+		return r.repository.BindNoCandidateExecution(ctx, executionKey)
 	}
 	if err := validateCandidate(candidate, startHeight, endHeight, maxBlocks); err != nil {
 		return nil, err
@@ -98,6 +121,10 @@ func (r *repairerImpl) PrepareNext(
 	prepared, err := r.repository.Prepare(ctx, candidate)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to persist CSCB repair manifest: %w", err)
+	}
+	prepared, err = r.repository.BindExecutionKey(ctx, executionKey, prepared.ID)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to bind CSCB repair execution: %w", err)
 	}
 	reportProgress(progress, "prepared", len(candidate.Blocks), len(candidate.Blocks), candidate.EndHeight-1)
 	return prepared, nil
@@ -222,43 +249,50 @@ func (r *repairerImpl) DeleteOldObject(ctx context.Context, repairID int64) (*Ma
 	if manifest.State != StateVerified {
 		return nil, xerrors.Errorf("CSCB repair must be verified before old object deletion: id=%d state=%s", manifest.ID, manifest.State)
 	}
-	topology, err := r.store.ListObjectVersions(ctx, manifest.Bucket, manifest.OldConsolidatedObjectKey)
-	if err != nil {
-		return nil, err
-	}
-	if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
-		return r.repository.Complete(ctx, manifest.ID, completedOutcome)
-	}
-	if err := r.requirePinnedObjectVersion(
+	return r.repository.CompleteWithOldObjectDeletion(
 		ctx,
-		manifest.NewConsolidatedObjectKey,
-		manifest.NewConsolidatedObjectVersion,
-	); err != nil {
-		return nil, xerrors.Errorf("rebuilt CSCB changed before old-object deletion: %w", err)
-	}
-	if err := requireExactTopology(topology, manifest.OldConsolidatedObjectVersion); err != nil {
-		return nil, xerrors.Errorf("dirty CSCB topology changed before deletion: %w", err)
-	}
-	if err := r.store.DeleteObjectVersion(
-		ctx,
-		manifest.Bucket,
-		manifest.OldConsolidatedObjectKey,
-		manifest.OldConsolidatedObjectVersion.VersionID,
-	); err != nil {
-		return nil, xerrors.Errorf("failed to delete pinned dirty CSCB version: %w", err)
-	}
-	topology, err = r.store.ListObjectVersions(ctx, manifest.Bucket, manifest.OldConsolidatedObjectKey)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to verify dirty CSCB deletion: %w", err)
-	}
-	if len(topology.Versions) != 0 || len(topology.DeleteMarkers) != 0 {
-		return nil, xerrors.Errorf(
-			"dirty CSCB still has versions after exact-version deletion: versions=%d delete_markers=%d",
-			len(topology.Versions),
-			len(topology.DeleteMarkers),
-		)
-	}
-	return r.repository.Complete(ctx, manifest.ID, completedOutcome)
+		manifest.ID,
+		completedOutcome,
+		func(locked *Manifest) error {
+			if err := r.requirePinnedObjectVersion(
+				ctx,
+				locked.NewConsolidatedObjectKey,
+				locked.NewConsolidatedObjectVersion,
+			); err != nil {
+				return xerrors.Errorf("rebuilt CSCB changed before old-object deletion: %w", err)
+			}
+			topology, err := r.store.ListObjectVersions(ctx, locked.Bucket, locked.OldConsolidatedObjectKey)
+			if err != nil {
+				return xerrors.Errorf("failed to inspect old CSCB before deletion: %w", err)
+			}
+			if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
+				return nil
+			}
+			if err := requireExactTopology(topology, locked.OldConsolidatedObjectVersion); err != nil {
+				return xerrors.Errorf("old CSCB topology changed before deletion: %w", err)
+			}
+			if err := r.store.DeleteObjectVersion(
+				ctx,
+				locked.Bucket,
+				locked.OldConsolidatedObjectKey,
+				locked.OldConsolidatedObjectVersion.VersionID,
+			); err != nil {
+				return xerrors.Errorf("failed to delete pinned old CSCB version: %w", err)
+			}
+			topology, err = r.store.ListObjectVersions(ctx, locked.Bucket, locked.OldConsolidatedObjectKey)
+			if err != nil {
+				return xerrors.Errorf("failed to verify old CSCB deletion: %w", err)
+			}
+			if len(topology.Versions) != 0 || len(topology.DeleteMarkers) != 0 {
+				return xerrors.Errorf(
+					"old CSCB still has versions after exact-version deletion: versions=%d delete_markers=%d",
+					len(topology.Versions),
+					len(topology.DeleteMarkers),
+				)
+			}
+			return nil
+		},
+	)
 }
 
 func (r *repairerImpl) validate() error {
@@ -301,6 +335,18 @@ func validateCandidate(manifest *Manifest, startHeight uint64, endHeight uint64,
 		}
 	}
 	return nil
+}
+
+func validExecutionKey(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, ch := range value {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *repairerImpl) inspectExactObjectVersion(ctx context.Context, key string) (ObjectVersion, error) {
