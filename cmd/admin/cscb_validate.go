@@ -941,10 +941,10 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 			summary.SkippedCount++
 		} else if isCSCBFile(file) {
 			summary.ConsolidatedObjectCount++
-			formats[file.GetObjectFormat().String()] = struct{}{}
+			formats[cscbBlockObjectFormatName(file.GetObjectFormat())] = struct{}{}
 		} else {
 			summary.SingleBlockObjectCount++
-			formats[file.GetObjectFormat().String()] = struct{}{}
+			formats[cscbBlockObjectFormatName(file.GetObjectFormat())] = struct{}{}
 		}
 		summary.MetadataByteLength += file.GetByteLength()
 		summary.MetadataUncompressedBytes += file.GetUncompressedLength()
@@ -954,6 +954,13 @@ func summarizeCSCBFiles(files []*api.BlockFile) cscbFileSummary {
 	}
 	sort.Strings(summary.Formats)
 	return summary
+}
+
+func cscbBlockObjectFormatName(format api.BlockObjectFormat) string {
+	if format == api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK {
+		return "BLOCK_OBJECT_FORMAT_SINGLE_BLOCK"
+	}
+	return format.String()
 }
 
 func isCSCBFile(file *api.BlockFile) bool {

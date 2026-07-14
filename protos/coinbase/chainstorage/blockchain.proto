@@ -42,8 +42,10 @@ message BlockIdentifier {
 enum BlockObjectFormat {
   option allow_alias = true;
 
-  BLOCK_OBJECT_FORMAT_SINGLE_BLOCK = 0;
+  // Alias order controls the protojson spelling. Keep the pre-rename name first
+  // until mixed-version REST clients and servers no longer coexist.
   BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK = 0;
+  BLOCK_OBJECT_FORMAT_SINGLE_BLOCK = 0;
   BLOCK_OBJECT_FORMAT_CSCB_BATCH = 1;
 }
 
