@@ -758,7 +758,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	))); err != nil {
 		return nil, xerrors.Errorf("failed to unmarshal config: %w", err)
 	}
-	if cfg.AWS.Storage.Consolidation.Mode == deprecatedConsolidationModeLegacyOnly {
+	if cfg.AWS.Storage.Consolidation.Mode == deprecatedConsolidationModeBeforeSingleBlockRename {
 		cfg.AWS.Storage.Consolidation.Mode = ConsolidationModeSingleBlockOnly
 	}
 
@@ -792,21 +792,21 @@ const (
 
 	// Deprecated aliases are accepted only at the configuration boundary so a
 	// rolling deployment can consume the previous production configuration.
-	deprecatedConsolidationModeLegacyOnly                         ConsolidationMode = "legacy_only"
-	deprecatedConsolidationLegacyObjectRetentionKey                                 = "aws.storage.consolidation.legacy_object_retention"
-	deprecatedConsolidationLegacyShadowWriteAfterSyncerCutoverKey                   = "aws.storage.consolidation.legacy_shadow_write_after_syncer_cutover"
+	deprecatedConsolidationModeBeforeSingleBlockRename               ConsolidationMode = "legacy_only"
+	deprecatedConsolidationObjectRetentionKeyBeforeSingleBlockRename                   = "aws.storage.consolidation.legacy_object_retention"
+	deprecatedConsolidationShadowWriteKeyBeforeSingleBlockRename                       = "aws.storage.consolidation.legacy_shadow_write_after_syncer_cutover"
 )
 
 func applyDeprecatedConsolidationAliases(v *viper.Viper) {
 	applyDeprecatedConfigAlias(
 		v,
 		consolidationSingleBlockObjectRetentionKey,
-		deprecatedConsolidationLegacyObjectRetentionKey,
+		deprecatedConsolidationObjectRetentionKeyBeforeSingleBlockRename,
 	)
 	applyDeprecatedConfigAlias(
 		v,
 		consolidationSingleBlockShadowWriteAfterSyncerCutoverKey,
-		deprecatedConsolidationLegacyShadowWriteAfterSyncerCutoverKey,
+		deprecatedConsolidationShadowWriteKeyBeforeSingleBlockRename,
 	)
 }
 

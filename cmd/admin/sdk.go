@@ -173,7 +173,9 @@ func parseBlockReadSource(value string) (api.BlockReadSource, error) {
 	switch strings.ToLower(value) {
 	case "", "default":
 		return api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT, nil
-	case "single-block", "single_block", "legacy":
+	case "single-block", "single_block":
+		return api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK, nil
+	case "legacy": // Backward-compatible input; canonical help text advertises single-block only.
 		return api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK, nil
 	case "consolidated":
 		return api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED, nil
