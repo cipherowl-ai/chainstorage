@@ -65,10 +65,10 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
 
 	var (
-		meta           metastorage.MetaStorage
-		blob           blobstorage.BlobStorage
-		legacyUploader blobstorage.LegacyBlockUploader
-		s3Session      *chains3.S3
+		meta                metastorage.MetaStorage
+		blob                blobstorage.BlobStorage
+		singleBlockUploader blobstorage.SingleBlockUploader
+		s3Session           *chains3.S3
 	)
 	app := testapp.New(
 		t,
@@ -77,12 +77,12 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		chains3.Module,
 		metastorage.Module,
 		blobstorage.Module,
-		fx.Populate(&meta, &blob, &legacyUploader, &s3Session),
+		fx.Populate(&meta, &blob, &singleBlockUploader, &s3Session),
 	)
 	defer app.Close()
 	require.NotNil(meta)
 	require.NotNil(blob)
-	require.NotNil(legacyUploader)
+	require.NotNil(singleBlockUploader)
 	require.NotNil(s3Session)
 
 	rawS3 := awss3.NewFromConfig(s3Session.Config)
@@ -109,7 +109,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		Blobdata: &api.Block_Solana{Solana: &api.SolanaBlobdata{Header: []byte(`{"slot":9000000000,"transactions":["one","two"]}`)}},
 	}
 
-	legacyKey, err := legacyUploader.Upload(ctx, block, api.Compression_GZIP)
+	legacyKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 	require.NoError(err)
 	require.NotEmpty(legacyKey)
 	block.Metadata.ObjectKeyMain = legacyKey

@@ -118,10 +118,10 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	block.ByteOffset = 0
 	block.ByteLength = 0
 	block.UncompressedLength = 0
-	guardStorage, ok := s.accessor.(internal.LegacyObjectUploadGuardStorage)
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
 	require.True(ok)
 	uploadContext, cancelUpload := context.WithCancel(ctx)
-	uploadGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(uploadContext, block.Tag, block.Height, block.Hash)
+	uploadGuard, err := guardStorage.AcquireSingleBlockUploadGuard(uploadContext, block.Tag, block.Height, block.Hash)
 	require.NoError(err)
 	require.NotNil(uploadGuard)
 	require.False(uploadGuard.RetirementFenced())
@@ -208,7 +208,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	require.NoError(uploadGuard.Release())
 	require.NoError(<-prepareDone)
 
-	fencedGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, block.Tag, block.Height, block.Hash)
+	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, block.Tag, block.Height, block.Hash)
 	require.NoError(err)
 	require.NotNil(fencedGuard)
 	require.True(fencedGuard.RetirementFenced())
@@ -298,7 +298,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	require.Contains(err.Error(), "cannot restore or rewrite deleted legacy object metadata")
 }
 
-func (s *blockStorageTestSuite) TestLegacyObjectUploadGuardMatchesNullableHash() {
+func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
 	height := s.config.Chain.BlockStartHeight + 1
@@ -319,9 +319,9 @@ func (s *blockStorageTestSuite) TestLegacyObjectUploadGuardMatchesNullableHash()
 	).Scan(&blockMetadataID)
 	require.NoError(err)
 
-	guardStorage, ok := s.accessor.(internal.LegacyObjectUploadGuardStorage)
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
 	require.True(ok)
-	guard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, tag, height, "")
+	guard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "")
 	require.NoError(err)
 	require.NotNil(guard)
 	require.False(guard.RetirementFenced())
@@ -332,7 +332,7 @@ func (s *blockStorageTestSuite) TestLegacyObjectUploadGuardMatchesNullableHash()
 		SET legacy_object_retirement_fenced_at = CURRENT_TIMESTAMP
 		WHERE id = $1`, blockMetadataID)
 	require.NoError(err)
-	fencedGuard, err := guardStorage.AcquireLegacyObjectUploadGuard(ctx, tag, height, "")
+	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "")
 	require.NoError(err)
 	require.NotNil(fencedGuard)
 	require.True(fencedGuard.RetirementFenced())

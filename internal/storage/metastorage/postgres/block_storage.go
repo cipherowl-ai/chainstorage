@@ -37,7 +37,7 @@ type (
 		instrumentGetBlockByTimestamp    instrument.InstrumentWithResult[*api.BlockMetadata]
 	}
 
-	legacyObjectUploadGuard struct {
+	singleBlockUploadGuard struct {
 		conn       *sql.Conn
 		tx         *sql.Tx
 		fenced     bool
@@ -81,20 +81,20 @@ func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 	return &accessor, nil
 }
 
-func (b *blockStorageImpl) AcquireLegacyObjectUploadGuard(
+func (b *blockStorageImpl) AcquireSingleBlockUploadGuard(
 	ctx context.Context,
 	tag uint32,
 	height uint64,
 	hash string,
-) (internal.LegacyObjectUploadGuard, error) {
+) (internal.SingleBlockUploadGuard, error) {
 	conn, err := b.db.Conn(ctx)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to acquire legacy object upload connection: %w", err)
+		return nil, xerrors.Errorf("failed to acquire single-block upload connection: %w", err)
 	}
 	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		_ = conn.Close()
-		return nil, xerrors.Errorf("failed to begin legacy object upload guard: %w", err)
+		return nil, xerrors.Errorf("failed to begin single-block upload guard: %w", err)
 	}
 	if err := retirementlock.Acquire(ctx, tx, tag, height, hash); err != nil {
 		_ = tx.Rollback()
@@ -113,20 +113,20 @@ func (b *blockStorageImpl) AcquireLegacyObjectUploadGuard(
 	if err != nil && err != sql.ErrNoRows {
 		_ = tx.Rollback()
 		_ = conn.Close()
-		return nil, xerrors.Errorf("failed to acquire legacy object upload guard: %w", err)
+		return nil, xerrors.Errorf("failed to acquire single-block upload guard: %w", err)
 	}
-	return &legacyObjectUploadGuard{
+	return &singleBlockUploadGuard{
 		conn:   conn,
 		tx:     tx,
 		fenced: err == nil && retirementFencedAt.Valid,
 	}, nil
 }
 
-func (g *legacyObjectUploadGuard) RetirementFenced() bool {
+func (g *singleBlockUploadGuard) RetirementFenced() bool {
 	return g != nil && g.fenced
 }
 
-func (g *legacyObjectUploadGuard) Release() error {
+func (g *singleBlockUploadGuard) Release() error {
 	if g == nil || g.tx == nil {
 		return nil
 	}

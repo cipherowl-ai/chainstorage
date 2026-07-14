@@ -12,14 +12,14 @@ import (
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 )
 
-func (m *metaStorageImpl) AcquireLegacyObjectUploadGuard(
+func (m *metaStorageImpl) AcquireSingleBlockUploadGuard(
 	ctx context.Context,
 	tag uint32,
 	height uint64,
 	hash string,
-) (internal.LegacyObjectUploadGuard, error) {
+) (internal.SingleBlockUploadGuard, error) {
 	// Durable retirement is Postgres-only, so DynamoDB has no retirement fence.
-	return internal.NewUnfencedLegacyObjectUploadGuard(), nil
+	return internal.NewUnfencedSingleBlockUploadGuard(), nil
 }
 
 type (

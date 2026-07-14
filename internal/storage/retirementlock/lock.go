@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-// Acquire serializes legacy object uploads with retirement preparation even
+// Acquire serializes single-block object uploads with retirement preparation even
 // before block metadata exists. Hash collisions only cause safe over-serialization.
 func Acquire(ctx context.Context, tx *sql.Tx, tag uint32, height uint64, hash string) error {
 	key := fmt.Sprintf("%d\x1f%d\x1f%s", tag, height, hash)

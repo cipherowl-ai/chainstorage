@@ -66,18 +66,18 @@ type (
 		BlockStorage
 		EventStorage
 		TransactionStorage
-		LegacyObjectUploadGuardStorage
+		SingleBlockUploadGuardStorage
 	}
 
-	// LegacyObjectUploadGuard serializes a legacy single-block PUT with retirement
+	// SingleBlockUploadGuard serializes a single-block PUT with retirement
 	// preparation, including when its metadata row does not exist yet.
-	LegacyObjectUploadGuard interface {
+	SingleBlockUploadGuard interface {
 		RetirementFenced() bool
 		Release() error
 	}
 
-	LegacyObjectUploadGuardStorage interface {
-		AcquireLegacyObjectUploadGuard(ctx context.Context, tag uint32, height uint64, hash string) (LegacyObjectUploadGuard, error)
+	SingleBlockUploadGuardStorage interface {
+		AcquireSingleBlockUploadGuard(ctx context.Context, tag uint32, height uint64, hash string) (SingleBlockUploadGuard, error)
 	}
 
 	Result struct {
@@ -129,17 +129,17 @@ type (
 	}
 )
 
-type unfencedLegacyObjectUploadGuard struct{}
+type unfencedSingleBlockUploadGuard struct{}
 
-func NewUnfencedLegacyObjectUploadGuard() LegacyObjectUploadGuard {
-	return unfencedLegacyObjectUploadGuard{}
+func NewUnfencedSingleBlockUploadGuard() SingleBlockUploadGuard {
+	return unfencedSingleBlockUploadGuard{}
 }
 
-func (unfencedLegacyObjectUploadGuard) RetirementFenced() bool {
+func (unfencedSingleBlockUploadGuard) RetirementFenced() bool {
 	return false
 }
 
-func (unfencedLegacyObjectUploadGuard) Release() error {
+func (unfencedSingleBlockUploadGuard) Release() error {
 	return nil
 }
 

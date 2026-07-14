@@ -12,10 +12,10 @@ import (
 )
 
 type (
-	// LegacyBlockUploader is the only production interface that can create
-	// legacy single-block objects. Every call is serialized with the metadata
-	// retirement fence before it reaches the raw blob store.
-	LegacyBlockUploader interface {
+	// SingleBlockUploader is the only production interface that can create
+	// single-block objects. Every call is serialized with the metadata retirement
+	// fence before it reaches the raw blob store.
+	SingleBlockUploader interface {
 		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
 		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
 	}
@@ -31,15 +31,15 @@ type (
 	blobStorageResult struct {
 		fx.Out
 		BlobStorage         BlobStorage
-		LegacyBlockUploader LegacyBlockUploader
+		SingleBlockUploader SingleBlockUploader
 	}
 
 	safeBlobStorage struct {
 		storage storageinternal.BlobStorage
 	}
 
-	guardedLegacyBlockUploader struct {
-		raw         storageinternal.LegacyBlockUploader
+	guardedSingleBlockUploader struct {
+		raw         storageinternal.SingleBlockUploader
 		metaStorage metastorage.MetaStorage
 	}
 )
@@ -55,7 +55,7 @@ func withBlobStorageFactory(params blobStorageProviderParams) (blobStorageResult
 	}
 	return blobStorageResult{
 		BlobStorage: &safeBlobStorage{storage: core},
-		LegacyBlockUploader: &guardedLegacyBlockUploader{
+		SingleBlockUploader: &guardedSingleBlockUploader{
 			raw:         core,
 			metaStorage: params.MetaStorage,
 		},
@@ -78,7 +78,7 @@ func (s *safeBlobStorage) PreSign(ctx context.Context, objectKey string) (string
 	return s.storage.PreSign(ctx, objectKey)
 }
 
-func (u *guardedLegacyBlockUploader) Upload(
+func (u *guardedSingleBlockUploader) Upload(
 	ctx context.Context,
 	block *api.Block,
 	compression api.Compression,
@@ -87,12 +87,12 @@ func (u *guardedLegacyBlockUploader) Upload(
 	if block != nil {
 		metadata = block.Metadata
 	}
-	return metastorage.UploadLegacyBlockObject(ctx, u.metaStorage, metadata, func() (string, error) {
+	return metastorage.UploadSingleBlockObject(ctx, u.metaStorage, metadata, func() (string, error) {
 		return u.raw.Upload(ctx, block, compression)
 	})
 }
 
-func (u *guardedLegacyBlockUploader) UploadRaw(
+func (u *guardedSingleBlockUploader) UploadRaw(
 	ctx context.Context,
 	rawBlockData *RawBlockData,
 ) (string, error) {
@@ -100,7 +100,7 @@ func (u *guardedLegacyBlockUploader) UploadRaw(
 	if rawBlockData != nil {
 		metadata = rawBlockData.BlockMetadata
 	}
-	return metastorage.UploadLegacyBlockObject(ctx, u.metaStorage, metadata, func() (string, error) {
+	return metastorage.UploadSingleBlockObject(ctx, u.metaStorage, metadata, func() (string, error) {
 		return u.raw.UploadRaw(ctx, rawBlockData)
 	})
 }

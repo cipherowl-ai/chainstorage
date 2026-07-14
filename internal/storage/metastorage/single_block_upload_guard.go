@@ -9,19 +9,19 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-var ErrLegacyObjectRetirementFenced = errors.New("legacy object upload blocked by retirement fence")
+var ErrSingleBlockRetirementFenced = errors.New("single-block upload blocked by retirement fence")
 
-type legacyObjectUploadStorage interface {
+type singleBlockUploadStorage interface {
 	GetBlockByHash(ctx context.Context, tag uint32, height uint64, blockHash string) (*api.BlockMetadata, error)
-	LegacyObjectUploadGuardStorage
+	SingleBlockUploadGuardStorage
 }
 
-// UploadLegacyBlockObject serializes a legacy single-block PUT with retirement
+// UploadSingleBlockObject serializes a single-block PUT with retirement
 // preparation. Storage implementations must return a non-nil guard even when
 // canonical metadata does not exist yet.
-func UploadLegacyBlockObject(
+func UploadSingleBlockObject(
 	ctx context.Context,
-	metadataStorage legacyObjectUploadStorage,
+	metadataStorage singleBlockUploadStorage,
 	metadata *api.BlockMetadata,
 	upload func() (string, error),
 ) (objectKey string, err error) {
@@ -31,12 +31,12 @@ func UploadLegacyBlockObject(
 	if metadataStorage == nil {
 		return "", xerrors.New("metadata storage is required for guarded upload")
 	}
-	guard, err := metadataStorage.AcquireLegacyObjectUploadGuard(ctx, metadata.Tag, metadata.Height, metadata.Hash)
+	guard, err := metadataStorage.AcquireSingleBlockUploadGuard(ctx, metadata.Tag, metadata.Height, metadata.Hash)
 	if err != nil {
 		return "", err
 	}
 	if guard == nil {
-		return "", xerrors.New("legacy object upload guard is required")
+		return "", xerrors.New("single-block upload guard is required")
 	}
 	defer func() {
 		if releaseErr := guard.Release(); releaseErr != nil {
@@ -50,7 +50,7 @@ func UploadLegacyBlockObject(
 	}
 	return "", xerrors.Errorf(
 		"%w: tag=%d height=%d hash=%s",
-		ErrLegacyObjectRetirementFenced,
+		ErrSingleBlockRetirementFenced,
 		metadata.Tag,
 		metadata.Height,
 		metadata.Hash,

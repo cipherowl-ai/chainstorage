@@ -69,17 +69,17 @@ func NewMetaStorage(params Params) (internal.Result, error) {
 	}, nil
 }
 
-func (m *metaStorageImpl) AcquireLegacyObjectUploadGuard(
+func (m *metaStorageImpl) AcquireSingleBlockUploadGuard(
 	ctx context.Context,
 	tag uint32,
 	height uint64,
 	hash string,
-) (internal.LegacyObjectUploadGuard, error) {
-	storage, ok := m.BlockStorage.(internal.LegacyObjectUploadGuardStorage)
+) (internal.SingleBlockUploadGuard, error) {
+	storage, ok := m.BlockStorage.(internal.SingleBlockUploadGuardStorage)
 	if !ok {
-		return nil, xerrors.New("postgres block storage does not support legacy object upload guards")
+		return nil, xerrors.New("postgres block storage does not support single-block upload guards")
 	}
-	return storage.AcquireLegacyObjectUploadGuard(ctx, tag, height, hash)
+	return storage.AcquireSingleBlockUploadGuard(ctx, tag, height, hash)
 }
 
 func (f *metaStorageFactory) Create() (internal.Result, error) {

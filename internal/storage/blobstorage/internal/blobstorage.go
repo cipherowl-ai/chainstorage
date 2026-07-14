@@ -62,16 +62,16 @@ type (
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}
 
-	// LegacyBlockUploader is deliberately confined to the blobstorage package
+	// SingleBlockUploader is deliberately confined to the blobstorage package
 	// tree. Production consumers receive only the guarded public uploader.
-	LegacyBlockUploader interface {
+	SingleBlockUploader interface {
 		Upload(ctx context.Context, block *api.Block, compression api.Compression) (string, error)
 		UploadRaw(ctx context.Context, rawBlockData *RawBlockData) (string, error)
 	}
 
 	BlobStorageCore interface {
 		BlobStorage
-		LegacyBlockUploader
+		SingleBlockUploader
 	}
 
 	BlobStorageFactory interface {

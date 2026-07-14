@@ -22,19 +22,19 @@ type (
 	DLQProcessorTaskParams struct {
 		fx.In
 		fxparams.Params
-		DLQ              dlq.DLQ
-		BlockchainClient client.Client `name:"slave"`
-		LegacyUploader   blobstorage.LegacyBlockUploader
-		MetaStorage      metastorage.MetaStorage
+		DLQ                 dlq.DLQ
+		BlockchainClient    client.Client `name:"slave"`
+		SingleBlockUploader blobstorage.SingleBlockUploader
+		MetaStorage         metastorage.MetaStorage
 	}
 
 	dlqProcessorTask struct {
-		enabled          bool
-		logger           *zap.Logger
-		dlq              dlq.DLQ
-		blockchainClient client.Client
-		legacyUploader   blobstorage.LegacyBlockUploader
-		metaStorage      metastorage.MetaStorage
+		enabled             bool
+		logger              *zap.Logger
+		dlq                 dlq.DLQ
+		blockchainClient    client.Client
+		singleBlockUploader blobstorage.SingleBlockUploader
+		metaStorage         metastorage.MetaStorage
 	}
 )
 
@@ -44,12 +44,12 @@ var (
 
 func NewDLQProcessor(params DLQProcessorTaskParams) Task {
 	return &dlqProcessorTask{
-		enabled:          !params.Config.Cron.DisableDLQProcessor,
-		logger:           log.WithPackage(params.Logger),
-		dlq:              params.DLQ,
-		blockchainClient: params.BlockchainClient,
-		legacyUploader:   params.LegacyUploader,
-		metaStorage:      params.MetaStorage,
+		enabled:             !params.Config.Cron.DisableDLQProcessor,
+		logger:              log.WithPackage(params.Logger),
+		dlq:                 params.DLQ,
+		blockchainClient:    params.BlockchainClient,
+		singleBlockUploader: params.SingleBlockUploader,
+		metaStorage:         params.MetaStorage,
 	}
 }
 
@@ -146,7 +146,7 @@ func (t *dlqProcessorTask) processFailedTransactionTrace(ctx context.Context, me
 	objectKey := metadata.ObjectKeyMain
 
 	compression := storage_utils.GetCompressionType(objectKey)
-	_, err = t.legacyUploader.Upload(ctx, block, compression)
+	_, err = t.singleBlockUploader.Upload(ctx, block, compression)
 	if err != nil {
 		return xerrors.Errorf("failed to upload to blob store with compression type %v: %w", compression.String(), err)
 	}

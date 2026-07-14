@@ -11,18 +11,18 @@ import (
 )
 
 type uploadGuardTestStorage struct {
-	guard       LegacyObjectUploadGuard
+	guard       SingleBlockUploadGuard
 	existing    *api.BlockMetadata
 	acquireErr  error
 	metadataErr error
 }
 
-func (s *uploadGuardTestStorage) AcquireLegacyObjectUploadGuard(
+func (s *uploadGuardTestStorage) AcquireSingleBlockUploadGuard(
 	ctx context.Context,
 	tag uint32,
 	height uint64,
 	hash string,
-) (LegacyObjectUploadGuard, error) {
+) (SingleBlockUploadGuard, error) {
 	return s.guard, s.acquireErr
 }
 
@@ -50,32 +50,32 @@ func (g *uploadGuardTestLease) Release() error {
 	return g.releaseErr
 }
 
-func TestUploadLegacyBlockObjectFailsClosedForRetirementFence(t *testing.T) {
+func TestUploadSingleBlockObjectFailsClosedForRetirementFence(t *testing.T) {
 	require := require.New(t)
 	metadata := testGuardMetadata()
 	lease := &uploadGuardTestLease{fenced: true}
 	storage := &uploadGuardTestStorage{guard: lease}
 	uploadCalls := 0
 
-	objectKey, err := UploadLegacyBlockObject(context.Background(), storage, metadata, func() (string, error) {
+	objectKey, err := UploadSingleBlockObject(context.Background(), storage, metadata, func() (string, error) {
 		uploadCalls++
 		return "legacy/new.gzip", nil
 	})
 
-	require.ErrorIs(err, ErrLegacyObjectRetirementFenced)
+	require.ErrorIs(err, ErrSingleBlockRetirementFenced)
 	require.Empty(objectKey)
 	require.Zero(uploadCalls)
 	require.Equal(1, lease.releaseCall)
 }
 
-func TestUploadLegacyBlockObjectHoldsGuardThroughPut(t *testing.T) {
+func TestUploadSingleBlockObjectHoldsGuardThroughPut(t *testing.T) {
 	require := require.New(t)
 	metadata := testGuardMetadata()
 	lease := &uploadGuardTestLease{}
 	storage := &uploadGuardTestStorage{guard: lease}
 	uploadCalls := 0
 
-	objectKey, err := UploadLegacyBlockObject(context.Background(), storage, metadata, func() (string, error) {
+	objectKey, err := UploadSingleBlockObject(context.Background(), storage, metadata, func() (string, error) {
 		uploadCalls++
 		require.Zero(lease.releaseCall)
 		return "legacy/new.gzip", nil
@@ -87,22 +87,22 @@ func TestUploadLegacyBlockObjectHoldsGuardThroughPut(t *testing.T) {
 	require.Equal(1, lease.releaseCall)
 }
 
-func TestUploadLegacyBlockObjectFailsClosedForMissingGuard(t *testing.T) {
+func TestUploadSingleBlockObjectFailsClosedForMissingGuard(t *testing.T) {
 	require := require.New(t)
 	storage := &uploadGuardTestStorage{}
 	uploadCalls := 0
 
-	objectKey, err := UploadLegacyBlockObject(context.Background(), storage, testGuardMetadata(), func() (string, error) {
+	objectKey, err := UploadSingleBlockObject(context.Background(), storage, testGuardMetadata(), func() (string, error) {
 		uploadCalls++
 		return "legacy/new.gzip", nil
 	})
 
-	require.ErrorContains(err, "legacy object upload guard is required")
+	require.ErrorContains(err, "single-block upload guard is required")
 	require.Empty(objectKey)
 	require.Zero(uploadCalls)
 }
 
-func TestUploadLegacyBlockObjectJoinsReleaseFailure(t *testing.T) {
+func TestUploadSingleBlockObjectJoinsReleaseFailure(t *testing.T) {
 	require := require.New(t)
 	metadata := testGuardMetadata()
 	uploadErr := errors.New("put failed")
@@ -110,7 +110,7 @@ func TestUploadLegacyBlockObjectJoinsReleaseFailure(t *testing.T) {
 	lease := &uploadGuardTestLease{releaseErr: releaseErr}
 	storage := &uploadGuardTestStorage{guard: lease}
 
-	_, err := UploadLegacyBlockObject(context.Background(), storage, metadata, func() (string, error) {
+	_, err := UploadSingleBlockObject(context.Background(), storage, metadata, func() (string, error) {
 		return "", uploadErr
 	})
 
