@@ -59,7 +59,7 @@ func TestUploadSingleBlockObjectFailsClosedForRetirementFence(t *testing.T) {
 
 	objectKey, err := UploadSingleBlockObject(context.Background(), storage, metadata, func() (string, error) {
 		uploadCalls++
-		return "legacy/new.gzip", nil
+		return "single-block/new.gzip", nil
 	})
 
 	require.ErrorIs(err, ErrSingleBlockRetirementFenced)
@@ -78,11 +78,11 @@ func TestUploadSingleBlockObjectHoldsGuardThroughPut(t *testing.T) {
 	objectKey, err := UploadSingleBlockObject(context.Background(), storage, metadata, func() (string, error) {
 		uploadCalls++
 		require.Zero(lease.releaseCall)
-		return "legacy/new.gzip", nil
+		return "single-block/new.gzip", nil
 	})
 
 	require.NoError(err)
-	require.Equal("legacy/new.gzip", objectKey)
+	require.Equal("single-block/new.gzip", objectKey)
 	require.Equal(1, uploadCalls)
 	require.Equal(1, lease.releaseCall)
 }
@@ -94,7 +94,7 @@ func TestUploadSingleBlockObjectFailsClosedForMissingGuard(t *testing.T) {
 
 	objectKey, err := UploadSingleBlockObject(context.Background(), storage, testGuardMetadata(), func() (string, error) {
 		uploadCalls++
-		return "legacy/new.gzip", nil
+		return "single-block/new.gzip", nil
 	})
 
 	require.ErrorContains(err, "single-block upload guard is required")

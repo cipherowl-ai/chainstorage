@@ -109,10 +109,10 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		Blobdata: &api.Block_Solana{Solana: &api.SolanaBlobdata{Header: []byte(`{"slot":9000000000,"transactions":["one","two"]}`)}},
 	}
 
-	legacyKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
+	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 	require.NoError(err)
-	require.NotEmpty(legacyKey)
-	block.Metadata.ObjectKeyMain = legacyKey
+	require.NotEmpty(singleBlockKey)
+	block.Metadata.ObjectKeyMain = singleBlockKey
 	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil))
 
 	records, err := meta.GetBlocksMissingConsolidationShadow(ctx, tag, height, height+1, 1)
@@ -121,10 +121,10 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	blockMetadataID := records[0].ID
 	defer cleanupLifecycleMetadata(t, db, blockMetadataID, bucket)
 
-	downloadedLegacy, err := blob.Download(ctx, records[0].Metadata)
+	downloadedSingleBlock, err := blob.Download(ctx, records[0].Metadata)
 	require.NoError(err)
-	require.True(proto.Equal(block, downloadedLegacy))
-	consolidatedPayload, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(downloadedLegacy))
+	require.True(proto.Equal(block, downloadedSingleBlock))
+	consolidatedPayload, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(downloadedSingleBlock))
 	require.NoError(err)
 	consolidatedKey, placements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{
 		Metadata:           records[0].Metadata,
@@ -141,7 +141,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		Tag:                       tag,
 		Height:                    height,
 		Hash:                      block.Metadata.Hash,
-		LegacyObjectKeyMain:       legacyKey,
+		LegacyObjectKeyMain:       singleBlockKey,
 		ConsolidatedObjectKeyMain: consolidatedKey,
 		ObjectFormat:              placement.ObjectFormat,
 		ByteOffset:                placement.ByteOffset,
@@ -224,7 +224,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.Equal(retirement.ActionDeletedVerified, report.Items[0].Action)
 	require.Equal(retirement.RetirementStateDeletedVerified, report.Items[0].RetirementState)
 
-	legacyTopology, err := store.ListObjectVersions(ctx, bucket, legacyKey)
+	legacyTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
 	require.Empty(legacyTopology.Versions)
 	require.Empty(legacyTopology.DeleteMarkers)

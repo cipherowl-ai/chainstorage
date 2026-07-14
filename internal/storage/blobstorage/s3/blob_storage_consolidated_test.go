@@ -431,14 +431,14 @@ func TestReadExpectedRangeBodyRejectsOversizedRead(t *testing.T) {
 	require.Contains(err.Error(), "range body length mismatch")
 }
 
-func TestBlobStorage_DownloadConsolidatedMetadataWithZeroLengthUsesLegacy(t *testing.T) {
+func TestBlobStorage_DownloadConsolidatedMetadataWithZeroLengthUsesSingleBlockPath(t *testing.T) {
 	require := testutil.Require(t)
 
 	metadata := &api.BlockMetadata{
 		Tag:           7,
 		Height:        100,
 		Hash:          "hash-100",
-		ObjectKeyMain: "legacy/object",
+		ObjectKeyMain: "single-block/object",
 		ObjectFormat:  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		ByteLength:    0,
 	}

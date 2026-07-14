@@ -70,7 +70,7 @@ func (s *SyncerTestSuite) TestNoOp() {
 	require.Equal(uint64(100), result.canonicalChainTipHeight)
 }
 
-func (s *SyncerTestSuite) TestRetirementFenceFailsBeforeLegacyUpload() {
+func (s *SyncerTestSuite) TestRetirementFenceFailsBeforeSingleBlockUpload() {
 	require := testutil.Require(s.T())
 	block := testutil.MakeBlocksFromStartHeight(123456, 1, tag)[0]
 	s.singleBlockUploader.EXPECT().Upload(gomock.Any(), block, api.Compression_NONE).

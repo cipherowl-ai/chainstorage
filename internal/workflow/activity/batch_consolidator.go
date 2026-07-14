@@ -636,7 +636,7 @@ func (a *BatchConsolidator) buildPayloads(
 			metadata := record.Metadata
 			block, err := a.blobStorage.Download(groupCtx, metadata)
 			if err != nil {
-				return xerrors.Errorf("failed to download legacy block (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
+				return xerrors.Errorf("failed to download single-block object (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
 			if err := validateDownloadedBlock(metadata, block); err != nil {
 				return err

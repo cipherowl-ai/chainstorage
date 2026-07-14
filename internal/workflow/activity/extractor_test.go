@@ -114,7 +114,7 @@ func (s *ExtractorTestSuite) TestSuccess() {
 	require.Equal(objectKey, metadata.ObjectKeyMain)
 }
 
-func (s *ExtractorTestSuite) TestRetirementFenceFailsBeforeLegacyUpload() {
+func (s *ExtractorTestSuite) TestRetirementFenceFailsBeforeSingleBlockUpload() {
 	const (
 		tag    uint32 = 1
 		height uint64 = 123456

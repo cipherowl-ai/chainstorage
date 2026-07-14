@@ -751,7 +751,7 @@ func makeConsolidatorFixture(count int, startHeight uint64) ([]*metastorage.Bloc
 			Hash:          fmt.Sprintf("hash-%d", height),
 			ParentHash:    fmt.Sprintf("hash-%d", height-1),
 			ParentHeight:  height - 1,
-			ObjectKeyMain: fmt.Sprintf("legacy/%d.gzip", height),
+			ObjectKeyMain: fmt.Sprintf("single-block/%d.gzip", height),
 		}
 		records[i] = &metastorage.BlockMetadataRecord{
 			ID:       int64(10 + i),

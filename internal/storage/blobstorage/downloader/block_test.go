@@ -508,7 +508,7 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_CSCBLimitsConcurrencyAcrossF
 	require.LessOrEqual(tracker.peakActive(), workerLimit)
 }
 
-func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesOrder() {
+func (s *blockDownloaderTestSuite) TestDownloadMany_MixedSingleBlockAndCSCBPreservesOrder() {
 	require := testutil.Require(s.T())
 	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
 	defer fixture.close()
@@ -519,24 +519,24 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesO
 		file.FileUrl = cscbServer.URL
 	}
 
-	legacyBlock := &api.Block{
+	singleBlock := &api.Block{
 		Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
 		Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
-		Metadata:   &api.BlockMetadata{Tag: 1, Height: 900, Hash: "legacy-hash"},
+		Metadata:   &api.BlockMetadata{Tag: 1, Height: 900, Hash: "single-block-hash"},
 	}
-	legacyPayload, err := proto.Marshal(legacyBlock)
+	singleBlockPayload, err := proto.Marshal(singleBlock)
 	require.NoError(err)
-	legacyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	singleBlockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		require.Equal(http.MethodGet, r.Method)
-		_, _ = w.Write(legacyPayload)
+		_, _ = w.Write(singleBlockPayload)
 	}))
-	defer legacyServer.Close()
+	defer singleBlockServer.Close()
 
-	legacyFile := &api.BlockFile{
+	singleBlockFile := &api.BlockFile{
 		Tag:     1,
 		Height:  900,
-		Hash:    "legacy-hash",
-		FileUrl: legacyServer.URL,
+		Hash:    "single-block-hash",
+		FileUrl: singleBlockServer.URL,
 	}
 
 	s.app = testapp.New(
@@ -548,7 +548,7 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesO
 
 	rawBlocks, err := s.downloader.DownloadMany(context.Background(), []*api.BlockFile{
 		fixture.blockFiles[1],
-		legacyFile,
+		singleBlockFile,
 		fixture.blockFiles[0],
 	})
 	require.NoError(err)
@@ -561,7 +561,7 @@ func (s *blockDownloaderTestSuite) TestDownloadMany_MixedLegacyAndCSCBPreservesO
 	if diff := cmp.Diff(expectedFirst, rawBlocks[0], protocmp.Transform()); diff != "" {
 		require.FailNow(diff)
 	}
-	if diff := cmp.Diff(legacyBlock, rawBlocks[1], protocmp.Transform()); diff != "" {
+	if diff := cmp.Diff(singleBlock, rawBlocks[1], protocmp.Transform()); diff != "" {
 		require.FailNow(diff)
 	}
 	if diff := cmp.Diff(expectedThird, rawBlocks[2], protocmp.Transform()); diff != "" {
@@ -605,7 +605,7 @@ func (s *blockDownloaderTestSuite) TestDownloadStream_CSCB() {
 	}
 }
 
-func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyGzip() {
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_SingleBlockGzip() {
 	require := testutil.Require(s.T())
 	s.app = testapp.New(
 		s.T(),
@@ -629,7 +629,7 @@ func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyGzip() {
 	require.Equal(expectedBlockBytes, got)
 }
 
-func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsShortPayload() {
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_SingleBlockDetectsShortPayload() {
 	require := testutil.Require(s.T())
 	s.app = testapp.New(
 		s.T(),
@@ -650,7 +650,7 @@ func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsShortPay
 	require.Contains(err.Error(), "length mismatch")
 }
 
-func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_LegacyDetectsOversizedPayload() {
+func (s *blockDownloaderTestSuite) TestOpenRawBlockPayload_SingleBlockDetectsOversizedPayload() {
 	require := testutil.Require(s.T())
 	s.app = testapp.New(
 		s.T(),
