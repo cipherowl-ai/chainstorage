@@ -32,7 +32,7 @@ func TestBlockMetadataToProto_ConsolidatedFields(t *testing.T) {
 	require.Equal(t, entry.ObjectKeyMain, actual.GetObjectKeyMain())
 }
 
-func TestBlockMetadataToProto_LegacyMissingFields(t *testing.T) {
+func TestBlockMetadataToProto_SingleBlockMissingFields(t *testing.T) {
 	entry := &BlockMetaDataDDBEntry{
 		Tag:           1,
 		Hash:          "0xabc",
@@ -45,7 +45,7 @@ func TestBlockMetadataToProto_LegacyMissingFields(t *testing.T) {
 
 	actual := BlockMetadataToProto(entry)
 
-	require.Equal(t, api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK, actual.GetObjectFormat())
+	require.Equal(t, api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK, actual.GetObjectFormat())
 	require.Zero(t, actual.GetByteOffset())
 	require.Zero(t, actual.GetByteLength())
 	require.Zero(t, actual.GetUncompressedLength())

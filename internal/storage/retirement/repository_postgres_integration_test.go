@@ -43,7 +43,7 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	// Exercise the complete lifecycle for SQL NULL hashes. Repository reads
 	// normalize NULL to an empty string, while writes use NULLIF consistently.
 	hash := ""
-	legacyKey := fmt.Sprintf("legacy/%d.gzip", height)
+	singleBlockKey := fmt.Sprintf("single-block/%d.gzip", height)
 	cscbKey := fmt.Sprintf("consolidated/%d.cscb.gzip", height)
 	validatedAt := time.Now().UTC().Add(-96 * time.Hour)
 	retiredAt := validatedAt
@@ -68,9 +68,9 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	).Scan(&blockMetadataID)
 	require.NoError(err)
 	defer func() {
-		_, _ = db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement DISABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
-		_, _ = db.ExecContext(ctx, `DELETE FROM block_legacy_object_retirement WHERE block_metadata_id = $1`, blockMetadataID)
-		_, _ = db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement ENABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention DISABLE TRIGGER block_single_block_retention_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention ENABLE TRIGGER block_single_block_retention_delete_trigger`)
 		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE block_metadata_id = $1`, blockMetadataID)
 		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE block_metadata_id = $1`, blockMetadataID)
 		_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, blockMetadataID)
@@ -81,15 +81,15 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.NoError(err)
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, legacy_object_key_main,
+			block_metadata_id, tag, height, hash, single_block_object_key_main,
 			consolidated_object_key_main, object_format, byte_offset, byte_length,
-			uncompressed_length, validated_at, legacy_object_retired_at, legacy_object_retire_after
+			uncompressed_length, validated_at, single_block_retention_started_at, single_block_delete_after
 		) VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
 		blockMetadataID,
 		tag,
 		height,
 		hash,
-		legacyKey,
+		singleBlockKey,
 		cscbKey,
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		0,
@@ -110,11 +110,11 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 		Hash:                           hash,
 		State:                          RetirementStateEligible,
 		Bucket:                         "integration-bucket",
-		LegacyObjectKey:                legacyKey,
-		LegacyObjectKeySHA256:          keySHA256(legacyKey),
-		LegacyObjectVersionIDs:         []string{"legacy-v1"},
-		LegacyObjectETag:               "legacy-etag",
-		LegacyObjectBytes:              256,
+		SingleBlockObjectKey:           singleBlockKey,
+		SingleBlockObjectKeySHA256:     keySHA256(singleBlockKey),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         256,
 		ConsolidatedObjectKey:          cscbKey,
 		ConsolidatedObjectVersionID:    "cscb-v1",
 		ConsolidatedObjectETag:         "cscb-etag",
@@ -125,70 +125,70 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 		PreparedAt:                     preparedAt,
 	}
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO block_legacy_object_retirement (
+		INSERT INTO block_single_block_retention (
 			block_metadata_id, tag, height, hash, state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, prepared_at
 		) VALUES ($1, $2, $3, NULLIF($4, ''), 'deleted_verified', $5, $6, $7, $8, $9, $10,
 			$11, $12, $13, $14, $15, $16, $17, CURRENT_TIMESTAMP)`,
-		blockMetadataID, tag, height, hash, manifest.Bucket, legacyKey, manifest.LegacyObjectKeySHA256,
-		pq.Array(manifest.LegacyObjectVersionIDs), manifest.LegacyObjectETag, manifest.LegacyObjectBytes,
+		blockMetadataID, tag, height, hash, manifest.Bucket, singleBlockKey, manifest.SingleBlockObjectKeySHA256,
+		pq.Array(manifest.SingleBlockObjectVersionIDs), manifest.SingleBlockObjectETag, manifest.SingleBlockObjectBytes,
 		cscbKey, manifest.ConsolidatedObjectVersionID, manifest.ConsolidatedObjectETag,
 		manifest.ConsolidatedByteOffset, manifest.ConsolidatedByteLength, manifest.ConsolidatedUncompressedLength,
 		manifest.PayloadSHA256,
 	)
 	require.Error(err)
 	require.Contains(err.Error(), "must be inserted in eligible state")
-	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET legacy_object_retire_after = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
 	err = repo.PrepareRetirement(ctx, manifest)
 	require.Error(err)
 	require.Contains(err.Error(), "failed to lock canonical retirement metadata")
-	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET legacy_object_retire_after = $2 WHERE block_metadata_id = $1`, blockMetadataID, retireAfter)
+	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = $2 WHERE block_metadata_id = $1`, blockMetadataID, retireAfter)
 	require.NoError(err)
 	require.NoError(repo.PrepareRetirement(ctx, manifest))
-	_, err = db.ExecContext(ctx, `DELETE FROM block_legacy_object_retirement WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "audit manifests cannot be deleted")
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO block_legacy_object_retirement (
+		INSERT INTO block_single_block_retention (
 			block_metadata_id, tag, height, hash, state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, prepared_at
 		) VALUES ($1, $2, $3, NULLIF($4, ''), 'eligible', $5, $6, $7, ARRAY['null'], $8, $9,
 			$10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP)
 		ON CONFLICT (block_metadata_id) DO NOTHING`,
-		blockMetadataID, tag, height, hash, manifest.Bucket, legacyKey, manifest.LegacyObjectKeySHA256,
-		manifest.LegacyObjectETag, manifest.LegacyObjectBytes, cscbKey, manifest.ConsolidatedObjectVersionID,
+		blockMetadataID, tag, height, hash, manifest.Bucket, singleBlockKey, manifest.SingleBlockObjectKeySHA256,
+		manifest.SingleBlockObjectETag, manifest.SingleBlockObjectBytes, cscbKey, manifest.ConsolidatedObjectVersionID,
 		manifest.ConsolidatedObjectETag, manifest.ConsolidatedByteOffset, manifest.ConsolidatedByteLength,
 		manifest.ConsolidatedUncompressedLength, manifest.PayloadSHA256,
 	)
 	require.Error(err)
-	require.Contains(err.Error(), "block_legacy_object_retirement_immutable_version_ids_check")
+	require.Contains(err.Error(), "block_single_block_retention_immutable_version_ids_check")
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO block_legacy_object_retirement (
+		INSERT INTO block_single_block_retention (
 			block_metadata_id, tag, height, hash, state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, prepared_at
 		) VALUES ($1, $2, $3, NULLIF($4, ''), 'eligible', $5, $6, $7, ARRAY[NULL]::TEXT[], $8, $9,
 			$10, $11, $12, $13, $14, $15, $16, CURRENT_TIMESTAMP)
 		ON CONFLICT (block_metadata_id) DO NOTHING`,
-		blockMetadataID, tag, height, hash, manifest.Bucket, legacyKey, manifest.LegacyObjectKeySHA256,
-		manifest.LegacyObjectETag, manifest.LegacyObjectBytes, cscbKey, manifest.ConsolidatedObjectVersionID,
+		blockMetadataID, tag, height, hash, manifest.Bucket, singleBlockKey, manifest.SingleBlockObjectKeySHA256,
+		manifest.SingleBlockObjectETag, manifest.SingleBlockObjectBytes, cscbKey, manifest.ConsolidatedObjectVersionID,
 		manifest.ConsolidatedObjectETag, manifest.ConsolidatedByteOffset, manifest.ConsolidatedByteLength,
 		manifest.ConsolidatedUncompressedLength, manifest.PayloadSHA256,
 	)
 	require.Error(err)
-	require.Contains(err.Error(), "block_legacy_object_retirement_immutable_version_ids_check")
+	require.Contains(err.Error(), "block_single_block_retention_immutable_version_ids_check")
 	firstObservedAt, observedAt, err := repo.ObserveRetentionSafety(ctx, manifest.Bucket, cscbKey, keySHA256("safe-configuration-v1"))
 	require.NoError(err)
 	require.Equal(firstObservedAt, observedAt)
@@ -200,10 +200,10 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.NoError(err)
 	require.Equal(resetFirstObservedAt, resetObservedAt)
 	require.False(resetFirstObservedAt.Before(laterObservedAt))
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET state = 'deleted_verified' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET state = 'deleted_verified' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "invalid legacy retirement transition")
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET consolidated_object_etag = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
+	require.Contains(err.Error(), "invalid single-block retirement transition")
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET consolidated_object_etag = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change pinned retirement manifest fields")
 
@@ -211,20 +211,20 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	claimToken := "integration-claim"
 	require.NoError(repo.ClaimRetirement(ctx, blockMetadataID, claimToken, startedAt, startedAt.Add(time.Hour)))
 	var databaseClaimExpiresAt time.Time
-	require.NoError(db.QueryRowContext(ctx, `SELECT claim_expires_at FROM block_legacy_object_retirement WHERE block_metadata_id = $1`, blockMetadataID).Scan(&databaseClaimExpiresAt))
+	require.NoError(db.QueryRowContext(ctx, `SELECT claim_expires_at FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID).Scan(&databaseClaimExpiresAt))
 	require.WithinDuration(time.Now().UTC().Add(time.Hour), databaseClaimExpiresAt, 5*time.Second)
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET claim_token = 'stolen-claim' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET claim_token = 'stolen-claim' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "cannot replace an active legacy retirement claim")
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET state = 'deleted_pending_verification', claim_token = 'stolen-claim' WHERE block_metadata_id = $1`, blockMetadataID)
+	require.Contains(err.Error(), "cannot replace an active single-block retirement claim")
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET state = 'deleted_pending_verification', claim_token = 'stolen-claim' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "cannot change claim owner while recording legacy object deletion")
+	require.Contains(err.Error(), "cannot change claim owner while recording single-block object deletion")
 	err = repo.ClaimRetirement(ctx, blockMetadataID, "competing-claim", startedAt.Add(48*time.Hour), startedAt.Add(49*time.Hour))
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	err = repo.RenewRetirementClaim(ctx, blockMetadataID, "competing-claim", startedAt.Add(time.Second), startedAt.Add(2*time.Hour))
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	require.NoError(repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, startedAt.Add(time.Second), startedAt.Add(2*time.Hour)))
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET claim_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET claim_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
 	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, ActionDeletedObjectVersion)
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
@@ -235,7 +235,7 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	postReorgRow, err := repo.GetMetadataRow(ctx, blockMetadataID)
 	require.NoError(err)
 	require.False(postReorgRow.Canonical)
-	require.Equal(legacyKey, postReorgRow.LegacyObjectKey)
+	require.Equal(singleBlockKey, postReorgRow.SingleBlockObjectKey)
 	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, "competing-claim", ActionDeletedObjectVersion)
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET byte_length = 127 WHERE block_metadata_id = $1`, blockMetadataID)
@@ -245,7 +245,7 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Contains(err.Error(), "CSCB metadata changed")
 	failedRow, err := repo.GetMetadataRow(ctx, blockMetadataID)
 	require.NoError(err)
-	require.Equal(legacyKey, failedRow.LegacyObjectKey)
+	require.Equal(singleBlockKey, failedRow.SingleBlockObjectKey)
 	require.Equal(RetirementStateDeleting, failedRow.Retirement.State)
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET byte_length = 128 WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
@@ -255,22 +255,22 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 
 	pendingRow, err := repo.GetMetadataRow(ctx, blockMetadataID)
 	require.NoError(err)
-	require.Empty(pendingRow.LegacyObjectKey)
-	require.Empty(pendingRow.Shadow.LegacyObjectKey)
-	require.NotNil(pendingRow.Shadow.LegacyObjectDeletedAt)
+	require.Empty(pendingRow.SingleBlockObjectKey)
+	require.Empty(pendingRow.Shadow.SingleBlockObjectKey)
+	require.NotNil(pendingRow.Shadow.SingleBlockObjectDeletedAt)
 	require.Equal(RetirementStateDeletedPendingVerification, pendingRow.Retirement.State)
-	require.Empty(pendingRow.Retirement.LegacyObjectKey)
+	require.Empty(pendingRow.Retirement.SingleBlockObjectKey)
 	require.Equal(ActionDeletedObjectVersion, pendingRow.Retirement.Outcome)
 	require.NotNil(pendingRow.Retirement.DeletedAt)
 	require.Nil(pendingRow.Retirement.VerifiedAt)
 	require.Equal(claimToken, pendingRow.Retirement.ClaimToken)
 
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET consolidated_object_version_id = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET consolidated_object_version_id = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change pinned retirement manifest fields")
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET state = 'eligible' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET state = 'eligible' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "invalid legacy retirement transition")
+	require.Contains(err.Error(), "invalid single-block retirement transition")
 
 	_, err = repo.FinalizeRetirement(ctx, blockMetadataID, "competing-claim", ActionDeletedVerified)
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
@@ -284,21 +284,21 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.NoError(err)
 	require.False(row.Canonical)
 	require.Empty(row.Hash)
-	require.Empty(row.LegacyObjectKey)
+	require.Empty(row.SingleBlockObjectKey)
 	require.NotNil(row.Shadow)
 	require.Empty(row.Shadow.Hash)
-	require.Empty(row.Shadow.LegacyObjectKey)
-	require.NotNil(row.Shadow.LegacyObjectDeletedAt)
-	require.WithinDuration(deletedAt, *row.Shadow.LegacyObjectDeletedAt, time.Microsecond)
+	require.Empty(row.Shadow.SingleBlockObjectKey)
+	require.NotNil(row.Shadow.SingleBlockObjectDeletedAt)
+	require.WithinDuration(deletedAt, *row.Shadow.SingleBlockObjectDeletedAt, time.Microsecond)
 	require.Equal(cscbKey, row.Shadow.ConsolidatedObjectKey)
 	require.Equal(cscbKey, row.PrimaryObjectKey)
 	require.NotNil(row.Retirement)
 	require.WithinDuration(time.Now().UTC(), row.Retirement.PreparedAt, 5*time.Second)
 	require.Equal(RetirementStateDeletedVerified, row.Retirement.State)
-	require.Empty(row.Retirement.LegacyObjectKey)
-	require.Equal(keySHA256(legacyKey), row.Retirement.LegacyObjectKeySHA256)
-	require.Equal([]string{"legacy-v1"}, row.Retirement.LegacyObjectVersionIDs)
-	require.Empty(row.Retirement.LegacyObjectETag)
+	require.Empty(row.Retirement.SingleBlockObjectKey)
+	require.Equal(keySHA256(singleBlockKey), row.Retirement.SingleBlockObjectKeySHA256)
+	require.Equal([]string{"single-block-v1"}, row.Retirement.SingleBlockObjectVersionIDs)
+	require.Empty(row.Retirement.SingleBlockObjectETag)
 	require.Empty(row.Retirement.ClaimToken)
 	require.Nil(row.Retirement.ClaimExpiresAt)
 	require.NotNil(row.Retirement.DeleteStartedAt)
@@ -309,9 +309,9 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Equal(ActionDeletedVerified, row.Retirement.Outcome)
 	require.WithinDuration(deletedAt, *row.Retirement.DeletedAt, time.Microsecond)
 	require.WithinDuration(verifiedAt, *row.Retirement.VerifiedAt, time.Microsecond)
-	_, err = db.ExecContext(ctx, `UPDATE block_legacy_object_retirement SET outcome = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET outcome = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "cannot change a verified legacy retirement")
+	require.Contains(err.Error(), "cannot change a verified single-block retirement")
 
 	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, 0)
 	require.NoError(err)

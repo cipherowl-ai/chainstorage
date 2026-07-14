@@ -82,18 +82,18 @@ func (s *blockStorageTestSuite) TearDownTest() {
 	if s.db != nil {
 		ctx := context.Background()
 		s.T().Log("Clearing database tables after test")
-		_, err := s.db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement DISABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
+		_, err := s.db.ExecContext(ctx, `ALTER TABLE block_single_block_retention DISABLE TRIGGER block_single_block_retention_delete_trigger`)
 		if err != nil {
 			s.T().Errorf("Failed to disable retirement audit delete trigger for test cleanup: %v", err)
 			return
 		}
 		defer func() {
-			if _, err := s.db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement ENABLE TRIGGER block_legacy_object_retirement_delete_trigger`); err != nil {
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE block_single_block_retention ENABLE TRIGGER block_single_block_retention_delete_trigger`); err != nil {
 				s.T().Errorf("Failed to restore retirement audit delete trigger after test cleanup: %v", err)
 			}
 		}()
 		// Clear all tables in reverse order due to foreign key constraints
-		tables := []string{"block_events", "block_legacy_object_retirement", "block_consolidation_shadow", "canonical_blocks", "block_metadata"}
+		tables := []string{"block_events", "block_single_block_retention", "block_consolidation_shadow", "canonical_blocks", "block_metadata"}
 		for _, table := range tables {
 			_, err := s.db.ExecContext(ctx, fmt.Sprintf("DELETE FROM %s", table))
 			if err != nil {
@@ -113,8 +113,8 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	require := testutil.Require(s.T())
 	ctx := context.Background()
 	block := testutil.MakeBlockMetadatasFromStartHeight(s.config.Chain.BlockStartHeight, 1, tag)[0]
-	block.ObjectKeyMain = "legacy/fenced-block.gzip"
-	block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+	block.ObjectKeyMain = "single-block/fenced-block.gzip"
+	block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
 	block.ByteOffset = 0
 	block.ByteLength = 0
 	block.UncompressedLength = 0
@@ -154,9 +154,9 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	retireAfter := validatedAt.Add(72 * time.Hour)
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, legacy_object_key_main,
+			block_metadata_id, tag, height, hash, single_block_object_key_main,
 			consolidated_object_key_main, object_format, byte_offset, byte_length,
-			uncompressed_length, validated_at, legacy_object_retired_at, legacy_object_retire_after
+			uncompressed_length, validated_at, single_block_retention_started_at, single_block_delete_after
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)`,
 		blockMetadataID,
 		block.Tag,
@@ -182,11 +182,11 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 		Hash:                           block.Hash,
 		State:                          retirement.RetirementStateEligible,
 		Bucket:                         "integration-bucket",
-		LegacyObjectKey:                block.ObjectKeyMain,
-		LegacyObjectKeySHA256:          sha256Hex(block.ObjectKeyMain),
-		LegacyObjectVersionIDs:         []string{"legacy-v1"},
-		LegacyObjectETag:               "legacy-etag",
-		LegacyObjectBytes:              512,
+		SingleBlockObjectKey:           block.ObjectKeyMain,
+		SingleBlockObjectKeySHA256:     sha256Hex(block.ObjectKeyMain),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         512,
 		ConsolidatedObjectKey:          cscbKey,
 		ConsolidatedObjectVersionID:    "cscb-v1",
 		ConsolidatedObjectETag:         "cscb-etag",
@@ -222,16 +222,16 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 			uncompressed_length = NULL
 		WHERE id = $1`,
 		blockMetadataID,
-		"legacy/direct-sql-regression.gzip",
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		"single-block/direct-sql-regression.gzip",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
 	)
 	require.Error(err)
-	require.Contains(err.Error(), "cannot change CSCB placement after legacy object retirement is fenced")
+	require.Contains(err.Error(), "cannot change CSCB placement after single-block object retirement is fenced")
 
-	replayedLegacy := proto.Clone(block).(*api.BlockMetadata)
-	replayedLegacy.ObjectKeyMain = "legacy/replayed-block.gzip"
-	replayedLegacy.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
-	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+	replayedSingleBlock := proto.Clone(block).(*api.BlockMetadata)
+	replayedSingleBlock.ObjectKeyMain = "single-block/replayed-block.gzip"
+	replayedSingleBlock.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedSingleBlock}, nil))
 
 	for _, fetched := range []*api.BlockMetadata{
 		mustGetBlockByHash(s.T(), s.accessor, block),
@@ -249,7 +249,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	require.NoError(repo.ClaimRetirement(ctx, blockMetadataID, claimToken, claimedAt, claimedAt.Add(time.Hour)))
 	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, retirement.ActionDeletedObjectVersion)
 	require.NoError(err)
-	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedSingleBlock}, nil))
 	for _, fetched := range []*api.BlockMetadata{
 		mustGetBlockByHash(s.T(), s.accessor, block),
 		mustGetBlockByHeight(s.T(), s.accessor, block),
@@ -259,7 +259,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	}
 	_, err = repo.FinalizeRetirement(ctx, blockMetadataID, claimToken, retirement.ActionDeletedVerified)
 	require.NoError(err)
-	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedLegacy}, nil))
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedSingleBlock}, nil))
 
 	for _, fetched := range []*api.BlockMetadata{
 		mustGetBlockByHash(s.T(), s.accessor, block),
@@ -272,30 +272,30 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 		require.Equal(uint64(256), fetched.UncompressedLength)
 	}
 
-	var clearedLegacyPath sql.NullString
-	var legacyDeletedAt sql.NullTime
+	var clearedSingleBlockPath sql.NullString
+	var singleBlockDeletedAt sql.NullTime
 	err = s.db.QueryRowContext(ctx, `
-		SELECT legacy_object_key_main, legacy_object_deleted_at
+		SELECT single_block_object_key_main, single_block_object_deleted_at
 		FROM block_consolidation_shadow
-		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&clearedLegacyPath, &legacyDeletedAt)
+		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&clearedSingleBlockPath, &singleBlockDeletedAt)
 	require.NoError(err)
-	require.False(clearedLegacyPath.Valid)
-	require.True(legacyDeletedAt.Valid)
+	require.False(clearedSingleBlockPath.Valid)
+	require.True(singleBlockDeletedAt.Valid)
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE block_consolidation_shadow
-		SET legacy_object_key_main = $2,
-			legacy_object_deleted_at = NULL
-		WHERE block_metadata_id = $1`, blockMetadataID, "legacy/direct-shadow-regression.gzip")
+		SET single_block_object_key_main = $2,
+			single_block_object_deleted_at = NULL
+		WHERE block_metadata_id = $1`, blockMetadataID, "single-block/direct-shadow-regression.gzip")
 	require.Error(err)
-	require.Contains(err.Error(), "cannot restore or rewrite deleted legacy object metadata")
+	require.Contains(err.Error(), "cannot restore or rewrite deleted single-block object metadata")
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE block_consolidation_shadow
-		SET legacy_object_deleted_at = legacy_object_deleted_at + INTERVAL '1 second'
+		SET single_block_object_deleted_at = single_block_object_deleted_at + INTERVAL '1 second'
 		WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
-	require.Contains(err.Error(), "cannot restore or rewrite deleted legacy object metadata")
+	require.Contains(err.Error(), "cannot restore or rewrite deleted single-block object metadata")
 }
 
 func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() {
@@ -329,7 +329,7 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 
 	_, err = s.db.ExecContext(ctx, `
 		UPDATE block_metadata
-		SET legacy_object_retirement_fenced_at = CURRENT_TIMESTAMP
+		SET single_block_retention_fenced_at = CURRENT_TIMESTAMP
 		WHERE id = $1`, blockMetadataID)
 	require.NoError(err)
 	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "")
@@ -337,6 +337,85 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 	require.NotNil(fencedGuard)
 	require.True(fencedGuard.RetirementFenced())
 	require.NoError(fencedGuard.Release())
+}
+
+func (s *blockStorageTestSuite) TestSingleBlockShadowCompatibilityColumnsStaySynchronized() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	height := s.config.Chain.BlockStartHeight + 2
+	validatedAt := time.Now().UTC().Add(-96 * time.Hour).Truncate(time.Microsecond)
+	deleteAfter := validatedAt.Add(72 * time.Hour)
+
+	var blockMetadataID int64
+	err := s.db.QueryRowContext(ctx, `
+		INSERT INTO block_metadata (
+			height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+			object_format, byte_offset, byte_length, uncompressed_length
+		) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, $8, $9, $10)
+		RETURNING id`,
+		height,
+		tag,
+		"compatibility-hash",
+		height-1,
+		"consolidated/compatibility.cscb.gzip",
+		time.Now().UTC().Unix(),
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+	).Scan(&blockMetadataID)
+	require.NoError(err)
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, legacy_object_key_main,
+			consolidated_object_key_main, object_format, byte_offset, byte_length,
+			uncompressed_length, validated_at, legacy_object_retired_at, legacy_object_retire_after
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)`,
+		blockMetadataID,
+		tag,
+		height,
+		"compatibility-hash",
+		"single-block/compatibility.gzip",
+		"consolidated/compatibility.cscb.gzip",
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+		validatedAt,
+		deleteAfter,
+	)
+	require.NoError(err)
+
+	var canonicalKey string
+	var canonicalStartedAt time.Time
+	var canonicalDeleteAfter time.Time
+	err = s.db.QueryRowContext(ctx, `
+		SELECT single_block_object_key_main, single_block_retention_started_at, single_block_delete_after
+		FROM block_consolidation_shadow
+		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&canonicalKey, &canonicalStartedAt, &canonicalDeleteAfter)
+	require.NoError(err)
+	require.Equal("single-block/compatibility.gzip", canonicalKey)
+	require.WithinDuration(validatedAt, canonicalStartedAt, 0)
+	require.WithinDuration(deleteAfter, canonicalDeleteAfter, 0)
+
+	deletedAt := time.Now().UTC().Truncate(time.Microsecond)
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_object_key_main = NULL,
+			single_block_object_deleted_at = $2
+		WHERE block_metadata_id = $1`, blockMetadataID, deletedAt)
+	require.NoError(err)
+
+	var compatibilityKey sql.NullString
+	var canonicalDeletedAt time.Time
+	err = s.db.QueryRowContext(ctx, `
+		SELECT legacy_object_key_main, single_block_object_deleted_at
+		FROM block_consolidation_shadow
+		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&compatibilityKey, &canonicalDeletedAt)
+	require.NoError(err)
+	require.False(compatibilityKey.Valid)
+	require.WithinDuration(deletedAt, canonicalDeletedAt, 0)
 }
 
 func sha256Hex(value string) string {
@@ -590,7 +669,7 @@ func (s *blockStorageTestSuite) getBlockMetadataID(ctx context.Context, block *a
 }
 
 type consolidationShadowAudit struct {
-	LegacyObjectKey       string
+	SingleBlockObjectKey  string
 	ConsolidatedObjectKey string
 	RetiredAt             *time.Time
 	RetireAfter           *time.Time
@@ -598,23 +677,23 @@ type consolidationShadowAudit struct {
 
 func (s *blockStorageTestSuite) getConsolidationShadowAudit(ctx context.Context, block *api.BlockMetadata) consolidationShadowAudit {
 	require := testutil.Require(s.T())
-	var legacyObjectKey, consolidatedObjectKey string
+	var singleBlockObjectKey, consolidatedObjectKey string
 	var retiredAt sql.NullTime
 	var retireAfter sql.NullTime
 	err := s.db.QueryRowContext(
 		ctx,
-		`SELECT shadow.legacy_object_key_main, shadow.consolidated_object_key_main,
-			shadow.legacy_object_retired_at, shadow.legacy_object_retire_after
+		`SELECT shadow.single_block_object_key_main, shadow.consolidated_object_key_main,
+			shadow.single_block_retention_started_at, shadow.single_block_delete_after
 		 FROM block_metadata bm
 		 JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
 		 WHERE bm.tag = $1 AND bm.height = $2 AND bm.hash = $3`,
 		block.GetTag(),
 		block.GetHeight(),
 		block.GetHash(),
-	).Scan(&legacyObjectKey, &consolidatedObjectKey, &retiredAt, &retireAfter)
+	).Scan(&singleBlockObjectKey, &consolidatedObjectKey, &retiredAt, &retireAfter)
 	require.NoError(err)
 	audit := consolidationShadowAudit{
-		LegacyObjectKey:       legacyObjectKey,
+		SingleBlockObjectKey:  singleBlockObjectKey,
 		ConsolidatedObjectKey: consolidatedObjectKey,
 	}
 	if retiredAt.Valid {
@@ -636,10 +715,10 @@ func (s *blockStorageTestSuite) insertConsolidationShadow(
 	byteLength uint64,
 	uncompressedLength uint64,
 	validated bool,
-	legacyObjectKeyMain string,
+	singleBlockObjectKeyMain string,
 ) {
-	if legacyObjectKeyMain == "" {
-		legacyObjectKeyMain = block.GetObjectKeyMain()
+	if singleBlockObjectKeyMain == "" {
+		singleBlockObjectKeyMain = block.GetObjectKeyMain()
 	}
 	s.insertConsolidationShadowWithIdentity(
 		ctx,
@@ -649,7 +728,7 @@ func (s *blockStorageTestSuite) insertConsolidationShadow(
 		byteLength,
 		uncompressedLength,
 		validated,
-		legacyObjectKeyMain,
+		singleBlockObjectKeyMain,
 		block.GetTag(),
 		block.GetHeight(),
 		block.GetHash(),
@@ -664,7 +743,7 @@ func (s *blockStorageTestSuite) insertConsolidationShadowWithIdentity(
 	byteLength uint64,
 	uncompressedLength uint64,
 	validated bool,
-	legacyObjectKeyMain string,
+	singleBlockObjectKeyMain string,
 	shadowTag uint32,
 	shadowHeight uint64,
 	shadowHash string,
@@ -677,14 +756,14 @@ func (s *blockStorageTestSuite) insertConsolidationShadowWithIdentity(
 	_, err := s.db.ExecContext(
 		ctx,
 		`INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			block_metadata_id, tag, height, hash, single_block_object_key_main, consolidated_object_key_main,
 			object_format, byte_offset, byte_length, uncompressed_length, validated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		s.getBlockMetadataID(ctx, block),
 		shadowTag,
 		shadowHeight,
 		shadowHash,
-		legacyObjectKeyMain,
+		singleBlockObjectKeyMain,
 		consolidatedObjectKey,
 		int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
 		byteOffset,
@@ -708,7 +787,7 @@ func (s *blockStorageTestSuite) insertInvalidConsolidationShadow(
 	_, err := s.db.ExecContext(
 		ctx,
 		`INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, legacy_object_key_main, consolidated_object_key_main,
+			block_metadata_id, tag, height, hash, single_block_object_key_main, consolidated_object_key_main,
 			object_format, byte_offset, byte_length, uncompressed_length, validated_at
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		s.getBlockMetadataID(ctx, block),
@@ -753,7 +832,7 @@ func (s *blockStorageTestSuite) TestGetConsolidationShadowPredicates() {
 
 	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/validated.cscb.zstd", 10, 20, 20, true, "")
 	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/unvalidated.cscb.zstd", 30, 40, 40, false, "")
-	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/wrong-legacy-key.cscb.zstd", 50, 60, 60, true, "legacy/key/does/not/match")
+	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/wrong-single-block-key.cscb.zstd", 50, 60, 60, true, "single-block/key/does/not/match")
 
 	expected := expectedConsolidationShadow(blocks[0], "consolidated/validated.cscb.zstd", 10, 20, 20)
 	actual, err := s.accessor.GetBlockConsolidationShadow(ctx, blocks[0])
@@ -860,7 +939,7 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
 	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/first.cscb.zstd", 30, 40, 40, true, "")
 	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/second.cscb.zstd", 50, 60, 60, true, "")
 	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/unvalidated.cscb.zstd", 70, 80, 80, false, "")
-	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/wrong-legacy-key.cscb.zstd", 90, 100, 100, true, "legacy/key/does/not/match")
+	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/wrong-single-block-key.cscb.zstd", 90, 100, 100, true, "single-block/key/does/not/match")
 	s.insertConsolidationShadowWithIdentity(ctx, blocks[5], "consolidated/wrong-tag.cscb.zstd", 110, 120, 120, true, blocks[5].GetObjectKeyMain(), tag+1, blocks[5].GetHeight(), blocks[5].GetHash())
 	s.insertConsolidationShadowWithIdentity(ctx, blocks[6], "consolidated/wrong-height.cscb.zstd", 130, 140, 140, true, blocks[6].GetObjectKeyMain(), tag, blocks[6].GetHeight()+1000, blocks[6].GetHash())
 	s.insertConsolidationShadowWithIdentity(ctx, blocks[7], "consolidated/wrong-hash.cscb.zstd", 150, 160, 160, true, blocks[7].GetObjectKeyMain(), tag, blocks[7].GetHeight(), "wrong-hash")
@@ -919,7 +998,7 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsRequiresProm
 		ctx,
 		blocks[1],
 		"consolidated/wrong-format.cscb.zstd",
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
 		30,
 		40,
 		40,
@@ -943,7 +1022,7 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsRequiresProm
 		0,
 	)
 	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/promoted.cscb.zstd", 90, 100, 100, true, "")
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[4].GetHeight(), blocks[4].GetHeight()+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[4].GetHeight(), blocks[4].GetHeight()+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(1), result.Blocks)
 
@@ -969,7 +1048,7 @@ func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimar
 			Tag:                       blocks[0].GetTag(),
 			Height:                    blocks[0].GetHeight(),
 			Hash:                      blocks[0].GetHash(),
-			LegacyObjectKeyMain:       blocks[0].GetObjectKeyMain(),
+			SingleBlockObjectKeyMain:  blocks[0].GetObjectKeyMain(),
 			ConsolidatedObjectKeyMain: "consolidated/first.cscb.zstd",
 			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			ByteOffset:                100,
@@ -993,7 +1072,7 @@ func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimar
 			Tag:                       blocks[1].GetTag(),
 			Height:                    blocks[1].GetHeight(),
 			Hash:                      blocks[1].GetHash(),
-			LegacyObjectKeyMain:       "legacy/key/does/not/match",
+			SingleBlockObjectKeyMain:  "single-block/key/does/not/match",
 			ConsolidatedObjectKeyMain: "consolidated/wrong.cscb.zstd",
 			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			ByteOffset:                300,
@@ -1021,7 +1100,7 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesVali
 	s.insertConsolidationShadow(ctx, blocks[1], "consolidated/second.cscb.zstd", 30, 40, 40, true, "")
 
 	beforePromotion := time.Now().UTC()
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+3, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+3, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(2), result.Blocks)
 
@@ -1038,12 +1117,12 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesVali
 	s.equalProto(blocks[2], primary)
 
 	audit := s.getConsolidationShadowAudit(ctx, blocks[0])
-	require.Equal(blocks[0].GetObjectKeyMain(), audit.LegacyObjectKey)
+	require.Equal(blocks[0].GetObjectKeyMain(), audit.SingleBlockObjectKey)
 	require.Equal("consolidated/first.cscb.zstd", audit.ConsolidatedObjectKey)
 	require.NotNil(audit.RetiredAt)
 	require.NotNil(audit.RetireAfter)
 	require.WithinDuration(beforePromotion, *audit.RetiredAt, time.Minute)
-	require.WithinDuration(audit.RetiredAt.Add(config.DefaultLegacyObjectRetention), *audit.RetireAfter, time.Minute)
+	require.WithinDuration(audit.RetiredAt.Add(config.DefaultSingleBlockObjectRetention), *audit.RetireAfter, time.Minute)
 
 	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+3)
 	require.NoError(err)
@@ -1081,7 +1160,7 @@ func (s *blockStorageTestSuite) TestGetFirstPromotableBlockConsolidationShadowFi
 	require.NoError(err)
 	s.insertConsolidationShadow(ctx, blocks[2], "consolidated/unvalidated.cscb.zstd", 10, 20, 20, false, "")
 	s.insertConsolidationShadow(ctx, blocks[3], "consolidated/promoted.cscb.zstd", 10, 20, 20, true, "")
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[3].GetHeight(), blocks[3].GetHeight()+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, blocks[3].GetHeight(), blocks[3].GetHeight()+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(1), result.Blocks)
 	s.insertConsolidationShadow(ctx, blocks[4], "consolidated/first-promotable.cscb.zstd", 10, 20, 20, true, "")
@@ -1111,7 +1190,7 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsMissingShado
 	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
 	require.NoError(err)
 
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(0), result.Blocks)
 
@@ -1132,13 +1211,13 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsRejectsInval
 		ctx,
 		blocks[0],
 		"consolidated/invalid.cscb.zstd",
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
 		10,
 		20,
 		20,
 	)
 
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.Error(err)
 	require.Nil(result)
 	require.Contains(err.Error(), "invalid consolidation shadow metadata")
@@ -1161,11 +1240,11 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsSkipsStaleRe
 	reorgBlock := proto.Clone(blocks[3]).(*api.BlockMetadata)
 	reorgBlock.Hash = "0xreorg"
 	reorgBlock.ParentHash = blocks[2].GetHash()
-	reorgBlock.ObjectKeyMain = "legacy/reorg.gzip"
+	reorgBlock.ObjectKeyMain = "single-block/reorg.gzip"
 	err = s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{reorgBlock}, blocks[2])
 	require.NoError(err)
 
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, reorgBlock.GetHeight(), reorgBlock.GetHeight()+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, reorgBlock.GetHeight(), reorgBlock.GetHeight()+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(0), result.Blocks)
 
@@ -1184,11 +1263,11 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsIdempotentRe
 	require.NoError(err)
 	s.insertConsolidationShadow(ctx, blocks[0], "consolidated/first.cscb.zstd", 10, 20, 20, true, "")
 
-	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultLegacyObjectRetention)
+	result, err := s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(1), result.Blocks)
 
-	result, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultLegacyObjectRetention)
+	result, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+1, 10, config.DefaultSingleBlockObjectRetention)
 	require.NoError(err)
 	require.Equal(uint64(0), result.Blocks)
 
@@ -1216,7 +1295,7 @@ func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsRollsBackOnI
 		40,
 	)
 
-	_, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+2, 10, config.DefaultLegacyObjectRetention)
+	_, err = s.accessor.PromoteBlockConsolidationShadows(ctx, tag, startHeight, startHeight+2, 10, config.DefaultSingleBlockObjectRetention)
 	require.Error(err)
 	require.Contains(err.Error(), "invalid consolidation shadow metadata")
 

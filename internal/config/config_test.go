@@ -923,30 +923,58 @@ func TestConsolidationHistoricalBackfillModeAcceptedAsDeprecatedAlias(t *testing
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
-func TestConsolidationLegacyObjectRetentionConfig(t *testing.T) {
+func TestConsolidationSingleBlockObjectRetentionConfig(t *testing.T) {
 	require := testutil.Require(t)
 
 	cfg, err := config.New()
 	require.NoError(err)
-	require.Equal(config.DefaultLegacyObjectRetention, cfg.AWS.Storage.Consolidation.LegacyObjectRetention)
+	require.Equal(config.DefaultSingleBlockObjectRetention, cfg.AWS.Storage.Consolidation.SingleBlockObjectRetention)
 
-	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "24h")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SINGLE_BLOCK_OBJECT_RETENTION", "24h")
 	cfg, err = config.New()
 	require.NoError(err)
-	require.Equal(24*time.Hour, cfg.AWS.Storage.Consolidation.LegacyObjectRetention)
+	require.Equal(24*time.Hour, cfg.AWS.Storage.Consolidation.SingleBlockObjectRetention)
 }
 
-func TestConsolidationLegacyObjectRetentionMustBePositiveWhenEnabled(t *testing.T) {
+func TestDeprecatedConsolidationConfigAliases(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", "legacy_only")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "24h")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_SHADOW_WRITE_AFTER_SYNCER_CUTOVER", "true")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(config.ConsolidationModeSingleBlockOnly, cfg.AWS.Storage.Consolidation.Mode)
+	require.Equal(24*time.Hour, cfg.AWS.Storage.Consolidation.SingleBlockObjectRetention)
+	require.True(cfg.AWS.Storage.Consolidation.SingleBlockShadowWriteAfterSyncerCutover)
+}
+
+func TestCanonicalConsolidationConfigTakesPrecedenceOverDeprecatedAliases(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SINGLE_BLOCK_OBJECT_RETENTION", "48h")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "24h")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SINGLE_BLOCK_SHADOW_WRITE_AFTER_SYNCER_CUTOVER", "false")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_SHADOW_WRITE_AFTER_SYNCER_CUTOVER", "true")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(48*time.Hour, cfg.AWS.Storage.Consolidation.SingleBlockObjectRetention)
+	require.False(cfg.AWS.Storage.Consolidation.SingleBlockShadowWriteAfterSyncerCutover)
+}
+
+func TestConsolidationSingleBlockObjectRetentionMustBePositiveWhenEnabled(t *testing.T) {
 	require := testutil.Require(t)
 
 	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
 	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
 	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeAutoConsolidate))
-	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_LEGACY_OBJECT_RETENTION", "0s")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_SINGLE_BLOCK_OBJECT_RETENTION", "0s")
 
 	_, err := config.New()
 	require.Error(err)
-	require.Contains(err.Error(), "legacy_object_retention must be positive")
+	require.Contains(err.Error(), "single_block_object_retention must be positive")
 }
 
 func TestConsolidationPromoteFinalizedRequiresSafePromotionLag(t *testing.T) {
@@ -1106,23 +1134,23 @@ func getDataCompressionType(cfg *config.Config) api.Compression {
 func defaultConsolidationConfig() config.ConsolidationConfig {
 	memoryBudgetBytes := uint64(268435456)
 	return config.ConsolidationConfig{
-		Enabled:                false,
-		Mode:                   config.ConsolidationModeLegacyOnly,
-		Codec:                  api.Compression_ZSTD,
-		CodecLevel:             6,
-		MaxCompressedBytes:     2147483648,
-		MaxUncompressedBytes:   137438953472,
-		MaxBlocks:              1000,
-		CompressionChunkBlocks: 10,
-		FlushInterval:          time.Minute,
-		ShadowTimeout:          30 * time.Second,
-		MaxInflightRawBlocks:   4,
-		MemoryBudgetBytes:      &memoryBudgetBytes,
-		LocalSpillDir:          "/tmp/chainstorage-cscb",
-		ShardSize:              10000,
-		MultipartThreshold:     134217728,
-		ReadShadowFirst:        false,
-		LegacyObjectRetention:  config.DefaultLegacyObjectRetention,
+		Enabled:                    false,
+		Mode:                       config.ConsolidationModeSingleBlockOnly,
+		Codec:                      api.Compression_ZSTD,
+		CodecLevel:                 6,
+		MaxCompressedBytes:         2147483648,
+		MaxUncompressedBytes:       137438953472,
+		MaxBlocks:                  1000,
+		CompressionChunkBlocks:     10,
+		FlushInterval:              time.Minute,
+		ShadowTimeout:              30 * time.Second,
+		MaxInflightRawBlocks:       4,
+		MemoryBudgetBytes:          &memoryBudgetBytes,
+		LocalSpillDir:              "/tmp/chainstorage-cscb",
+		ShardSize:                  10000,
+		MultipartThreshold:         134217728,
+		ReadShadowFirst:            false,
+		SingleBlockObjectRetention: config.DefaultSingleBlockObjectRetention,
 	}
 }
 

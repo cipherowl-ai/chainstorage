@@ -33,11 +33,11 @@ func (s blockMetadataScanner) Scan(dest ...interface{}) error {
 	return nil
 }
 
-func TestScanBlockMetadata_LegacyNullByteFields(t *testing.T) {
+func TestScanBlockMetadata_SingleBlockNullByteFields(t *testing.T) {
 	actual, err := scanBlockMetadata(blockMetadataScanner{})
 
 	require.NoError(t, err)
-	require.Equal(t, api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK, actual.GetObjectFormat())
+	require.Equal(t, api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK, actual.GetObjectFormat())
 	require.Zero(t, actual.GetByteOffset())
 	require.Zero(t, actual.GetByteLength())
 	require.Zero(t, actual.GetUncompressedLength())

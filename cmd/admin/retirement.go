@@ -36,8 +36,8 @@ type retirementFlags struct {
 }
 
 var (
-	legacyRetirementFlags          retirementFlags
-	legacyRetirementReconcileFlags retirementFlags
+	singleBlockRetirementFlags          retirementFlags
+	singleBlockRetirementReconcileFlags retirementFlags
 )
 
 func newRetirementCommand() *cobra.Command {
@@ -45,56 +45,56 @@ func newRetirementCommand() *cobra.Command {
 		Use:   "retirement",
 		Short: "plan and execute guarded storage retirement operations",
 	}
-	cmd.AddCommand(newLegacyRetirementPlanCommand())
-	cmd.AddCommand(newLegacyRetirementReconcileCommand())
+	cmd.AddCommand(newSingleBlockRetirementPlanCommand())
+	cmd.AddCommand(newSingleBlockRetirementReconcileCommand())
 	return cmd
 }
 
-func newLegacyRetirementPlanCommand() *cobra.Command {
+func newSingleBlockRetirementPlanCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "plan-legacy-single-blocks",
-		Short: "dry-run legacy single-block object retirement after CSCB validation",
-		Long: `Plan retirement for legacy single-block S3 objects whose active metadata has already been promoted to validated CSCB metadata.
+		Use:   "plan-single-blocks",
+		Short: "dry-run single-block object retirement after CSCB validation",
+		Long: `Plan retirement for single-block S3 objects whose active metadata has already been promoted to validated CSCB metadata.
 
 The command is dry-run by default. It emits one auditable JSON report containing the bucket,
-legacy key, version id when available, height, hash, legacy bytes, consolidated key,
+single-block key, version id when available, height, hash, single-block bytes, consolidated key,
 validated_at, retired_at, eligible_at, action, and skip reason for every scanned canonical row.
 
-Execution persists a write-ahead manifest, independently parses and compares the pinned legacy
+Execution persists a write-ahead manifest, independently parses and compares the pinned single-block
 version with the pinned CSCB payload, revalidates immediately before deleting exactly one S3
-version, verifies the key has no remaining versions, transactionally clears the legacy path,
+version, verifies the key has no remaining versions, transactionally clears the single-block path,
 then performs a fresh CSCB range read before marking the retirement verified.
 The command also verifies the live bucket policy denies every unconditional write and every API
 delete to each CSCB key, so no newer version or delete marker can replace the pinned payload.
 Production execution requires both --execute and --confirm-production-delete.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLegacyRetirementPlan(cmd.Context(), legacyRetirementFlags)
+			return runSingleBlockRetirementPlan(cmd.Context(), singleBlockRetirementFlags)
 		},
 	}
 
-	addLegacyRetirementFlags(cmd, &legacyRetirementFlags)
+	addSingleBlockRetirementFlags(cmd, &singleBlockRetirementFlags)
 	return cmd
 }
 
-func newLegacyRetirementReconcileCommand() *cobra.Command {
+func newSingleBlockRetirementReconcileCommand() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "reconcile-legacy-single-blocks",
-		Short: "inspect or resume durable legacy object retirements",
+		Use:   "reconcile-single-blocks",
+		Short: "inspect or resume durable single-block object retirements",
 		Long: `Inspect write-ahead retirement manifests left in eligible, deleting, or deleted-pending-verification state.
 
 The command is report-only by default. With explicit execution gates, it can safely resume a
-pre-delete manifest, record an already-completed S3 deletion while clearing the legacy path, or
+pre-delete manifest, record an already-completed S3 deletion while clearing the single-block path, or
 finish fresh CSCB verification against the persisted digest after the path has been cleared.
 Execution remains blocked unless the live CSCB write-once bucket policy is verifiable.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLegacyRetirementReconcile(cmd.Context(), legacyRetirementReconcileFlags)
+			return runSingleBlockRetirementReconcile(cmd.Context(), singleBlockRetirementReconcileFlags)
 		},
 	}
-	addLegacyRetirementFlags(cmd, &legacyRetirementReconcileFlags)
+	addSingleBlockRetirementFlags(cmd, &singleBlockRetirementReconcileFlags)
 	return cmd
 }
 
-func addLegacyRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
+func addSingleBlockRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
 	cmd.Flags().Uint32Var(&flags.tag, "tag", 0, "block tag; default zero resolves to the configured stable tag")
 	cmd.Flags().Uint64Var(&flags.startHeight, "start-height", 0, "inclusive block start height")
 	cmd.Flags().Uint64Var(&flags.endHeight, "end-height", 0, "exclusive block end height")
@@ -112,7 +112,7 @@ func addLegacyRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
 	_ = cmd.MarkFlagRequired("end-height")
 }
 
-func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
+func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) error {
 	if flags.endHeight <= flags.startHeight {
 		return xerrors.Errorf("end height must be greater than start height: start=%d end=%d", flags.startHeight, flags.endHeight)
 	}
@@ -132,10 +132,10 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 	defer app.Close()
 	cfg := app.Config()
 	if cfg.StorageType.MetaStorageType != config.MetaStorageType_POSTGRES {
-		return xerrors.Errorf("legacy retirement planner requires Postgres meta storage, got %v", cfg.StorageType.MetaStorageType)
+		return xerrors.Errorf("single-block retirement planner requires Postgres meta storage, got %v", cfg.StorageType.MetaStorageType)
 	}
 	if cfg.StorageType.BlobStorageType != config.BlobStorageType_UNSPECIFIED && cfg.StorageType.BlobStorageType != config.BlobStorageType_S3 {
-		return xerrors.Errorf("legacy retirement planner requires S3 blob storage, got %v", cfg.StorageType.BlobStorageType)
+		return xerrors.Errorf("single-block retirement planner requires S3 blob storage, got %v", cfg.StorageType.BlobStorageType)
 	}
 	if cfg.AWS.Postgres == nil {
 		return xerrors.New("postgres config is required")
@@ -143,7 +143,7 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
 	targetChain := approvalChainFromFlags()
-	logger.Info("planning legacy single-block retirement",
+	logger.Info("planning single-block object retirement",
 		zap.String("environment", string(cfg.Env())),
 		zap.String("chain", targetChain),
 		zap.String("bucket", cfg.AWS.Bucket),
@@ -189,24 +189,24 @@ func runLegacyRetirementPlan(ctx context.Context, flags retirementFlags) error {
 
 	report, err := planner.Plan(ctx, req)
 	if err != nil {
-		return xerrors.Errorf("failed to plan legacy retirement: %w", err)
+		return xerrors.Errorf("failed to plan single-block retirement: %w", err)
 	}
 	if flags.execute {
 		err = planner.Apply(ctx, req, report)
 	}
 	if reportErr := writeRetirementReport(flags.reportFile, report); reportErr != nil {
 		if err != nil {
-			return xerrors.Errorf("legacy retirement failed (%v) and report write failed: %w", err, reportErr)
+			return xerrors.Errorf("single-block retirement failed (%v) and report write failed: %w", err, reportErr)
 		}
 		return reportErr
 	}
 	if err != nil {
-		return xerrors.Errorf("failed to execute one or more legacy retirements: %w", err)
+		return xerrors.Errorf("failed to execute one or more single-block retirements: %w", err)
 	}
 	return nil
 }
 
-func runLegacyRetirementReconcile(ctx context.Context, flags retirementFlags) error {
+func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlags) error {
 	if flags.endHeight <= flags.startHeight {
 		return xerrors.Errorf("end height must be greater than start height: start=%d end=%d", flags.startHeight, flags.endHeight)
 	}
@@ -222,10 +222,10 @@ func runLegacyRetirementReconcile(ctx context.Context, flags retirementFlags) er
 	defer app.Close()
 	cfg := app.Config()
 	if cfg.StorageType.MetaStorageType != config.MetaStorageType_POSTGRES || cfg.AWS.Postgres == nil {
-		return xerrors.New("legacy retirement reconciler requires Postgres meta storage")
+		return xerrors.New("single-block retirement reconciler requires Postgres meta storage")
 	}
 	if cfg.StorageType.BlobStorageType != config.BlobStorageType_UNSPECIFIED && cfg.StorageType.BlobStorageType != config.BlobStorageType_S3 {
-		return xerrors.Errorf("legacy retirement reconciler requires S3 blob storage, got %v", cfg.StorageType.BlobStorageType)
+		return xerrors.Errorf("single-block retirement reconciler requires S3 blob storage, got %v", cfg.StorageType.BlobStorageType)
 	}
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
@@ -259,16 +259,16 @@ func runLegacyRetirementReconcile(ctx context.Context, flags retirementFlags) er
 	}
 	report, reconcileErr := planner.Reconcile(ctx, req)
 	if report == nil {
-		return xerrors.Errorf("failed to reconcile legacy retirements: %w", reconcileErr)
+		return xerrors.Errorf("failed to reconcile single-block retirements: %w", reconcileErr)
 	}
 	if reportErr := writeRetirementReport(flags.reportFile, report); reportErr != nil {
 		if reconcileErr != nil {
-			return xerrors.Errorf("legacy retirement reconciliation failed (%v) and report write failed: %w", reconcileErr, reportErr)
+			return xerrors.Errorf("single-block retirement reconciliation failed (%v) and report write failed: %w", reconcileErr, reportErr)
 		}
 		return reportErr
 	}
 	if reconcileErr != nil {
-		return xerrors.Errorf("failed to reconcile one or more legacy retirements: %w", reconcileErr)
+		return xerrors.Errorf("failed to reconcile one or more single-block retirements: %w", reconcileErr)
 	}
 	return nil
 }

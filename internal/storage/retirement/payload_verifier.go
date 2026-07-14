@@ -38,20 +38,20 @@ func newPayloadVerifier(store ObjectStore) *payloadVerifier {
 }
 
 func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (string, error) {
-	legacyCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
+	singleBlockCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
 	if err != nil {
 		return "", err
 	}
-	legacyPayload, err := storageutils.Decompress(legacyCompressed, storageutils.GetCompressionType(candidate.Key))
+	singleBlockPayload, err := storageutils.Decompress(singleBlockCompressed, storageutils.GetCompressionType(candidate.Key))
 	if err != nil {
-		return "", xerrors.Errorf("failed to decompress pinned legacy object: %w", err)
+		return "", xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
 	}
-	var legacyBlock api.Block
-	if err := proto.Unmarshal(legacyPayload, &legacyBlock); err != nil {
-		return "", xerrors.Errorf("failed to parse pinned legacy block payload: %w", err)
+	var singleBlockBlock api.Block
+	if err := proto.Unmarshal(singleBlockPayload, &singleBlockBlock); err != nil {
+		return "", xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
 	}
-	if err := validatePayloadIdentity(&legacyBlock, candidate); err != nil {
-		return "", xerrors.Errorf("pinned legacy block identity mismatch: %w", err)
+	if err := validatePayloadIdentity(&singleBlockBlock, candidate); err != nil {
+		return "", xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
 	}
 
 	_, cscbBlock, err := v.readConsolidatedPayload(ctx, candidate)
@@ -64,12 +64,12 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 	if storageutils.HasBlockStoragePlacement(cscbBlock) {
 		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
 	}
-	legacyComparable := storageutils.CloneBlockWithoutStoragePlacement(&legacyBlock)
+	singleBlockComparable := storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock)
 	cscbComparable := storageutils.CloneBlockWithoutStoragePlacement(cscbBlock)
-	if !proto.Equal(legacyComparable, cscbComparable) {
-		return "", xerrors.Errorf("legacy and CSCB block payloads differ at height %d", candidate.Height)
+	if !proto.Equal(singleBlockComparable, cscbComparable) {
+		return "", xerrors.Errorf("single-block and CSCB block payloads differ at height %d", candidate.Height)
 	}
-	legacyDigest, err := canonicalBlockDigest(legacyComparable)
+	singleBlockDigest, err := canonicalBlockDigest(singleBlockComparable)
 	if err != nil {
 		return "", err
 	}
@@ -77,10 +77,10 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 	if err != nil {
 		return "", err
 	}
-	if legacyDigest != cscbDigest {
-		return "", xerrors.Errorf("legacy and CSCB canonical payload digests differ at height %d", candidate.Height)
+	if singleBlockDigest != cscbDigest {
+		return "", xerrors.Errorf("single-block and CSCB canonical payload digests differ at height %d", candidate.Height)
 	}
-	return legacyDigest, nil
+	return singleBlockDigest, nil
 }
 
 func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Candidate) (string, error) {

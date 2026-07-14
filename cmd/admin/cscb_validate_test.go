@@ -43,13 +43,13 @@ func TestBuildCSCBValidationCasesIncludesRequiredCoverage(t *testing.T) {
 
 func TestCompareCSCBBlocksIgnoresSourceSpecificMetadata(t *testing.T) {
 	require := require.New(t)
-	legacy := &api.Block{
+	singleBlock := &api.Block{
 		Metadata: &api.BlockMetadata{
 			Tag:           1,
 			Height:        42,
 			Hash:          "hash",
 			ParentHash:    "parent",
-			ObjectKeyMain: "legacy/object",
+			ObjectKeyMain: "single-block/object",
 		},
 	}
 	consolidated := &api.Block{
@@ -65,23 +65,23 @@ func TestCompareCSCBBlocksIgnoresSourceSpecificMetadata(t *testing.T) {
 		},
 	}
 
-	comparison := compareCSCBBlocks([]*api.Block{legacy}, []*api.Block{consolidated})
+	comparison := compareCSCBBlocks([]*api.Block{singleBlock}, []*api.Block{consolidated})
 	require.True(comparison.correct)
 	require.Empty(comparison.mismatchHeights)
 	require.Equal(1, comparison.hashesCompared)
-	require.Equal(comparison.firstLegacyHash, comparison.firstConsolidatedHash)
+	require.Equal(comparison.firstSingleBlockHash, comparison.firstConsolidatedHash)
 }
 
 func TestCompareCSCBBlocksDetectsMismatch(t *testing.T) {
 	require := require.New(t)
-	legacy := &api.Block{
+	singleBlock := &api.Block{
 		Metadata: &api.BlockMetadata{Height: 42, Hash: "hash"},
 	}
 	consolidated := &api.Block{
 		Metadata: &api.BlockMetadata{Height: 42, Hash: "different"},
 	}
 
-	comparison := compareCSCBBlocks([]*api.Block{legacy}, []*api.Block{consolidated})
+	comparison := compareCSCBBlocks([]*api.Block{singleBlock}, []*api.Block{consolidated})
 	require.False(comparison.correct)
 	require.Equal([]uint64{42}, comparison.mismatchHeights)
 }
@@ -200,14 +200,14 @@ func TestCanonicalRawBlockDataHashHandlesSkippedBlock(t *testing.T) {
 func TestCompareCSCBDigestsDetectsMismatch(t *testing.T) {
 	require := require.New(t)
 	comparison := compareCSCBDigests(
-		[]cscbBlockDigest{{height: 42, hash: "legacy"}},
+		[]cscbBlockDigest{{height: 42, hash: "single-block"}},
 		[]cscbBlockDigest{{height: 42, hash: "consolidated"}},
 	)
 
 	require.False(comparison.correct)
 	require.Equal([]uint64{42}, comparison.mismatchHeights)
 	require.Equal(1, comparison.hashesCompared)
-	require.Equal("legacy", comparison.firstLegacyHash)
+	require.Equal("single-block", comparison.firstSingleBlockHash)
 	require.Equal("consolidated", comparison.firstConsolidatedHash)
 }
 
@@ -240,7 +240,7 @@ func TestSummarizeDurationsUsesNearestRankPercentile(t *testing.T) {
 	require.Equal(float64(50), summary.MaxMs)
 }
 
-func TestSummarizeCSCBFilesDoesNotCountSkippedBlocksAsLegacyFallback(t *testing.T) {
+func TestSummarizeCSCBFilesDoesNotCountSkippedBlocksAsSingleBlockFallback(t *testing.T) {
 	require := require.New(t)
 
 	summary := summarizeCSCBFiles([]*api.BlockFile{
@@ -262,10 +262,10 @@ func TestSummarizeCSCBFilesDoesNotCountSkippedBlocksAsLegacyFallback(t *testing.
 	require.Equal(3, summary.Count)
 	require.Equal(1, summary.ConsolidatedObjectCount)
 	require.Equal(1, summary.SkippedCount)
-	require.Equal(1, summary.LegacyObjectCount)
+	require.Equal(1, summary.SingleBlockObjectCount)
 	require.Equal(uint64(100), summary.FirstHeight)
 	require.Equal(uint64(102), summary.LastHeight)
-	require.Equal([]string{"BLOCK_OBJECT_FORMAT_CSCB_BATCH", "BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK"}, summary.Formats)
+	require.Equal([]string{"BLOCK_OBJECT_FORMAT_CSCB_BATCH", "BLOCK_OBJECT_FORMAT_SINGLE_BLOCK"}, summary.Formats)
 }
 
 func TestSanitizeCSCBStringRedactsEmbeddedURLs(t *testing.T) {

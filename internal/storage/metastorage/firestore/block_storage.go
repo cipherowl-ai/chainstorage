@@ -287,7 +287,7 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for Firestore")
 }
 
-func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, legacyObjectRetention time.Duration) (*internal.ConsolidationPromotionResult, error) {
+func (b *blockStorageImpl) PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, singleBlockObjectRetention time.Duration) (*internal.ConsolidationPromotionResult, error) {
 	return nil, xerrors.New("PromoteBlockConsolidationShadows not implemented for Firestore")
 }
 

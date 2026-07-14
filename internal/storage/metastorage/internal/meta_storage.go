@@ -34,7 +34,7 @@ type (
 		GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error)
 		SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
-		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, legacyObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
+		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, singleBlockObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
 	}
 
 	EventStorage interface {
@@ -98,7 +98,7 @@ type (
 		Tag                       uint32
 		Height                    uint64
 		Hash                      string
-		LegacyObjectKeyMain       string
+		SingleBlockObjectKeyMain  string
 		ConsolidatedObjectKeyMain string
 		ObjectFormat              api.BlockObjectFormat
 		ByteOffset                uint64

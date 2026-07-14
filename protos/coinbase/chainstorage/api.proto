@@ -21,7 +21,10 @@ enum InitialPosition {
 }
 
 enum BlockReadSource {
+  option allow_alias = true;
+
   BLOCK_READ_SOURCE_DEFAULT = 0;
+  BLOCK_READ_SOURCE_SINGLE_BLOCK = 1;
   BLOCK_READ_SOURCE_LEGACY = 1;
   BLOCK_READ_SOURCE_CONSOLIDATED = 2;
 }

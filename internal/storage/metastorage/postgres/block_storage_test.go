@@ -9,7 +9,7 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-func TestBlockObjectByteFields_LegacyUsesNullSentinel(t *testing.T) {
+func TestBlockObjectByteFields_SingleBlockUsesNullSentinel(t *testing.T) {
 	block := testutil.MakeBlockMetadata(100, tag)
 
 	byteOffset, byteLength, uncompressedLength := blockObjectByteFields(block)

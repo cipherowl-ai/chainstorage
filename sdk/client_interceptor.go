@@ -124,15 +124,15 @@ func (c *timeoutableClient) GetBlockWithTagAndReadSource(ctx context.Context, ta
 	}
 
 	c.logger.Warn(
-		"consolidated block read timed out or failed; retrying legacy",
+		"consolidated block read timed out or failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("height", height),
 		zap.String("hash", hash),
 		zap.Error(err),
 	)
-	block, fallbackErr := c.getBlockWithTagAndReadSource(ctx, readSourceClient, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	block, fallbackErr := c.getBlockWithTagAndReadSource(ctx, readSourceClient, tag, height, hash, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to read consolidated block and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to read consolidated block and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return block, nil
 }
@@ -171,15 +171,15 @@ func (c *timeoutableClient) GetBlocksByRangeWithTagAndReadSource(ctx context.Con
 	}
 
 	c.logger.Warn(
-		"consolidated block range read timed out or failed; retrying legacy",
+		"consolidated block range read timed out or failed; retrying single-block",
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", startHeight),
 		zap.Uint64("end_height", endHeight),
 		zap.Error(err),
 	)
-	blocks, fallbackErr := c.getBlocksByRangeWithTagAndReadSource(ctx, readSourceClient, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY)
+	blocks, fallbackErr := c.getBlocksByRangeWithTagAndReadSource(ctx, readSourceClient, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
 	if fallbackErr != nil {
-		return nil, xerrors.Errorf("failed to read consolidated block range and legacy fallback failed (originalErr=%v): %w", err, fallbackErr)
+		return nil, xerrors.Errorf("failed to read consolidated block range and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
 	}
 	return blocks, nil
 }

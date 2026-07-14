@@ -141,7 +141,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		Tag:                       tag,
 		Height:                    height,
 		Hash:                      block.Metadata.Hash,
-		LegacyObjectKeyMain:       singleBlockKey,
+		SingleBlockObjectKeyMain:  singleBlockKey,
 		ConsolidatedObjectKeyMain: consolidatedKey,
 		ObjectFormat:              placement.ObjectFormat,
 		ByteOffset:                placement.ByteOffset,
@@ -154,14 +154,14 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 
 	var retiredAt, retireAfter time.Time
 	require.NoError(db.QueryRowContext(ctx, `
-		SELECT legacy_object_retired_at, legacy_object_retire_after
+		SELECT single_block_retention_started_at, single_block_delete_after
 		FROM block_consolidation_shadow
 		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&retiredAt, &retireAfter))
 	require.WithinDuration(retiredAt.Add(72*time.Hour), retireAfter, time.Microsecond)
 	_, err = db.ExecContext(ctx, `
 		UPDATE block_consolidation_shadow
-		SET legacy_object_retired_at = clock_timestamp() - INTERVAL '96 hours',
-			legacy_object_retire_after = clock_timestamp() - INTERVAL '24 hours'
+		SET single_block_retention_started_at = clock_timestamp() - INTERVAL '96 hours',
+			single_block_delete_after = clock_timestamp() - INTERVAL '24 hours'
 		WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
 
@@ -224,31 +224,31 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.Equal(retirement.ActionDeletedVerified, report.Items[0].Action)
 	require.Equal(retirement.RetirementStateDeletedVerified, report.Items[0].RetirementState)
 
-	legacyTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
-	require.Empty(legacyTopology.Versions)
-	require.Empty(legacyTopology.DeleteMarkers)
+	require.Empty(singleBlockTopology.Versions)
+	require.Empty(singleBlockTopology.DeleteMarkers)
 	cscbHead, err := store.HeadObject(ctx, bucket, consolidatedKey)
 	require.NoError(err)
 	require.True(cscbHead.Exists)
 
 	var (
-		shadowLegacyKey sql.NullString
-		deletedAt       sql.NullTime
-		state           string
-		manifestKey     sql.NullString
-		keyHash         string
+		shadowSingleBlockKey sql.NullString
+		deletedAt            sql.NullTime
+		state                string
+		manifestKey          sql.NullString
+		keyHash              string
 	)
 	require.NoError(db.QueryRowContext(ctx, `
-		SELECT shadow.legacy_object_key_main, shadow.legacy_object_deleted_at,
-			retirement.state, retirement.legacy_object_key_main, retirement.legacy_object_key_sha256
+		SELECT shadow.single_block_object_key_main, shadow.single_block_object_deleted_at,
+			retirement.state, retirement.single_block_object_key_main, retirement.single_block_object_key_sha256
 		FROM block_consolidation_shadow shadow
-		JOIN block_legacy_object_retirement retirement
+		JOIN block_single_block_retention retirement
 			ON retirement.block_metadata_id = shadow.block_metadata_id
 		WHERE shadow.block_metadata_id = $1`, blockMetadataID).Scan(
-		&shadowLegacyKey, &deletedAt, &state, &manifestKey, &keyHash,
+		&shadowSingleBlockKey, &deletedAt, &state, &manifestKey, &keyHash,
 	))
-	require.False(shadowLegacyKey.Valid)
+	require.False(shadowSingleBlockKey.Valid)
 	require.True(deletedAt.Valid)
 	require.Equal(retirement.RetirementStateDeletedVerified, state)
 	require.False(manifestKey.Valid)
@@ -341,9 +341,9 @@ func cleanupLifecycleMetadata(t *testing.T, db *sql.DB, blockMetadataID int64, b
 	t.Helper()
 	ctx := context.Background()
 	_, _ = db.ExecContext(ctx, `DELETE FROM cscb_retirement_safety_observation WHERE bucket = $1`, bucket)
-	_, _ = db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement DISABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
-	_, _ = db.ExecContext(ctx, `DELETE FROM block_legacy_object_retirement WHERE block_metadata_id = $1`, blockMetadataID)
-	_, _ = db.ExecContext(ctx, `ALTER TABLE block_legacy_object_retirement ENABLE TRIGGER block_legacy_object_retirement_delete_trigger`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention DISABLE TRIGGER block_single_block_retention_delete_trigger`)
+	_, _ = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention ENABLE TRIGGER block_single_block_retention_delete_trigger`)
 	_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE block_metadata_id = $1`, blockMetadataID)
 	_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE block_metadata_id = $1`, blockMetadataID)
 	_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, blockMetadataID)

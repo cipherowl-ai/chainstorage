@@ -387,7 +387,7 @@ func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request
 		request.StartHeight,
 		plan.EndHeight,
 		request.MaxBlocks,
-		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
+		a.config.AWS.Storage.Consolidation.SingleBlockObjectRetention,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to promote consolidation shadows: %w", err)
@@ -421,7 +421,7 @@ func (a *BatchConsolidator) promoteConsolidatedBlocks(ctx context.Context, mode 
 		request.StartHeight,
 		request.EndHeight,
 		request.MaxBlocks,
-		a.config.AWS.Storage.Consolidation.LegacyObjectRetention,
+		a.config.AWS.Storage.Consolidation.SingleBlockObjectRetention,
 	)
 	if err != nil {
 		return 0, xerrors.Errorf("failed to promote consolidated block metadata: %w", err)
@@ -761,7 +761,7 @@ func makeShadowPlacements(
 			Tag:                       metadata.GetTag(),
 			Height:                    metadata.GetHeight(),
 			Hash:                      metadata.GetHash(),
-			LegacyObjectKeyMain:       metadata.GetObjectKeyMain(),
+			SingleBlockObjectKeyMain:  metadata.GetObjectKeyMain(),
 			ConsolidatedObjectKeyMain: objectKey,
 			ObjectFormat:              placement.ObjectFormat,
 			ByteOffset:                placement.ByteOffset,

@@ -173,12 +173,12 @@ func parseBlockReadSource(value string) (api.BlockReadSource, error) {
 	switch strings.ToLower(value) {
 	case "", "default":
 		return api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT, nil
-	case "legacy":
-		return api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY, nil
+	case "single-block", "single_block", "legacy":
+		return api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK, nil
 	case "consolidated":
 		return api.BlockReadSource_BLOCK_READ_SOURCE_CONSOLIDATED, nil
 	default:
-		return api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT, xerrors.Errorf("invalid read source %q: expected default, legacy, or consolidated", value)
+		return api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT, xerrors.Errorf("invalid read source %q: expected default, single-block, or consolidated", value)
 	}
 }
 
@@ -211,10 +211,10 @@ func init() {
 	sdkCmd.PersistentFlags().Uint64Var(&sdkFlags.endHeight, "end-height", 0, "block end height")
 	sdkCmd.PersistentFlags().Uint32Var(&sdkFlags.tag, "tag", 0, "block tag")
 
-	blocksByRangeCmd.Flags().StringVar(&sdkFlags.readSource, "read-source", "default", "block read source: default, legacy, or consolidated")
+	blocksByRangeCmd.Flags().StringVar(&sdkFlags.readSource, "read-source", "default", "block read source: default, single-block, or consolidated")
 	getBlockCmd.Flags().StringVar(&sdkFlags.hash, "hash", "", "block hash (optional)")
 	getBlockCmd.Flags().BoolVar(&sdkFlags.blockValidation, "block-validation", false, "validate block (optional)")
-	getBlockCmd.Flags().StringVar(&sdkFlags.readSource, "read-source", "default", "block read source: default, legacy, or consolidated")
+	getBlockCmd.Flags().StringVar(&sdkFlags.readSource, "read-source", "default", "block read source: default, single-block, or consolidated")
 
 	streamBlockCmd.Flags().Int64Var(&sdkFlags.sequence, "sequence", 0, "last processed event sequence")
 	streamBlockCmd.Flags().Uint32Var(&sdkFlags.eventTag, "event-tag", 0, "event tag")

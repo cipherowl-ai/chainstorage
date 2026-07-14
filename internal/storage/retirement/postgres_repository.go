@@ -25,30 +25,30 @@ const metadataRowColumns = `
 	bm.byte_offset,
 	bm.byte_length,
 	bm.uncompressed_length,
-	bm.legacy_object_retirement_fenced_at,
+	bm.single_block_retention_fenced_at,
 	shadow.block_metadata_id,
 	shadow.tag,
 	shadow.height,
 	shadow.hash,
-	shadow.legacy_object_key_main,
+	shadow.single_block_object_key_main,
 	shadow.consolidated_object_key_main,
 	shadow.object_format,
 	shadow.byte_offset,
 	shadow.byte_length,
 	shadow.uncompressed_length,
 	shadow.validated_at,
-	shadow.legacy_object_retired_at,
-	shadow.legacy_object_retire_after,
-	shadow.legacy_object_deleted_at,
+	shadow.single_block_retention_started_at,
+	shadow.single_block_delete_after,
+	shadow.single_block_object_deleted_at,
 	shadow.format_version,
 	retirement.block_metadata_id,
 	retirement.state,
 	retirement.bucket,
-	retirement.legacy_object_key_main,
-	retirement.legacy_object_key_sha256,
-	retirement.legacy_object_version_ids,
-	retirement.legacy_object_etag,
-	retirement.legacy_object_bytes,
+	retirement.single_block_object_key_main,
+	retirement.single_block_object_key_sha256,
+	retirement.single_block_object_version_ids,
+	retirement.single_block_object_etag,
+	retirement.single_block_object_bytes,
 	retirement.consolidated_object_key_main,
 	retirement.consolidated_object_version_id,
 	retirement.consolidated_object_etag,
@@ -70,13 +70,13 @@ const metadataRowFrom = `
 	FROM canonical_blocks cb
 	JOIN block_metadata bm ON bm.id = cb.block_metadata_id AND bm.tag = cb.tag AND bm.height = cb.height
 	LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-	LEFT JOIN block_legacy_object_retirement retirement ON retirement.block_metadata_id = bm.id`
+	LEFT JOIN block_single_block_retention retirement ON retirement.block_metadata_id = bm.id`
 
 const metadataRowByIDFrom = `
 	FROM block_metadata bm
 	LEFT JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id AND cb.tag = bm.tag AND cb.height = bm.height
 	LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-	LEFT JOIN block_legacy_object_retirement retirement ON retirement.block_metadata_id = bm.id`
+	LEFT JOIN block_single_block_retention retirement ON retirement.block_metadata_id = bm.id`
 
 type PostgresRepository struct {
 	db *sql.DB
@@ -169,10 +169,10 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
 		WHERE bm.id = $1
 			AND shadow.validated_at IS NOT NULL
-			AND shadow.legacy_object_retired_at IS NOT NULL
-			AND shadow.legacy_object_retire_after IS NOT NULL
-			AND shadow.legacy_object_retire_after <= CURRENT_TIMESTAMP
-			AND shadow.legacy_object_deleted_at IS NULL
+			AND shadow.single_block_retention_started_at IS NOT NULL
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_delete_after <= CURRENT_TIMESTAMP
+			AND shadow.single_block_object_deleted_at IS NULL
 		FOR UPDATE OF cb, bm, shadow`
 	var lockedID int64
 	var databasePreparedAt time.Time
@@ -192,7 +192,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	}
 	const fenceMetadata = `
 		UPDATE block_metadata
-		SET legacy_object_retirement_fenced_at = COALESCE(legacy_object_retirement_fenced_at, $2)
+		SET single_block_retention_fenced_at = COALESCE(single_block_retention_fenced_at, $2)
 		WHERE id = $1
 			AND object_key_main = $3
 			AND object_format = $4
@@ -218,10 +218,10 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	}
 
 	const insert = `
-		INSERT INTO block_legacy_object_retirement (
+		INSERT INTO block_single_block_retention (
 			block_metadata_id, tag, height, hash, state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, outcome, prepared_at, updated_at
@@ -236,11 +236,11 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		manifest.Hash,
 		manifest.State,
 		manifest.Bucket,
-		manifest.LegacyObjectKey,
-		manifest.LegacyObjectKeySHA256,
-		pq.Array(manifest.LegacyObjectVersionIDs),
-		manifest.LegacyObjectETag,
-		manifest.LegacyObjectBytes,
+		manifest.SingleBlockObjectKey,
+		manifest.SingleBlockObjectKeySHA256,
+		pq.Array(manifest.SingleBlockObjectVersionIDs),
+		manifest.SingleBlockObjectETag,
+		manifest.SingleBlockObjectBytes,
 		manifest.ConsolidatedObjectKey,
 		manifest.ConsolidatedObjectVersionID,
 		manifest.ConsolidatedObjectETag,
@@ -327,7 +327,7 @@ func (r *PostgresRepository) ClaimRetirement(
 		return xerrors.New("retirement claim lease must be at least one microsecond")
 	}
 	const query = `
-		UPDATE block_legacy_object_retirement
+		UPDATE block_single_block_retention
 		SET state = CASE WHEN state = $2 THEN $3 ELSE state END,
 			claim_token = $4,
 			claim_expires_at = CURRENT_TIMESTAMP + ($5 * INTERVAL '1 microsecond'),
@@ -383,7 +383,7 @@ func (r *PostgresRepository) RenewRetirementClaim(
 		return xerrors.New("retirement claim lease must be at least one microsecond")
 	}
 	const query = `
-		UPDATE block_legacy_object_retirement
+		UPDATE block_single_block_retention
 		SET claim_expires_at = CURRENT_TIMESTAMP + ($3 * INTERVAL '1 microsecond'),
 			last_attempt_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
@@ -427,7 +427,7 @@ func (r *PostgresRepository) RecordRetirementOutcome(
 		return xerrors.New("retirement claim token and outcome are required")
 	}
 	const query = `
-		UPDATE block_legacy_object_retirement
+		UPDATE block_single_block_retention
 		SET outcome = $3,
 			last_attempt_at = CURRENT_TIMESTAMP,
 			updated_at = CURRENT_TIMESTAMP
@@ -486,10 +486,10 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 		return time.Time{}, xerrors.Errorf("active or shadow CSCB metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
 	}
 	if manifest.State == RetirementStateDeletedPendingVerification {
-		if manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" || manifest.Outcome == "" ||
+		if manifest.SingleBlockObjectKey != "" || manifest.SingleBlockObjectETag != "" || manifest.Outcome == "" ||
 			manifest.DeleteStartedAt == nil || manifest.LastAttemptAt == nil || manifest.DeletedAt == nil ||
 			manifest.VerifiedAt != nil || manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil ||
-			metadata.shadowLegacyKey.Valid || !metadata.shadowDeletedAt.Valid ||
+			metadata.shadowSingleBlockKey.Valid || !metadata.shadowDeletedAt.Valid ||
 			!metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt) {
 			return time.Time{}, xerrors.Errorf("pending-verification retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
 		}
@@ -504,8 +504,8 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 	if manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
 		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 	}
-	if !metadata.shadowLegacyKey.Valid || metadata.shadowLegacyKey.String != manifest.LegacyObjectKey || metadata.shadowDeletedAt.Valid {
-		return time.Time{}, xerrors.Errorf("legacy shadow metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
+	if !metadata.shadowSingleBlockKey.Valid || metadata.shadowSingleBlockKey.String != manifest.SingleBlockObjectKey || metadata.shadowDeletedAt.Valid {
+		return time.Time{}, xerrors.Errorf("single-block shadow metadata changed before retirement finalization: block_metadata_id=%d", blockMetadataID)
 	}
 	var databaseDeletedAt time.Time
 	if err := tx.QueryRowContext(ctx, `
@@ -520,12 +520,12 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 
 	const clearShadow = `
 		UPDATE block_consolidation_shadow
-		SET legacy_object_key_main = NULL,
-			legacy_object_deleted_at = $3
+		SET single_block_object_key_main = NULL,
+			single_block_object_deleted_at = $3
 		WHERE block_metadata_id = $1
-			AND legacy_object_key_main = $2
-			AND legacy_object_deleted_at IS NULL`
-	result, err := tx.ExecContext(ctx, clearShadow, blockMetadataID, manifest.LegacyObjectKey, databaseDeletedAt)
+			AND single_block_object_key_main = $2
+			AND single_block_object_deleted_at IS NULL`
+	result, err := tx.ExecContext(ctx, clearShadow, blockMetadataID, manifest.SingleBlockObjectKey, databaseDeletedAt)
 	if err != nil {
 		return time.Time{}, xerrors.Errorf("failed to clear retired shadow path: %w", err)
 	}
@@ -534,10 +534,10 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 	}
 
 	const recordDeleted = `
-		UPDATE block_legacy_object_retirement
+		UPDATE block_single_block_retention
 		SET state = $2,
-			legacy_object_key_main = NULL,
-			legacy_object_etag = '',
+			single_block_object_key_main = NULL,
+			single_block_object_etag = '',
 			outcome = $3,
 			deleted_at = $4,
 			last_attempt_at = $4,
@@ -613,8 +613,8 @@ func (r *PostgresRepository) FinalizeRetirement(
 	if manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
 		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 	}
-	if manifest.LegacyObjectKey != "" || manifest.LegacyObjectETag != "" || manifest.DeletedAt == nil || manifest.VerifiedAt != nil ||
-		metadata.shadowLegacyKey.Valid || !metadata.shadowDeletedAt.Valid ||
+	if manifest.SingleBlockObjectKey != "" || manifest.SingleBlockObjectETag != "" || manifest.DeletedAt == nil || manifest.VerifiedAt != nil ||
+		metadata.shadowSingleBlockKey.Valid || !metadata.shadowDeletedAt.Valid ||
 		!metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt) {
 		return time.Time{}, xerrors.Errorf("pending-verification retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
 	}
@@ -630,7 +630,7 @@ func (r *PostgresRepository) FinalizeRetirement(
 	}
 
 	const finalize = `
-		UPDATE block_legacy_object_retirement
+		UPDATE block_single_block_retention
 		SET state = $2,
 			claim_token = NULL,
 			claim_expires_at = NULL,
@@ -666,8 +666,8 @@ func (r *PostgresRepository) FinalizeRetirement(
 }
 
 func finalizedMetadataIsConsistent(metadata finalizationMetadata, manifest RetirementManifest) bool {
-	return manifest.LegacyObjectKey == "" &&
-		manifest.LegacyObjectETag == "" &&
+	return manifest.SingleBlockObjectKey == "" &&
+		manifest.SingleBlockObjectETag == "" &&
 		manifest.Outcome != "" &&
 		manifest.DeleteStartedAt != nil &&
 		manifest.LastAttemptAt != nil &&
@@ -675,7 +675,7 @@ func finalizedMetadataIsConsistent(metadata finalizationMetadata, manifest Retir
 		manifest.VerifiedAt != nil &&
 		manifest.ClaimToken == "" &&
 		manifest.ClaimExpiresAt == nil &&
-		!metadata.shadowLegacyKey.Valid &&
+		!metadata.shadowSingleBlockKey.Valid &&
 		metadata.shadowDeletedAt.Valid &&
 		metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt)
 }
@@ -684,7 +684,7 @@ type finalizationMetadata struct {
 	shadowTag                int64
 	shadowHeight             int64
 	shadowHash               sql.NullString
-	shadowLegacyKey          sql.NullString
+	shadowSingleBlockKey     sql.NullString
 	shadowDeletedAt          sql.NullTime
 	shadowConsolidatedKey    string
 	shadowObjectFormat       int64
@@ -710,8 +710,8 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 			shadow.tag,
 			shadow.height,
 			shadow.hash,
-			shadow.legacy_object_key_main,
-			shadow.legacy_object_deleted_at,
+			shadow.single_block_object_key_main,
+			shadow.single_block_object_deleted_at,
 			shadow.consolidated_object_key_main,
 			shadow.object_format,
 			shadow.byte_offset,
@@ -727,7 +727,7 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 			bm.byte_length,
 			bm.uncompressed_length,
 			bm.skipped,
-			bm.legacy_object_retirement_fenced_at
+			bm.single_block_retention_fenced_at
 		FROM block_consolidation_shadow shadow
 		JOIN block_metadata bm ON bm.id = shadow.block_metadata_id
 		WHERE shadow.block_metadata_id = $1
@@ -737,7 +737,7 @@ func lockFinalizationMetadata(ctx context.Context, tx *sql.Tx, blockMetadataID i
 		&metadata.shadowTag,
 		&metadata.shadowHeight,
 		&metadata.shadowHash,
-		&metadata.shadowLegacyKey,
+		&metadata.shadowSingleBlockKey,
 		&metadata.shadowDeletedAt,
 		&metadata.shadowConsolidatedKey,
 		&metadata.shadowObjectFormat,
@@ -803,13 +803,13 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 	const query = `
 		SELECT
 			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
 			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
-		FROM block_legacy_object_retirement
+		FROM block_single_block_retention
 		WHERE tag = $1
 			AND height >= $2
 			AND height < $3
@@ -860,25 +860,25 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var shadowTag sql.NullInt64
 	var shadowHeight sql.NullInt64
 	var shadowHash sql.NullString
-	var shadowLegacyKey sql.NullString
+	var shadowSingleBlockKey sql.NullString
 	var shadowConsolidatedKey sql.NullString
 	var shadowObjectFormat sql.NullInt64
 	var shadowByteOffset sql.NullInt64
 	var shadowByteLength sql.NullInt64
 	var shadowUncompressedLength sql.NullInt64
 	var shadowValidatedAt sql.NullTime
-	var shadowLegacyObjectRetiredAt sql.NullTime
-	var shadowLegacyObjectRetireAfter sql.NullTime
-	var shadowLegacyObjectDeletedAt sql.NullTime
+	var shadowSingleBlockRetentionStartedAt sql.NullTime
+	var shadowSingleBlockDeleteAfter sql.NullTime
+	var shadowSingleBlockObjectDeletedAt sql.NullTime
 	var shadowFormatVersion sql.NullInt64
 	var retirementBlockMetadataID sql.NullInt64
 	var retirementState sql.NullString
 	var retirementBucket sql.NullString
-	var retirementLegacyKey sql.NullString
-	var retirementLegacyKeySHA256 sql.NullString
+	var retirementSingleBlockKey sql.NullString
+	var retirementSingleBlockKeySHA256 sql.NullString
 	var retirementVersionIDs pq.StringArray
-	var retirementLegacyETag sql.NullString
-	var retirementLegacyBytes sql.NullInt64
+	var retirementSingleBlockETag sql.NullString
+	var retirementSingleBlockBytes sql.NullInt64
 	var retirementConsolidatedKey sql.NullString
 	var retirementConsolidatedVersionID sql.NullString
 	var retirementConsolidatedETag sql.NullString
@@ -912,25 +912,25 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&shadowTag,
 		&shadowHeight,
 		&shadowHash,
-		&shadowLegacyKey,
+		&shadowSingleBlockKey,
 		&shadowConsolidatedKey,
 		&shadowObjectFormat,
 		&shadowByteOffset,
 		&shadowByteLength,
 		&shadowUncompressedLength,
 		&shadowValidatedAt,
-		&shadowLegacyObjectRetiredAt,
-		&shadowLegacyObjectRetireAfter,
-		&shadowLegacyObjectDeletedAt,
+		&shadowSingleBlockRetentionStartedAt,
+		&shadowSingleBlockDeleteAfter,
+		&shadowSingleBlockObjectDeletedAt,
 		&shadowFormatVersion,
 		&retirementBlockMetadataID,
 		&retirementState,
 		&retirementBucket,
-		&retirementLegacyKey,
-		&retirementLegacyKeySHA256,
+		&retirementSingleBlockKey,
+		&retirementSingleBlockKeySHA256,
 		&retirementVersionIDs,
-		&retirementLegacyETag,
-		&retirementLegacyBytes,
+		&retirementSingleBlockETag,
+		&retirementSingleBlockBytes,
 		&retirementConsolidatedKey,
 		&retirementConsolidatedVersionID,
 		&retirementConsolidatedETag,
@@ -956,12 +956,12 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	row.PrimaryUncompressedLength = nullableUint64(primaryUncompressedLength)
 	row.RetirementFencedAt = nullableTime(primaryRetirementFencedAt)
 	if shadowBlockMetadataID.Valid {
-		row.LegacyObjectKey = shadowLegacyKey.String
+		row.SingleBlockObjectKey = shadowSingleBlockKey.String
 		row.Shadow = &ConsolidationShadow{
 			Tag:                   uint32(shadowTag.Int64),
 			Height:                uint64(shadowHeight.Int64),
 			Hash:                  shadowHash.String,
-			LegacyObjectKey:       shadowLegacyKey.String,
+			SingleBlockObjectKey:  shadowSingleBlockKey.String,
 			ConsolidatedObjectKey: shadowConsolidatedKey.String,
 			ObjectFormat:          api.BlockObjectFormat(shadowObjectFormat.Int64),
 			ByteOffset:            nullableUint64(shadowByteOffset),
@@ -970,9 +970,9 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 			FormatVersion:         int(shadowFormatVersion.Int64),
 		}
 		row.Shadow.ValidatedAt = nullableTime(shadowValidatedAt)
-		row.Shadow.LegacyObjectRetiredAt = nullableTime(shadowLegacyObjectRetiredAt)
-		row.Shadow.LegacyObjectRetireAfter = nullableTime(shadowLegacyObjectRetireAfter)
-		row.Shadow.LegacyObjectDeletedAt = nullableTime(shadowLegacyObjectDeletedAt)
+		row.Shadow.SingleBlockRetentionStartedAt = nullableTime(shadowSingleBlockRetentionStartedAt)
+		row.Shadow.SingleBlockDeleteAfter = nullableTime(shadowSingleBlockDeleteAfter)
+		row.Shadow.SingleBlockObjectDeletedAt = nullableTime(shadowSingleBlockObjectDeletedAt)
 	}
 	if retirementBlockMetadataID.Valid {
 		row.Retirement = &RetirementManifest{
@@ -982,11 +982,11 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 			Hash:                           row.Hash,
 			State:                          retirementState.String,
 			Bucket:                         retirementBucket.String,
-			LegacyObjectKey:                retirementLegacyKey.String,
-			LegacyObjectKeySHA256:          retirementLegacyKeySHA256.String,
-			LegacyObjectVersionIDs:         append([]string(nil), retirementVersionIDs...),
-			LegacyObjectETag:               retirementLegacyETag.String,
-			LegacyObjectBytes:              nullableUint64(retirementLegacyBytes),
+			SingleBlockObjectKey:           retirementSingleBlockKey.String,
+			SingleBlockObjectKeySHA256:     retirementSingleBlockKeySHA256.String,
+			SingleBlockObjectVersionIDs:    append([]string(nil), retirementVersionIDs...),
+			SingleBlockObjectETag:          retirementSingleBlockETag.String,
+			SingleBlockObjectBytes:         nullableUint64(retirementSingleBlockBytes),
 			ConsolidatedObjectKey:          retirementConsolidatedKey.String,
 			ConsolidatedObjectVersionID:    retirementConsolidatedVersionID.String,
 			ConsolidatedObjectETag:         retirementConsolidatedETag.String,
@@ -1012,13 +1012,13 @@ func getManifestForUpdate(ctx context.Context, tx *sql.Tx, blockMetadataID int64
 	const query = `
 		SELECT
 			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
-			legacy_object_key_main, legacy_object_key_sha256, legacy_object_version_ids,
-			legacy_object_etag, legacy_object_bytes,
+			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
 			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
-		FROM block_legacy_object_retirement
+		FROM block_single_block_retention
 		WHERE block_metadata_id = $1
 		FOR UPDATE`
 	manifest, err := scanManifest(tx.QueryRowContext(ctx, query, blockMetadataID))
@@ -1031,9 +1031,9 @@ func getManifestForUpdate(ctx context.Context, tx *sql.Tx, blockMetadataID int64
 func scanManifest(source scanner) (RetirementManifest, error) {
 	var manifest RetirementManifest
 	var hash sql.NullString
-	var legacyKey sql.NullString
+	var singleBlockKey sql.NullString
 	var versionIDs pq.StringArray
-	var legacyBytes int64
+	var singleBlockBytes int64
 	var byteOffset int64
 	var byteLength int64
 	var uncompressedLength int64
@@ -1051,11 +1051,11 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 		&hash,
 		&manifest.State,
 		&manifest.Bucket,
-		&legacyKey,
-		&manifest.LegacyObjectKeySHA256,
+		&singleBlockKey,
+		&manifest.SingleBlockObjectKeySHA256,
 		&versionIDs,
-		&manifest.LegacyObjectETag,
-		&legacyBytes,
+		&manifest.SingleBlockObjectETag,
+		&singleBlockBytes,
 		&manifest.ConsolidatedObjectKey,
 		&manifest.ConsolidatedObjectVersionID,
 		&manifest.ConsolidatedObjectETag,
@@ -1075,13 +1075,13 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	); err != nil {
 		return RetirementManifest{}, err
 	}
-	if legacyBytes < 0 || byteOffset < 0 || byteLength < 0 || uncompressedLength < 0 || attemptCount < 0 {
+	if singleBlockBytes < 0 || byteOffset < 0 || byteLength < 0 || uncompressedLength < 0 || attemptCount < 0 {
 		return RetirementManifest{}, xerrors.New("retirement manifest contains negative byte fields")
 	}
 	manifest.Hash = hash.String
-	manifest.LegacyObjectKey = legacyKey.String
-	manifest.LegacyObjectVersionIDs = append([]string(nil), versionIDs...)
-	manifest.LegacyObjectBytes = uint64(legacyBytes)
+	manifest.SingleBlockObjectKey = singleBlockKey.String
+	manifest.SingleBlockObjectVersionIDs = append([]string(nil), versionIDs...)
+	manifest.SingleBlockObjectBytes = uint64(singleBlockBytes)
 	manifest.ConsolidatedByteOffset = uint64(byteOffset)
 	manifest.ConsolidatedByteLength = uint64(byteLength)
 	manifest.ConsolidatedUncompressedLength = uint64(uncompressedLength)
@@ -1099,11 +1099,11 @@ func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) erro
 	if !row.Canonical || row.BlockMetadataID != manifest.BlockMetadataID || row.Tag != manifest.Tag || row.Height != manifest.Height || row.Hash != manifest.Hash {
 		return xerrors.Errorf("canonical metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
-	if row.Skipped || row.Shadow == nil || !validShadowReference(row, row.Shadow) || row.LegacyObjectKey != manifest.LegacyObjectKey {
-		return xerrors.Errorf("legacy shadow metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
+	if row.Skipped || row.Shadow == nil || !validShadowReference(row, row.Shadow) || row.SingleBlockObjectKey != manifest.SingleBlockObjectKey {
+		return xerrors.Errorf("single-block shadow metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
-	if row.Shadow.ValidatedAt == nil || row.Shadow.LegacyObjectRetiredAt == nil || row.Shadow.LegacyObjectRetireAfter == nil ||
-		row.Shadow.LegacyObjectDeletedAt != nil {
+	if row.Shadow.ValidatedAt == nil || row.Shadow.SingleBlockRetentionStartedAt == nil || row.Shadow.SingleBlockDeleteAfter == nil ||
+		row.Shadow.SingleBlockObjectDeletedAt != nil {
 		return xerrors.Errorf("retirement eligibility changed before manifest persistence: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.PrimaryObjectKey != manifest.ConsolidatedObjectKey ||
@@ -1117,10 +1117,10 @@ func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) erro
 }
 
 func validatePreparedManifest(manifest RetirementManifest) error {
-	if manifest.BlockMetadataID <= 0 || manifest.Bucket == "" || manifest.LegacyObjectKey == "" ||
-		manifest.LegacyObjectKeySHA256 != keySHA256(manifest.LegacyObjectKey) ||
-		len(manifest.LegacyObjectVersionIDs) != 1 || !isImmutableVersionID(manifest.LegacyObjectVersionIDs[0]) ||
-		manifest.LegacyObjectETag == "" || manifest.LegacyObjectBytes == 0 ||
+	if manifest.BlockMetadataID <= 0 || manifest.Bucket == "" || manifest.SingleBlockObjectKey == "" ||
+		manifest.SingleBlockObjectKeySHA256 != keySHA256(manifest.SingleBlockObjectKey) ||
+		len(manifest.SingleBlockObjectVersionIDs) != 1 || !isImmutableVersionID(manifest.SingleBlockObjectVersionIDs[0]) ||
+		manifest.SingleBlockObjectETag == "" || manifest.SingleBlockObjectBytes == 0 ||
 		manifest.ConsolidatedObjectKey == "" || !isImmutableVersionID(manifest.ConsolidatedObjectVersionID) || manifest.ConsolidatedObjectETag == "" ||
 		manifest.ConsolidatedByteLength == 0 || manifest.ConsolidatedUncompressedLength == 0 ||
 		!isSHA256Hex(manifest.PayloadSHA256) || manifest.PreparedAt.IsZero() {
@@ -1138,11 +1138,11 @@ func samePreparedManifest(existing RetirementManifest, expected RetirementManife
 		existing.Height == expected.Height &&
 		existing.Hash == expected.Hash &&
 		existing.Bucket == expected.Bucket &&
-		existing.LegacyObjectKey == expected.LegacyObjectKey &&
-		existing.LegacyObjectKeySHA256 == expected.LegacyObjectKeySHA256 &&
-		sameStrings(existing.LegacyObjectVersionIDs, expected.LegacyObjectVersionIDs) &&
-		existing.LegacyObjectETag == expected.LegacyObjectETag &&
-		existing.LegacyObjectBytes == expected.LegacyObjectBytes &&
+		existing.SingleBlockObjectKey == expected.SingleBlockObjectKey &&
+		existing.SingleBlockObjectKeySHA256 == expected.SingleBlockObjectKeySHA256 &&
+		sameStrings(existing.SingleBlockObjectVersionIDs, expected.SingleBlockObjectVersionIDs) &&
+		existing.SingleBlockObjectETag == expected.SingleBlockObjectETag &&
+		existing.SingleBlockObjectBytes == expected.SingleBlockObjectBytes &&
 		existing.ConsolidatedObjectKey == expected.ConsolidatedObjectKey &&
 		existing.ConsolidatedObjectVersionID == expected.ConsolidatedObjectVersionID &&
 		existing.ConsolidatedObjectETag == expected.ConsolidatedObjectETag &&

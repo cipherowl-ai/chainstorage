@@ -189,8 +189,8 @@ func (r *fakeRepo) RecordRetirementObjectDeleted(
 	}
 	deletedAt := time.Now().UTC()
 	manifest.State = RetirementStateDeletedPendingVerification
-	manifest.LegacyObjectKey = ""
-	manifest.LegacyObjectETag = ""
+	manifest.SingleBlockObjectKey = ""
+	manifest.SingleBlockObjectETag = ""
 	manifest.DeletedAt = &deletedAt
 	manifest.LastAttemptAt = &deletedAt
 	manifest.Outcome = outcome
@@ -199,10 +199,10 @@ func (r *fakeRepo) RecordRetirementObjectDeleted(
 		if r.rows[i].BlockMetadataID != blockMetadataID {
 			continue
 		}
-		r.rows[i].LegacyObjectKey = ""
+		r.rows[i].SingleBlockObjectKey = ""
 		if r.rows[i].Shadow != nil {
-			r.rows[i].Shadow.LegacyObjectKey = ""
-			r.rows[i].Shadow.LegacyObjectDeletedAt = &deletedAt
+			r.rows[i].Shadow.SingleBlockObjectKey = ""
+			r.rows[i].Shadow.SingleBlockObjectDeletedAt = &deletedAt
 		}
 		r.rows[i].Retirement = &manifest
 	}
@@ -412,7 +412,7 @@ func TestPlannerPlan_NotEligibleRetentionPeriod(t *testing.T) {
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-time.Hour)
 	store := newFakeStore()
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	planner := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store)
 
 	report, err := planner.Plan(context.Background(), testRequest(now, false))
@@ -421,16 +421,16 @@ func TestPlannerPlan_NotEligibleRetentionPeriod(t *testing.T) {
 	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipRetentionPeriodActive, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-	require.Zero(store.versionCalls[row.LegacyObjectKey])
+	require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 }
 
 func TestPlannerPlan_MissingRetirementMarkerIsNeverEligible(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-30 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
-	row.Shadow.LegacyObjectRetiredAt = nil
-	row.Shadow.LegacyObjectRetireAfter = nil
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row.Shadow.SingleBlockRetentionStartedAt = nil
+	row.Shadow.SingleBlockDeleteAfter = nil
 	store := newFakeStore()
 
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
@@ -439,16 +439,16 @@ func TestPlannerPlan_MissingRetirementMarkerIsNeverEligible(t *testing.T) {
 	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipMissingRetirementMarker, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-	require.Zero(store.versionCalls[row.LegacyObjectKey])
+	require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 }
 
 func TestPlannerPlan_MissingCSCBObject(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/missing.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/missing.cscb.zstd", validatedAt)
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	planner := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store)
 
 	report, err := planner.Plan(context.Background(), testRequest(now, false))
@@ -456,16 +456,16 @@ func TestPlannerPlan_MissingCSCBObject(t *testing.T) {
 	require.Len(report.Items, 1)
 	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipMissingCSCBObject, report.Items[0].SkipReason)
-	require.Equal("legacy-v1", report.Items[0].VersionID)
-	require.Equal(uint64(42), report.Items[0].LegacyBytes)
+	require.Equal("single-block-v1", report.Items[0].VersionID)
+	require.Equal(uint64(42), report.Items[0].SingleBlockBytes)
 }
 
 func TestPlannerPlan_RequiresLiveCSCBWriteOncePolicy(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
 	store.policyErrors[row.PrimaryObjectKey] = errors.New("bucket policy is missing")
 
@@ -483,8 +483,8 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
-	row.Shadow.LegacyObjectKey = "legacy/stale.zstd"
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row.Shadow.SingleBlockObjectKey = "single-block/stale.zstd"
 	store := newFakeStore()
 	planner := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store)
 
@@ -496,22 +496,22 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
-func TestPlannerPlan_ActiveLegacyMetadataIsNeverRetired(t *testing.T) {
+func TestPlannerPlan_ActiveSingleBlockMetadataIsNeverRetired(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := activeLegacyTestRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := activeSingleBlockTestRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(1024, 1024)
 
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 	require.Len(report.Items, 1)
 	require.Equal(ActionSkip, report.Items[0].Action)
-	require.Equal(SkipActiveMetadataStillLegacy, report.Items[0].SkipReason)
+	require.Equal(SkipActiveMetadataStillSingleBlock, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-	require.Zero(store.versionCalls[row.LegacyObjectKey])
+	require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 }
 
 func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
@@ -520,7 +520,7 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 	validatedAt := now.Add(-8 * 24 * time.Hour)
 
 	t.Run("validation not passed", func(t *testing.T) {
-		row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 		row.Shadow.ValidatedAt = nil
 		store := newFakeStore()
 		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
@@ -529,11 +529,11 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 		require.Equal(ActionSkip, report.Items[0].Action)
 		require.Equal(SkipValidationNotPassed, report.Items[0].SkipReason)
 		require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-		require.Zero(store.versionCalls[row.LegacyObjectKey])
+		require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 	})
 
 	t.Run("range not approved", func(t *testing.T) {
-		row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 		store := newFakeStore()
 		req := testRequest(now, false)
 		req.Approval.EndHeight = req.EndHeight - 1
@@ -543,7 +543,7 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 		require.Equal(ActionSkip, report.Items[0].Action)
 		require.Equal(SkipChainRangeNotApproved, report.Items[0].SkipReason)
 		require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-		require.Zero(store.versionCalls[row.LegacyObjectKey])
+		require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 	})
 }
 
@@ -551,7 +551,7 @@ func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 
 	t.Run("fallback errors", func(t *testing.T) {
 		req := testRequest(now, false)
@@ -577,7 +577,7 @@ func TestPlannerPlan_SkippedReorgAndPromotedRows(t *testing.T) {
 	skipped := testRow(100, "hash-100", "", "consolidated/canary.cscb.zstd", validatedAt)
 	skipped.Skipped = true
 
-	stale := testRow(101, "hash-101", "legacy/101.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	stale := testRow(101, "hash-101", "single-block/101.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	stale.Shadow.Hash = "hash-before-reorg"
 
 	promoted := testRow(102, "hash-102", "consolidated/primary.cscb.zstd", "consolidated/canary.cscb.zstd", validatedAt)
@@ -593,26 +593,26 @@ func TestPlannerPlan_SkippedReorgAndPromotedRows(t *testing.T) {
 	require.Equal(SkipInvalidMetadataReference, report.Items[2].SkipReason)
 }
 
-func TestPlannerPlan_PromotedRowUsesShadowLegacyKeyAndRetireAfter(t *testing.T) {
+func TestPlannerPlan_PromotedRowUsesShadowSingleBlockKeyAndRetireAfter(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-time.Hour)
 	retiredAt := now.Add(-2 * time.Minute)
 	retireAfter := now.Add(-time.Minute)
-	legacyKey := "legacy/102.zstd"
+	singleBlockKey := "single-block/102.zstd"
 	cscbKey := "consolidated/primary.cscb.zstd"
-	row := testRow(102, "hash-102", legacyKey, cscbKey, validatedAt)
-	row.Shadow.LegacyObjectRetiredAt = &retiredAt
-	row.Shadow.LegacyObjectRetireAfter = &retireAfter
+	row := testRow(102, "hash-102", singleBlockKey, cscbKey, validatedAt)
+	row.Shadow.SingleBlockRetentionStartedAt = &retiredAt
+	row.Shadow.SingleBlockDeleteAfter = &retireAfter
 	store := newFakeStore()
-	store.topologies[legacyKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[singleBlockKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[cscbKey] = cscbObjectHead(1024, 1024)
 
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 	require.Len(report.Items, 1)
 	require.Equal(ActionReportOnly, report.Items[0].Action)
-	require.Equal(legacyKey, report.Items[0].Key)
+	require.Equal(singleBlockKey, report.Items[0].Key)
 	require.Equal(cscbKey, report.Items[0].ConsolidatedKey)
 	require.Equal(retiredAt, *report.Items[0].RetiredAt)
 	require.Equal(retireAfter, *report.Items[0].EligibleAt)
@@ -623,9 +623,9 @@ func TestPlannerPlan_VersionedDeleteMarkerBehavior(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = ObjectVersionTopology{DeleteMarkers: []ObjectDeleteMarker{{
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{DeleteMarkers: []ObjectDeleteMarker{{
 		VersionID: "delete-marker-v1",
 		IsLatest:  true,
 	}}}
@@ -633,12 +633,12 @@ func TestPlannerPlan_VersionedDeleteMarkerBehavior(t *testing.T) {
 	require.NoError(err)
 	require.Len(report.Items, 1)
 	require.Equal(ActionSkip, report.Items[0].Action)
-	require.Equal(SkipUnsafeLegacyVersionTopology, report.Items[0].SkipReason)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
 	require.Equal(1, report.Summary.DeleteMarkerRows)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
-func TestPlannerPlan_RejectsNonSingletonLegacyTopology(t *testing.T) {
+func TestPlannerPlan_RejectsNonSingletonSingleBlockTopology(t *testing.T) {
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
 	for _, test := range []struct {
@@ -648,26 +648,26 @@ func TestPlannerPlan_RejectsNonSingletonLegacyTopology(t *testing.T) {
 		{
 			name: "older version exists",
 			topology: ObjectVersionTopology{Versions: []ObjectVersion{
-				{VersionID: "legacy-v2", ETag: "etag-v2", Bytes: 42, IsLatest: true},
-				{VersionID: "legacy-v1", ETag: "etag-v1", Bytes: 41, IsLatest: false},
+				{VersionID: "single-block-v2", ETag: "etag-v2", Bytes: 42, IsLatest: true},
+				{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 41, IsLatest: false},
 			}},
 		},
 		{
 			name: "single version is not latest",
 			topology: ObjectVersionTopology{Versions: []ObjectVersion{
-				{VersionID: "legacy-v1", ETag: "etag-v1", Bytes: 42, IsLatest: false},
+				{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 42, IsLatest: false},
 			}},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			require := require.New(t)
-			row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+			row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 			store := newFakeStore()
-			store.topologies[row.LegacyObjectKey] = test.topology
+			store.topologies[row.SingleBlockObjectKey] = test.topology
 			report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 			require.NoError(err)
 			require.Equal(ActionSkip, report.Items[0].Action)
-			require.Equal(SkipUnsafeLegacyVersionTopology, report.Items[0].SkipReason)
+			require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
 			require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 		})
 	}
@@ -676,16 +676,16 @@ func TestPlannerPlan_RejectsNonSingletonLegacyTopology(t *testing.T) {
 func TestPlannerPlan_RejectsMutableNullVersionIDs(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("null", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("null", "single-block-etag", 42)
 	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
 
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
-	require.Equal(SkipLegacyVersionIDUnavailable, report.Items[0].SkipReason)
+	require.Equal(SkipSingleBlockVersionIDUnavailable, report.Items[0].SkipReason)
 
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	head := cscbObjectHead(1024, 1024)
 	head.VersionID = "null"
 	store.heads[row.PrimaryObjectKey] = head
@@ -697,9 +697,9 @@ func TestPlannerPlan_RejectsMutableNullVersionIDs(t *testing.T) {
 func TestPlannerPlan_RequiresIndependentPayloadComparison(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
 	planner, verifier := newTestPlanner(&fakeRepo{rows: []MetadataRow{row}}, store)
 	verifier.verifyErr = errors.New("payloads differ")
@@ -707,7 +707,7 @@ func TestPlannerPlan_RequiresIndependentPayloadComparison(t *testing.T) {
 	report, err := planner.Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 	require.Equal(ActionSkip, report.Items[0].Action)
-	require.Equal(SkipLegacyPayloadMismatch, report.Items[0].SkipReason)
+	require.Equal(SkipSingleBlockPayloadMismatch, report.Items[0].SkipReason)
 	require.Empty(report.Items[0].PayloadSHA256)
 }
 
@@ -715,9 +715,9 @@ func TestPlannerPlan_DryRunOutput(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(1024, 1024)
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
@@ -734,7 +734,7 @@ func TestPlannerPlan_DryRunOutput(t *testing.T) {
 	require.Equal(uint64(428059000), decoded.EndHeight)
 	require.Equal(1, decoded.Summary.EligibleRows)
 	require.Equal(ActionReportOnly, decoded.Items[0].Action)
-	require.Equal("legacy-v1", decoded.Items[0].VersionID)
+	require.Equal("single-block-v1", decoded.Items[0].VersionID)
 	require.Empty(decoded.Items[0].SkipReason)
 }
 
@@ -743,11 +743,11 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
 	const (
-		startHeight     = uint64(428058000)
-		endHeight       = uint64(428059000)
-		cscbKey         = "BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/consolidated/v=7/shard=00000000042805000000-00000000042806000000/00000000000428058000-00000000000428059000-deadbeef.cscb.zstd"
-		bucket          = "co-chainstorage-solana-mainnet-prod"
-		legacyBytesEach = uint64(123)
+		startHeight          = uint64(428058000)
+		endHeight            = uint64(428059000)
+		cscbKey              = "BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/consolidated/v=7/shard=00000000042805000000-00000000042806000000/00000000000428058000-00000000000428059000-deadbeef.cscb.zstd"
+		bucket               = "co-chainstorage-solana-mainnet-prod"
+		singleBlockBytesEach = uint64(123)
 	)
 
 	rows := make([]MetadataRow, 0, endHeight-startHeight)
@@ -758,9 +758,9 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 		key := fmt.Sprintf("BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/0/%d/%s.zstd", height, hash)
 		rows = append(rows, testRow(height, hash, key, cscbKey, validatedAt))
 		store.topologies[key] = safeTopology(
-			fmt.Sprintf("legacy-version-%d", height),
-			fmt.Sprintf("legacy-etag-%d", height),
-			legacyBytesEach,
+			fmt.Sprintf("single-block-version-%d", height),
+			fmt.Sprintf("single-block-etag-%d", height),
+			singleBlockBytesEach,
 		)
 	}
 	req := testRequest(now, false)
@@ -777,8 +777,8 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	require.Equal(1000, report.Summary.TotalRows)
 	require.Equal(1000, report.Summary.EligibleRows)
 	require.Zero(report.Summary.SkippedRows)
-	require.Equal(uint64(1000)*legacyBytesEach, report.Summary.LegacyBytes)
-	require.Equal(uint64(1000)*legacyBytesEach, report.Summary.EligibleBytes)
+	require.Equal(uint64(1000)*singleBlockBytesEach, report.Summary.SingleBlockBytes)
+	require.Equal(uint64(1000)*singleBlockBytesEach, report.Summary.EligibleBytes)
 	require.Equal(1, store.headCalls[cscbKey])
 	require.Equal(1, store.policyCalls[cscbKey])
 	require.True(report.SafetyGates.CSCBWriteOncePolicyVerified)
@@ -786,8 +786,8 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	first := report.Items[0]
 	require.Equal(startHeight, first.Height)
 	require.Equal("solana-hash-428058000", first.Hash)
-	require.Equal("legacy-version-428058000", first.VersionID)
-	require.Equal(legacyBytesEach, first.LegacyBytes)
+	require.Equal("single-block-version-428058000", first.VersionID)
+	require.Equal(singleBlockBytesEach, first.SingleBlockBytes)
 	require.Equal(cscbKey, first.ConsolidatedKey)
 	require.Equal(ActionReportOnly, first.Action)
 	require.Empty(first.SkipReason)
@@ -795,7 +795,7 @@ func TestPlannerPlan_ExactSolanaCanaryReportShape(t *testing.T) {
 	last := report.Items[len(report.Items)-1]
 	require.Equal(endHeight-1, last.Height)
 	require.Equal("solana-hash-428058999", last.Hash)
-	require.Equal("legacy-version-428058999", last.VersionID)
+	require.Equal("single-block-version-428058999", last.VersionID)
 	require.Equal(cscbKey, last.ConsolidatedKey)
 	require.Equal(ActionReportOnly, last.Action)
 }
@@ -891,13 +891,13 @@ func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	cscbKey := "consolidated/shared.cscb.zstd"
-	first := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
-	second := testRow(428058001, "hash-428058001", "legacy/428058001.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	first := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	second := testRow(428058001, "hash-428058001", "single-block/428058001.zstd", cscbKey, now.Add(-8*24*time.Hour))
 	repo := &fakeRepo{rows: []MetadataRow{first, second}}
 	store := newFakeStore()
 	store.deleteMutates = true
 	for _, row := range repo.rows {
-		store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	}
 	cscbHead := cscbObjectHead(1024, 1024)
 	store.heads[cscbKey] = cscbHead
@@ -917,11 +917,11 @@ func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.
 func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	row := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
 	repo := &fakeRepo{rows: []MetadataRow{row}}
 	store := newFakeStore()
 	store.deleteMutates = true
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	cscbHead := cscbObjectHead(1024, 1024)
 	store.heads[row.PrimaryObjectKey] = cscbHead
 	store.versionHeads[versionObjectKey(row.PrimaryObjectKey, cscbHead.VersionID)] = cscbHead
@@ -941,18 +941,18 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	err = planner.Apply(context.Background(), req, report)
 	require.NoError(err)
 	require.Len(store.deleted, 1)
-	require.Equal("legacy-v1", store.deleted[0].VersionID)
+	require.Equal("single-block-v1", store.deleted[0].VersionID)
 	require.Equal(ActionDeletedVerified, report.Items[0].Action)
 	require.Empty(report.Items[0].Key)
-	require.NotNil(report.Items[0].LegacyDeletedAt)
+	require.NotNil(report.Items[0].SingleBlockDeletedAt)
 	require.NotNil(report.Items[0].RetirementVerifiedAt)
 	manifest := repo.manifests[row.BlockMetadataID]
 	require.Equal(RetirementStateDeletedVerified, manifest.State)
-	require.Empty(manifest.LegacyObjectKey)
+	require.Empty(manifest.SingleBlockObjectKey)
 	require.NotNil(manifest.DeletedAt)
-	require.Empty(repo.rows[0].LegacyObjectKey)
-	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
-	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 
 	dryRunReq := req
 	dryRunReq.Execute = false
@@ -960,10 +960,10 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	finalReport, err := planner.Plan(context.Background(), dryRunReq)
 	require.NoError(err)
 	require.Equal(ActionAlreadyDeleted, finalReport.Items[0].Action)
-	require.NotNil(finalReport.Items[0].LegacyDeletedAt)
+	require.NotNil(finalReport.Items[0].SingleBlockDeletedAt)
 	require.NotNil(finalReport.Items[0].RetirementVerifiedAt)
 	require.Empty(finalReport.Items[0].Key)
-	require.Equal(keySHA256(row.LegacyObjectKey), manifest.LegacyObjectKeySHA256)
+	require.Equal(keySHA256(row.SingleBlockObjectKey), manifest.SingleBlockObjectKeySHA256)
 }
 
 func TestPlannerApply_RejectsTamperedReportBeforeManifestWrite(t *testing.T) {
@@ -972,9 +972,9 @@ func TestPlannerApply_RejectsTamperedReportBeforeManifestWrite(t *testing.T) {
 		mutate func(req PlanRequest, report *Report)
 	}{
 		{
-			name: "legacy key",
+			name: "single-block key",
 			mutate: func(req PlanRequest, report *Report) {
-				report.Items[0].Key = "legacy/other.zstd"
+				report.Items[0].Key = "single-block/other.zstd"
 			},
 		},
 		{
@@ -1031,24 +1031,24 @@ func TestPlannerApply_RevalidatesTopologyAfterManifestPersistence(t *testing.T) 
 	err := planner.Apply(context.Background(), req, report)
 	require.Error(err)
 	require.Empty(store.deleted)
-	require.Equal(SkipUnsafeLegacyVersionTopology, report.Items[0].SkipReason)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
 	manifest := repo.manifests[report.Items[0].BlockMetadataID]
 	require.Equal(RetirementStateDeleting, manifest.State)
-	require.NotEmpty(manifest.LegacyObjectKey)
+	require.NotEmpty(manifest.SingleBlockObjectKey)
 	require.Equal(1, manifest.AttemptCount)
-	require.Equal(SkipUnsafeLegacyVersionTopology, manifest.Outcome)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, manifest.Outcome)
 }
 
 func TestPlannerApply_StopsAfterFirstFailure(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	first := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", "consolidated/first.cscb.zstd", now.Add(-8*24*time.Hour))
-	second := testRow(428058001, "hash-428058001", "legacy/428058001.zstd", "consolidated/second.cscb.zstd", now.Add(-8*24*time.Hour))
+	first := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", "consolidated/first.cscb.zstd", now.Add(-8*24*time.Hour))
+	second := testRow(428058001, "hash-428058001", "single-block/428058001.zstd", "consolidated/second.cscb.zstd", now.Add(-8*24*time.Hour))
 	repo := &fakeRepo{rows: []MetadataRow{first, second}}
 	store := newFakeStore()
 	store.deleteMutates = true
 	for _, row := range repo.rows {
-		store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 		head := cscbObjectHead(1024, 1024)
 		store.heads[row.PrimaryObjectKey] = head
 		store.versionHeads[versionObjectKey(row.PrimaryObjectKey, head.VersionID)] = head
@@ -1060,9 +1060,9 @@ func TestPlannerApply_StopsAfterFirstFailure(t *testing.T) {
 	require.NoError(err)
 	require.Len(report.Items, 2)
 
-	firstSafe := store.topologies[first.LegacyObjectKey]
+	firstSafe := store.topologies[first.SingleBlockObjectKey]
 	store.listHook = func(key string, call int) ObjectVersionTopology {
-		if key != first.LegacyObjectKey || call < 3 {
+		if key != first.SingleBlockObjectKey || call < 3 {
 			return store.topologies[key]
 		}
 		return ObjectVersionTopology{Versions: []ObjectVersion{
@@ -1074,13 +1074,13 @@ func TestPlannerApply_StopsAfterFirstFailure(t *testing.T) {
 	err = planner.Apply(context.Background(), req, report)
 	require.Error(err)
 	require.Empty(store.deleted)
-	require.Equal(SkipUnsafeLegacyVersionTopology, report.Items[0].SkipReason)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
 	require.Equal(SkipNotAttemptedAfterFailure, report.Items[1].SkipReason)
 	_, secondManifestExists := repo.manifests[second.BlockMetadataID]
 	require.False(secondManifestExists)
 }
 
-func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterLegacyDelete(t *testing.T) {
+func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterSingleBlockDelete(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	store.headHook = func(key string, call int) ObjectHead {
@@ -1099,10 +1099,10 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterLegacyDelete(t *testing
 	require.Equal(1, report.Summary.DeletedRows)
 	require.Equal(SkipCSCBObjectChanged, report.Items[0].SkipReason)
 	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
-	require.Empty(repo.manifests[row.BlockMetadataID].LegacyObjectKey)
-	require.Empty(repo.rows[0].LegacyObjectKey)
-	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
-	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	require.Empty(repo.manifests[row.BlockMetadataID].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 	require.Equal(1, repo.recordDeletedCalls)
 	require.Zero(repo.finalizeCalls)
 }
@@ -1129,7 +1129,7 @@ func TestPlannerApply_UsesFreshVerifierAfterRecordingDeletion(t *testing.T) {
 	require.Equal(ActionDeletedObjectVersion, report.Items[0].Action)
 	require.Equal(1, report.Summary.DeletedRows)
 	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
-	require.Empty(repo.rows[0].LegacyObjectKey)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
 	require.Zero(repo.finalizeCalls)
 }
 
@@ -1156,7 +1156,7 @@ func TestPlannerReconcile_CompletesCrashBeforeDeletionRecord(t *testing.T) {
 	require.Equal(SkipPostDeleteVerificationFailed, report.Items[0].SkipReason)
 	require.Len(store.deleted, 1)
 	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
-	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
+	require.Equal(row.SingleBlockObjectKey, repo.rows[0].SingleBlockObjectKey)
 
 	repo.recordDeletedErr = nil
 	manifest := repo.manifests[row.BlockMetadataID]
@@ -1171,8 +1171,8 @@ func TestPlannerReconcile_CompletesCrashBeforeDeletionRecord(t *testing.T) {
 	require.Equal(ActionDeletedVerified, reconcileReport.Items[0].Action)
 	require.Len(store.deleted, 1)
 	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
-	require.Empty(repo.rows[0].LegacyObjectKey)
-	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
 }
 
 func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
@@ -1187,9 +1187,9 @@ func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
 	require.Len(store.deleted, 1)
 	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[row.BlockMetadataID].State)
 	require.Equal(SkipPostDeleteVerificationFailed, repo.manifests[row.BlockMetadataID].Outcome)
-	require.Empty(repo.rows[0].LegacyObjectKey)
-	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
-	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 	dryRunReq := req
 	dryRunReq.Execute = false
 	dryRunReq.ProductionDeleteEnabled = false
@@ -1198,7 +1198,7 @@ func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
 	require.Equal(ActionDeletedObjectVersion, dryRunReport.Items[0].Action)
 	require.Equal(SkipRetirementVerificationPending, dryRunReport.Items[0].SkipReason)
 	require.Equal(1, dryRunReport.Summary.DeletedRows)
-	require.NotNil(dryRunReport.Items[0].LegacyDeletedAt)
+	require.NotNil(dryRunReport.Items[0].SingleBlockDeletedAt)
 	require.Nil(dryRunReport.Items[0].RetirementVerifiedAt)
 
 	repo.finalizeErr = nil
@@ -1216,9 +1216,9 @@ func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
 	require.Len(store.deleted, 1)
 	require.Equal(2, verifier.consolidatedCalls)
 	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
-	require.Empty(repo.rows[0].LegacyObjectKey)
-	require.Empty(repo.rows[0].Shadow.LegacyObjectKey)
-	require.NotNil(repo.rows[0].Shadow.LegacyObjectDeletedAt)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 }
 
 func TestPlannerReconcile_DoesNotFinalizeExternallyMissingEligibleObject(t *testing.T) {
@@ -1226,7 +1226,7 @@ func TestPlannerReconcile_DoesNotFinalizeExternallyMissingEligibleObject(t *test
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	manifest := manifestFromCandidate(report.Items[0], req.Now)
 	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
-	delete(store.topologies, row.LegacyObjectKey)
+	delete(store.topologies, row.SingleBlockObjectKey)
 
 	reconcileReport, err := planner.Reconcile(context.Background(), req)
 	require.Error(err)
@@ -1234,7 +1234,7 @@ func TestPlannerReconcile_DoesNotFinalizeExternallyMissingEligibleObject(t *test
 	require.Equal(ActionSkip, reconcileReport.Items[0].Action)
 	require.Equal(SkipMetadataChanged, reconcileReport.Items[0].SkipReason)
 	require.Equal(RetirementStateEligible, repo.manifests[row.BlockMetadataID].State)
-	require.Equal(row.LegacyObjectKey, repo.rows[0].LegacyObjectKey)
+	require.Equal(row.SingleBlockObjectKey, repo.rows[0].SingleBlockObjectKey)
 	require.Zero(repo.finalizeCalls)
 }
 
@@ -1309,7 +1309,7 @@ func TestPlannerPlan_RejectsInconsistentFinalizedRetirement(t *testing.T) {
 	require.NoError(err)
 	require.Equal(ActionAlreadyDeleted, finalReport.Items[0].Action)
 
-	repo.rows[0].PrimaryObjectKey = "legacy/regressed.gzip"
+	repo.rows[0].PrimaryObjectKey = "single-block/regressed.gzip"
 	inconsistentReport, err := planner.Plan(context.Background(), req)
 	require.NoError(err)
 	require.Equal(ActionSkip, inconsistentReport.Items[0].Action)
@@ -1320,13 +1320,13 @@ func TestPlannerPlan_UsesCSCBUncompressedLengthForPlacementBounds(t *testing.T) 
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 	row.PrimaryByteOffset = 900
 	row.PrimaryByteLength = 100
 	row.Shadow.ByteOffset = 900
 	row.Shadow.ByteLength = 100
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	store.heads[row.Shadow.ConsolidatedObjectKey] = cscbObjectHead(100, 1000)
 
 	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
@@ -1353,9 +1353,9 @@ func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			require := require.New(t)
-			row := testRow(100, "hash-100", "legacy/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+			row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
 			store := newFakeStore()
-			store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+			store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 			store.heads[row.Shadow.ConsolidatedObjectKey] = ObjectHead{
 				Exists:    true,
 				Bytes:     test.compressedBytes,
@@ -1375,9 +1375,9 @@ func TestPlannerPlan_InvalidCSCBUncompressedLengthFailsClosed(t *testing.T) {
 func TestPlannerPlan_CSCBLifecycleExpirationFailsClosed(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
-	row := testRow(428058000, "hash-428058000", "legacy/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
 	store := newFakeStore()
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	head := cscbObjectHead(1024, 1024)
 	head.Expiration = `expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`
 	store.heads[row.PrimaryObjectKey] = head
@@ -1422,14 +1422,14 @@ func newExecutableTestFixture(t *testing.T) (
 	row := testRow(
 		428058000,
 		"hash-428058000",
-		"legacy/428058000.zstd",
+		"single-block/428058000.zstd",
 		"consolidated/canary.cscb.zstd",
 		now.Add(-8*24*time.Hour),
 	)
 	repo := &fakeRepo{rows: []MetadataRow{row}}
 	store := newFakeStore()
 	store.deleteMutates = true
-	store.topologies[row.LegacyObjectKey] = safeTopology("legacy-v1", "legacy-etag", 42)
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	cscbHead := cscbObjectHead(1024, 1024)
 	store.heads[row.PrimaryObjectKey] = cscbHead
 	store.versionHeads[versionObjectKey(row.PrimaryObjectKey, cscbHead.VersionID)] = cscbHead
@@ -1463,7 +1463,7 @@ func testRequest(now time.Time, execute bool) PlanRequest {
 	}
 }
 
-func testRow(height uint64, hash string, legacyKey string, cscbKey string, validatedAt time.Time) MetadataRow {
+func testRow(height uint64, hash string, singleBlockKey string, cscbKey string, validatedAt time.Time) MetadataRow {
 	retiredAt := validatedAt
 	retireAfter := validatedAt.Add(72 * time.Hour)
 	return MetadataRow{
@@ -1473,25 +1473,25 @@ func testRow(height uint64, hash string, legacyKey string, cscbKey string, valid
 		Height:                    height,
 		Hash:                      hash,
 		PrimaryObjectKey:          cscbKey,
-		LegacyObjectKey:           legacyKey,
+		SingleBlockObjectKey:      singleBlockKey,
 		PrimaryObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		PrimaryByteOffset:         100,
 		PrimaryByteLength:         200,
 		PrimaryUncompressedLength: 300,
 		Shadow: &ConsolidationShadow{
-			Tag:                     0,
-			Height:                  height,
-			Hash:                    hash,
-			LegacyObjectKey:         legacyKey,
-			ConsolidatedObjectKey:   cscbKey,
-			ObjectFormat:            api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
-			ByteOffset:              100,
-			ByteLength:              200,
-			UncompressedLength:      300,
-			ValidatedAt:             &validatedAt,
-			LegacyObjectRetiredAt:   &retiredAt,
-			LegacyObjectRetireAfter: &retireAfter,
-			FormatVersion:           1,
+			Tag:                           0,
+			Height:                        height,
+			Hash:                          hash,
+			SingleBlockObjectKey:          singleBlockKey,
+			ConsolidatedObjectKey:         cscbKey,
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                    100,
+			ByteLength:                    200,
+			UncompressedLength:            300,
+			ValidatedAt:                   &validatedAt,
+			SingleBlockRetentionStartedAt: &retiredAt,
+			SingleBlockDeleteAfter:        &retireAfter,
+			FormatVersion:                 1,
 		},
 	}
 }
@@ -1518,10 +1518,10 @@ func cscbObjectMetadata(uncompressedLength string, format string, compressionSco
 	}
 }
 
-func activeLegacyTestRow(height uint64, hash string, legacyKey string, cscbKey string, validatedAt time.Time) MetadataRow {
-	row := testRow(height, hash, legacyKey, cscbKey, validatedAt)
-	row.PrimaryObjectKey = legacyKey
-	row.PrimaryObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
+func activeSingleBlockTestRow(height uint64, hash string, singleBlockKey string, cscbKey string, validatedAt time.Time) MetadataRow {
+	row := testRow(height, hash, singleBlockKey, cscbKey, validatedAt)
+	row.PrimaryObjectKey = singleBlockKey
+	row.PrimaryObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
 	row.PrimaryByteOffset = 0
 	row.PrimaryByteLength = 0
 	row.PrimaryUncompressedLength = 0

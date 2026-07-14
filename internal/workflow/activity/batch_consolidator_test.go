@@ -105,7 +105,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanNoOpsWhenShadow
 		MaxBlocks:   100,
 	}
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -132,7 +132,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateEmptyScanPromotesExistin
 		MaxBlocks:   100,
 	}
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{Blocks: 12}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -160,7 +160,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateRejectsMissingCoverageBe
 		MaxBlocks:   100,
 	}
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Times(0)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -185,7 +185,7 @@ func (s *BatchConsolidatorTestSuite) TestDeprecatedHistoricalBackfillAliasRemain
 		MaxBlocks:   100,
 	}
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -237,7 +237,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 			Tag:                       records[0].Metadata.GetTag(),
 			Height:                    records[0].Metadata.GetHeight(),
 			Hash:                      records[0].Metadata.GetHash(),
-			LegacyObjectKeyMain:       records[0].Metadata.GetObjectKeyMain(),
+			SingleBlockObjectKeyMain:  records[0].Metadata.GetObjectKeyMain(),
 			ConsolidatedObjectKeyMain: objectKey,
 			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			ByteOffset:                0,
@@ -249,7 +249,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 			Tag:                       records[1].Metadata.GetTag(),
 			Height:                    records[1].Metadata.GetHeight(),
 			Hash:                      records[1].Metadata.GetHash(),
-			LegacyObjectKeyMain:       records[1].Metadata.GetObjectKeyMain(),
+			SingleBlockObjectKeyMain:  records[1].Metadata.GetObjectKeyMain(),
 			ConsolidatedObjectKeyMain: objectKey,
 			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			ByteOffset:                100,
@@ -260,7 +260,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -275,7 +275,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		PersistBlockConsolidationShadows(gomock.Any(), expectedShadows).
 		Return(nil)
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{Blocks: 2}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
@@ -309,7 +309,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateAllowsPartialRetryWindow
 	}
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).Times(2).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).Times(2).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -354,7 +354,7 @@ func (s *BatchConsolidatorTestSuite) TestAutoConsolidateAllowsGappedMissingShado
 	}
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).Times(2).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).Times(2).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -415,7 +415,7 @@ func (s *BatchConsolidatorTestSuite) TestUploadFailureDoesNotPersistShadowPlacem
 	}
 
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{}, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
@@ -517,7 +517,7 @@ func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedPromotesShadows() {
 		GetLatestBlock(gomock.Any(), request.Tag).
 		Return(&api.BlockMetadata{Tag: request.Tag, Height: 1_300}, nil)
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{Blocks: 12}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
@@ -548,7 +548,7 @@ func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedExecuteCapsAtGateAndSaf
 		GetLatestBlock(gomock.Any(), request.Tag).
 		Return(&api.BlockMetadata{Tag: request.Tag, Height: 1_080}, nil)
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, gateHeight, request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, gateHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{Blocks: 12}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
@@ -578,7 +578,7 @@ func (s *BatchConsolidatorTestSuite) TestPromoteFinalizedExecuteAllowsMissingPro
 		GetLatestBlock(gomock.Any(), request.Tag).
 		Return(&api.BlockMetadata{Tag: request.Tag, Height: 1_080}, nil)
 	s.metaStorage.EXPECT().
-		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, uint64(1_071), request.MaxBlocks, config.DefaultLegacyObjectRetention).
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, uint64(1_071), request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
 		Return(&metastorage.ConsolidationPromotionResult{Blocks: 12}, nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)

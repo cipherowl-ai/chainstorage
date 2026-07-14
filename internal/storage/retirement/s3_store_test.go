@@ -26,41 +26,41 @@ func TestS3ObjectStore_ListObjectVersionsPaginatesAndFiltersExactKey(t *testing.
 	first := client.EXPECT().ListObjectVersions(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, input *awss3.ListObjectVersionsInput, options ...func(*awss3.Options)) (*awss3.ListObjectVersionsOutput, error) {
 			require.Equal("bucket", aws.ToString(input.Bucket))
-			require.Equal("legacy/key", aws.ToString(input.Prefix))
+			require.Equal("single-block/key", aws.ToString(input.Prefix))
 			require.Equal(int32(1000), aws.ToInt32(input.MaxKeys))
 			require.Empty(aws.ToString(input.KeyMarker))
 			require.Empty(aws.ToString(input.VersionIdMarker))
 			return &awss3.ListObjectVersionsOutput{
 				Versions: []awss3types.ObjectVersion{
-					{Key: aws.String("legacy/key"), VersionId: aws.String("v2"), ETag: aws.String("etag-v2"), Size: aws.Int64(22), IsLatest: aws.Bool(true), LastModified: &modified},
-					{Key: aws.String("legacy/key-sibling"), VersionId: aws.String("ignored"), ETag: aws.String("ignored"), Size: aws.Int64(999)},
+					{Key: aws.String("single-block/key"), VersionId: aws.String("v2"), ETag: aws.String("etag-v2"), Size: aws.Int64(22), IsLatest: aws.Bool(true), LastModified: &modified},
+					{Key: aws.String("single-block/key-sibling"), VersionId: aws.String("ignored"), ETag: aws.String("ignored"), Size: aws.Int64(999)},
 				},
 				DeleteMarkers: []awss3types.DeleteMarkerEntry{
-					{Key: aws.String("legacy/key-sibling"), VersionId: aws.String("ignored-marker")},
+					{Key: aws.String("single-block/key-sibling"), VersionId: aws.String("ignored-marker")},
 				},
 				IsTruncated:         aws.Bool(true),
-				NextKeyMarker:       aws.String("legacy/key"),
+				NextKeyMarker:       aws.String("single-block/key"),
 				NextVersionIdMarker: aws.String("v2"),
 			}, nil
 		},
 	)
 	client.EXPECT().ListObjectVersions(gomock.Any(), gomock.Any()).After(first).DoAndReturn(
 		func(ctx context.Context, input *awss3.ListObjectVersionsInput, options ...func(*awss3.Options)) (*awss3.ListObjectVersionsOutput, error) {
-			require.Equal("legacy/key", aws.ToString(input.KeyMarker))
+			require.Equal("single-block/key", aws.ToString(input.KeyMarker))
 			require.Equal("v2", aws.ToString(input.VersionIdMarker))
 			return &awss3.ListObjectVersionsOutput{
 				Versions: []awss3types.ObjectVersion{
-					{Key: aws.String("legacy/key"), VersionId: aws.String("v1"), ETag: aws.String("etag-v1"), Size: aws.Int64(11), IsLatest: aws.Bool(false)},
+					{Key: aws.String("single-block/key"), VersionId: aws.String("v1"), ETag: aws.String("etag-v1"), Size: aws.Int64(11), IsLatest: aws.Bool(false)},
 				},
 				DeleteMarkers: []awss3types.DeleteMarkerEntry{
-					{Key: aws.String("legacy/key"), VersionId: aws.String("marker-v3"), IsLatest: aws.Bool(false)},
+					{Key: aws.String("single-block/key"), VersionId: aws.String("marker-v3"), IsLatest: aws.Bool(false)},
 				},
 				IsTruncated: aws.Bool(false),
 			}, nil
 		},
 	)
 
-	topology, err := store.ListObjectVersions(context.Background(), "bucket", "legacy/key")
+	topology, err := store.ListObjectVersions(context.Background(), "bucket", "single-block/key")
 	require.NoError(err)
 	require.Len(topology.Versions, 2)
 	require.Equal("v2", topology.Versions[0].VersionID)
@@ -103,14 +103,14 @@ func TestS3ObjectStore_UsesPinnedVersionForHeadReadRangeAndDelete(t *testing.T) 
 
 	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, input *awss3.GetObjectInput, options ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
-			require.Equal("legacy-v1", aws.ToString(input.VersionId))
+			require.Equal("single-block-v1", aws.ToString(input.VersionId))
 			require.Empty(aws.ToString(input.Range))
-			return &awss3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader([]byte("legacy")))}, nil
+			return &awss3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader([]byte("single-block")))}, nil
 		},
 	)
-	data, err := store.ReadObjectVersion(context.Background(), "bucket", "legacy/key", "legacy-v1")
+	data, err := store.ReadObjectVersion(context.Background(), "bucket", "single-block/key", "single-block-v1")
 	require.NoError(err)
-	require.Equal([]byte("legacy"), data)
+	require.Equal([]byte("single-block"), data)
 
 	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, input *awss3.GetObjectInput, options ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
@@ -126,12 +126,12 @@ func TestS3ObjectStore_UsesPinnedVersionForHeadReadRangeAndDelete(t *testing.T) 
 	client.EXPECT().DeleteObject(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, input *awss3.DeleteObjectInput, options ...func(*awss3.Options)) (*awss3.DeleteObjectOutput, error) {
 			require.Equal("bucket", aws.ToString(input.Bucket))
-			require.Equal("legacy/key", aws.ToString(input.Key))
-			require.Equal("legacy-v1", aws.ToString(input.VersionId))
+			require.Equal("single-block/key", aws.ToString(input.Key))
+			require.Equal("single-block-v1", aws.ToString(input.VersionId))
 			return &awss3.DeleteObjectOutput{}, nil
 		},
 	)
-	require.NoError(store.DeleteObjectVersion(context.Background(), "bucket", "legacy/key", "legacy-v1"))
+	require.NoError(store.DeleteObjectVersion(context.Background(), "bucket", "single-block/key", "single-block-v1"))
 }
 
 func TestS3ObjectStore_RejectsMutableOrEmptyVersionIDs(t *testing.T) {

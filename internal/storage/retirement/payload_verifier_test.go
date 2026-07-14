@@ -78,7 +78,7 @@ func TestPayloadVerifier_FreshInstanceDoesNotReuseCachedCSCBBytes(t *testing.T) 
 	require.Error(err)
 }
 
-func TestPayloadVerifier_ParsesSupportedLegacyCompression(t *testing.T) {
+func TestPayloadVerifier_ParsesSupportedSingleBlockCompression(t *testing.T) {
 	tests := []struct {
 		name        string
 		suffix      string
@@ -93,7 +93,7 @@ func TestPayloadVerifier_ParsesSupportedLegacyCompression(t *testing.T) {
 			require := require.New(t)
 			candidate, store, payload := retirementPayloadFixture(t)
 			delete(store.objects, versionObjectKey(candidate.Key, candidate.VersionID))
-			candidate.Key = "legacy/429600000" + test.suffix
+			candidate.Key = "single-block/429600000" + test.suffix
 			compressed, err := storageutils.Compress(payload, test.compression)
 			require.NoError(err)
 			store.objects[versionObjectKey(candidate.Key, candidate.VersionID)] = compressed
@@ -147,14 +147,14 @@ func TestPayloadVerifier_RejectsMatchingPayloadWithWrongBlockIdentity(t *testing
 	require.Contains(err.Error(), "identity mismatch")
 }
 
-func TestPayloadVerifier_RejectsMalformedLegacyAndCSCBPayloads(t *testing.T) {
-	t.Run("legacy protobuf", func(t *testing.T) {
+func TestPayloadVerifier_RejectsMalformedSingleBlockAndCSCBPayloads(t *testing.T) {
+	t.Run("single-block protobuf", func(t *testing.T) {
 		require := require.New(t)
 		candidate, store, _ := retirementPayloadFixture(t)
 		store.objects[versionObjectKey(candidate.Key, candidate.VersionID)] = gzipPayload(t, []byte("not-a-protobuf"))
 		_, err := newPayloadVerifier(store).Verify(context.Background(), candidate)
 		require.Error(err)
-		require.Contains(err.Error(), "parse pinned legacy")
+		require.Contains(err.Error(), "parse pinned single-block")
 	})
 
 	t.Run("CSCB chunk checksum", func(t *testing.T) {
@@ -185,8 +185,8 @@ func retirementPayloadFixture(t *testing.T) (Candidate, *fakeStore, []byte) {
 	require.NoError(err)
 	candidate := Candidate{
 		Bucket:             "bucket",
-		Key:                "legacy/429600000.gzip",
-		VersionID:          "legacy-v1",
+		Key:                "single-block/429600000.gzip",
+		VersionID:          "single-block-v1",
 		Height:             block.Metadata.Height,
 		Hash:               block.Metadata.Hash,
 		BlockMetadataID:    9001,

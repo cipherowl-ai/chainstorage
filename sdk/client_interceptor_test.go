@@ -187,7 +187,7 @@ func (s *clientInterceptorTestSuite) TestGetBlockWithTagAndReadSource_FallsBackA
 
 	require := testutil.Require(s.T())
 	var consolidatedAttempts int
-	var legacyAttempts int
+	var singleBlockAttempts int
 	delegate := &readSourceClientForTest{
 		Client: s.client,
 		getBlockWithTagAndReadSource: func(ctx context.Context, tag_ uint32, height_ uint64, hash_ string, readSource_ api.BlockReadSource) (*api.Block, error) {
@@ -199,8 +199,8 @@ func (s *clientInterceptorTestSuite) TestGetBlockWithTagAndReadSource_FallsBackA
 				consolidatedAttempts++
 				<-ctx.Done()
 				return nil, ctx.Err()
-			case api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY:
-				legacyAttempts++
+			case api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK:
+				singleBlockAttempts++
 				require.NoError(ctx.Err())
 				return expected, nil
 			default:
@@ -222,7 +222,7 @@ func (s *clientInterceptorTestSuite) TestGetBlockWithTagAndReadSource_FallsBackA
 	require.NoError(err)
 	require.Equal(expected, actual)
 	require.Equal(retry.DefaultMaxAttempts, consolidatedAttempts)
-	require.Equal(1, legacyAttempts)
+	require.Equal(1, singleBlockAttempts)
 }
 
 func (s *clientInterceptorTestSuite) TestGetBlocksByRangeWithTagAndReadSource_FallsBackAfterConsolidatedTimeout() {
@@ -235,7 +235,7 @@ func (s *clientInterceptorTestSuite) TestGetBlocksByRangeWithTagAndReadSource_Fa
 
 	require := testutil.Require(s.T())
 	var consolidatedAttempts int
-	var legacyAttempts int
+	var singleBlockAttempts int
 	delegate := &readSourceClientForTest{
 		Client: s.client,
 		getBlockWithTagAndReadSource: func(context.Context, uint32, uint64, string, api.BlockReadSource) (*api.Block, error) {
@@ -250,8 +250,8 @@ func (s *clientInterceptorTestSuite) TestGetBlocksByRangeWithTagAndReadSource_Fa
 				consolidatedAttempts++
 				<-ctx.Done()
 				return nil, ctx.Err()
-			case api.BlockReadSource_BLOCK_READ_SOURCE_LEGACY:
-				legacyAttempts++
+			case api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK:
+				singleBlockAttempts++
 				require.NoError(ctx.Err())
 				return expected, nil
 			default:
@@ -270,7 +270,7 @@ func (s *clientInterceptorTestSuite) TestGetBlocksByRangeWithTagAndReadSource_Fa
 	require.NoError(err)
 	require.Equal(expected, actual)
 	require.Equal(retry.DefaultMaxAttempts, consolidatedAttempts)
-	require.Equal(1, legacyAttempts)
+	require.Equal(1, singleBlockAttempts)
 }
 
 func (s *clientInterceptorTestSuite) TestGetChainEvents() {

@@ -6,6 +6,21 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestSingleBlockEnumAliases(t *testing.T) {
+	assert.Equal(
+		t,
+		BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK,
+		BlockReadSource_BLOCK_READ_SOURCE_LEGACY,
+	)
+	assert.Equal(
+		t,
+		BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
+		BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK,
+	)
+	assert.Equal(t, "BLOCK_READ_SOURCE_SINGLE_BLOCK", BlockReadSource(1).String())
+	assert.Equal(t, "BLOCK_OBJECT_FORMAT_SINGLE_BLOCK", BlockObjectFormat(0).String())
+}
+
 func TestSolanaProgramName(t *testing.T) {
 	expectedNames := map[SolanaProgram]string{
 		SolanaProgram_RAW:                          "raw",

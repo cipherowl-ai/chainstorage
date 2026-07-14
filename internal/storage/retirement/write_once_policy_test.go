@@ -108,8 +108,8 @@ func TestS3ObjectStore_InspectObjectRetentionSafetyRejectsMatchingLifecycleActio
 		{
 			name: "expiration for unrelated prefix",
 			rules: []awss3types.LifecycleRule{{
-				ID: aws.String("legacy-only"), Status: awss3types.ExpirationStatusEnabled,
-				Filter:     &awss3types.LifecycleRuleFilter{Prefix: aws.String("legacy/")},
+				ID: aws.String("single-block-only"), Status: awss3types.ExpirationStatusEnabled,
+				Filter:     &awss3types.LifecycleRuleFilter{Prefix: aws.String("single-block/")},
 				Expiration: &awss3types.LifecycleExpiration{Days: aws.Int32(1)},
 			}},
 			valid: true,
@@ -208,7 +208,7 @@ func TestStatementEnforcesCSCBWriteOnce(t *testing.T) {
 		{name: "allow is insufficient", policy: replacePolicy(valid, `"Effect":"Deny"`, `"Effect":"Allow"`)},
 		{name: "restricted principal", policy: replacePolicy(valid, `"Principal":"*"`, `"Principal":{"AWS":"arn:aws:iam::992382740726:role/writer"}`)},
 		{name: "wrong action", policy: replacePolicy(valid, `"Action":"s3:PutObject"`, `"Action":"s3:GetObject"`)},
-		{name: "wrong resource", policy: replacePolicy(valid, `/*/consolidated/*`, `/legacy/*`)},
+		{name: "wrong resource", policy: replacePolicy(valid, `/*/consolidated/*`, `/single-block/*`)},
 		{name: "missing condition", policy: replacePolicy(valid, `,"Condition":{"Null":{"s3:if-none-match":"true"}}`, ``)},
 		{name: "condition false", policy: replacePolicy(valid, `"s3:if-none-match":"true"`, `"s3:if-none-match":"false"`)},
 		{name: "narrowing extra condition", policy: replacePolicy(valid, `"Null":{"s3:if-none-match":"true"}`, `"Null":{"s3:if-none-match":"true"},"Bool":{"aws:SecureTransport":"true"}`)},
@@ -241,7 +241,7 @@ func TestStatementEnforcesCSCBMutationProtection(t *testing.T) {
 		{name: "missing delete version", policy: replacePolicy(valid, `,"s3:DeleteObjectVersion"`, ``)},
 		{name: "missing replicate object", policy: replacePolicy(valid, `,"s3:ReplicateObject"`, ``)},
 		{name: "missing replicate delete", policy: replacePolicy(valid, `,"s3:ReplicateDelete"`, ``)},
-		{name: "wrong resource", policy: replacePolicy(valid, `/*/consolidated/*`, `/legacy/*`)},
+		{name: "wrong resource", policy: replacePolicy(valid, `/*/consolidated/*`, `/single-block/*`)},
 		{name: "narrowing condition", policy: replacePolicy(valid, `}`, `,"Condition":{"Bool":{"aws:SecureTransport":"true"}}}`)},
 		{name: "not action", policy: replacePolicy(valid, `"Action"`, `"NotAction"`)},
 	}
