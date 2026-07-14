@@ -58,7 +58,6 @@ type (
 		StartHeight        uint64
 		EndHeight          uint64 `validate:"gtfield=StartHeight"`
 		MaxBlocks          uint64 `validate:"required"`
-		DeleteOldObjects   bool
 		RepairExecutionKey string
 	}
 
@@ -71,7 +70,6 @@ type (
 		ObjectKey          string
 		OldObjectKey       string
 		RepairedObjects    uint64
-		PendingOldDeletion bool
 	}
 
 	BatchConsolidatorStatsRequest struct {
@@ -325,14 +323,20 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 			return nil, xerrors.Errorf("failed to restore CSCB repair to single-block metadata: %w", err)
 		}
 	}
-	if manifest.State == cscbrepair.StateRestored {
-		normalResponse, err := a.executeShadowDualWrite(ctx, &BatchConsolidatorRequest{
+	if manifest.State == cscbrepair.StateRestored && manifest.CanonicalBlockCount > 0 {
+		expectedRecords := make(map[int64]cscbrepair.Block, manifest.CanonicalBlockCount)
+		for _, block := range manifest.Blocks {
+			if block.Canonical {
+				expectedRecords[block.BlockMetadataID] = block
+			}
+		}
+		normalResponse, err := a.executeShadowDualWriteWithExpected(ctx, &BatchConsolidatorRequest{
 			Mode:        config.ConsolidationModeHistoricalBackfill,
 			Tag:         manifest.Tag,
 			StartHeight: manifest.StartHeight,
 			EndHeight:   manifest.EndHeight,
 			MaxBlocks:   request.MaxBlocks,
-		})
+		}, expectedRecords)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to rebuild normalized CSCB: %w", err)
 		}
@@ -348,14 +352,13 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 			return nil, xerrors.Errorf("failed to verify rebuilt CSCB: %w", err)
 		}
 	}
-	pendingOldDeletion := manifest.State == cscbrepair.StateVerified && !request.DeleteOldObjects
-	if manifest.State == cscbrepair.StateVerified && request.DeleteOldObjects {
-		manifest, err = repairer.DeleteOldObject(ctx, manifest.ID)
+	if manifest.State == cscbrepair.StateRestored || manifest.State == cscbrepair.StateVerified {
+		manifest, err = repairer.Complete(ctx, manifest.ID, progress)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to delete pinned dirty CSCB: %w", err)
+			return nil, xerrors.Errorf("failed to complete CSCB repair: %w", err)
 		}
 	}
-	if manifest.State != cscbrepair.StateCompleted && !pendingOldDeletion {
+	if manifest.State != cscbrepair.StateCompleted {
 		return nil, xerrors.Errorf("CSCB repair made no terminal progress: id=%d state=%s", manifest.ID, manifest.State)
 	}
 
@@ -363,18 +366,25 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 		"processed CSCB repair",
 		zap.String("final_state", string(manifest.State)),
 		zap.String("new_object_key", manifest.NewConsolidatedObjectKey),
-		zap.Bool("pending_old_deletion", pendingOldDeletion),
+		zap.String("old_object_outcome", manifest.Outcome),
 	)
+	consolidatedBlocks := manifest.CanonicalBlockCount
+	promotedBlocks := manifest.CanonicalBlockCount
+	objectKey := manifest.NewConsolidatedObjectKey
+	if manifest.Outcome == cscbrepair.OutcomeAlreadyCleanStorageNeutral {
+		consolidatedBlocks = 0
+		promotedBlocks = 0
+		objectKey = manifest.OldConsolidatedObjectKey
+	}
 	return &BatchConsolidatorResponse{
 		StartHeight:        manifest.StartHeight,
 		EndHeight:          manifest.EndHeight,
 		ScannedBlocks:      manifest.TotalBlockCount,
-		ConsolidatedBlocks: manifest.CanonicalBlockCount,
-		PromotedBlocks:     manifest.CanonicalBlockCount,
-		ObjectKey:          manifest.NewConsolidatedObjectKey,
+		ConsolidatedBlocks: consolidatedBlocks,
+		PromotedBlocks:     promotedBlocks,
+		ObjectKey:          objectKey,
 		OldObjectKey:       manifest.OldConsolidatedObjectKey,
 		RepairedObjects:    1,
-		PendingOldDeletion: pendingOldDeletion,
 	}, nil
 }
 
@@ -411,6 +421,14 @@ func (a *BatchConsolidator) getCSCBRepairer(ctx context.Context) (cscbrepair.Rep
 }
 
 func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
+	return a.executeShadowDualWriteWithExpected(ctx, request, nil)
+}
+
+func (a *BatchConsolidator) executeShadowDualWriteWithExpected(
+	ctx context.Context,
+	request *BatchConsolidatorRequest,
+	expectedRecords map[int64]cscbrepair.Block,
+) (*BatchConsolidatorResponse, error) {
 	if err := a.validateShadowWriteMode(request.Mode); err != nil {
 		return nil, err
 	}
@@ -435,9 +453,13 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 			return nil, err
 		}
 	}
-	prePromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
-	if err != nil {
-		return nil, err
+	var prePromotedBlocks uint64
+	if expectedRecords == nil {
+		var err error
+		prePromotedBlocks, err = a.promoteConsolidatedBlocks(ctx, mode, request)
+		if err != nil {
+			return nil, err
+		}
 	}
 	scanStart := time.Now()
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
@@ -447,11 +469,23 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	scanDuration := time.Since(scanStart)
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
+		if expectedRecords != nil {
+			postPromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
+			if err != nil {
+				return nil, err
+			}
+			prePromotedBlocks += postPromotedBlocks
+		}
 		return &BatchConsolidatorResponse{
 			StartHeight:    request.StartHeight,
 			EndHeight:      request.EndHeight,
 			PromotedBlocks: prePromotedBlocks,
 		}, nil
+	}
+	if expectedRecords != nil {
+		if err := validateExactRepairRecords(records, expectedRecords); err != nil {
+			return nil, err
+		}
 	}
 
 	buildStart := time.Now()
@@ -516,6 +550,48 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 		zap.Duration("total_duration", time.Since(totalStart)),
 	)
 	return response, nil
+}
+
+func validateExactRepairRecords(
+	records []*metastorage.BlockMetadataRecord,
+	expected map[int64]cscbrepair.Block,
+) error {
+	if len(records) != len(expected) {
+		return xerrors.Errorf("CSCB repair rebuild row count mismatch before upload: expected=%d actual=%d", len(expected), len(records))
+	}
+	seen := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		if record == nil || record.Metadata == nil {
+			return xerrors.New("CSCB repair rebuild returned missing block metadata record")
+		}
+		block, ok := expected[record.ID]
+		if !ok {
+			return xerrors.Errorf("CSCB repair rebuild returned unexpected metadata_id=%d", record.ID)
+		}
+		if _, ok := seen[record.ID]; ok {
+			return xerrors.Errorf("CSCB repair rebuild returned duplicate metadata_id=%d", record.ID)
+		}
+		seen[record.ID] = struct{}{}
+		metadata := record.Metadata
+		if metadata.GetTag() != block.Tag || metadata.GetHeight() != block.Height || metadata.GetHash() != block.Hash {
+			return xerrors.Errorf(
+				"CSCB repair rebuild identity changed for metadata_id=%d: expected=(%d,%d,%q) actual=(%d,%d,%q)",
+				record.ID,
+				block.Tag,
+				block.Height,
+				block.Hash,
+				metadata.GetTag(),
+				metadata.GetHeight(),
+				metadata.GetHash(),
+			)
+		}
+		if metadata.GetObjectKeyMain() != block.SingleBlockObjectKey ||
+			metadata.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK ||
+			metadata.GetByteOffset() != 0 || metadata.GetByteLength() != 0 || metadata.GetUncompressedLength() != 0 {
+			return xerrors.Errorf("CSCB repair rebuild metadata is not restored to the pinned single-block placement for metadata_id=%d", record.ID)
+		}
+	}
+	return nil
 }
 
 func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {

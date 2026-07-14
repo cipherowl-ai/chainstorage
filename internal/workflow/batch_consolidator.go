@@ -33,15 +33,14 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode             config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
-		Tag              uint32
-		StartHeight      uint64
-		EndHeight        uint64 `validate:"gtfield=StartHeight"`
-		BatchSize        uint64
-		CheckpointSize   uint64
-		MaxBlocks        uint64
-		Parallelism      int `validate:"omitempty,gt=0"`
-		DeleteOldObjects bool
+		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
+		Tag            uint32
+		StartHeight    uint64
+		EndHeight      uint64 `validate:"gtfield=StartHeight"`
+		BatchSize      uint64
+		CheckpointSize uint64
+		MaxBlocks      uint64
+		Parallelism    int `validate:"omitempty,gt=0"`
 	}
 
 	batchConsolidatorPendingActivity struct {
@@ -504,7 +503,6 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			StartHeight:        request.StartHeight,
 			EndHeight:          request.EndHeight,
 			MaxBlocks:          maxBlocks,
-			DeleteOldObjects:   request.DeleteOldObjects,
 			RepairExecutionKey: makeRepairExecutionKey(ctx, repairIteration),
 		})
 		if err != nil {
@@ -520,7 +518,7 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			logger.Info("CSCB repair range is complete")
 			return nil
 		}
-		if response.ScannedBlocks == 0 || response.ConsolidatedBlocks == 0 {
+		if response.ScannedBlocks == 0 {
 			return xerrors.Errorf(
 				"repair_existing_cscb made no block progress for old object %q",
 				response.OldObjectKey,
@@ -538,12 +536,8 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			zap.Uint64("end_height", response.EndHeight),
 			zap.Uint64("blocks", response.ScannedBlocks),
 			zap.Uint64("canonical_blocks", response.ConsolidatedBlocks),
-			zap.Bool("pending_old_deletion", response.PendingOldDeletion),
+			zap.Bool("rebuilt_cscb", response.ObjectKey != "" && response.ObjectKey != response.OldObjectKey),
 		)
-		if response.PendingOldDeletion {
-			logger.Info("CSCB repair stopped after verification because old-object deletion was not enabled")
-			return nil
-		}
 		repairIteration++
 		if processedBlocks >= checkpointSize {
 			newRequest := *request

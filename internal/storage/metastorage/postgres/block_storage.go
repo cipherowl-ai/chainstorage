@@ -15,6 +15,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/blockchain/parser"
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepairlock"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres/model"
@@ -200,6 +201,16 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			}
 		}()
 
+		tags := make([]uint32, 0, len(blocks))
+		for _, block := range blocks {
+			if block != nil {
+				tags = append(tags, block.Tag)
+			}
+		}
+		if err := cscbrepairlock.AcquireTags(txCtx, tx, tags); err != nil {
+			return err
+		}
+
 		// Different queries for skipped vs non-skipped blocks due to different conflict resolution
 		blockMetadataSkippedQuery := `
 			INSERT INTO block_metadata (
@@ -230,25 +241,45 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				parent_hash = EXCLUDED.parent_hash,
 				parent_height = EXCLUDED.parent_height,
 				object_key_main = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.object_key_main
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+						OR EXISTS (
+							SELECT 1 FROM cscb_repair_block repair_block
+							WHERE repair_block.block_metadata_id = block_metadata.id
+						) THEN block_metadata.object_key_main
 					ELSE EXCLUDED.object_key_main
 				END,
 				timestamp = EXCLUDED.timestamp,
 				skipped = EXCLUDED.skipped,
 				object_format = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.object_format
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+						OR EXISTS (
+							SELECT 1 FROM cscb_repair_block repair_block
+							WHERE repair_block.block_metadata_id = block_metadata.id
+						) THEN block_metadata.object_format
 					ELSE EXCLUDED.object_format
 				END,
 				byte_offset = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.byte_offset
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+						OR EXISTS (
+							SELECT 1 FROM cscb_repair_block repair_block
+							WHERE repair_block.block_metadata_id = block_metadata.id
+						) THEN block_metadata.byte_offset
 					ELSE EXCLUDED.byte_offset
 				END,
 				byte_length = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.byte_length
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+						OR EXISTS (
+							SELECT 1 FROM cscb_repair_block repair_block
+							WHERE repair_block.block_metadata_id = block_metadata.id
+						) THEN block_metadata.byte_length
 					ELSE EXCLUDED.byte_length
 				END,
 				uncompressed_length = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL THEN block_metadata.uncompressed_length
+					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+						OR EXISTS (
+							SELECT 1 FROM cscb_repair_block repair_block
+							WHERE repair_block.block_metadata_id = block_metadata.id
+						) THEN block_metadata.uncompressed_length
 					ELSE EXCLUDED.uncompressed_length
 				END
 			RETURNING id`
@@ -1038,6 +1069,15 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			_ = tx.Rollback()
 		}
 	}()
+	tags := make([]uint32, 0, len(placements))
+	for _, placement := range placements {
+		if placement != nil {
+			tags = append(tags, placement.Tag)
+		}
+	}
+	if err := cscbrepairlock.AcquireTags(ctx, tx, tags); err != nil {
+		return err
+	}
 
 	const query = `
 		INSERT INTO block_consolidation_shadow (
@@ -1131,6 +1171,9 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 			_ = tx.Rollback()
 		}
 	}()
+	if err := cscbrepairlock.AcquireTag(ctx, tx, tag); err != nil {
+		return nil, err
+	}
 
 	const invalidShadowQuery = `
 		SELECT shadow.block_metadata_id, shadow.height

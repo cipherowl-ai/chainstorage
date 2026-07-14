@@ -27,18 +27,17 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 	prepared := repairActivityManifest(cscbrepair.StatePrepared, oldKey, "")
 	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
 	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
+	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
 	fake := &repairActivityFake{
-		prepared: prepared,
-		restored: restored,
-		verified: verified,
+		prepared:  prepared,
+		restored:  restored,
+		verified:  verified,
+		completed: completed,
 	}
 	s.batchConsolidator.repairer = fake
 	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
 	gomock.InOrder(
-		s.metaStorage.EXPECT().
-			PromoteBlockConsolidationShadows(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100), config.DefaultSingleBlockObjectRetention).
-			Return(&metastorage.ConsolidationPromotionResult{}, nil),
 		s.metaStorage.EXPECT().
 			GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
 			Return(records, nil),
@@ -63,19 +62,78 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 		ObjectKey:          newKey,
 		OldObjectKey:       oldKey,
 		RepairedObjects:    1,
-		PendingOldDeletion: true,
 	}, response)
-	require.Equal([]string{"prepare", "restore", "verify"}, fake.calls)
+	require.Equal([]string{"prepare", "restore", "verify", "complete"}, fake.calls)
 	require.Equal(testRepairExecutionKey, fake.executionKey)
 }
 
-func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBDeletesOnlyAfterVerified() {
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRejectsNonExactRebuildBeforeUpload() {
+	require := testutil.Require(s.T())
+	records, _ := makeConsolidatorFixture(1, 1000)
+	oldKey := "consolidated/dirty.cscb.zstd"
+	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
+	restored.Blocks[0].BlockMetadataID = 999
+	fake := &repairActivityFake{prepared: restored}
+	s.batchConsolidator.repairer = fake
+
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
+		Return(records, nil)
+
+	_, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		RepairExecutionKey: testRepairExecutionKey,
+	})
+	require.ErrorContains(err, "unexpected metadata_id=10")
+	require.Equal([]string{"prepare"}, fake.calls)
+}
+
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesAfterShadowsPersisted() {
 	require := testutil.Require(s.T())
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
+	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
 	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
 	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
-	fake := &repairActivityFake{prepared: verified, completed: completed}
+	fake := &repairActivityFake{prepared: restored, verified: verified, completed: completed}
+	s.batchConsolidator.repairer = fake
+
+	gomock.InOrder(
+		s.metaStorage.EXPECT().
+			GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
+			Return(nil, nil),
+		s.metaStorage.EXPECT().
+			PromoteBlockConsolidationShadows(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100), config.DefaultSingleBlockObjectRetention).
+			Return(&metastorage.ConsolidationPromotionResult{Blocks: 1}, nil),
+	)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		RepairExecutionKey: testRepairExecutionKey,
+	})
+	require.NoError(err)
+	require.Equal(uint64(1), response.RepairedObjects)
+	require.Equal([]string{"prepare", "verify", "complete"}, fake.calls)
+}
+
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBCompletesAllNonCanonicalObjectWithoutRebuild() {
+	require := testutil.Require(s.T())
+	oldKey := "consolidated/dirty.cscb.zstd"
+	prepared := repairActivityManifest(cscbrepair.StatePrepared, oldKey, "")
+	prepared.CanonicalBlockCount = 0
+	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
+	restored.CanonicalBlockCount = 0
+	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, "")
+	completed.CanonicalBlockCount = 0
+	fake := &repairActivityFake{prepared: prepared, restored: restored, completed: completed}
 	s.batchConsolidator.repairer = fake
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
@@ -84,14 +142,39 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBDeletesOnlyAfterVerif
 		StartHeight:        900,
 		EndHeight:          1200,
 		MaxBlocks:          100,
-		DeleteOldObjects:   true,
 		RepairExecutionKey: testRepairExecutionKey,
 	})
 	require.NoError(err)
 	require.Equal(uint64(1), response.RepairedObjects)
-	require.False(response.PendingOldDeletion)
-	require.Equal([]string{"prepare", "delete"}, fake.calls)
+	require.Zero(response.ConsolidatedBlocks)
+	require.Empty(response.ObjectKey)
+	require.Equal([]string{"prepare", "restore", "complete"}, fake.calls)
 	require.Equal(testRepairExecutionKey, fake.executionKey)
+}
+
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRecordsAlreadyCleanObjectWithoutRebuild() {
+	require := testutil.Require(s.T())
+	oldKey := "consolidated/already-clean.cscb.zstd"
+	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, "")
+	completed.Outcome = cscbrepair.OutcomeAlreadyCleanStorageNeutral
+	fake := &repairActivityFake{prepared: completed}
+	s.batchConsolidator.repairer = fake
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		RepairExecutionKey: testRepairExecutionKey,
+	})
+	require.NoError(err)
+	require.Equal(uint64(1), response.RepairedObjects)
+	require.Equal(uint64(1), response.ScannedBlocks)
+	require.Zero(response.ConsolidatedBlocks)
+	require.Zero(response.PromotedBlocks)
+	require.Equal(oldKey, response.ObjectKey)
+	require.Equal([]string{"prepare"}, fake.calls)
 }
 
 func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string) *cscbrepair.Manifest {
@@ -105,6 +188,14 @@ func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string
 		TotalBlockCount:          1,
 		OldConsolidatedObjectKey: oldKey,
 		NewConsolidatedObjectKey: newKey,
+		Blocks: []cscbrepair.Block{{
+			BlockMetadataID:      10,
+			Canonical:            true,
+			Tag:                  2,
+			Height:               1000,
+			Hash:                 "hash-1000",
+			SingleBlockObjectKey: "single-block/1000.gzip",
+		}},
 	}
 }
 
@@ -134,8 +225,8 @@ func (f *repairActivityFake) VerifyRebuilt(context.Context, int64, cscbrepair.Pr
 	return f.verified, nil
 }
 
-func (f *repairActivityFake) DeleteOldObject(context.Context, int64) (*cscbrepair.Manifest, error) {
-	f.calls = append(f.calls, "delete")
+func (f *repairActivityFake) Complete(context.Context, int64, cscbrepair.Progress) (*cscbrepair.Manifest, error) {
+	f.calls = append(f.calls, "complete")
 	return f.completed, nil
 }
 
