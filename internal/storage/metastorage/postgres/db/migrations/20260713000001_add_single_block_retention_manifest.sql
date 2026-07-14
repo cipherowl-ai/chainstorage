@@ -1,7 +1,8 @@
 -- +goose Up
 -- The three compatibility columns were deployed before the single-block
--- terminology was standardized. Keep them synchronized during rolling
--- deployments so old and new pods can safely overlap.
+-- terminology was standardized. Keep schema reads and writes synchronized
+-- during rolling deployments. This compatibility does not authorize retirement
+-- execution until every single-block writer runs the guarded uploader.
 ALTER TABLE block_consolidation_shadow
     ALTER COLUMN legacy_object_key_main DROP NOT NULL,
     ADD COLUMN single_block_object_key_main TEXT,

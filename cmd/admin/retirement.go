@@ -21,18 +21,19 @@ import (
 )
 
 type retirementFlags struct {
-	tag                     uint32
-	startHeight             uint64
-	endHeight               uint64
-	limit                   uint64
-	approveChain            string
-	approveStartHeight      uint64
-	approveEndHeight        uint64
-	clientMigrationApproved bool
-	fallbackErrorCount      uint64
-	execute                 bool
-	confirmProductionDelete bool
-	reportFile              string
+	tag                       uint32
+	startHeight               uint64
+	endHeight                 uint64
+	limit                     uint64
+	approveChain              string
+	approveStartHeight        uint64
+	approveEndHeight          uint64
+	clientMigrationApproved   bool
+	singleBlockWritersGuarded bool
+	fallbackErrorCount        uint64
+	execute                   bool
+	confirmProductionDelete   bool
+	reportFile                string
 }
 
 var (
@@ -66,7 +67,9 @@ version, verifies the key has no remaining versions, transactionally clears the 
 then performs a fresh CSCB range read before marking the retirement verified.
 The command also verifies the live bucket policy denies every unconditional write and every API
 delete to each CSCB key, so no newer version or delete marker can replace the pinned payload.
-Production execution requires both --execute and --confirm-production-delete.`,
+Execution requires --single-block-writers-guarded to confirm every live single-block writer
+honors the retirement fence. Production execution additionally requires
+--confirm-production-delete.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSingleBlockRetirementPlan(cmd.Context(), singleBlockRetirementFlags)
 		},
@@ -85,7 +88,8 @@ func newSingleBlockRetirementReconcileCommand() *cobra.Command {
 The command is report-only by default. With explicit execution gates, it can safely resume a
 pre-delete manifest, record an already-completed S3 deletion while clearing the single-block path, or
 finish fresh CSCB verification against the persisted digest after the path has been cleared.
-Execution remains blocked unless the live CSCB write-once bucket policy is verifiable.`,
+Execution remains blocked unless every live single-block writer honors the retirement fence and
+the live CSCB write-once bucket policy is verifiable.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSingleBlockRetirementReconcile(cmd.Context(), singleBlockRetirementReconcileFlags)
 		},
@@ -103,6 +107,7 @@ func addSingleBlockRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
 	cmd.Flags().Uint64Var(&flags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
 	cmd.Flags().Uint64Var(&flags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
 	cmd.Flags().BoolVar(&flags.clientMigrationApproved, "client-migration-approved", false, "confirm known file clients are migrated or out of scope")
+	cmd.Flags().BoolVar(&flags.singleBlockWritersGuarded, "single-block-writers-guarded", false, "confirm every live single-block writer honors the retirement fence")
 	cmd.Flags().Uint64Var(&flags.fallbackErrorCount, "fallback-read-errors", 0, "active fallback/read error count from the operator's observation window")
 	cmd.Flags().BoolVar(&flags.execute, "execute", false, "execute guarded retirement state transitions and exact-version deletion")
 	cmd.Flags().BoolVar(&flags.confirmProductionDelete, "confirm-production-delete", false, "second explicit gate required with --execute in production")
@@ -118,6 +123,9 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 	}
 	if flags.execute && isProductionEnvironment(commonFlags.env) && !flags.confirmProductionDelete {
 		return xerrors.New("production execution requires --execute and --confirm-production-delete")
+	}
+	if flags.execute && !flags.singleBlockWritersGuarded {
+		return xerrors.New("retirement execution requires --single-block-writers-guarded")
 	}
 
 	var deps struct {
@@ -166,20 +174,21 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 		retirement.NewS3ObjectStore(deps.S3Client),
 	)
 	req := retirement.PlanRequest{
-		Environment:             string(cfg.Env()),
-		Blockchain:              commonFlags.blockchain,
-		Network:                 commonFlags.network,
-		Sidechain:               commonFlags.sidechain,
-		Bucket:                  cfg.AWS.Bucket,
-		Tag:                     tag,
-		StartHeight:             flags.startHeight,
-		EndHeight:               flags.endHeight,
-		Limit:                   flags.limit,
-		Now:                     time.Now().UTC(),
-		Execute:                 flags.execute,
-		ProductionDeleteEnabled: flags.confirmProductionDelete,
-		ClientMigrationApproved: flags.clientMigrationApproved,
-		FallbackErrorCount:      flags.fallbackErrorCount,
+		Environment:               string(cfg.Env()),
+		Blockchain:                commonFlags.blockchain,
+		Network:                   commonFlags.network,
+		Sidechain:                 commonFlags.sidechain,
+		Bucket:                    cfg.AWS.Bucket,
+		Tag:                       tag,
+		StartHeight:               flags.startHeight,
+		EndHeight:                 flags.endHeight,
+		Limit:                     flags.limit,
+		Now:                       time.Now().UTC(),
+		Execute:                   flags.execute,
+		ProductionDeleteEnabled:   flags.confirmProductionDelete,
+		ClientMigrationApproved:   flags.clientMigrationApproved,
+		SingleBlockWritersGuarded: flags.singleBlockWritersGuarded,
+		FallbackErrorCount:        flags.fallbackErrorCount,
 		Approval: retirement.Approval{
 			Chain:       flags.approveChain,
 			StartHeight: flags.approveStartHeight,
@@ -213,6 +222,9 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 	if flags.execute && isProductionEnvironment(commonFlags.env) && !flags.confirmProductionDelete {
 		return xerrors.New("production reconciliation requires --execute and --confirm-production-delete")
 	}
+	if flags.execute && !flags.singleBlockWritersGuarded {
+		return xerrors.New("retirement reconciliation requires --single-block-writers-guarded")
+	}
 
 	var deps struct {
 		fx.In
@@ -237,20 +249,21 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 
 	planner := retirement.NewPlanner(retirement.NewPostgresRepository(db), retirement.NewS3ObjectStore(deps.S3Client))
 	req := retirement.PlanRequest{
-		Environment:             string(cfg.Env()),
-		Blockchain:              commonFlags.blockchain,
-		Network:                 commonFlags.network,
-		Sidechain:               commonFlags.sidechain,
-		Bucket:                  cfg.AWS.Bucket,
-		Tag:                     tag,
-		StartHeight:             flags.startHeight,
-		EndHeight:               flags.endHeight,
-		Limit:                   flags.limit,
-		Now:                     time.Now().UTC(),
-		Execute:                 flags.execute,
-		ProductionDeleteEnabled: flags.confirmProductionDelete,
-		ClientMigrationApproved: flags.clientMigrationApproved,
-		FallbackErrorCount:      flags.fallbackErrorCount,
+		Environment:               string(cfg.Env()),
+		Blockchain:                commonFlags.blockchain,
+		Network:                   commonFlags.network,
+		Sidechain:                 commonFlags.sidechain,
+		Bucket:                    cfg.AWS.Bucket,
+		Tag:                       tag,
+		StartHeight:               flags.startHeight,
+		EndHeight:                 flags.endHeight,
+		Limit:                     flags.limit,
+		Now:                       time.Now().UTC(),
+		Execute:                   flags.execute,
+		ProductionDeleteEnabled:   flags.confirmProductionDelete,
+		ClientMigrationApproved:   flags.clientMigrationApproved,
+		SingleBlockWritersGuarded: flags.singleBlockWritersGuarded,
+		FallbackErrorCount:        flags.fallbackErrorCount,
 		Approval: retirement.Approval{
 			Chain:       flags.approveChain,
 			StartHeight: flags.approveStartHeight,

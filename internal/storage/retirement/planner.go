@@ -79,6 +79,9 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 	if !req.Execute {
 		return xerrors.New("execute must be enabled to apply a retirement report")
 	}
+	if !req.SingleBlockWritersGuarded {
+		return xerrors.New("retirement execution requires all single-block writers to honor the retirement fence")
+	}
 	if isProduction(req.Environment) && !req.ProductionDeleteEnabled {
 		return xerrors.New("production deletion requires explicit production-delete confirmation")
 	}
@@ -130,6 +133,9 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	}
 	if req.Execute && isProduction(req.Environment) && !req.ProductionDeleteEnabled {
 		return nil, xerrors.New("production reconciliation requires explicit production-delete confirmation")
+	}
+	if req.Execute && !req.SingleBlockWritersGuarded {
+		return nil, xerrors.New("retirement reconciliation requires all single-block writers to honor the retirement fence")
 	}
 	manifests, err := p.repo.ListPendingRetirements(ctx, req.Tag, req.StartHeight, req.EndHeight, req.Limit)
 	if err != nil {
@@ -330,6 +336,10 @@ func (p *Planner) planRow(
 	}
 	if !req.ClientMigrationApproved {
 		item.SkipReason = SkipFileClientsNotApproved
+		return item
+	}
+	if req.Execute && !req.SingleBlockWritersGuarded {
+		item.SkipReason = SkipSingleBlockWritersNotGuarded
 		return item
 	}
 
@@ -801,6 +811,7 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
 		req.ClientMigrationApproved &&
+		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
 		row.Tag == candidate.Tag &&
@@ -833,6 +844,7 @@ func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
 		req.ClientMigrationApproved &&
+		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
 		row.Tag == candidate.Tag &&
@@ -942,6 +954,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		report.EndHeight != req.EndHeight ||
 		report.Approval != req.Approval ||
 		report.SafetyGates.ClientMigrationApproved != req.ClientMigrationApproved ||
+		report.SafetyGates.SingleBlockWritersGuarded != req.SingleBlockWritersGuarded ||
 		report.SafetyGates.FallbackReadErrors != req.FallbackErrorCount ||
 		report.SafetyGates.ProductionDeleteEnabled != req.ProductionDeleteEnabled ||
 		report.SafetyGates.VersionedDeleteMode != "exact_single_object_version_only" ||
@@ -949,7 +962,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		!report.SafetyGates.CSCBWriteOncePolicyVerified {
 		return xerrors.New("retirement report does not match the execution request")
 	}
-	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved {
+	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved || !req.SingleBlockWritersGuarded {
 		return xerrors.New("retirement execution safety gates are not satisfied")
 	}
 	for _, item := range report.Items {
@@ -1101,11 +1114,12 @@ func newReport(req PlanRequest) *Report {
 		EndHeight:   req.EndHeight,
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
-			ClientMigrationApproved: req.ClientMigrationApproved,
-			FallbackReadErrors:      req.FallbackErrorCount,
-			VersionedDeleteMode:     "exact_single_object_version_only",
-			CSCBWriteOncePolicyMode: cscbWriteOncePolicyMode,
-			ProductionDeleteEnabled: req.ProductionDeleteEnabled,
+			ClientMigrationApproved:   req.ClientMigrationApproved,
+			SingleBlockWritersGuarded: req.SingleBlockWritersGuarded,
+			FallbackReadErrors:        req.FallbackErrorCount,
+			VersionedDeleteMode:       "exact_single_object_version_only",
+			CSCBWriteOncePolicyMode:   cscbWriteOncePolicyMode,
+			ProductionDeleteEnabled:   req.ProductionDeleteEnabled,
 		},
 		Items: make([]Candidate, 0),
 	}

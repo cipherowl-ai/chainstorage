@@ -570,6 +570,32 @@ func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
 	})
 }
 
+func TestPlannerPlan_RequiresGuardedSingleBlockWritersOnlyForExecution(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+	planner := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store)
+
+	dryRunReq := testRequest(now, false)
+	dryRunReq.SingleBlockWritersGuarded = false
+	dryRunReport, err := planner.Plan(context.Background(), dryRunReq)
+	require.NoError(err)
+	require.Equal(ActionReportOnly, dryRunReport.Items[0].Action)
+	require.False(dryRunReport.SafetyGates.SingleBlockWritersGuarded)
+
+	executeReq := testRequest(now, true)
+	executeReq.ProductionDeleteEnabled = true
+	executeReq.SingleBlockWritersGuarded = false
+	executeReport, err := planner.Plan(context.Background(), executeReq)
+	require.NoError(err)
+	require.Equal(ActionSkip, executeReport.Items[0].Action)
+	require.Equal(SkipSingleBlockWritersNotGuarded, executeReport.Items[0].SkipReason)
+	require.Error(planner.Apply(context.Background(), executeReq, executeReport))
+}
+
 func TestPlannerPlan_SkippedReorgAndPromotedRows(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -996,6 +1022,12 @@ func TestPlannerApply_RejectsTamperedReportBeforeManifestWrite(t *testing.T) {
 			},
 		},
 		{
+			name: "single-block writer gate mismatch",
+			mutate: func(req PlanRequest, report *Report) {
+				report.SafetyGates.SingleBlockWritersGuarded = false
+			},
+		},
+		{
 			name: "write-once policy gate mismatch",
 			mutate: func(req PlanRequest, report *Report) {
 				report.SafetyGates.CSCBWriteOncePolicyVerified = false
@@ -1143,6 +1175,16 @@ func TestPlannerApply_RejectsBlockThatIsNoLongerCanonical(t *testing.T) {
 	require.Equal(SkipMetadataChanged, report.Items[0].SkipReason)
 	require.Empty(repo.manifests)
 	require.Empty(store.deleted)
+}
+
+func TestPlannerReconcile_RequiresGuardedSingleBlockWritersForExecution(t *testing.T) {
+	require := require.New(t)
+	_, _, _, planner, _, req, _ := newExecutableTestFixture(t)
+	req.SingleBlockWritersGuarded = false
+
+	report, err := planner.Reconcile(context.Background(), req)
+	require.ErrorContains(err, "single-block writers")
+	require.Nil(report)
 }
 
 func TestPlannerReconcile_CompletesCrashBeforeDeletionRecord(t *testing.T) {
@@ -1445,16 +1487,17 @@ func newExecutableTestFixture(t *testing.T) (
 
 func testRequest(now time.Time, execute bool) PlanRequest {
 	return PlanRequest{
-		Environment:             "production",
-		Blockchain:              "solana",
-		Network:                 "mainnet",
-		Bucket:                  "co-chainstorage-solana-mainnet-prod",
-		Tag:                     0,
-		StartHeight:             428058000,
-		EndHeight:               428059000,
-		Now:                     now,
-		Execute:                 execute,
-		ClientMigrationApproved: true,
+		Environment:               "production",
+		Blockchain:                "solana",
+		Network:                   "mainnet",
+		Bucket:                    "co-chainstorage-solana-mainnet-prod",
+		Tag:                       0,
+		StartHeight:               428058000,
+		EndHeight:                 428059000,
+		Now:                       now,
+		Execute:                   execute,
+		ClientMigrationApproved:   true,
+		SingleBlockWritersGuarded: true,
 		Approval: Approval{
 			Chain:       "solana-mainnet",
 			StartHeight: 428058000,
