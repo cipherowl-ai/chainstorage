@@ -20,6 +20,7 @@ import (
 	blobstoragemocks "github.com/coinbase/chainstorage/internal/storage/blobstorage/mocks"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	metastoragemocks "github.com/coinbase/chainstorage/internal/storage/metastorage/mocks"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -725,7 +726,7 @@ func (m *consolidatedPayloadsMatcher) Matches(x any) bool {
 		if err := proto.Unmarshal(raw, &block); err != nil {
 			return false
 		}
-		if !proto.Equal(&block, m.blocks[i]) {
+		if !proto.Equal(&block, storageutils.CloneBlockWithoutStoragePlacement(m.blocks[i])) {
 			return false
 		}
 	}

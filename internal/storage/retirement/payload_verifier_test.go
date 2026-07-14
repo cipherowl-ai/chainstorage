@@ -27,7 +27,7 @@ func TestPayloadVerifier_ParsesAndMatchesExactPinnedVersions(t *testing.T) {
 	require.NoError(err)
 	var block api.Block
 	require.NoError(proto.Unmarshal(payload, &block))
-	expected, err := canonicalBlockDigest(normalizeStoragePlacement(&block))
+	expected, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(&block))
 	require.NoError(err)
 	require.Equal(expected, digest)
 
@@ -37,7 +37,7 @@ func TestPayloadVerifier_ParsesAndMatchesExactPinnedVersions(t *testing.T) {
 	require.Equal(expected, digest)
 }
 
-func TestPayloadVerifier_NormalizesOnlyStoragePlacementMetadata(t *testing.T) {
+func TestPayloadVerifier_RejectsCSCBPayloadWithStoragePlacementMetadata(t *testing.T) {
 	require := require.New(t)
 	candidate, store, payload := retirementPayloadFixture(t)
 
@@ -55,18 +55,12 @@ func TestPayloadVerifier_NormalizesOnlyStoragePlacementMetadata(t *testing.T) {
 	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, consolidatedPayload)
 
 	_, err = newPayloadVerifier(store).Verify(context.Background(), candidate)
-	require.NoError(err)
-
-	consolidated.Metadata.ParentHash = "different-parent"
-	consolidatedPayload, err = proto.Marshal(&consolidated)
-	require.NoError(err)
-	candidate.ByteLength = uint64(len(consolidatedPayload))
-	candidate.UncompressedLength = uint64(len(consolidatedPayload))
-	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, consolidatedPayload)
-
-	_, err = newPayloadVerifier(store).Verify(context.Background(), candidate)
 	require.Error(err)
-	require.Contains(err.Error(), "payloads differ")
+	require.Contains(err.Error(), "retains storage placement metadata")
+
+	_, err = newPayloadVerifier(store).VerifyConsolidated(context.Background(), candidate)
+	require.Error(err)
+	require.Contains(err.Error(), "retains storage placement metadata")
 }
 
 func TestPayloadVerifier_FreshInstanceDoesNotReuseCachedCSCBBytes(t *testing.T) {

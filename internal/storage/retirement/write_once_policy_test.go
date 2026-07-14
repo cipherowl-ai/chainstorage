@@ -56,11 +56,11 @@ func TestS3ObjectStore_InspectObjectRetentionSafetyRequiresAllControlPlaneProtec
 		},
 		{
 			name:       "missing conditional write protection",
-			statements: []string{validDeleteProtectionStatement(`"*"`), validLifecycleConfigurationProtectionStatement(`"*"`)},
+			statements: []string{validMutationProtectionStatement(`"*"`), validLifecycleConfigurationProtectionStatement(`"*"`)},
 		},
 		{
 			name:       "missing lifecycle configuration protection",
-			statements: []string{validConditionalWriteStatement(`"*"`), validDeleteProtectionStatement(`"*"`)},
+			statements: []string{validConditionalWriteStatement(`"*"`), validMutationProtectionStatement(`"*"`)},
 		},
 	}
 	for _, test := range tests {
@@ -225,20 +225,22 @@ func TestStatementEnforcesCSCBWriteOnce(t *testing.T) {
 	}
 }
 
-func TestStatementEnforcesCSCBDeleteProtection(t *testing.T) {
+func TestStatementEnforcesCSCBMutationProtection(t *testing.T) {
 	objectARN := "arn:aws:s3:::" + testWriteOnceBucket + "/" + testWriteOnceKey
-	valid := validDeleteProtectionStatement(`"*"`)
+	valid := validMutationProtectionStatement(`"*"`)
 	tests := []struct {
 		name   string
 		policy string
 		valid  bool
 	}{
 		{name: "valid all principal", policy: valid, valid: true},
-		{name: "valid terraform principal", policy: validDeleteProtectionStatement(`{"AWS":["*"]}`), valid: true},
+		{name: "valid terraform principal", policy: validMutationProtectionStatement(`{"AWS":["*"]}`), valid: true},
 		{name: "allow is insufficient", policy: replacePolicy(valid, `"Effect":"Deny"`, `"Effect":"Allow"`)},
 		{name: "restricted principal", policy: replacePolicy(valid, `"Principal":"*"`, `"Principal":{"AWS":"arn:aws:iam::992382740726:role/writer"}`)},
 		{name: "missing delete object", policy: replacePolicy(valid, `"s3:DeleteObject",`, ``)},
 		{name: "missing delete version", policy: replacePolicy(valid, `,"s3:DeleteObjectVersion"`, ``)},
+		{name: "missing replicate object", policy: replacePolicy(valid, `,"s3:ReplicateObject"`, ``)},
+		{name: "missing replicate delete", policy: replacePolicy(valid, `,"s3:ReplicateDelete"`, ``)},
 		{name: "wrong resource", policy: replacePolicy(valid, `/*/consolidated/*`, `/legacy/*`)},
 		{name: "narrowing condition", policy: replacePolicy(valid, `}`, `,"Condition":{"Bool":{"aws:SecureTransport":"true"}}}`)},
 		{name: "not action", policy: replacePolicy(valid, `"Action"`, `"NotAction"`)},
@@ -249,7 +251,7 @@ func TestStatementEnforcesCSCBDeleteProtection(t *testing.T) {
 			var statement bucketPolicyStatement
 			err := json.Unmarshal([]byte(test.policy), &statement)
 			require.NoError(t, err)
-			require.Equal(t, test.valid, statementEnforcesCSCBDeleteProtection(statement, objectARN))
+			require.Equal(t, test.valid, statementEnforcesCSCBMutationProtection(statement, objectARN))
 		})
 	}
 }
@@ -285,7 +287,7 @@ func validWriteOncePolicy(principal string) string {
 	return fmt.Sprintf(
 		`{"Version":"2012-10-17","Statement":[%s,%s,%s]}`,
 		validConditionalWriteStatement(principal),
-		validDeleteProtectionStatement(principal),
+		validMutationProtectionStatement(principal),
 		validLifecycleConfigurationProtectionStatement(principal),
 	)
 }
@@ -294,8 +296,8 @@ func validConditionalWriteStatement(principal string) string {
 	return fmt.Sprintf(`{"Effect":"Deny","Principal":%s,"Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/*/consolidated/*","Condition":{"Null":{"s3:if-none-match":"true"}}}`, principal, testWriteOnceBucket)
 }
 
-func validDeleteProtectionStatement(principal string) string {
-	return fmt.Sprintf(`{"Effect":"Deny","Principal":%s,"Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":"arn:aws:s3:::%s/*/consolidated/*"}`, principal, testWriteOnceBucket)
+func validMutationProtectionStatement(principal string) string {
+	return fmt.Sprintf(`{"Effect":"Deny","Principal":%s,"Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ReplicateObject","s3:ReplicateDelete"],"Resource":"arn:aws:s3:::%s/*/consolidated/*"}`, principal, testWriteOnceBucket)
 }
 
 func validLifecycleConfigurationProtectionStatement(principal string) string {

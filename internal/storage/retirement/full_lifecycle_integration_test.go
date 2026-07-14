@@ -1,9 +1,11 @@
 package retirement_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"testing"
 	"time"
 
@@ -19,9 +21,11 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	chains3 "github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	metapostgres "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -120,7 +124,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	downloadedLegacy, err := blob.Download(ctx, records[0].Metadata)
 	require.NoError(err)
 	require.True(proto.Equal(block, downloadedLegacy))
-	consolidatedPayload, err := proto.Marshal(downloadedLegacy)
+	consolidatedPayload, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(downloadedLegacy))
 	require.NoError(err)
 	consolidatedKey, placements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{
 		Metadata:           records[0].Metadata,
@@ -167,7 +171,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, active.ObjectFormat)
 	parsedCSCB, err := blob.Download(ctx, active)
 	require.NoError(err)
-	require.True(proto.Equal(normalizeLifecycleBlock(block), normalizeLifecycleBlock(parsedCSCB)))
+	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(parsedCSCB)))
 
 	policy := retentionSafeBucketPolicy(bucket)
 	_, err = rawS3.PutBucketPolicy(ctx, &awss3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(policy)})
@@ -255,17 +259,58 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.Equal(consolidatedKey, activeAfterDelete.ObjectKeyMain)
 	parsedAfterDelete, err := blob.Download(ctx, activeAfterDelete)
 	require.NoError(err)
-	require.True(proto.Equal(normalizeLifecycleBlock(block), normalizeLifecycleBlock(parsedAfterDelete)))
+	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(parsedAfterDelete)))
+	rawCSCBBlock, err := readRawLifecycleCSCBBlock(ctx, rawS3, bucket, consolidatedKey, activeAfterDelete)
+	require.NoError(err)
+	require.False(storageutils.HasBlockStoragePlacement(rawCSCBBlock))
+	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), rawCSCBBlock))
 }
 
-func normalizeLifecycleBlock(block *api.Block) *api.Block {
-	clone := proto.Clone(block).(*api.Block)
-	clone.Metadata.ObjectKeyMain = ""
-	clone.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
-	clone.Metadata.ByteOffset = 0
-	clone.Metadata.ByteLength = 0
-	clone.Metadata.UncompressedLength = 0
-	return clone
+func readRawLifecycleCSCBBlock(
+	ctx context.Context,
+	client *awss3.Client,
+	bucket string,
+	key string,
+	metadata *api.BlockMetadata,
+) (*api.Block, error) {
+	object, err := client.GetObject(ctx, &awss3.GetObjectInput{Bucket: aws.String(bucket), Key: aws.String(key)})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = object.Body.Close() }()
+	data, err := io.ReadAll(object.Body)
+	if err != nil {
+		return nil, err
+	}
+	index, err := cscb.ParseIndex(data)
+	if err != nil {
+		return nil, err
+	}
+	block, chunk, err := index.LookupBlock(metadata)
+	if err != nil {
+		return nil, err
+	}
+	start := chunk.CompressedPayloadOffset
+	end := start + chunk.CompressedLength
+	if end < start || end > uint64(len(data)) {
+		return nil, fmt.Errorf("CSCB chunk bounds are invalid: start=%d end=%d bytes=%d", start, end, len(data))
+	}
+	chunkPayload, err := cscb.DecodeChunkFrame(bytes.NewReader(data[start:end]), index.Header.Codec)
+	if err != nil {
+		return nil, err
+	}
+	if err := cscb.ValidateChunkPayload(chunkPayload, chunk); err != nil {
+		return nil, err
+	}
+	payload, err := cscb.ExtractBlockPayload(chunkPayload, block)
+	if err != nil {
+		return nil, err
+	}
+	var result api.Block
+	if err := proto.Unmarshal(payload, &result); err != nil {
+		return nil, err
+	}
+	return &result, nil
 }
 
 func openLifecycleDB(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {
@@ -286,7 +331,7 @@ func retentionSafeBucketPolicy(bucket string) string {
 		"Version":"2012-10-17",
 		"Statement":[
 			{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::%[1]s/*/consolidated/*","Condition":{"Null":{"s3:if-none-match":"true"}}},
-			{"Effect":"Deny","Principal":"*","Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":"arn:aws:s3:::%[1]s/*/consolidated/*"},
+			{"Effect":"Deny","Principal":"*","Action":["s3:DeleteObject","s3:DeleteObjectVersion","s3:ReplicateObject","s3:ReplicateDelete"],"Resource":"arn:aws:s3:::%[1]s/*/consolidated/*"},
 			{"Effect":"Deny","Principal":"*","Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::%[1]s"}
 		]
 	}`, bucket)

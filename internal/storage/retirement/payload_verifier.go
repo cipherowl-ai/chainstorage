@@ -61,8 +61,11 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 	if err := validatePayloadIdentity(cscbBlock, candidate); err != nil {
 		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
 	}
-	legacyComparable := normalizeStoragePlacement(&legacyBlock)
-	cscbComparable := normalizeStoragePlacement(cscbBlock)
+	if storageutils.HasBlockStoragePlacement(cscbBlock) {
+		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
+	}
+	legacyComparable := storageutils.CloneBlockWithoutStoragePlacement(&legacyBlock)
+	cscbComparable := storageutils.CloneBlockWithoutStoragePlacement(cscbBlock)
 	if !proto.Equal(legacyComparable, cscbComparable) {
 		return "", xerrors.Errorf("legacy and CSCB block payloads differ at height %d", candidate.Height)
 	}
@@ -88,20 +91,10 @@ func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Cand
 	if err := validatePayloadIdentity(block, candidate); err != nil {
 		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
 	}
-	return canonicalBlockDigest(normalizeStoragePlacement(block))
-}
-
-func normalizeStoragePlacement(block *api.Block) *api.Block {
-	clone := proto.Clone(block).(*api.Block)
-	if clone.Metadata == nil {
-		return clone
+	if storageutils.HasBlockStoragePlacement(block) {
+		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
 	}
-	clone.Metadata.ObjectKeyMain = ""
-	clone.Metadata.ByteOffset = 0
-	clone.Metadata.ByteLength = 0
-	clone.Metadata.UncompressedLength = 0
-	clone.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_LEGACY_SINGLE_BLOCK
-	return clone
+	return canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(block))
 }
 
 func canonicalBlockDigest(block *api.Block) (string, error) {

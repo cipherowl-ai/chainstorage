@@ -17,7 +17,7 @@ import (
 	"golang.org/x/xerrors"
 )
 
-const cscbWriteOncePolicyMode = "bucket_deny_unconditional_put_all_delete_and_lifecycle_mutation_no_matching_lifecycle_actions"
+const cscbWriteOncePolicyMode = "bucket_deny_unconditional_put_delete_replication_and_lifecycle_mutation_no_matching_lifecycle_actions"
 
 type (
 	policyStringList []string
@@ -69,24 +69,24 @@ func (s *S3ObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket
 	objectARN := "arn:aws:s3:::" + bucket + "/" + key
 	bucketARN := "arn:aws:s3:::" + bucket
 	writeProtected := false
-	deleteProtected := false
+	mutationProtected := false
 	lifecycleConfigurationProtected := false
 	for _, statement := range policy.Statements {
 		if statementEnforcesCSCBWriteOnce(statement, objectARN) {
 			writeProtected = true
 		}
-		if statementEnforcesCSCBDeleteProtection(statement, objectARN) {
-			deleteProtected = true
+		if statementEnforcesCSCBMutationProtection(statement, objectARN) {
+			mutationProtected = true
 		}
 		if statementEnforcesLifecycleConfigurationProtection(statement, bucketARN) {
 			lifecycleConfigurationProtected = true
 		}
 	}
-	if !writeProtected || !deleteProtected || !lifecycleConfigurationProtected {
+	if !writeProtected || !mutationProtected || !lifecycleConfigurationProtected {
 		return snapshot, xerrors.Errorf(
-			"bucket policy does not make CSCB object retention-safe (conditional_put=%t delete_protected=%t lifecycle_configuration_protected=%t): bucket=%s key=%s",
+			"bucket policy does not make CSCB object retention-safe (conditional_put=%t mutation_protected=%t lifecycle_configuration_protected=%t): bucket=%s key=%s",
 			writeProtected,
-			deleteProtected,
+			mutationProtected,
 			lifecycleConfigurationProtected,
 			bucket,
 			key,
@@ -223,13 +223,15 @@ func statementEnforcesCSCBWriteOnce(statement bucketPolicyStatement, objectARN s
 	return ok && len(values) == 1 && values[0] == "true"
 }
 
-func statementEnforcesCSCBDeleteProtection(statement bucketPolicyStatement, objectARN string) bool {
+func statementEnforcesCSCBMutationProtection(statement bucketPolicyStatement, objectARN string) bool {
 	if statement.Effect != "Deny" || len(statement.NotPrincipal) != 0 || len(statement.NotAction) != 0 || len(statement.NotResource) != 0 || len(statement.Condition) != 0 {
 		return false
 	}
 	return principalIncludesEveryone(statement.Principal) &&
 		policyPatternsInclude(statement.Action, "s3:DeleteObject") &&
 		policyPatternsInclude(statement.Action, "s3:DeleteObjectVersion") &&
+		policyPatternsInclude(statement.Action, "s3:ReplicateObject") &&
+		policyPatternsInclude(statement.Action, "s3:ReplicateDelete") &&
 		policyPatternsInclude(statement.Resource, objectARN)
 }
 

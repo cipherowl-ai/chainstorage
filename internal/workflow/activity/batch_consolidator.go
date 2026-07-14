@@ -18,6 +18,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -640,7 +641,8 @@ func (a *BatchConsolidator) buildPayloads(
 			if err := validateDownloadedBlock(metadata, block); err != nil {
 				return err
 			}
-			rawBlockPayload, err := proto.Marshal(block)
+			storageNeutralBlock := storageutils.CloneBlockWithoutStoragePlacement(block)
+			rawBlockPayload, err := proto.Marshal(storageNeutralBlock)
 			if err != nil {
 				return xerrors.Errorf("failed to marshal block (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
