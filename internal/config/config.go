@@ -631,6 +631,7 @@ const (
 	// auto_consolidate, which is the normal serial cron mode.
 	ConsolidationModeHistoricalBackfill        ConsolidationMode = "historical_backfill"
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
+	ConsolidationModeRepairExistingCSCB        ConsolidationMode = "repair_existing_cscb"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
 	DefaultSingleBlockObjectRetention                            = 72 * time.Hour
 
@@ -655,6 +656,10 @@ func (m ConsolidationMode) IsShadowWrite() bool {
 	return m == ConsolidationModeShadowDualWrite ||
 		m == ConsolidationModeAutoConsolidate ||
 		m == ConsolidationModeHistoricalBackfill
+}
+
+func (m ConsolidationMode) IsRepairExistingCSCB() bool {
+	return m == ConsolidationModeRepairExistingCSCB
 }
 
 func New(opts ...ConfigOption) (*Config, error) {

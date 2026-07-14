@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"strconv"
 
 	"go.temporal.io/sdk/client"
@@ -31,7 +33,7 @@ type (
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill"`
+		Mode           config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
 		Tag            uint32
 		StartHeight    uint64
 		EndHeight      uint64 `validate:"gtfield=StartHeight"`
@@ -164,6 +166,23 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		ctx = w.withActivityOptions(ctx)
 		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
 		cursorCtx := w.withCursorActivityOptions(ctx, cfg)
+		if mode.IsRepairExistingCSCB() {
+			if parallelism != 1 {
+				return xerrors.Errorf("repair_existing_cscb requires parallelism=1, got %d", parallelism)
+			}
+			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
+				return err
+			}
+			return w.executeRepairExistingCSCB(
+				ctx,
+				logger,
+				metrics,
+				request,
+				tag,
+				checkpointSize,
+				maxBlocks,
+			)
+		}
 		usePersistedShadowStats := workflow.GetVersion(
 			ctx,
 			batchConsolidatorShadowStatsChangeID,
@@ -464,6 +483,81 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		logger.Info("workflow finished")
 		return nil
 	})
+}
+
+func (w *BatchConsolidator) executeRepairExistingCSCB(
+	ctx workflow.Context,
+	logger *zap.Logger,
+	metrics client.MetricsHandler,
+	request *BatchConsolidatorRequest,
+	tag uint32,
+	checkpointSize uint64,
+	maxBlocks uint64,
+) error {
+	processedBlocks := uint64(0)
+	repairIteration := uint64(0)
+	for {
+		response, err := w.batchConsolidator.Execute(ctx, &activity.BatchConsolidatorRequest{
+			Mode:               config.ConsolidationModeRepairExistingCSCB,
+			Tag:                tag,
+			StartHeight:        request.StartHeight,
+			EndHeight:          request.EndHeight,
+			MaxBlocks:          maxBlocks,
+			RepairExecutionKey: makeRepairExecutionKey(ctx, repairIteration),
+		})
+		if err != nil {
+			return xerrors.Errorf(
+				"failed to repair existing CSCB range [%d, %d): %w",
+				request.StartHeight,
+				request.EndHeight,
+				err,
+			)
+		}
+		if response.RepairedObjects == 0 {
+			metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
+			logger.Info("CSCB repair range is complete")
+			return nil
+		}
+		if response.ScannedBlocks == 0 {
+			return xerrors.Errorf(
+				"repair_existing_cscb made no block progress for old object %q",
+				response.OldObjectKey,
+			)
+		}
+		processedBlocks += response.ScannedBlocks
+		metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(response.RepairedObjects))
+		metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(response.ConsolidatedBlocks))
+		metrics.Gauge(batchConsolidatorHeightGauge).Update(float64(response.EndHeight - 1))
+		logger.Info(
+			"repaired existing CSCB object",
+			zap.String("old_object_key", response.OldObjectKey),
+			zap.String("new_object_key", response.ObjectKey),
+			zap.Uint64("start_height", response.StartHeight),
+			zap.Uint64("end_height", response.EndHeight),
+			zap.Uint64("blocks", response.ScannedBlocks),
+			zap.Uint64("canonical_blocks", response.ConsolidatedBlocks),
+			zap.Bool("rebuilt_cscb", response.ObjectKey != "" && response.ObjectKey != response.OldObjectKey),
+		)
+		repairIteration++
+		if processedBlocks >= checkpointSize {
+			newRequest := *request
+			logger.Info(
+				"CSCB repair checkpoint reached",
+				zap.Uint64("processed_blocks", processedBlocks),
+				zap.Reflect("new_request", newRequest),
+			)
+			return w.continueAsNew(ctx, &newRequest)
+		}
+	}
+}
+
+func makeRepairExecutionKey(ctx workflow.Context, iteration uint64) string {
+	info := workflow.GetInfo(ctx)
+	payload := info.WorkflowExecution.ID + "\x00" +
+		info.WorkflowExecution.RunID + "\x00" +
+		strconv.FormatUint(iteration, 10)
+	digest := sha256.Sum256([]byte(payload))
+	return hex.EncodeToString(digest[:])
 }
 
 func (w *BatchConsolidator) processAutoConsolidateBatchParallel(
@@ -789,15 +883,17 @@ func batchConsolidatorMode(
 	case config.ConsolidationModeShadowDualWrite,
 		config.ConsolidationModeAutoConsolidate,
 		config.ConsolidationModeHistoricalBackfill,
-		config.ConsolidationModePromoteFinalized:
+		config.ConsolidationModePromoteFinalized,
+		config.ConsolidationModeRepairExistingCSCB:
 		return mode, nil
 	default:
 		return "", xerrors.Errorf(
-			"batch_consolidator requires mode %q, %q, %q, or %q, got %q",
+			"batch_consolidator requires mode %q, %q, %q, %q, or %q, got %q",
 			config.ConsolidationModeShadowDualWrite,
 			config.ConsolidationModeAutoConsolidate,
 			config.ConsolidationModeHistoricalBackfill,
 			config.ConsolidationModePromoteFinalized,
+			config.ConsolidationModeRepairExistingCSCB,
 			mode,
 		)
 	}

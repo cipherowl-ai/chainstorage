@@ -22,6 +22,18 @@ type blockPayloadVerifier interface {
 	VerifyConsolidated(ctx context.Context, candidate Candidate) (string, error)
 }
 
+type (
+	PinnedPayloadInspection struct {
+		CanonicalSHA256     string
+		HasStoragePlacement bool
+	}
+
+	PinnedPayloadVerifier interface {
+		InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
+		InspectConsolidated(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
+	}
+)
+
 type payloadVerifier struct {
 	store ObjectStore
 
@@ -37,64 +49,81 @@ func newPayloadVerifier(store ObjectStore) *payloadVerifier {
 	}
 }
 
+func NewPinnedPayloadVerifier(store ObjectStore) PinnedPayloadVerifier {
+	return newPayloadVerifier(store)
+}
+
 func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (string, error) {
-	singleBlockCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
+	singleBlockInspection, err := v.InspectSingleBlock(ctx, candidate)
 	if err != nil {
 		return "", err
+	}
+	consolidatedInspection, err := v.InspectConsolidated(ctx, candidate)
+	if err != nil {
+		return "", err
+	}
+	if consolidatedInspection.HasStoragePlacement {
+		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
+	}
+	if singleBlockInspection.CanonicalSHA256 != consolidatedInspection.CanonicalSHA256 {
+		return "", xerrors.Errorf("single-block and CSCB block payloads differ at height %d", candidate.Height)
+	}
+	return singleBlockInspection.CanonicalSHA256, nil
+}
+
+func (v *payloadVerifier) InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error) {
+	singleBlockCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
+	if err != nil {
+		return PinnedPayloadInspection{}, err
 	}
 	singleBlockPayload, err := storageutils.Decompress(singleBlockCompressed, storageutils.GetCompressionType(candidate.Key))
 	if err != nil {
-		return "", xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
+		return PinnedPayloadInspection{}, xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
 	}
 	var singleBlockBlock api.Block
 	if err := proto.Unmarshal(singleBlockPayload, &singleBlockBlock); err != nil {
-		return "", xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
+		return PinnedPayloadInspection{}, xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
 	}
 	if err := validatePayloadIdentity(&singleBlockBlock, candidate); err != nil {
-		return "", xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
+		return PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
 	}
+	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock))
+	if err != nil {
+		return PinnedPayloadInspection{}, err
+	}
+	return PinnedPayloadInspection{
+		CanonicalSHA256:     digest,
+		HasStoragePlacement: storageutils.HasBlockStoragePlacement(&singleBlockBlock),
+	}, nil
+}
 
+func (v *payloadVerifier) InspectConsolidated(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error) {
 	_, cscbBlock, err := v.readConsolidatedPayload(ctx, candidate)
 	if err != nil {
-		return "", err
+		return PinnedPayloadInspection{}, err
 	}
 	if err := validatePayloadIdentity(cscbBlock, candidate); err != nil {
-		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
+		return PinnedPayloadInspection{}, xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
 	}
-	if storageutils.HasBlockStoragePlacement(cscbBlock) {
-		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
-	}
-	singleBlockComparable := storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock)
-	cscbComparable := storageutils.CloneBlockWithoutStoragePlacement(cscbBlock)
-	if !proto.Equal(singleBlockComparable, cscbComparable) {
-		return "", xerrors.Errorf("single-block and CSCB block payloads differ at height %d", candidate.Height)
-	}
-	singleBlockDigest, err := canonicalBlockDigest(singleBlockComparable)
+	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(cscbBlock))
 	if err != nil {
-		return "", err
+		return PinnedPayloadInspection{}, err
 	}
-	cscbDigest, err := canonicalBlockDigest(cscbComparable)
-	if err != nil {
-		return "", err
-	}
-	if singleBlockDigest != cscbDigest {
-		return "", xerrors.Errorf("single-block and CSCB canonical payload digests differ at height %d", candidate.Height)
-	}
-	return singleBlockDigest, nil
+	return PinnedPayloadInspection{
+		CanonicalSHA256:     digest,
+		HasStoragePlacement: storageutils.HasBlockStoragePlacement(cscbBlock),
+	}, nil
 }
 
 func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Candidate) (string, error) {
-	_, block, err := v.readConsolidatedPayload(ctx, candidate)
+	inspection, err := v.InspectConsolidated(ctx, candidate)
 	if err != nil {
 		return "", err
 	}
-	if err := validatePayloadIdentity(block, candidate); err != nil {
-		return "", xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
-	}
-	if storageutils.HasBlockStoragePlacement(block) {
+	if inspection.HasStoragePlacement {
 		return "", xerrors.Errorf("pinned CSCB block payload retains storage placement metadata at height %d", candidate.Height)
 	}
-	return canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(block))
+	return inspection.CanonicalSHA256, nil
 }
 
 func canonicalBlockDigest(block *api.Block) (string, error) {

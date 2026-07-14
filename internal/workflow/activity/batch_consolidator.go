@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	sdkactivity "go.temporal.io/sdk/activity"
@@ -16,8 +17,12 @@ import (
 
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
+	chains3 "github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepair"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
+	metapostgres "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
+	"github.com/coinbase/chainstorage/internal/storage/retirement"
 	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
@@ -33,6 +38,9 @@ type (
 		config              *config.Config
 		metaStorage         metastorage.MetaStorage
 		blobStorage         blobstorage.BlobStorage
+		s3Client            chains3.Client
+		repairerMu          sync.Mutex
+		repairer            cscbrepair.Repairer
 	}
 
 	BatchConsolidatorParams struct {
@@ -41,14 +49,16 @@ type (
 		Runtime     cadence.Runtime
 		MetaStorage metastorage.MetaStorage
 		BlobStorage blobstorage.BlobStorage
+		S3Client    chains3.Client `optional:"true"`
 	}
 
 	BatchConsolidatorRequest struct {
-		Mode        config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill"`
-		Tag         uint32
-		StartHeight uint64
-		EndHeight   uint64 `validate:"gtfield=StartHeight"`
-		MaxBlocks   uint64 `validate:"required"`
+		Mode               config.ConsolidationMode `validate:"omitempty,oneof=shadow_dual_write auto_consolidate historical_backfill repair_existing_cscb"`
+		Tag                uint32
+		StartHeight        uint64
+		EndHeight          uint64 `validate:"gtfield=StartHeight"`
+		MaxBlocks          uint64 `validate:"required"`
+		RepairExecutionKey string
 	}
 
 	BatchConsolidatorResponse struct {
@@ -58,6 +68,8 @@ type (
 		ConsolidatedBlocks uint64
 		PromotedBlocks     uint64
 		ObjectKey          string
+		OldObjectKey       string
+		RepairedObjects    uint64
 	}
 
 	BatchConsolidatorStatsRequest struct {
@@ -118,6 +130,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 		config:              params.Config,
 		metaStorage:         params.MetaStorage,
 		blobStorage:         params.BlobStorage,
+		s3Client:            params.S3Client,
 	}
 	a.register(a.execute)
 	a.statsActivity.register(a.executeStats)
@@ -237,6 +250,9 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	if mode == "" {
 		mode = a.config.AWS.Storage.Consolidation.Mode
 	}
+	if mode.IsRepairExistingCSCB() {
+		return a.executeRepairExistingCSCB(ctx, request)
+	}
 	if mode.IsShadowWrite() {
 		return a.executeShadowDualWrite(ctx, request)
 	}
@@ -257,7 +273,162 @@ func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolida
 	}
 }
 
+func (a *BatchConsolidator) executeRepairExistingCSCB(
+	ctx context.Context,
+	request *BatchConsolidatorRequest,
+) (*BatchConsolidatorResponse, error) {
+	if err := a.validateConsolidationEnabled(); err != nil {
+		return nil, err
+	}
+	repairer, err := a.getCSCBRepairer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	progress := func(stage string, completed int, total int, height uint64) {
+		sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.repair."+stage, completed, total, height)
+	}
+	manifest, err := repairer.PrepareNext(
+		ctx,
+		request.RepairExecutionKey,
+		request.Tag,
+		request.StartHeight,
+		request.EndHeight,
+		request.MaxBlocks,
+		progress,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to prepare next CSCB repair: %w", err)
+	}
+	if manifest == nil {
+		return &BatchConsolidatorResponse{
+			StartHeight: request.StartHeight,
+			EndHeight:   request.EndHeight,
+		}, nil
+	}
+
+	logger := a.getLogger(ctx).With(
+		zap.Int64("repair_id", manifest.ID),
+		zap.String("repair_state", string(manifest.State)),
+		zap.String("old_object_key", manifest.OldConsolidatedObjectKey),
+		zap.Uint64("repair_start_height", manifest.StartHeight),
+		zap.Uint64("repair_end_height", manifest.EndHeight),
+		zap.Uint64("repair_blocks", manifest.TotalBlockCount),
+		zap.Uint64("repair_canonical_blocks", manifest.CanonicalBlockCount),
+	)
+	logger.Info("resuming CSCB repair")
+
+	if manifest.State == cscbrepair.StatePrepared {
+		manifest, err = repairer.Restore(ctx, manifest.ID, progress)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to restore CSCB repair to single-block metadata: %w", err)
+		}
+	}
+	if manifest.State == cscbrepair.StateRestored && manifest.CanonicalBlockCount > 0 {
+		expectedRecords := make(map[int64]cscbrepair.Block, manifest.CanonicalBlockCount)
+		for _, block := range manifest.Blocks {
+			if block.Canonical {
+				expectedRecords[block.BlockMetadataID] = block
+			}
+		}
+		normalResponse, err := a.executeShadowDualWriteWithExpected(ctx, &BatchConsolidatorRequest{
+			Mode:        config.ConsolidationModeHistoricalBackfill,
+			Tag:         manifest.Tag,
+			StartHeight: manifest.StartHeight,
+			EndHeight:   manifest.EndHeight,
+			MaxBlocks:   request.MaxBlocks,
+		}, expectedRecords)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to rebuild normalized CSCB: %w", err)
+		}
+		if normalResponse.ScannedBlocks != 0 && normalResponse.ScannedBlocks != manifest.CanonicalBlockCount {
+			return nil, xerrors.Errorf(
+				"CSCB repair rebuilt unexpected canonical row count: expected=%d actual=%d",
+				manifest.CanonicalBlockCount,
+				normalResponse.ScannedBlocks,
+			)
+		}
+		manifest, err = repairer.VerifyRebuilt(ctx, manifest.ID, progress)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to verify rebuilt CSCB: %w", err)
+		}
+	}
+	if manifest.State == cscbrepair.StateRestored || manifest.State == cscbrepair.StateVerified {
+		manifest, err = repairer.Complete(ctx, manifest.ID, progress)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to complete CSCB repair: %w", err)
+		}
+	}
+	if manifest.State != cscbrepair.StateCompleted {
+		return nil, xerrors.Errorf("CSCB repair made no terminal progress: id=%d state=%s", manifest.ID, manifest.State)
+	}
+
+	logger.Info(
+		"processed CSCB repair",
+		zap.String("final_state", string(manifest.State)),
+		zap.String("new_object_key", manifest.NewConsolidatedObjectKey),
+		zap.String("old_object_outcome", manifest.Outcome),
+	)
+	consolidatedBlocks := manifest.CanonicalBlockCount
+	promotedBlocks := manifest.CanonicalBlockCount
+	objectKey := manifest.NewConsolidatedObjectKey
+	if manifest.Outcome == cscbrepair.OutcomeAlreadyCleanStorageNeutral {
+		consolidatedBlocks = 0
+		promotedBlocks = 0
+		objectKey = manifest.OldConsolidatedObjectKey
+	}
+	return &BatchConsolidatorResponse{
+		StartHeight:        manifest.StartHeight,
+		EndHeight:          manifest.EndHeight,
+		ScannedBlocks:      manifest.TotalBlockCount,
+		ConsolidatedBlocks: consolidatedBlocks,
+		PromotedBlocks:     promotedBlocks,
+		ObjectKey:          objectKey,
+		OldObjectKey:       manifest.OldConsolidatedObjectKey,
+		RepairedObjects:    1,
+	}, nil
+}
+
+func (a *BatchConsolidator) getCSCBRepairer(ctx context.Context) (cscbrepair.Repairer, error) {
+	a.repairerMu.Lock()
+	defer a.repairerMu.Unlock()
+	if a.repairer != nil {
+		return a.repairer, nil
+	}
+	if a.config.StorageType.MetaStorageType != config.MetaStorageType_POSTGRES || a.config.AWS.Postgres == nil {
+		return nil, xerrors.New("repair_existing_cscb requires Postgres meta storage")
+	}
+	if a.config.StorageType.BlobStorageType != config.BlobStorageType_UNSPECIFIED &&
+		a.config.StorageType.BlobStorageType != config.BlobStorageType_S3 {
+		return nil, xerrors.New("repair_existing_cscb requires S3 blob storage")
+	}
+	if a.s3Client == nil {
+		return nil, xerrors.New("repair_existing_cscb requires an S3 client")
+	}
+	pool, err := metapostgres.GetConnectionPool(ctx, a.config.AWS.Postgres)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get CSCB repair Postgres pool: %w", err)
+	}
+	db := pool.DB()
+	if db == nil {
+		return nil, xerrors.New("CSCB repair Postgres pool returned a nil database")
+	}
+	a.repairer = cscbrepair.NewRepairer(
+		cscbrepair.NewPostgresRepository(db),
+		retirement.NewS3ObjectStore(a.s3Client),
+		a.config.AWS.Bucket,
+	)
+	return a.repairer, nil
+}
+
 func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
+	return a.executeShadowDualWriteWithExpected(ctx, request, nil)
+}
+
+func (a *BatchConsolidator) executeShadowDualWriteWithExpected(
+	ctx context.Context,
+	request *BatchConsolidatorRequest,
+	expectedRecords map[int64]cscbrepair.Block,
+) (*BatchConsolidatorResponse, error) {
 	if err := a.validateShadowWriteMode(request.Mode); err != nil {
 		return nil, err
 	}
@@ -282,9 +453,13 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 			return nil, err
 		}
 	}
-	prePromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
-	if err != nil {
-		return nil, err
+	var prePromotedBlocks uint64
+	if expectedRecords == nil {
+		var err error
+		prePromotedBlocks, err = a.promoteConsolidatedBlocks(ctx, mode, request)
+		if err != nil {
+			return nil, err
+		}
 	}
 	scanStart := time.Now()
 	records, err := a.metaStorage.GetBlocksMissingConsolidationShadow(ctx, request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks)
@@ -294,11 +469,23 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 	scanDuration := time.Since(scanStart)
 	logger.Info("scanned missing consolidation shadows", zap.Int("records", len(records)), zap.Duration("duration", scanDuration))
 	if len(records) == 0 {
+		if expectedRecords != nil {
+			postPromotedBlocks, err := a.promoteConsolidatedBlocks(ctx, mode, request)
+			if err != nil {
+				return nil, err
+			}
+			prePromotedBlocks += postPromotedBlocks
+		}
 		return &BatchConsolidatorResponse{
 			StartHeight:    request.StartHeight,
 			EndHeight:      request.EndHeight,
 			PromotedBlocks: prePromotedBlocks,
 		}, nil
+	}
+	if expectedRecords != nil {
+		if err := validateExactRepairRecords(records, expectedRecords); err != nil {
+			return nil, err
+		}
 	}
 
 	buildStart := time.Now()
@@ -363,6 +550,48 @@ func (a *BatchConsolidator) executeShadowDualWrite(ctx context.Context, request 
 		zap.Duration("total_duration", time.Since(totalStart)),
 	)
 	return response, nil
+}
+
+func validateExactRepairRecords(
+	records []*metastorage.BlockMetadataRecord,
+	expected map[int64]cscbrepair.Block,
+) error {
+	if len(records) != len(expected) {
+		return xerrors.Errorf("CSCB repair rebuild row count mismatch before upload: expected=%d actual=%d", len(expected), len(records))
+	}
+	seen := make(map[int64]struct{}, len(records))
+	for _, record := range records {
+		if record == nil || record.Metadata == nil {
+			return xerrors.New("CSCB repair rebuild returned missing block metadata record")
+		}
+		block, ok := expected[record.ID]
+		if !ok {
+			return xerrors.Errorf("CSCB repair rebuild returned unexpected metadata_id=%d", record.ID)
+		}
+		if _, ok := seen[record.ID]; ok {
+			return xerrors.Errorf("CSCB repair rebuild returned duplicate metadata_id=%d", record.ID)
+		}
+		seen[record.ID] = struct{}{}
+		metadata := record.Metadata
+		if metadata.GetTag() != block.Tag || metadata.GetHeight() != block.Height || metadata.GetHash() != block.Hash {
+			return xerrors.Errorf(
+				"CSCB repair rebuild identity changed for metadata_id=%d: expected=(%d,%d,%q) actual=(%d,%d,%q)",
+				record.ID,
+				block.Tag,
+				block.Height,
+				block.Hash,
+				metadata.GetTag(),
+				metadata.GetHeight(),
+				metadata.GetHash(),
+			)
+		}
+		if metadata.GetObjectKeyMain() != block.SingleBlockObjectKey ||
+			metadata.GetObjectFormat() != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK ||
+			metadata.GetByteOffset() != 0 || metadata.GetByteLength() != 0 || metadata.GetUncompressedLength() != 0 {
+			return xerrors.Errorf("CSCB repair rebuild metadata is not restored to the pinned single-block placement for metadata_id=%d", record.ID)
+		}
+	}
+	return nil
 }
 
 func (a *BatchConsolidator) executePromoteFinalized(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {

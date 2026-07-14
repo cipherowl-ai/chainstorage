@@ -173,6 +173,13 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 			AND shadow.single_block_delete_after IS NOT NULL
 			AND shadow.single_block_delete_after <= CURRENT_TIMESTAMP
 			AND shadow.single_block_object_deleted_at IS NULL
+			AND NOT EXISTS (
+				SELECT 1
+				FROM cscb_repair_block repair_block
+				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
+				WHERE repair_block.block_metadata_id = bm.id
+					AND repair.state <> 'completed'
+			)
 		FOR UPDATE OF cb, bm, shadow`
 	var lockedID int64
 	var databasePreparedAt time.Time
@@ -493,6 +500,9 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 			!metadata.shadowDeletedAt.Time.Equal(*manifest.DeletedAt) {
 			return time.Time{}, xerrors.Errorf("pending-verification retirement metadata is inconsistent: block_metadata_id=%d", blockMetadataID)
 		}
+		if err := clearCompletedRepairSingleBlockPath(ctx, tx, blockMetadataID, ""); err != nil {
+			return time.Time{}, err
+		}
 		if err := tx.Commit(); err != nil {
 			return time.Time{}, xerrors.Errorf("failed to commit idempotent retirement object deletion: %w", err)
 		}
@@ -563,10 +573,38 @@ func (r *PostgresRepository) RecordRetirementObjectDeleted(
 	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
 		return time.Time{}, xerrors.Errorf("%w: block_metadata_id=%d rows=%d err=%v", ErrRetirementClaimUnavailable, blockMetadataID, rows, err)
 	}
+	if err := clearCompletedRepairSingleBlockPath(ctx, tx, blockMetadataID, manifest.SingleBlockObjectKey); err != nil {
+		return time.Time{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return time.Time{}, xerrors.Errorf("failed to commit retirement object deletion: %w", err)
 	}
 	return databaseDeletedAt, nil
+}
+
+func clearCompletedRepairSingleBlockPath(
+	ctx context.Context,
+	tx *sql.Tx,
+	blockMetadataID int64,
+	expectedObjectKey string,
+) error {
+	result, err := tx.ExecContext(ctx, `
+		UPDATE cscb_repair_block
+		SET single_block_object_key_main = NULL
+		WHERE block_metadata_id = $1
+			AND single_block_object_key_main IS NOT NULL
+			AND ($2 = '' OR single_block_object_key_main = $2)`, blockMetadataID, expectedObjectKey)
+	if err != nil {
+		return xerrors.Errorf("failed to clear retired CSCB repair single-block path: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return xerrors.Errorf("failed to inspect retired CSCB repair path clear: %w", err)
+	}
+	if rows > 1 {
+		return xerrors.Errorf("retired CSCB repair path clear guard failed: block_metadata_id=%d rows=%d", blockMetadataID, rows)
+	}
+	return nil
 }
 
 func (r *PostgresRepository) FinalizeRetirement(
