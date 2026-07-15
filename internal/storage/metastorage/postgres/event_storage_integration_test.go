@@ -55,6 +55,7 @@ func (s *eventStorageTestSuite) SetupTest() {
 	// Get database connection for cleanup
 	db, err := newDBConnection(context.Background(), cfg.AWS.Postgres)
 	require.NoError(err)
+	require.NoError(runMigrations(context.Background(), db))
 	s.db = db
 }
 
