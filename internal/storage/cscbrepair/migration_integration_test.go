@@ -39,6 +39,7 @@ func TestIntegrationCSCBRepairReferenceIndexMigration(t *testing.T) {
 	require.NoError(goose.SetDialect("postgres"))
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
 	requireReferenceIndexes(t, db, "hash")
+	requireNoTemporaryReferenceIndexes(t, db)
 	requireReferenceIndexPlans(t, db)
 
 	// Rewind only the index migration and recreate the shape left by the
@@ -58,7 +59,24 @@ func TestIntegrationCSCBRepairReferenceIndexMigration(t *testing.T) {
 
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
 	requireReferenceIndexes(t, db, "hash")
+	requireNoTemporaryReferenceIndexes(t, db)
 	requireReferenceIndexPlans(t, db)
+}
+
+func requireNoTemporaryReferenceIndexes(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_class index_class
+		JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+		WHERE index_namespace.nspname = current_schema()
+			AND index_class.relname IN (
+				'idx_block_metadata_object_key_reference_hash_new',
+				'idx_block_consolidation_shadow_object_key_reference_hash_new'
+			)`).Scan(&count)
+	require.NoError(t, err)
+	require.Zero(t, count)
 }
 
 func requireReferenceIndexes(t *testing.T, db *sql.DB, expectedMethod string) {
