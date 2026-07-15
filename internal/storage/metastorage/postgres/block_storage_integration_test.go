@@ -636,7 +636,13 @@ func (s *blockStorageTestSuite) TestGetBlockByHashInvalidHeight() {
 func (s *blockStorageTestSuite) TestGetBlockByHashQueryUsesPartialIndex() {
 	require := testutil.Require(s.T())
 
-	rows, err := s.db.QueryContext(context.Background(), "EXPLAIN "+blockMetadataByHashQuery(), tag, s.config.Chain.BlockStartHeight, "0x0")
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	require.NoError(err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(context.Background(), "SET LOCAL enable_seqscan = off")
+	require.NoError(err)
+
+	rows, err := tx.QueryContext(context.Background(), "EXPLAIN "+blockMetadataByHashQuery(), tag, s.config.Chain.BlockStartHeight, "0x0")
 	require.NoError(err)
 	defer rows.Close()
 
