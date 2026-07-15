@@ -28,6 +28,20 @@ type eventStorageTestSuite struct {
 	db       *sql.DB
 }
 
+func (s *eventStorageTestSuite) SetupSuite() {
+	require := testutil.Require(s.T())
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		return
+	}
+
+	db, err := newDBConnection(context.Background(), cfg.AWS.Postgres)
+	require.NoError(err)
+	defer db.Close()
+	require.NoError(runMigrations(context.Background(), db))
+}
+
 func (s *eventStorageTestSuite) SetupTest() {
 	require := testutil.Require(s.T())
 	var accessor internal.MetaStorage
@@ -55,7 +69,6 @@ func (s *eventStorageTestSuite) SetupTest() {
 	// Get database connection for cleanup
 	db, err := newDBConnection(context.Background(), cfg.AWS.Postgres)
 	require.NoError(err)
-	require.NoError(runMigrations(context.Background(), db))
 	s.db = db
 }
 
