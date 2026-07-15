@@ -332,6 +332,30 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 	).Scan(&blockMetadataID)
 	require.NoError(err)
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+		VALUES ($1, $2, $3)`, height, blockMetadataID, tag)
+	require.NoError(err)
+	var nonCanonicalBlockMetadataID int64
+	err = s.db.QueryRowContext(ctx, `
+		INSERT INTO block_metadata (
+			height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+			object_format, byte_offset, byte_length, uncompressed_length
+		) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+		RETURNING id`,
+		height,
+		tag,
+		height-1,
+		"consolidated/non-canonical-null-hash.cscb.gzip",
+		time.Now().UTC().Unix(),
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+	).Scan(&nonCanonicalBlockMetadataID)
+	require.NoError(err)
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET single_block_retention_fenced_at = CURRENT_TIMESTAMP
+		WHERE id = $1`, nonCanonicalBlockMetadataID)
+	require.NoError(err)
 
 	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
 	require.True(ok)
@@ -351,6 +375,68 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 	require.NotNil(fencedGuard)
 	require.True(fencedGuard.RetirementFenced())
 	require.NoError(fencedGuard.Release())
+}
+
+func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesExactHash() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	height := s.config.Chain.BlockStartHeight + 3
+
+	var fencedBlockMetadataID int64
+	for _, blockHash := range []string{"unfenced-hash", "fenced-hash"} {
+		var blockMetadataID int64
+		err := s.db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, $3, $4, $5, $6, FALSE, $7, 0, 128, 128)
+			RETURNING id`,
+			height,
+			tag,
+			blockHash,
+			height-1,
+			"consolidated/"+blockHash+".cscb.gzip",
+			time.Now().UTC().Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&blockMetadataID)
+		require.NoError(err)
+		if blockHash == "fenced-hash" {
+			fencedBlockMetadataID = blockMetadataID
+		}
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET single_block_retention_fenced_at = CURRENT_TIMESTAMP
+		WHERE id = $1`, fencedBlockMetadataID)
+	require.NoError(err)
+
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
+	require.True(ok)
+	unfencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "unfenced-hash")
+	require.NoError(err)
+	require.False(unfencedGuard.RetirementFenced())
+	require.NoError(unfencedGuard.Release())
+	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "fenced-hash")
+	require.NoError(err)
+	require.True(fencedGuard.RetirementFenced())
+	require.NoError(fencedGuard.Release())
+}
+
+func (s *blockStorageTestSuite) TestSingleBlockUploadGuardWithoutHashAllowsMissingCanonicalMetadata() {
+	require := testutil.Require(s.T())
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
+	require.True(ok)
+
+	guard, err := guardStorage.AcquireSingleBlockUploadGuard(
+		context.Background(),
+		tag,
+		s.config.Chain.BlockStartHeight+4,
+		"",
+	)
+	require.NoError(err)
+	require.NotNil(guard)
+	require.False(guard.RetirementFenced())
+	require.NoError(guard.Release())
 }
 
 func (s *blockStorageTestSuite) TestSingleBlockShadowCompatibilityColumnsStaySynchronized() {
@@ -656,6 +742,70 @@ func (s *blockStorageTestSuite) TestGetBlockByHashQueryUsesPartialIndex() {
 
 	plan := strings.Join(lines, "\n")
 	assert.Contains(s.T(), plan, "unique_tag_hash_regular")
+	assert.NotContains(s.T(), plan, "Seq Scan")
+}
+
+func (s *blockStorageTestSuite) TestSingleBlockUploadGuardByHashQueryUsesPartialIndex() {
+	require := testutil.Require(s.T())
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	require.NoError(err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(context.Background(), "SET LOCAL enable_seqscan = off")
+	require.NoError(err)
+
+	rows, err := tx.QueryContext(
+		context.Background(),
+		"EXPLAIN "+singleBlockUploadGuardByHashQuery(),
+		tag,
+		s.config.Chain.BlockStartHeight,
+		"0x0",
+	)
+	require.NoError(err)
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		require.NoError(rows.Scan(&line))
+		lines = append(lines, line)
+	}
+	require.NoError(rows.Err())
+
+	plan := strings.Join(lines, "\n")
+	assert.Contains(s.T(), plan, "unique_tag_hash_regular")
+	assert.NotContains(s.T(), plan, "Seq Scan")
+}
+
+func (s *blockStorageTestSuite) TestSingleBlockUploadGuardWithoutHashQueryUsesCanonicalIndexes() {
+	require := testutil.Require(s.T())
+
+	tx, err := s.db.BeginTx(context.Background(), nil)
+	require.NoError(err)
+	defer func() { _ = tx.Rollback() }()
+	_, err = tx.ExecContext(context.Background(), "SET LOCAL enable_seqscan = off")
+	require.NoError(err)
+
+	rows, err := tx.QueryContext(
+		context.Background(),
+		"EXPLAIN "+singleBlockUploadGuardWithoutHashQuery(),
+		tag,
+		s.config.Chain.BlockStartHeight,
+	)
+	require.NoError(err)
+	defer rows.Close()
+
+	var lines []string
+	for rows.Next() {
+		var line string
+		require.NoError(rows.Scan(&line))
+		lines = append(lines, line)
+	}
+	require.NoError(rows.Err())
+
+	plan := strings.Join(lines, "\n")
+	assert.Contains(s.T(), plan, "Index Scan using canonical_blocks_")
+	assert.Contains(s.T(), plan, "block_metadata_pkey")
 	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 

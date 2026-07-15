@@ -7,7 +7,6 @@ import (
 
 	_ "github.com/lib/pq"
 	"go.uber.org/zap"
-	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/log"
@@ -23,6 +22,9 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 	// Add connect_timeout if specified
 	if cfg.ConnectTimeout > 0 {
 		dsn += fmt.Sprintf(" connect_timeout=%d", int(cfg.ConnectTimeout.Seconds()))
+	}
+	if cfg.StatementTimeout > 0 {
+		dsn += fmt.Sprintf(" statement_timeout=%d", cfg.StatementTimeout.Milliseconds())
 	}
 
 	// Debug output for CI troubleshooting
@@ -51,14 +53,6 @@ func newDBConnection(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 	db.SetMaxIdleConns(cfg.MinConnections)
 	db.SetConnMaxLifetime(cfg.MaxLifetime)
 	db.SetConnMaxIdleTime(cfg.MaxIdleTime)
-
-	// Set statement timeout if specified
-	if cfg.StatementTimeout > 0 {
-		_, err := db.ExecContext(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", cfg.StatementTimeout.Milliseconds()))
-		if err != nil {
-			return nil, xerrors.Errorf("failed to set statement timeout: %w", err)
-		}
-	}
 
 	// Do not run schema migrations from runtime service connections.
 	// Server pods may connect through read replicas, and worker users may not own

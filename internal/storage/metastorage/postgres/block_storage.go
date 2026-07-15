@@ -64,6 +64,50 @@ func blockMetadataByHashQuery() string {
 				LIMIT 1`, blockMetadataColumns)
 }
 
+func singleBlockUploadGuardByHashQuery() string {
+	return `
+		SELECT
+			bm.single_block_retention_fenced_at IS NOT NULL
+			OR EXISTS (
+				SELECT 1
+				FROM cscb_repair_block repair_block
+				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
+				WHERE repair_block.block_metadata_id = bm.id
+					AND repair.state <> 'completed'
+			)
+		FROM block_metadata bm
+		WHERE bm.tag = $1
+			AND bm.height = $2
+			AND bm.hash = $3
+			AND bm.skipped = FALSE
+		FOR UPDATE`
+}
+
+// A block without a hash can only be identified by its canonical tag and height.
+// Resolve that row through canonical_blocks so the lookup remains indexed.
+func singleBlockUploadGuardWithoutHashQuery() string {
+	return `
+		SELECT
+			bm.single_block_retention_fenced_at IS NOT NULL
+			OR EXISTS (
+				SELECT 1
+				FROM cscb_repair_block repair_block
+				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
+				WHERE repair_block.block_metadata_id = bm.id
+					AND repair.state <> 'completed'
+			)
+		FROM canonical_blocks cb
+		JOIN block_metadata bm
+			ON bm.id = cb.block_metadata_id
+			AND bm.tag = cb.tag
+			AND bm.height = cb.height
+		WHERE cb.tag = $1
+			AND cb.height = $2
+			AND bm.hash IS NULL
+			AND bm.skipped = FALSE
+		FOR UPDATE OF bm`
+}
+
 func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
 	metrics := params.Metrics.SubScope("block_storage").Tagged(map[string]string{
 		"storage_type": "postgres",
@@ -103,22 +147,11 @@ func (b *blockStorageImpl) AcquireSingleBlockUploadGuard(
 		return nil, err
 	}
 	var singleBlockWriteFenced bool
-	err = tx.QueryRowContext(ctx, `
-		SELECT
-			bm.single_block_retention_fenced_at IS NOT NULL
-			OR EXISTS (
-				SELECT 1
-				FROM cscb_repair_block repair_block
-				JOIN cscb_repair_manifest repair ON repair.id = repair_block.repair_id
-				WHERE repair_block.block_metadata_id = bm.id
-					AND repair.state <> 'completed'
-			)
-		FROM block_metadata bm
-		WHERE bm.tag = $1
-			AND bm.height = $2
-			AND bm.hash IS NOT DISTINCT FROM NULLIF($3, '')
-			AND bm.skipped = FALSE
-		FOR UPDATE`, tag, height, hash).Scan(&singleBlockWriteFenced)
+	if hash == "" {
+		err = tx.QueryRowContext(ctx, singleBlockUploadGuardWithoutHashQuery(), tag, height).Scan(&singleBlockWriteFenced)
+	} else {
+		err = tx.QueryRowContext(ctx, singleBlockUploadGuardByHashQuery(), tag, height, hash).Scan(&singleBlockWriteFenced)
+	}
 	if err != nil && err != sql.ErrNoRows {
 		_ = tx.Rollback()
 		_ = conn.Close()
