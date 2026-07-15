@@ -32,7 +32,7 @@ func (s *eventStorageTestSuite) SetupSuite() {
 	require := testutil.Require(s.T())
 	cfg, err := config.New()
 	require.NoError(err)
-	if cfg.AWS.Postgres == nil {
+	if !cfg.IsIntegrationTest() || cfg.AWS.Postgres == nil {
 		return
 	}
 
