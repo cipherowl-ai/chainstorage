@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/lib/pq"
 	"github.com/pressly/goose/v3"
 	"github.com/stretchr/testify/require"
 
@@ -38,32 +39,120 @@ func TestIntegrationCSCBRepairReferenceIndexMigration(t *testing.T) {
 	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
 	require.NoError(goose.SetDialect("postgres"))
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+	requireCandidateIndex(t, db)
 	requireReferenceIndexes(t, db, "hash")
-	requireNoTemporaryReferenceIndexes(t, db)
-	requireReferenceIndexPlans(t, db)
+	requireNoTemporaryIndexes(t, db)
+	requireIndexPlans(t, db)
 
 	// Rewind only the index migration and recreate the shape left by the
 	// original B-tree migration. Applying the migration again must replace it,
 	// just as it replaces an invalid concurrent index left by a failed build.
 	require.NoError(goose.DownToContext(ctx, db, "db/migrations", 20260714000001))
 	_, err = db.ExecContext(ctx, `
+		CREATE INDEX idx_block_metadata_cscb_repair_candidate
+		ON block_metadata (tag, height DESC, object_key_main, id)
+		WHERE object_format = 1 AND object_key_main IS NOT NULL AND object_key_main <> '';
+
 		CREATE INDEX idx_block_metadata_object_key_reference
 		ON block_metadata (object_key_main, id)
 		WHERE object_key_main IS NOT NULL AND object_key_main <> '';
 
 		CREATE INDEX idx_block_consolidation_shadow_object_key_reference
 		ON block_consolidation_shadow (consolidated_object_key_main, block_metadata_id)
+		WHERE consolidated_object_key_main IS NOT NULL AND consolidated_object_key_main <> '';
+
+		CREATE INDEX idx_block_metadata_cscb_repair_candidate_new
+		ON block_metadata (tag, height DESC, object_key_main, id)
+		WHERE object_format = 1 AND object_key_main IS NOT NULL AND object_key_main <> '';
+
+		CREATE INDEX idx_block_metadata_object_key_reference_hash_new
+		ON block_metadata USING HASH (object_key_main)
+		WHERE object_key_main IS NOT NULL AND object_key_main <> '';
+
+		CREATE INDEX idx_block_consolidation_shadow_object_key_reference_hash_new
+		ON block_consolidation_shadow USING HASH (consolidated_object_key_main)
 		WHERE consolidated_object_key_main IS NOT NULL AND consolidated_object_key_main <> ''`)
 	require.NoError(err)
-	requireReferenceIndexes(t, db, "btree")
+
+	// Only the isolated local test superuser may emulate catalog state from an
+	// interrupted concurrent build. Migrations still run as the application
+	// owner so this test does not alter normal object ownership or privileges.
+	superuserConfig := *cfg.AWS.Postgres
+	superuserConfig.User = "postgres"
+	superuserConfig.Password = "postgres"
+	catalogDB, err := openRepairDB(ctx, &superuserConfig)
+	require.NoError(err)
+	defer func() { _ = catalogDB.Close() }()
+	_, err = catalogDB.ExecContext(ctx, `
+		UPDATE pg_index
+		SET indisvalid = FALSE, indisready = FALSE
+		WHERE indexrelid IN (
+			'idx_block_metadata_cscb_repair_candidate'::regclass,
+			'idx_block_metadata_object_key_reference'::regclass,
+			'idx_block_consolidation_shadow_object_key_reference'::regclass,
+			'idx_block_metadata_cscb_repair_candidate_new'::regclass,
+			'idx_block_metadata_object_key_reference_hash_new'::regclass,
+			'idx_block_consolidation_shadow_object_key_reference_hash_new'::regclass
+		)`)
+	require.NoError(err)
+	requireInvalidIndexes(t, db, 6)
 
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+	requireCandidateIndex(t, db)
 	requireReferenceIndexes(t, db, "hash")
-	requireNoTemporaryReferenceIndexes(t, db)
-	requireReferenceIndexPlans(t, db)
+	requireNoTemporaryIndexes(t, db)
+	requireIndexPlans(t, db)
 }
 
-func requireNoTemporaryReferenceIndexes(t *testing.T, db *sql.DB) {
+func requireCandidateIndex(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var method, definition string
+	var valid, ready bool
+	err := db.QueryRow(`
+		SELECT access_method.amname, index_state.indisvalid, index_state.indisready,
+			pg_get_indexdef(index_state.indexrelid)
+		FROM pg_index index_state
+		JOIN pg_class index_class ON index_class.oid = index_state.indexrelid
+		JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+		JOIN pg_am access_method ON access_method.oid = index_class.relam
+		WHERE index_namespace.nspname = current_schema()
+			AND index_class.relname = 'idx_block_metadata_cscb_repair_candidate'`).Scan(
+		&method,
+		&valid,
+		&ready,
+		&definition,
+	)
+	require.NoError(t, err)
+	require.Equal(t, "btree", method)
+	require.True(t, valid)
+	require.True(t, ready)
+	require.Contains(t, definition, "(tag, height DESC, object_key_main, id)")
+	require.Contains(t, definition, "object_format = 1")
+}
+
+func requireInvalidIndexes(t *testing.T, db *sql.DB, expected int) {
+	t.Helper()
+	var count int
+	err := db.QueryRow(`
+		SELECT COUNT(*)
+		FROM pg_index index_state
+		JOIN pg_class index_class ON index_class.oid = index_state.indexrelid
+		JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
+		WHERE index_namespace.nspname = current_schema()
+			AND index_class.relname IN (
+				'idx_block_metadata_cscb_repair_candidate',
+				'idx_block_metadata_object_key_reference',
+				'idx_block_consolidation_shadow_object_key_reference',
+				'idx_block_metadata_cscb_repair_candidate_new',
+				'idx_block_metadata_object_key_reference_hash_new',
+				'idx_block_consolidation_shadow_object_key_reference_hash_new'
+			)
+			AND (NOT index_state.indisvalid OR NOT index_state.indisready)`).Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, expected, count)
+}
+
+func requireNoTemporaryIndexes(t *testing.T, db *sql.DB) {
 	t.Helper()
 	var count int
 	err := db.QueryRow(`
@@ -72,6 +161,7 @@ func requireNoTemporaryReferenceIndexes(t *testing.T, db *sql.DB) {
 		JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
 		WHERE index_namespace.nspname = current_schema()
 			AND index_class.relname IN (
+				'idx_block_metadata_cscb_repair_candidate_new',
 				'idx_block_metadata_object_key_reference_hash_new',
 				'idx_block_consolidation_shadow_object_key_reference_hash_new'
 			)`).Scan(&count)
@@ -120,23 +210,32 @@ func requireReferenceIndex(t *testing.T, db *sql.DB, indexName string, column st
 	}
 }
 
-func requireReferenceIndexPlans(t *testing.T, db *sql.DB) {
+func requireIndexPlans(t *testing.T, db *sql.DB) {
 	t.Helper()
 	requireReferenceIndexPlan(t, db, `
 		SELECT COUNT(*)
 		FROM block_metadata
-		WHERE object_key_main = 'consolidated/test.cscb'
+		WHERE object_key_main = $1
 			AND object_key_main <> ''
-			AND NOT (id = ANY(ARRAY[1]::BIGINT[]))`, "idx_block_metadata_object_key_reference")
+			AND NOT (id = ANY($2))`, "idx_block_metadata_object_key_reference", "consolidated/test.cscb", pq.Array([]int64{1}))
 	requireReferenceIndexPlan(t, db, `
 		SELECT COUNT(*)
 		FROM block_consolidation_shadow
-		WHERE consolidated_object_key_main = 'consolidated/test.cscb'
+		WHERE consolidated_object_key_main = $1
 			AND consolidated_object_key_main <> ''
-			AND NOT (block_metadata_id = ANY(ARRAY[1]::BIGINT[]))`, "idx_block_consolidation_shadow_object_key_reference")
+			AND NOT (block_metadata_id = ANY($2))`, "idx_block_consolidation_shadow_object_key_reference", "consolidated/test.cscb", pq.Array([]int64{1}))
+	requireReferenceIndexPlan(t, db, `
+		SELECT object_key_main
+		FROM block_metadata
+		WHERE tag = $1
+			AND height >= $2
+			AND height < $3
+			AND object_format = $4
+			AND object_key_main IS NOT NULL
+			AND object_key_main <> ''`, "idx_block_metadata_cscb_repair_candidate", uint32(2), uint64(1000), uint64(2000), 1)
 }
 
-func requireReferenceIndexPlan(t *testing.T, db *sql.DB, query string, indexName string) {
+func requireReferenceIndexPlan(t *testing.T, db *sql.DB, query string, indexName string, args ...any) {
 	t.Helper()
 	tx, err := db.Begin()
 	require.NoError(t, err)
@@ -144,7 +243,7 @@ func requireReferenceIndexPlan(t *testing.T, db *sql.DB, query string, indexName
 	_, err = tx.Exec(`SET LOCAL enable_seqscan = off`)
 	require.NoError(t, err)
 
-	rows, err := tx.Query("EXPLAIN (COSTS OFF) " + query)
+	rows, err := tx.Query("EXPLAIN (COSTS OFF) "+query, args...)
 	require.NoError(t, err)
 	defer rows.Close()
 

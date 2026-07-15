@@ -1,11 +1,15 @@
 -- +goose NO TRANSACTION
 
 -- +goose Up
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_block_metadata_cscb_repair_candidate
+DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_cscb_repair_candidate_new;
+CREATE INDEX CONCURRENTLY idx_block_metadata_cscb_repair_candidate_new
     ON block_metadata (tag, height DESC, object_key_main, id)
     WHERE object_format = 1
         AND object_key_main IS NOT NULL
         AND object_key_main <> '';
+DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_cscb_repair_candidate;
+ALTER INDEX idx_block_metadata_cscb_repair_candidate_new
+    RENAME TO idx_block_metadata_cscb_repair_candidate;
 
 -- CSCB repair only performs exact object-key reference checks. B-trees over
 -- the full keys and row IDs consume unnecessary space and the block_metadata
@@ -37,4 +41,5 @@ DROP INDEX CONCURRENTLY IF EXISTS idx_block_consolidation_shadow_object_key_refe
 DROP INDEX CONCURRENTLY IF EXISTS idx_block_consolidation_shadow_object_key_reference;
 DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_object_key_reference_hash_new;
 DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_object_key_reference;
+DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_cscb_repair_candidate_new;
 DROP INDEX CONCURRENTLY IF EXISTS idx_block_metadata_cscb_repair_candidate;
