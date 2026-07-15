@@ -165,6 +165,8 @@ func findNextCandidateObject(
 		JOIN overlapping_keys candidate ON candidate.object_key_main = bm.object_key_main
 		WHERE bm.tag = $1
 			AND bm.object_format = $4
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
 		GROUP BY bm.object_key_main
 		ORDER BY MAX(bm.height) DESC, bm.object_key_main DESC
 		LIMIT 1`
@@ -1000,6 +1002,7 @@ func loadCandidateByKey(ctx context.Context, q queryer, tag uint32, objectKey st
 		LEFT JOIN block_single_block_retention retirement ON retirement.block_metadata_id = bm.id
 		WHERE bm.tag = $1
 			AND bm.object_key_main = $2
+			AND bm.object_key_main <> ''
 			AND bm.object_format = $3
 		ORDER BY bm.height ASC, bm.id ASC`
 	rows, err := q.QueryContext(ctx, query, tag, objectKey, api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH)
@@ -1534,11 +1537,15 @@ func requireNoUnexpectedOldReferences(ctx context.Context, q queryer, objectKey 
 		SELECT
 			(SELECT COUNT(*)
 			 FROM block_metadata
-			 WHERE object_key_main = $1 AND NOT (id = ANY($2)))
+			 WHERE object_key_main = $1
+				AND object_key_main <> ''
+				AND NOT (id = ANY($2)))
 			+
 			(SELECT COUNT(*)
 			 FROM block_consolidation_shadow
-			 WHERE consolidated_object_key_main = $1 AND NOT (block_metadata_id = ANY($2)))`
+			 WHERE consolidated_object_key_main = $1
+				AND consolidated_object_key_main <> ''
+				AND NOT (block_metadata_id = ANY($2)))`
 	var references uint64
 	if err := q.QueryRowContext(ctx, query, objectKey, pq.Array(ids)).Scan(&references); err != nil {
 		return xerrors.Errorf("failed to count unexpected dirty CSCB references: %w", err)
@@ -1567,11 +1574,15 @@ func requireExactNewReferences(ctx context.Context, q queryer, manifest *Manifes
 		SELECT
 			(SELECT COUNT(*)
 			 FROM block_metadata
-			 WHERE object_key_main = $1 AND NOT (id = ANY($2)))
+			 WHERE object_key_main = $1
+				AND object_key_main <> ''
+				AND NOT (id = ANY($2)))
 			+
 			(SELECT COUNT(*)
 			 FROM block_consolidation_shadow
-			 WHERE consolidated_object_key_main = $1 AND NOT (block_metadata_id = ANY($2)))`
+			 WHERE consolidated_object_key_main = $1
+				AND consolidated_object_key_main <> ''
+				AND NOT (block_metadata_id = ANY($2)))`
 	var references uint64
 	if err := q.QueryRowContext(ctx, query, objectKey, pq.Array(ids)).Scan(&references); err != nil {
 		return xerrors.Errorf("failed to count unexpected rebuilt CSCB references: %w", err)
@@ -1585,9 +1596,13 @@ func requireExactNewReferences(ctx context.Context, q queryer, manifest *Manifes
 func requireNoOldReferences(ctx context.Context, q queryer, objectKey string) error {
 	const query = `
 		SELECT
-			(SELECT COUNT(*) FROM block_metadata WHERE object_key_main = $1)
+			(SELECT COUNT(*)
+			 FROM block_metadata
+			 WHERE object_key_main = $1 AND object_key_main <> '')
 			+
-			(SELECT COUNT(*) FROM block_consolidation_shadow WHERE consolidated_object_key_main = $1)`
+			(SELECT COUNT(*)
+			 FROM block_consolidation_shadow
+			 WHERE consolidated_object_key_main = $1 AND consolidated_object_key_main <> '')`
 	var references uint64
 	if err := q.QueryRowContext(ctx, query, objectKey).Scan(&references); err != nil {
 		return xerrors.Errorf("failed to count old CSCB references: %w", err)
