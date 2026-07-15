@@ -44,58 +44,10 @@ func TestIntegrationCSCBRepairReferenceIndexMigration(t *testing.T) {
 	requireNoTemporaryIndexes(t, db)
 	requireIndexPlans(t, db)
 
-	// Rewind only the index migration and recreate the shape left by the
-	// original B-tree migration. Applying the migration again must replace it,
-	// just as it replaces an invalid concurrent index left by a failed build.
+	// Production rolls this migration down before applying the corrected index
+	// definitions. Exercise that exact clean down/up path.
 	require.NoError(goose.DownToContext(ctx, db, "db/migrations", 20260714000001))
-	_, err = db.ExecContext(ctx, `
-		CREATE INDEX idx_block_metadata_cscb_repair_candidate
-		ON block_metadata (tag, height DESC, object_key_main, id)
-		WHERE object_format = 1 AND object_key_main IS NOT NULL AND object_key_main <> '';
-
-		CREATE INDEX idx_block_metadata_object_key_reference
-		ON block_metadata (object_key_main, id)
-		WHERE object_key_main IS NOT NULL AND object_key_main <> '';
-
-		CREATE INDEX idx_block_consolidation_shadow_object_key_reference
-		ON block_consolidation_shadow (consolidated_object_key_main, block_metadata_id)
-		WHERE consolidated_object_key_main IS NOT NULL AND consolidated_object_key_main <> '';
-
-		CREATE INDEX idx_block_metadata_cscb_repair_candidate_new
-		ON block_metadata (tag, height DESC, object_key_main, id)
-		WHERE object_format = 1 AND object_key_main IS NOT NULL AND object_key_main <> '';
-
-		CREATE INDEX idx_block_metadata_object_key_reference_hash_new
-		ON block_metadata USING HASH (object_key_main)
-		WHERE object_key_main IS NOT NULL AND object_key_main <> '';
-
-		CREATE INDEX idx_block_consolidation_shadow_object_key_reference_hash_new
-		ON block_consolidation_shadow USING HASH (consolidated_object_key_main)
-		WHERE consolidated_object_key_main IS NOT NULL AND consolidated_object_key_main <> ''`)
-	require.NoError(err)
-
-	// Only the isolated local test superuser may emulate catalog state from an
-	// interrupted concurrent build. Migrations still run as the application
-	// owner so this test does not alter normal object ownership or privileges.
-	superuserConfig := *cfg.AWS.Postgres
-	superuserConfig.User = "postgres"
-	superuserConfig.Password = "postgres"
-	catalogDB, err := openRepairDB(ctx, &superuserConfig)
-	require.NoError(err)
-	defer func() { _ = catalogDB.Close() }()
-	_, err = catalogDB.ExecContext(ctx, `
-		UPDATE pg_index
-		SET indisvalid = FALSE, indisready = FALSE
-		WHERE indexrelid IN (
-			'idx_block_metadata_cscb_repair_candidate'::regclass,
-			'idx_block_metadata_object_key_reference'::regclass,
-			'idx_block_consolidation_shadow_object_key_reference'::regclass,
-			'idx_block_metadata_cscb_repair_candidate_new'::regclass,
-			'idx_block_metadata_object_key_reference_hash_new'::regclass,
-			'idx_block_consolidation_shadow_object_key_reference_hash_new'::regclass
-		)`)
-	require.NoError(err)
-	requireInvalidIndexes(t, db, 6)
+	requireNoRepairIndexes(t, db)
 
 	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
 	requireCandidateIndex(t, db)
@@ -130,13 +82,12 @@ func requireCandidateIndex(t *testing.T, db *sql.DB) {
 	require.Contains(t, definition, "object_format = 1")
 }
 
-func requireInvalidIndexes(t *testing.T, db *sql.DB, expected int) {
+func requireNoRepairIndexes(t *testing.T, db *sql.DB) {
 	t.Helper()
 	var count int
 	err := db.QueryRow(`
 		SELECT COUNT(*)
-		FROM pg_index index_state
-		JOIN pg_class index_class ON index_class.oid = index_state.indexrelid
+		FROM pg_class index_class
 		JOIN pg_namespace index_namespace ON index_namespace.oid = index_class.relnamespace
 		WHERE index_namespace.nspname = current_schema()
 			AND index_class.relname IN (
@@ -146,10 +97,9 @@ func requireInvalidIndexes(t *testing.T, db *sql.DB, expected int) {
 				'idx_block_metadata_cscb_repair_candidate_new',
 				'idx_block_metadata_object_key_reference_hash_new',
 				'idx_block_consolidation_shadow_object_key_reference_hash_new'
-			)
-			AND (NOT index_state.indisvalid OR NOT index_state.indisready)`).Scan(&count)
+			)`).Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, expected, count)
+	require.Zero(t, count)
 }
 
 func requireNoTemporaryIndexes(t *testing.T, db *sql.DB) {
