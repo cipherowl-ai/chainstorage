@@ -363,13 +363,21 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 	require.NoError(err)
 	require.NotNil(guard)
 	require.False(guard.RetirementFenced())
+	canonicalUpdateDone := make(chan error, 1)
+	go func() {
+		_, updateErr := s.db.ExecContext(ctx, `
+			UPDATE canonical_blocks
+			SET block_metadata_id = $1
+			WHERE tag = $2 AND height = $3`, nonCanonicalBlockMetadataID, tag, height)
+		canonicalUpdateDone <- updateErr
+	}()
+	select {
+	case updateErr := <-canonicalUpdateDone:
+		require.Failf("canonical update bypassed upload guard", "unexpected result: %v", updateErr)
+	case <-time.After(100 * time.Millisecond):
+	}
 	require.NoError(guard.Release())
-
-	_, err = s.db.ExecContext(ctx, `
-		UPDATE block_metadata
-		SET single_block_retention_fenced_at = CURRENT_TIMESTAMP
-		WHERE id = $1`, blockMetadataID)
-	require.NoError(err)
+	require.NoError(<-canonicalUpdateDone)
 	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "")
 	require.NoError(err)
 	require.NotNil(fencedGuard)
@@ -742,6 +750,7 @@ func (s *blockStorageTestSuite) TestGetBlockByHashQueryUsesPartialIndex() {
 
 	plan := strings.Join(lines, "\n")
 	assert.Contains(s.T(), plan, "unique_tag_hash_regular")
+	assert.Contains(s.T(), plan, "Index Cond: ((tag = 1) AND ((hash)::text = '0x0'::text))")
 	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 
@@ -805,7 +814,9 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardWithoutHashQueryUsesCa
 
 	plan := strings.Join(lines, "\n")
 	assert.Contains(s.T(), plan, "Index Scan using canonical_blocks_")
+	assert.Contains(s.T(), plan, "Index Cond: ((height = '10'::bigint) AND (tag = 1))")
 	assert.Contains(s.T(), plan, "block_metadata_pkey")
+	assert.Contains(s.T(), plan, "Index Cond: (id = cb.block_metadata_id)")
 	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 

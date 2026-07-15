@@ -105,7 +105,7 @@ func singleBlockUploadGuardWithoutHashQuery() string {
 			AND cb.height = $2
 			AND bm.hash IS NULL
 			AND bm.skipped = FALSE
-		FOR UPDATE OF bm`
+		FOR UPDATE OF cb, bm`
 }
 
 func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
