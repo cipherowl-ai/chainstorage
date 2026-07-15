@@ -363,21 +363,24 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardMatchesNullableHash() 
 	require.NoError(err)
 	require.NotNil(guard)
 	require.False(guard.RetirementFenced())
-	canonicalUpdateDone := make(chan error, 1)
-	go func() {
-		_, updateErr := s.db.ExecContext(ctx, `
-			UPDATE canonical_blocks
-			SET block_metadata_id = $1
-			WHERE tag = $2 AND height = $3`, nonCanonicalBlockMetadataID, tag, height)
-		canonicalUpdateDone <- updateErr
-	}()
-	select {
-	case updateErr := <-canonicalUpdateDone:
-		require.Failf("canonical update bypassed upload guard", "unexpected result: %v", updateErr)
-	case <-time.After(100 * time.Millisecond):
-	}
+	canonicalUpdateConn, err := s.db.Conn(ctx)
+	require.NoError(err)
+	defer canonicalUpdateConn.Close()
+	_, err = canonicalUpdateConn.ExecContext(ctx, "SET lock_timeout = '100ms'")
+	require.NoError(err)
+	_, err = canonicalUpdateConn.ExecContext(ctx, `
+		UPDATE canonical_blocks
+		SET block_metadata_id = $1
+		WHERE tag = $2 AND height = $3`, nonCanonicalBlockMetadataID, tag, height)
+	require.ErrorContains(err, "canceling statement due to lock timeout")
 	require.NoError(guard.Release())
-	require.NoError(<-canonicalUpdateDone)
+	_, err = canonicalUpdateConn.ExecContext(ctx, "SET lock_timeout = 0")
+	require.NoError(err)
+	_, err = canonicalUpdateConn.ExecContext(ctx, `
+		UPDATE canonical_blocks
+		SET block_metadata_id = $1
+		WHERE tag = $2 AND height = $3`, nonCanonicalBlockMetadataID, tag, height)
+	require.NoError(err)
 	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, tag, height, "")
 	require.NoError(err)
 	require.NotNil(fencedGuard)
@@ -783,6 +786,7 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardByHashQueryUsesPartial
 
 	plan := strings.Join(lines, "\n")
 	assert.Contains(s.T(), plan, "unique_tag_hash_regular")
+	assert.Contains(s.T(), plan, "Index Cond: ((tag = 1) AND ((hash)::text = '0x0'::text))")
 	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 
