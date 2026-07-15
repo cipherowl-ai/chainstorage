@@ -819,8 +819,8 @@ func (s *blockStorageTestSuite) TestSingleBlockUploadGuardWithoutHashQueryUsesCa
 	plan := strings.Join(lines, "\n")
 	assert.Contains(s.T(), plan, "Index Scan using canonical_blocks_")
 	assert.Contains(s.T(), plan, "Index Cond: ((height = '10'::bigint) AND (tag = 1))")
-	// PostgreSQL may surface the primary-key equality as a join filter when the tables are nearly empty.
 	assert.Contains(s.T(), plan, "block_metadata_pkey")
+	assert.Regexp(s.T(), `Index Cond: \(id = \$[0-9]+\)`, plan)
 	assert.NotContains(s.T(), plan, "Seq Scan")
 }
 

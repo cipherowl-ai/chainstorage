@@ -96,16 +96,19 @@ func singleBlockUploadGuardWithoutHashQuery() string {
 				WHERE repair_block.block_metadata_id = bm.id
 					AND repair.state <> 'completed'
 			)
-		FROM canonical_blocks cb
-		JOIN block_metadata bm
-			ON bm.id = cb.block_metadata_id
-			AND bm.tag = cb.tag
-			AND bm.height = cb.height
-		WHERE cb.tag = $1
-			AND cb.height = $2
+		FROM block_metadata bm
+		WHERE bm.id = (
+			SELECT cb.block_metadata_id
+			FROM canonical_blocks cb
+			WHERE cb.tag = $1
+				AND cb.height = $2
+			FOR UPDATE
+		)
+			AND bm.tag = $1
+			AND bm.height = $2
 			AND bm.hash IS NULL
 			AND bm.skipped = FALSE
-		FOR UPDATE OF cb, bm`
+		FOR UPDATE OF bm`
 }
 
 func newBlockStorage(db *sql.DB, params Params) (internal.BlockStorage, error) {
