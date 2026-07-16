@@ -212,9 +212,9 @@ func requireNoShadowOnlyCandidates(
 			AND bm.tag = shadow.tag
 			AND bm.height = shadow.height
 			AND bm.hash IS NOT DISTINCT FROM shadow.hash
-		WHERE bm.tag = $1
-			AND bm.height >= $2
-			AND bm.height < $3
+		WHERE shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.height < $3
 			AND shadow.object_format = $4
 			AND shadow.consolidated_object_key_main IS NOT NULL
 			AND shadow.consolidated_object_key_main <> ''
@@ -225,7 +225,7 @@ func requireNoShadowOnlyCandidates(
 			AND NOT EXISTS (
 				SELECT 1
 				FROM cscb_repair_manifest repair
-				WHERE repair.tag = bm.tag
+				WHERE repair.tag = shadow.tag
 					AND (
 						repair.old_consolidated_object_key_main = shadow.consolidated_object_key_main
 						OR repair.new_consolidated_object_key_main = shadow.consolidated_object_key_main
