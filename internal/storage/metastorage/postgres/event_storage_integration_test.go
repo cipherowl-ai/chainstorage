@@ -28,20 +28,6 @@ type eventStorageTestSuite struct {
 	db       *sql.DB
 }
 
-func (s *eventStorageTestSuite) SetupSuite() {
-	require := testutil.Require(s.T())
-	cfg, err := config.New()
-	require.NoError(err)
-	if !cfg.IsIntegrationTest() || cfg.AWS.Postgres == nil {
-		return
-	}
-
-	db, err := newDBConnection(context.Background(), cfg.AWS.Postgres)
-	require.NoError(err)
-	defer db.Close()
-	require.NoError(runMigrations(context.Background(), db))
-}
-
 func (s *eventStorageTestSuite) SetupTest() {
 	require := testutil.Require(s.T())
 	var accessor internal.MetaStorage
