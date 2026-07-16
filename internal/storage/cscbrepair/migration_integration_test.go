@@ -162,6 +162,35 @@ func requireReferenceIndex(t *testing.T, db *sql.DB, indexName string, column st
 
 func requireIndexPlans(t *testing.T, db *sql.DB) {
 	t.Helper()
+	const shadowOnlyCandidateQuery = `
+		SELECT shadow.consolidated_object_key_main, MIN(bm.height), MAX(bm.height)
+		FROM block_consolidation_shadow shadow
+		JOIN block_metadata bm ON bm.id = shadow.block_metadata_id
+			AND bm.tag = shadow.tag
+			AND bm.height = shadow.height
+			AND bm.hash IS NOT DISTINCT FROM shadow.hash
+		WHERE shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.height < $3
+			AND shadow.object_format = $4
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''
+			AND (
+				bm.object_key_main IS DISTINCT FROM shadow.consolidated_object_key_main
+				OR bm.object_format <> $4
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM cscb_repair_manifest repair
+				WHERE repair.tag = shadow.tag
+					AND (
+						repair.old_consolidated_object_key_main = shadow.consolidated_object_key_main
+						OR repair.new_consolidated_object_key_main = shadow.consolidated_object_key_main
+					)
+			)
+		GROUP BY shadow.consolidated_object_key_main
+		ORDER BY MAX(bm.height) DESC, shadow.consolidated_object_key_main DESC
+		LIMIT 1`
 	requireReferenceIndexPlan(t, db, `
 		SELECT COUNT(*)
 		FROM block_metadata
@@ -183,6 +212,8 @@ func requireIndexPlans(t *testing.T, db *sql.DB) {
 			AND object_format = $4
 			AND object_key_main IS NOT NULL
 			AND object_key_main <> ''`, "idx_block_metadata_cscb_repair_candidate", uint32(2), uint64(1000), uint64(2000), 1)
+	requireReferenceIndexPlan(t, db, shadowOnlyCandidateQuery, "idx_block_consolidation_shadow_tag_height", uint32(2), uint64(1000), uint64(2000), 1)
+	requireReferenceIndexPlan(t, db, shadowOnlyCandidateQuery, "block_metadata_pkey", uint32(2), uint64(1000), uint64(2000), 1)
 }
 
 func requireReferenceIndexPlan(t *testing.T, db *sql.DB, query string, indexName string, args ...any) {
