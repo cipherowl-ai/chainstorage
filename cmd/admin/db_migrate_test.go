@@ -1,13 +1,30 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/pressly/goose/v3"
 	"github.com/stretchr/testify/require"
 
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 )
+
+type recordingMigrationExecer struct {
+	queries []string
+	failAt  int
+}
+
+func (e *recordingMigrationExecer) ExecContext(_ context.Context, query string, _ ...interface{}) (sql.Result, error) {
+	e.queries = append(e.queries, query)
+	if e.failAt >= 0 && len(e.queries)-1 == e.failAt {
+		return nil, errors.New("injected grant failure")
+	}
+	return nil, nil
+}
 
 func TestCollectDBMigrationsIncludesTimestampMigrations(t *testing.T) {
 	goose.SetBaseFS(postgres.GetEmbeddedMigrations())
@@ -27,4 +44,41 @@ func TestCollectDBMigrationsIncludesTimestampMigrations(t *testing.T) {
 	}
 
 	require.True(t, hasRetirementMigration)
+}
+
+func TestRunDBMigrateRequiresRuntimeUsers(t *testing.T) {
+	err := runDBMigrate(
+		"master",
+		"password",
+		"",
+		"server",
+		"localhost",
+		5432,
+		"chainstorage_ethereum_mainnet",
+		"disable",
+		30*time.Second,
+		time.Hour,
+		time.Minute,
+		false,
+	)
+	require.ErrorContains(t, err, "--worker-user and --server-user are required")
+}
+
+func TestMigrationPrivilegeQueriesCoverMasterOwnedObjects(t *testing.T) {
+	queries := migrationPrivilegeQueries("master-role", "worker-role", "server-role", "chainstorage-db")
+
+	require.Len(t, queries, 14)
+	require.Contains(t, queries, `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "worker-role"`)
+	require.Contains(t, queries, `GRANT SELECT ON ALL TABLES IN SCHEMA public TO "server-role"`)
+	require.Contains(t, queries, `ALTER DEFAULT PRIVILEGES FOR USER "master-role" IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO "worker-role"`)
+	require.Contains(t, queries, `ALTER DEFAULT PRIVILEGES FOR USER "master-role" IN SCHEMA public GRANT SELECT ON TABLES TO "server-role"`)
+}
+
+func TestGrantMigrationPrivilegesFailsClosed(t *testing.T) {
+	db := &recordingMigrationExecer{failAt: 4}
+
+	err := grantMigrationPrivileges(context.Background(), db, "master", "worker", "server", "chainstorage")
+
+	require.ErrorContains(t, err, "injected grant failure")
+	require.Len(t, db.queries, 5)
 }
