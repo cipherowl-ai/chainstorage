@@ -104,6 +104,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.NoError(err)
 	defer cleanupRepairBucket(t, rawS3, bucket)
+	store := retirement.NewS3ObjectStore(rawS3)
 
 	block := &api.Block{
 		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
@@ -122,6 +123,23 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	}
 	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 	require.NoError(err)
+	duplicateSingleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
+	require.NoError(err)
+	require.Equal(singleBlockKey, duplicateSingleBlockKey)
+	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	require.Len(singleBlockTopology.Versions, 2)
+	require.Empty(singleBlockTopology.DeleteMarkers)
+	var currentSingleBlockVersionID, historicalSingleBlockVersionID string
+	for _, version := range singleBlockTopology.Versions {
+		if version.IsLatest {
+			currentSingleBlockVersionID = version.VersionID
+		} else {
+			historicalSingleBlockVersionID = version.VersionID
+		}
+	}
+	require.NotEmpty(currentSingleBlockVersionID)
+	require.NotEmpty(historicalSingleBlockVersionID)
 	block.Metadata.ObjectKeyMain = singleBlockKey
 	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil))
 
@@ -165,7 +183,6 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Equal(uint64(1), promotion.Blocks)
 
-	store := retirement.NewS3ObjectStore(rawS3)
 	repository := cscbrepair.NewPostgresRepository(db)
 	candidateLockTx, err := db.BeginTx(ctx, nil)
 	require.NoError(err)
@@ -189,6 +206,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(cscbrepair.StatePrepared, manifest.State)
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
+	require.Equal(currentSingleBlockVersionID, manifest.Blocks[0].SingleBlockObjectVersion.VersionID)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
 	pendingKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
 	require.NoError(err)
@@ -372,9 +390,19 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.NoError(err)
 	require.False(rawClean.HasStoragePlacement)
-	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	singleBlockTopology, err = store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	require.Len(singleBlockTopology.Versions, 2)
+	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(singleBlockKey),
+		VersionId: aws.String(historicalSingleBlockVersionID),
+	})
+	require.NoError(err)
+	singleBlockTopology, err = store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
 	require.Len(singleBlockTopology.Versions, 1)
+	require.Equal(currentSingleBlockVersionID, singleBlockTopology.Versions[0].VersionID)
 
 	activeClean, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)

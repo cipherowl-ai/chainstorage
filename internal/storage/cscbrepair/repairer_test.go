@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"testing"
 	"time"
@@ -195,7 +196,10 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 				Versions: []retirement.ObjectVersion{{VersionID: "clean-cscb-version", ETag: "clean-cscb-etag", Bytes: uint64(len(cscbObject)), IsLatest: true}},
 			},
 			candidate.Blocks[0].SingleBlockObjectKey: {
-				Versions: []retirement.ObjectVersion{{VersionID: "single-version", ETag: "single-etag", Bytes: uint64(len(singleObject)), IsLatest: true}},
+				Versions: []retirement.ObjectVersion{
+					{VersionID: "single-current-version", ETag: "single-etag", Bytes: uint64(len(singleObject)), IsLatest: true},
+					{VersionID: "single-historical-version", ETag: "single-etag", Bytes: uint64(len(singleObject))},
+				},
 			},
 		},
 		objects: map[string][]byte{
@@ -221,6 +225,213 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	require.Nil(t, manifest.RestoredAt)
 	require.True(t, repository.inspectionRecorded)
 	require.True(t, repository.alreadyClean)
+}
+
+func TestInspectSingleBlockObjectVersionAllowsIdenticalDuplicateVersions(t *testing.T) {
+	payload := []byte("identical single-block payload")
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "same-etag", Bytes: uint64(len(payload)), IsLatest: true},
+			{VersionID: "historical-version", ETag: "same-etag", Bytes: uint64(len(payload))},
+		}},
+		objects: map[string][]byte{
+			"current-version":    payload,
+			"historical-version": append([]byte(nil), payload...),
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.NoError(t, err)
+	require.Equal(t, ObjectVersion{
+		VersionID: "current-version",
+		ETag:      "same-etag",
+		Bytes:     uint64(len(payload)),
+	}, version)
+	require.Equal(t, []string{"current-version", "historical-version"}, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.NoError(t, err)
+	require.Equal(t, "current-version", version.VersionID)
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *testing.T) {
+	versions := make([]retirement.ObjectVersion, maxSingleBlockVersionsToInspect+1)
+	for i := range versions {
+		versions[i] = retirement.ObjectVersion{
+			VersionID: fmt.Sprintf("version-%d", i),
+			ETag:      "same-etag",
+			Bytes:     4,
+			IsLatest:  i == 0,
+		}
+	}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: versions},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "too many single-block object versions to safely inspect")
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicatePayloads(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			{VersionID: "historical-version", ETag: "same-etag", Bytes: 4},
+		}},
+		objects: map[string][]byte{
+			"current-version":    []byte("same"),
+			"historical-version": []byte("diff"),
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "versions contain different payloads")
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicateMetadata(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
+			{VersionID: "historical-version", ETag: "historical-etag", Bytes: 4},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "versions have different metadata")
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{
+			Versions: []retirement.ObjectVersion{
+				{VersionID: "current-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			},
+			DeleteMarkers: []retirement.ObjectDeleteMarker{{VersionID: "delete-marker"}},
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "zero delete markers")
+}
+
+func TestRequirePinnedSingleBlockObjectVersionRejectsNewLatestVersion(t *testing.T) {
+	pinned := ObjectVersion{VersionID: "pinned-version", ETag: "same-etag", Bytes: 4}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "new-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			{VersionID: pinned.VersionID, ETag: pinned.ETag, Bytes: pinned.Bytes},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	err := repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned)
+	require.ErrorContains(t, err, "current version changed")
+}
+
+func TestRequirePinnedSingleBlockObjectVersionAllowsHistoricalDuplicateRemoval(t *testing.T) {
+	pinned := ObjectVersion{VersionID: "pinned-version", ETag: "same-etag", Bytes: 4}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: pinned.VersionID, ETag: pinned.ETag, Bytes: pinned.Bytes, IsLatest: true},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	require.NoError(t, repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned))
+}
+
+func TestRepairPhasesRejectSingleBlockTopologyDriftBeforeMutation(t *testing.T) {
+	phases := []struct {
+		name   string
+		state  State
+		invoke func(Repairer, int64) (*Manifest, error)
+	}{
+		{
+			name:  "restore",
+			state: StatePrepared,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.Restore(context.Background(), repairID, nil)
+			},
+		},
+		{
+			name:  "verify rebuilt",
+			state: StateRestored,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.VerifyRebuilt(context.Background(), repairID, nil)
+			},
+		},
+		{
+			name:  "complete",
+			state: StateVerified,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.Complete(context.Background(), repairID, nil)
+			},
+		},
+	}
+	drifts := []struct {
+		name     string
+		topology func(ObjectVersion) retirement.ObjectVersionTopology
+	}{
+		{
+			name: "new latest version",
+			topology: func(pinned ObjectVersion) retirement.ObjectVersionTopology {
+				return retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+					{VersionID: "new-version", ETag: pinned.ETag, Bytes: pinned.Bytes, IsLatest: true},
+					objectTopologyVersion(pinned),
+				}}
+			},
+		},
+		{
+			name: "delete marker",
+			topology: func(pinned ObjectVersion) retirement.ObjectVersionTopology {
+				return retirement.ObjectVersionTopology{
+					Versions:      []retirement.ObjectVersion{objectTopologyVersion(pinned)},
+					DeleteMarkers: []retirement.ObjectDeleteMarker{{VersionID: "delete-marker", IsLatest: true}},
+				}
+			},
+		},
+	}
+
+	for _, phase := range phases {
+		for _, drift := range drifts {
+			t.Run(phase.name+"/"+drift.name, func(t *testing.T) {
+				manifest := phaseBoundaryManifest(t, phase.state)
+				repository := &phaseBoundaryRepository{manifest: manifest}
+				store := &completionObjectStore{topologies: map[string]retirement.ObjectVersionTopology{
+					manifest.OldConsolidatedObjectKey: {
+						Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.OldConsolidatedObjectVersion)},
+					},
+					manifest.NewConsolidatedObjectKey: {
+						Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.NewConsolidatedObjectVersion)},
+					},
+					manifest.Blocks[0].SingleBlockObjectKey: drift.topology(manifest.Blocks[0].SingleBlockObjectVersion),
+				}}
+
+				_, err := phase.invoke(NewRepairer(repository, store, "repair-bucket"), manifest.ID)
+				require.ErrorContains(t, err, "single-block object changed")
+				require.False(t, repository.restoreCalled)
+				require.False(t, repository.recordVerifiedCalled)
+				require.False(t, repository.completeCalled)
+			})
+		}
+	}
 }
 
 func TestCompleteRejectsRetainedObjectTopologyDrift(t *testing.T) {
@@ -400,6 +611,35 @@ func executionKey(seed string) string {
 
 type pendingObjectStore struct{ retirement.ObjectStore }
 
+type versionedObjectStore struct {
+	retirement.ObjectStore
+	topology       retirement.ObjectVersionTopology
+	objects        map[string][]byte
+	readVersionIDs []string
+}
+
+func (s *versionedObjectStore) ListObjectVersions(
+	context.Context,
+	string,
+	string,
+) (retirement.ObjectVersionTopology, error) {
+	return s.topology, nil
+}
+
+func (s *versionedObjectStore) ReadObjectVersion(
+	_ context.Context,
+	_ string,
+	_ string,
+	versionID string,
+) ([]byte, error) {
+	s.readVersionIDs = append(s.readVersionIDs, versionID)
+	payload, ok := s.objects[versionID]
+	if !ok {
+		return nil, errors.New("object version not found")
+	}
+	return append([]byte(nil), payload...), nil
+}
+
 type preparationRepository struct {
 	Repository
 	candidate          *Manifest
@@ -557,6 +797,37 @@ type completionRepository struct {
 	committed      bool
 }
 
+type phaseBoundaryRepository struct {
+	Repository
+	manifest             *Manifest
+	restoreCalled        bool
+	recordVerifiedCalled bool
+	completeCalled       bool
+}
+
+func (r *phaseBoundaryRepository) Get(context.Context, int64) (*Manifest, error) {
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) GetRebuilt(context.Context, int64) (*Manifest, error) {
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) RestoreToSingleBlock(context.Context, int64) (*Manifest, error) {
+	r.restoreCalled = true
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) RecordVerified(context.Context, int64, string, ObjectVersion) (*Manifest, error) {
+	r.recordVerifiedCalled = true
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) CompleteRetainingOldObject(context.Context, int64, string) (*Manifest, error) {
+	r.completeCalled = true
+	return r.manifest, nil
+}
+
 func (r *completionRepository) Get(context.Context, int64) (*Manifest, error) {
 	return r.manifest, nil
 }
@@ -627,6 +898,19 @@ func completionManifest(t *testing.T) *Manifest {
 		TotalBlockCount:              1,
 		Blocks:                       []Block{block},
 	}
+}
+
+func phaseBoundaryManifest(t *testing.T, state State) *Manifest {
+	t.Helper()
+	manifest := completionManifest(t)
+	manifest.State = state
+	manifest.CanonicalBlockCount = 1
+	manifest.NewConsolidatedObjectKey = "consolidated/clean.cscb.zstd"
+	manifest.NewConsolidatedObjectVersion = ObjectVersion{VersionID: "new-version", ETag: "new-etag", Bytes: 300}
+	manifest.Blocks[0].Canonical = true
+	manifest.Blocks[0].ActiveObjectKey = manifest.NewConsolidatedObjectKey
+	manifest.Blocks[0].NewConsolidatedObjectKey = manifest.NewConsolidatedObjectKey
+	return manifest
 }
 
 func completionSingleBlockPayload(t *testing.T, block Block) []byte {
