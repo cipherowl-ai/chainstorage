@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
+	"regexp"
+	"sort"
 	"time"
 
 	"github.com/lib/pq"
@@ -22,6 +26,8 @@ const maxMigrationVersion int64 = 1<<63 - 1
 
 const migrationLockQuery = "SELECT pg_advisory_lock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
 const migrationUnlockQuery = "SELECT pg_advisory_unlock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
+
+var concurrentIndexPattern = regexp.MustCompile(`(?i)CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_$]*)`)
 
 type migrationExecer interface {
 	ExecContext(context.Context, string, ...interface{}) (sql.Result, error)
@@ -209,11 +215,20 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 		return nil
 	}
 
+	currentVersion, err := goose.GetDBVersion(db)
+	if err != nil {
+		return xerrors.Errorf("failed to get current database version before migration: %w", err)
+	}
+	pendingIndexNames, err := pendingConcurrentIndexNames(currentVersion)
+	if err != nil {
+		return xerrors.Errorf("failed to inspect pending concurrent indexes: %w", err)
+	}
+
 	// CREATE INDEX CONCURRENTLY can leave an invalid index when its client is
-	// interrupted. Remove such non-constraint indexes before Goose retries;
+	// interrupted. Remove only indexes owned by still-pending migrations;
 	// otherwise CREATE INDEX ... IF NOT EXISTS skips the invalid relation and
 	// can incorrectly mark the migration as applied.
-	if err := dropInvalidIndexes(ctx, db, logger); err != nil {
+	if err := dropInvalidIndexes(ctx, db, pendingIndexNames, logger); err != nil {
 		return xerrors.Errorf("failed to clean up invalid indexes: %w", err)
 	}
 
@@ -230,7 +245,7 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 		return xerrors.Errorf("failed to reconcile runtime role privileges: %w", err)
 	}
 
-	currentVersion, err := goose.GetDBVersion(db)
+	currentVersion, err = goose.GetDBVersion(db)
 	if err != nil {
 		return xerrors.Errorf("failed to get current database version: %w", err)
 	}
@@ -263,7 +278,40 @@ func acquireMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Dura
 	}, nil
 }
 
-func dropInvalidIndexes(ctx context.Context, db *sql.DB, logger *zap.Logger) error {
+func pendingConcurrentIndexNames(currentVersion int64) ([]string, error) {
+	migrations, err := goose.CollectMigrations("db/migrations", currentVersion, maxMigrationVersion)
+	if errors.Is(err, goose.ErrNoMigrationFiles) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, xerrors.Errorf("failed to collect pending migrations: %w", err)
+	}
+
+	migrationFS := postgres.GetEmbeddedMigrations()
+	indexNames := make(map[string]struct{})
+	for _, migration := range migrations {
+		contents, err := fs.ReadFile(migrationFS, migration.Source)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to read migration %s: %w", migration.Source, err)
+		}
+		for _, match := range concurrentIndexPattern.FindAllSubmatch(contents, -1) {
+			indexNames[string(match[1])] = struct{}{}
+		}
+	}
+
+	result := make([]string, 0, len(indexNames))
+	for name := range indexNames {
+		result = append(result, name)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func dropInvalidIndexes(ctx context.Context, db *sql.DB, pendingIndexNames []string, logger *zap.Logger) error {
+	if len(pendingIndexNames) == 0 {
+		return nil
+	}
+
 	rows, err := db.QueryContext(ctx, `
 SELECT n.nspname, c.relname
 FROM pg_index AS i
@@ -273,7 +321,8 @@ LEFT JOIN pg_constraint AS con ON con.conindid = i.indexrelid
 WHERE NOT i.indisvalid
   AND n.nspname = 'public'
   AND con.oid IS NULL
-ORDER BY c.relname`)
+  AND c.relname = ANY($1)
+ORDER BY c.relname`, pq.Array(pendingIndexNames))
 	if err != nil {
 		return xerrors.Errorf("failed to query invalid indexes: %w", err)
 	}

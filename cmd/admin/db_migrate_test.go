@@ -46,6 +46,25 @@ func TestCollectDBMigrationsIncludesTimestampMigrations(t *testing.T) {
 	require.True(t, hasRetirementMigration)
 }
 
+func TestPendingConcurrentIndexNamesOnlyIncludesPendingMigrations(t *testing.T) {
+	goose.SetBaseFS(postgres.GetEmbeddedMigrations())
+	t.Cleanup(func() {
+		goose.SetBaseFS(nil)
+	})
+
+	indexNames, err := pendingConcurrentIndexNames(20260714000001)
+	require.NoError(t, err)
+	require.Equal(t, []string{
+		"idx_block_consolidation_shadow_object_key_reference",
+		"idx_block_metadata_cscb_repair_candidate",
+		"idx_block_metadata_object_key_reference",
+	}, indexNames)
+
+	indexNames, err = pendingConcurrentIndexNames(maxMigrationVersion)
+	require.NoError(t, err)
+	require.Empty(t, indexNames)
+}
+
 func TestRunDBMigrateRequiresRuntimeUsers(t *testing.T) {
 	err := runDBMigrate(
 		"master",
