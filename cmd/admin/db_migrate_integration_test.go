@@ -32,31 +32,23 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 
 	masterUser := getEnvOrDefault("CHAINSTORAGE_AWS_POSTGRES_USER", "postgres")
 	masterPassword := getEnvOrDefault("CHAINSTORAGE_AWS_POSTGRES_PASSWORD", "postgres")
-	workerUser := "cs_solana_mainnet_worker"
-	workerPassword := getEnvOrDefault("CHAINSTORAGE_WORKER_PASSWORD", "worker_password")
 	dbName := "chainstorage_solana_mainnet"
 
 	unique := time.Now().UnixNano()
+	workerUser := fmt.Sprintf("migration_worker_test_%d", unique)
 	migrationUser := fmt.Sprintf("migration_admin_test_%d", unique)
 	migrationPassword := fmt.Sprintf("migration-password-%d", unique)
 	tableName := fmt.Sprintf("migration_owner_test_%d", unique)
 	indexName := fmt.Sprintf("migration_owner_idx_%d", unique)
 
 	masterDB := openIntegrationPostgres(t, host, port, "postgres", masterUser, masterPassword)
-	workerDB := openIntegrationPostgres(t, host, port, dbName, workerUser, workerPassword)
-
-	createRole := fmt.Sprintf(
-		"CREATE ROLE %s WITH LOGIN INHERIT NOSUPERUSER CREATEDB CREATEROLE PASSWORD %s",
-		pq.QuoteIdentifier(migrationUser),
-		pq.QuoteLiteral(migrationPassword),
-	)
-	_, err := masterDB.ExecContext(context.Background(), createRole)
-	require.NoError(t, err)
-
-	migrationDB := openIntegrationPostgres(t, host, port, dbName, migrationUser, migrationPassword)
+	masterNetworkDB := openIntegrationPostgres(t, host, port, dbName, masterUser, masterPassword)
+	var migrationDB *sql.DB
 	t.Cleanup(func() {
-		_ = migrationDB.Close()
-		_, _ = workerDB.ExecContext(
+		if migrationDB != nil {
+			_ = migrationDB.Close()
+		}
+		_, _ = masterNetworkDB.ExecContext(
 			context.Background(),
 			"DROP TABLE IF EXISTS public."+pq.QuoteIdentifier(tableName),
 		)
@@ -68,13 +60,43 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 			context.Background(),
 			"DROP ROLE IF EXISTS "+pq.QuoteIdentifier(migrationUser),
 		)
-		_ = workerDB.Close()
+		_, _ = masterDB.ExecContext(
+			context.Background(),
+			"DROP ROLE IF EXISTS "+pq.QuoteIdentifier(workerUser),
+		)
+		_ = masterNetworkDB.Close()
 		_ = masterDB.Close()
 	})
 
-	_, err = workerDB.ExecContext(
+	createWorkerRole := fmt.Sprintf(
+		"CREATE ROLE %s WITH NOLOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE",
+		pq.QuoteIdentifier(workerUser),
+	)
+	_, err := masterDB.ExecContext(context.Background(), createWorkerRole)
+	require.NoError(t, err)
+
+	createRole := fmt.Sprintf(
+		"CREATE ROLE %s WITH LOGIN INHERIT NOSUPERUSER CREATEDB CREATEROLE PASSWORD %s",
+		pq.QuoteIdentifier(migrationUser),
+		pq.QuoteLiteral(migrationPassword),
+	)
+	_, err = masterDB.ExecContext(context.Background(), createRole)
+	require.NoError(t, err)
+
+	migrationDB = openIntegrationPostgres(t, host, port, dbName, migrationUser, migrationPassword)
+
+	_, err = masterNetworkDB.ExecContext(
 		context.Background(),
 		"CREATE TABLE public."+pq.QuoteIdentifier(tableName)+" (id BIGINT)",
+	)
+	require.NoError(t, err)
+	_, err = masterNetworkDB.ExecContext(
+		context.Background(),
+		fmt.Sprintf(
+			"ALTER TABLE public.%s OWNER TO %s",
+			pq.QuoteIdentifier(tableName),
+			pq.QuoteIdentifier(workerUser),
+		),
 	)
 	require.NoError(t, err)
 
