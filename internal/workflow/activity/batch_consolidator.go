@@ -35,6 +35,7 @@ type (
 		latestBlockActivity baseActivity
 		planActivity        baseActivity
 		cursorActivity      baseActivity
+		candidateActivity   baseActivity
 		config              *config.Config
 		metaStorage         metastorage.MetaStorage
 		blobStorage         blobstorage.BlobStorage
@@ -59,6 +60,7 @@ type (
 		EndHeight          uint64 `validate:"gtfield=StartHeight"`
 		MaxBlocks          uint64 `validate:"required"`
 		RepairExecutionKey string
+		RepairObjectKey    string
 	}
 
 	BatchConsolidatorResponse struct {
@@ -118,6 +120,17 @@ type (
 		Tag    uint32
 		Height uint64
 	}
+
+	BatchConsolidatorRepairCandidatesRequest struct {
+		Tag         uint32
+		StartHeight uint64
+		EndHeight   uint64 `validate:"gtfield=StartHeight"`
+		Limit       int    `validate:"required,gt=0,lte=20"`
+	}
+
+	BatchConsolidatorRepairCandidatesResponse struct {
+		ObjectKeys []string
+	}
 )
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
@@ -127,6 +140,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
 		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
 		cursorActivity:      newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
+		candidateActivity:   newBaseActivity(ActivityBatchConsolidatorRepairCandidates, params.Runtime),
 		config:              params.Config,
 		metaStorage:         params.MetaStorage,
 		blobStorage:         params.BlobStorage,
@@ -137,6 +151,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a.latestBlockActivity.register(a.executeLatestBlock)
 	a.planActivity.register(a.executePlan)
 	a.cursorActivity.register(a.executeCursor)
+	a.candidateActivity.register(a.executeRepairCandidates)
 	return a
 }
 
@@ -170,6 +185,12 @@ func (a *BatchConsolidator) GetPromotionPlan(ctx workflow.Context, request *Batc
 func (a *BatchConsolidator) UpdateAutoConsolidateCursor(ctx workflow.Context, request *BatchConsolidatorCursorRequest) (*BatchConsolidatorCursorResponse, error) {
 	var response BatchConsolidatorCursorResponse
 	err := a.cursorActivity.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *BatchConsolidator) GetRepairCandidates(ctx workflow.Context, request *BatchConsolidatorRepairCandidatesRequest) (*BatchConsolidatorRepairCandidatesResponse, error) {
+	var response BatchConsolidatorRepairCandidatesResponse
+	err := a.candidateActivity.executeActivity(ctx, request, &response)
 	return &response, err
 }
 
@@ -242,6 +263,33 @@ func (a *BatchConsolidator) executeCursor(ctx context.Context, request *BatchCon
 	}, nil
 }
 
+func (a *BatchConsolidator) executeRepairCandidates(
+	ctx context.Context,
+	request *BatchConsolidatorRepairCandidatesRequest,
+) (*BatchConsolidatorRepairCandidatesResponse, error) {
+	if err := a.candidateActivity.validateRequest(request); err != nil {
+		return nil, err
+	}
+	if err := a.validateConsolidationEnabled(); err != nil {
+		return nil, err
+	}
+	repairer, err := a.getCSCBRepairer(ctx)
+	if err != nil {
+		return nil, err
+	}
+	objectKeys, err := repairer.ListCandidates(
+		ctx,
+		request.Tag,
+		request.StartHeight,
+		request.EndHeight,
+		request.Limit,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to list CSCB repair candidates: %w", err)
+	}
+	return &BatchConsolidatorRepairCandidatesResponse{ObjectKeys: objectKeys}, nil
+}
+
 func (a *BatchConsolidator) execute(ctx context.Context, request *BatchConsolidatorRequest) (*BatchConsolidatorResponse, error) {
 	if err := a.validateRequest(request); err != nil {
 		return nil, err
@@ -287,17 +335,31 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 	progress := func(stage string, completed int, total int, height uint64) {
 		sdkactivity.RecordHeartbeat(ctx, "batch_consolidator.repair."+stage, completed, total, height)
 	}
-	manifest, err := repairer.PrepareNext(
-		ctx,
-		request.RepairExecutionKey,
-		request.Tag,
-		request.StartHeight,
-		request.EndHeight,
-		request.MaxBlocks,
-		progress,
-	)
+	var manifest *cscbrepair.Manifest
+	if request.RepairObjectKey == "" {
+		manifest, err = repairer.PrepareNext(
+			ctx,
+			request.RepairExecutionKey,
+			request.Tag,
+			request.StartHeight,
+			request.EndHeight,
+			request.MaxBlocks,
+			progress,
+		)
+	} else {
+		manifest, err = repairer.PrepareObject(
+			ctx,
+			request.RepairExecutionKey,
+			request.Tag,
+			request.StartHeight,
+			request.EndHeight,
+			request.MaxBlocks,
+			request.RepairObjectKey,
+			progress,
+		)
+	}
 	if err != nil {
-		return nil, xerrors.Errorf("failed to prepare next CSCB repair: %w", err)
+		return nil, xerrors.Errorf("failed to prepare CSCB repair: %w", err)
 	}
 	if manifest == nil {
 		return &BatchConsolidatorResponse{

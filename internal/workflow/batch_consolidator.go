@@ -68,6 +68,8 @@ const (
 	batchConsolidatorAutoCursorVersion             = 1
 	batchConsolidatorAutoParallelismChangeID       = "batch-consolidator-auto-parallelism"
 	batchConsolidatorAutoParallelismVersion        = 1
+	batchConsolidatorRepairParallelismChangeID     = "batch-consolidator-repair-parallelism"
+	batchConsolidatorRepairParallelismVersion      = 1
 	batchConsolidatorPreviousMaxParallelism        = 10
 	batchConsolidatorMaxParallelism                = 20
 	maxUint64                                      = ^uint64(0)
@@ -167,13 +169,32 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
 		cursorCtx := w.withCursorActivityOptions(ctx, cfg)
 		if mode.IsRepairExistingCSCB() {
-			if parallelism != 1 {
-				return xerrors.Errorf("repair_existing_cscb requires parallelism=1, got %d", parallelism)
+			repairParallelismVersion := workflow.GetVersion(
+				ctx,
+				batchConsolidatorRepairParallelismChangeID,
+				workflow.DefaultVersion,
+				batchConsolidatorRepairParallelismVersion,
+			)
+			if repairParallelismVersion == workflow.DefaultVersion {
+				if parallelism != 1 {
+					return xerrors.Errorf("legacy repair_existing_cscb execution requires parallelism=1, got %d", parallelism)
+				}
 			}
 			if err := w.validateHistoricalBackfillRange(ctx, logger, tag, request.StartHeight, request.EndHeight, cfg.IrreversibleDistance); err != nil {
 				return err
 			}
-			return w.executeRepairExistingCSCB(
+			if repairParallelismVersion == workflow.DefaultVersion {
+				return w.executeRepairExistingCSCB(
+					ctx,
+					logger,
+					metrics,
+					request,
+					tag,
+					checkpointSize,
+					maxBlocks,
+				)
+			}
+			return w.executeRepairExistingCSCBParallel(
 				ctx,
 				logger,
 				metrics,
@@ -181,6 +202,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 				tag,
 				checkpointSize,
 				maxBlocks,
+				parallelism,
 			)
 		}
 		usePersistedShadowStats := workflow.GetVersion(
@@ -539,6 +561,145 @@ func (w *BatchConsolidator) executeRepairExistingCSCB(
 			zap.Bool("rebuilt_cscb", response.ObjectKey != "" && response.ObjectKey != response.OldObjectKey),
 		)
 		repairIteration++
+		if processedBlocks >= checkpointSize {
+			newRequest := *request
+			logger.Info(
+				"CSCB repair checkpoint reached",
+				zap.Uint64("processed_blocks", processedBlocks),
+				zap.Reflect("new_request", newRequest),
+			)
+			return w.continueAsNew(ctx, &newRequest)
+		}
+	}
+}
+
+func (w *BatchConsolidator) executeRepairExistingCSCBParallel(
+	ctx workflow.Context,
+	logger *zap.Logger,
+	metrics client.MetricsHandler,
+	request *BatchConsolidatorRequest,
+	tag uint32,
+	checkpointSize uint64,
+	maxBlocks uint64,
+	parallelism int,
+) error {
+	processedBlocks := uint64(0)
+	repairIteration := uint64(0)
+	for {
+		candidates, err := w.batchConsolidator.GetRepairCandidates(ctx, &activity.BatchConsolidatorRepairCandidatesRequest{
+			Tag:         tag,
+			StartHeight: request.StartHeight,
+			EndHeight:   request.EndHeight,
+			Limit:       parallelism,
+		})
+		if err != nil {
+			return xerrors.Errorf(
+				"failed to list existing CSCB repair candidates in range [%d, %d): %w",
+				request.StartHeight,
+				request.EndHeight,
+				err,
+			)
+		}
+		if len(candidates.ObjectKeys) == 0 {
+			metrics.Counter(batchConsolidatorEmptyBatchCounter).Inc(1)
+			logger.Info("CSCB repair range is complete")
+			return nil
+		}
+		if len(candidates.ObjectKeys) > parallelism {
+			return xerrors.Errorf(
+				"CSCB repair candidate list exceeds parallelism: candidates=%d parallelism=%d",
+				len(candidates.ObjectKeys),
+				parallelism,
+			)
+		}
+
+		pending := make([]batchConsolidatorPendingActivity, 0, len(candidates.ObjectKeys))
+		seen := make(map[string]struct{}, len(candidates.ObjectKeys))
+		for _, objectKey := range candidates.ObjectKeys {
+			if objectKey == "" {
+				return xerrors.New("CSCB repair candidate list contains an empty object key")
+			}
+			if _, ok := seen[objectKey]; ok {
+				return xerrors.Errorf("CSCB repair candidate list contains duplicate object key %q", objectKey)
+			}
+			seen[objectKey] = struct{}{}
+			activityRequest := &activity.BatchConsolidatorRequest{
+				Mode:               config.ConsolidationModeRepairExistingCSCB,
+				Tag:                tag,
+				StartHeight:        request.StartHeight,
+				EndHeight:          request.EndHeight,
+				MaxBlocks:          maxBlocks,
+				RepairExecutionKey: makeRepairExecutionKey(ctx, repairIteration),
+				RepairObjectKey:    objectKey,
+			}
+			pending = append(pending, batchConsolidatorPendingActivity{
+				request: activityRequest,
+				future:  workflow.ExecuteActivity(ctx, activity.ActivityBatchConsolidator, activityRequest),
+			})
+			repairIteration++
+		}
+
+		var firstErr error
+		for _, pendingActivity := range pending {
+			var response activity.BatchConsolidatorResponse
+			if err := pendingActivity.future.Get(ctx, &response); err != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf(
+						"failed to repair existing CSCB object %q: %w",
+						pendingActivity.request.RepairObjectKey,
+						err,
+					)
+				}
+				continue
+			}
+			if response.RepairedObjects != 1 {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf(
+						"repair_existing_cscb returned repaired_objects=%d for object %q",
+						response.RepairedObjects,
+						pendingActivity.request.RepairObjectKey,
+					)
+				}
+				continue
+			}
+			if response.OldObjectKey != pendingActivity.request.RepairObjectKey {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf(
+						"repair_existing_cscb returned unexpected old object: expected=%q actual=%q",
+						pendingActivity.request.RepairObjectKey,
+						response.OldObjectKey,
+					)
+				}
+				continue
+			}
+			if response.ScannedBlocks == 0 {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf(
+						"repair_existing_cscb made no block progress for old object %q",
+						response.OldObjectKey,
+					)
+				}
+				continue
+			}
+
+			processedBlocks += response.ScannedBlocks
+			metrics.Counter(batchConsolidatorObjectCounter).Inc(int64(response.RepairedObjects))
+			metrics.Counter(batchConsolidatorConsolidatedBlockCounter).Inc(int64(response.ConsolidatedBlocks))
+			metrics.Gauge(batchConsolidatorHeightGauge).Update(float64(response.EndHeight - 1))
+			logger.Info(
+				"repaired existing CSCB object",
+				zap.String("old_object_key", response.OldObjectKey),
+				zap.String("new_object_key", response.ObjectKey),
+				zap.Uint64("start_height", response.StartHeight),
+				zap.Uint64("end_height", response.EndHeight),
+				zap.Uint64("blocks", response.ScannedBlocks),
+				zap.Uint64("canonical_blocks", response.ConsolidatedBlocks),
+				zap.Bool("rebuilt_cscb", response.ObjectKey != "" && response.ObjectKey != response.OldObjectKey),
+			)
+		}
+		if firstErr != nil {
+			return firstErr
+		}
 		if processedBlocks >= checkpointSize {
 			newRequest := *request
 			logger.Info(

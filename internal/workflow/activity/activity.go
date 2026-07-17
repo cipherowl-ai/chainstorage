@@ -34,8 +34,7 @@ const (
 	ActivityBatchConsolidatorLatestBlock = "activity.batch_consolidator.latest_block"
 	ActivityBatchConsolidatorPlan        = "activity.batch_consolidator.plan"
 	ActivityBatchConsolidatorCursor      = "activity.batch_consolidator.cursor"
-
-	loggerMsg = "activity.request"
+	loggerMsg                            = "activity.request"
 
 	resultTypeTag     = "result_type"
 	resultTypeSuccess = "success"
@@ -43,6 +42,8 @@ const (
 
 	reorgDistanceCheckMetric = "reorg_distance_check"
 )
+
+const ActivityBatchConsolidatorRepairCandidates = "activity.batch_consolidator.repair_candidates"
 
 type baseActivity struct {
 	name       string

@@ -26,6 +26,7 @@ import (
 	chains3 "github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
 	"github.com/coinbase/chainstorage/internal/storage/cscbrepair"
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepairlock"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	metapostgres "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
@@ -165,9 +166,23 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(uint64(1), promotion.Blocks)
 
 	store := retirement.NewS3ObjectStore(rawS3)
-	repairer := cscbrepair.NewRepairer(cscbrepair.NewPostgresRepository(db), store, bucket)
+	repository := cscbrepair.NewPostgresRepository(db)
+	candidateLockTx, err := db.BeginTx(ctx, nil)
+	require.NoError(err)
+	require.NoError(cscbrepairlock.AcquireTag(ctx, candidateLockTx, tag))
+	listCtx, cancelList := context.WithTimeout(ctx, 2*time.Second)
+	candidateKeys, err := repository.ListCandidateObjectKeys(listCtx, tag, height, height+1, 10)
+	cancelList()
+	require.NoError(err)
+	require.Equal([]string{dirtyKey}, candidateKeys)
+	require.NoError(candidateLockTx.Rollback(), "read-only discovery must not wait for the placement-writer lock")
+	exactCandidate, err := repository.FindCandidateByObjectKey(ctx, tag, dirtyKey)
+	require.NoError(err)
+	require.Equal(dirtyKey, exactCandidate.OldConsolidatedObjectKey)
+
+	repairer := cscbrepair.NewRepairer(repository, store, bucket)
 	executionKey := repairSHA256(fmt.Sprintf("repair-main-%d", unique))
-	manifest, err := repairer.PrepareNext(ctx, executionKey, tag, height, height+1, 1, nil)
+	manifest, err := repairer.PrepareObject(ctx, executionKey, tag, height, height+1, 1, dirtyKey, nil)
 	require.NoError(err)
 	require.NotNil(manifest)
 	repairID = manifest.ID
@@ -175,6 +190,9 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
+	pendingKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	require.NoError(err)
+	require.Equal([]string{dirtyKey}, pendingKeys)
 
 	// The trigger must serialize any reference to the pinned key, even when a
 	// writer changes only object_format to a non-CSCB value. This closes the
@@ -378,6 +396,20 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Equal(manifest.ID, retried.ID)
 	require.Equal(cscbrepair.StateCompleted, retried.State)
+	concurrentExecutionKey := repairSHA256(fmt.Sprintf("repair-concurrent-%d", unique))
+	completedByObject, err := repairer.PrepareObject(
+		ctx,
+		concurrentExecutionKey,
+		tag,
+		height,
+		height+1,
+		1,
+		dirtyKey,
+		nil,
+	)
+	require.NoError(err)
+	require.Equal(manifest.ID, completedByObject.ID)
+	require.Equal(cscbrepair.StateCompleted, completedByObject.State)
 
 	// Exercise the real retirement executor after repair completion. The S3
 	// object deletion, shadow cleanup, retirement manifest, and repair audit
