@@ -26,6 +26,7 @@ import (
 	chains3 "github.com/coinbase/chainstorage/internal/s3"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage"
 	"github.com/coinbase/chainstorage/internal/storage/cscbrepair"
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepairlock"
 	"github.com/coinbase/chainstorage/internal/storage/metastorage"
 	metapostgres "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
@@ -166,9 +167,15 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	store := retirement.NewS3ObjectStore(rawS3)
 	repository := cscbrepair.NewPostgresRepository(db)
-	candidateKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	candidateLockTx, err := db.BeginTx(ctx, nil)
+	require.NoError(err)
+	require.NoError(cscbrepairlock.AcquireTag(ctx, candidateLockTx, tag))
+	listCtx, cancelList := context.WithTimeout(ctx, 2*time.Second)
+	candidateKeys, err := repository.ListCandidateObjectKeys(listCtx, tag, height, height+1, 10)
+	cancelList()
 	require.NoError(err)
 	require.Equal([]string{dirtyKey}, candidateKeys)
+	require.NoError(candidateLockTx.Rollback(), "read-only discovery must not wait for the placement-writer lock")
 	exactCandidate, err := repository.FindCandidateByObjectKey(ctx, tag, dirtyKey)
 	require.NoError(err)
 	require.Equal(dirtyKey, exactCandidate.OldConsolidatedObjectKey)
@@ -389,6 +396,20 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Equal(manifest.ID, retried.ID)
 	require.Equal(cscbrepair.StateCompleted, retried.State)
+	concurrentExecutionKey := repairSHA256(fmt.Sprintf("repair-concurrent-%d", unique))
+	completedByObject, err := repairer.PrepareObject(
+		ctx,
+		concurrentExecutionKey,
+		tag,
+		height,
+		height+1,
+		1,
+		dirtyKey,
+		nil,
+	)
+	require.NoError(err)
+	require.Equal(manifest.ID, completedByObject.ID)
+	require.Equal(cscbrepair.StateCompleted, completedByObject.State)
 
 	// Exercise the real retirement executor after repair completion. The S3
 	// object deletion, shadow cleanup, retirement manifest, and repair audit

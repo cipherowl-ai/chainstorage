@@ -101,7 +101,7 @@ func (r *PostgresRepository) FindPending(
 	return manifest, nil
 }
 
-func (r *PostgresRepository) FindPendingByObjectKey(
+func (r *PostgresRepository) FindByObjectKey(
 	ctx context.Context,
 	tag uint32,
 	objectKey string,
@@ -117,14 +117,13 @@ func (r *PostgresRepository) FindPendingByObjectKey(
 			FROM cscb_repair_manifest
 			WHERE tag = $1
 				AND old_consolidated_object_key_main = $2
-				AND state <> $3
 			LIMIT 1`, manifestColumns)
-	manifest, err := scanManifest(r.db.QueryRowContext(ctx, query, tag, objectKey, StateCompleted))
+	manifest, err := scanManifest(r.db.QueryRowContext(ctx, query, tag, objectKey))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
-		return nil, xerrors.Errorf("failed to find pending CSCB repair for object %q: %w", objectKey, err)
+		return nil, xerrors.Errorf("failed to find CSCB repair manifest for object %q: %w", objectKey, err)
 	}
 	if err := loadManifestBlocks(ctx, r.db, manifest); err != nil {
 		return nil, err
@@ -192,17 +191,8 @@ func (r *PostgresRepository) ListCandidateObjectKeys(
 		return nil, xerrors.New("CSCB repair candidate limit must be positive")
 	}
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to begin CSCB repair candidate listing: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := lockRepairTag(ctx, tx, tag); err != nil {
-		return nil, err
-	}
-
 	objectKeys := make([]string, 0, limit)
-	pendingRows, err := tx.QueryContext(ctx, `
+	pendingRows, err := r.db.QueryContext(ctx, `
 		SELECT old_consolidated_object_key_main, start_height, end_height
 		FROM cscb_repair_manifest
 		WHERE tag = $1
@@ -242,7 +232,7 @@ func (r *PostgresRepository) ListCandidateObjectKeys(
 
 	remaining := limit - len(objectKeys)
 	if remaining > 0 {
-		activeRows, err := tx.QueryContext(ctx, `
+		activeRows, err := r.db.QueryContext(ctx, `
 			WITH overlapping_keys AS (
 				SELECT DISTINCT bm.object_key_main
 				FROM block_metadata bm
@@ -311,12 +301,9 @@ func (r *PostgresRepository) ListCandidateObjectKeys(
 	}
 
 	if len(objectKeys) == 0 {
-		if err := requireNoShadowOnlyCandidates(ctx, tx, tag, startHeight, endHeight); err != nil {
+		if err := requireNoShadowOnlyCandidates(ctx, r.db, tag, startHeight, endHeight); err != nil {
 			return nil, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, xerrors.Errorf("failed to commit CSCB repair candidate listing: %w", err)
 	}
 	return objectKeys, nil
 }

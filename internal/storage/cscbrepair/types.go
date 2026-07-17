@@ -70,7 +70,7 @@ type (
 	Repository interface {
 		FindByExecutionKey(ctx context.Context, executionKey string) (*Manifest, bool, error)
 		FindPending(ctx context.Context, tag uint32) (*Manifest, error)
-		FindPendingByObjectKey(ctx context.Context, tag uint32, objectKey string) (*Manifest, error)
+		FindByObjectKey(ctx context.Context, tag uint32, objectKey string) (*Manifest, error)
 		FindNextCandidate(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (*Manifest, error)
 		FindCandidateByObjectKey(ctx context.Context, tag uint32, objectKey string) (*Manifest, error)
 		ListCandidateObjectKeys(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit int) ([]string, error)

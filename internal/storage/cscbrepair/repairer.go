@@ -118,7 +118,7 @@ func (r *repairerImpl) prepare(
 	if objectKey == "" {
 		pending, err = r.repository.FindPending(ctx, tag)
 	} else {
-		pending, err = r.repository.FindPendingByObjectKey(ctx, tag, objectKey)
+		pending, err = r.repository.FindByObjectKey(ctx, tag, objectKey)
 	}
 	if err != nil {
 		return nil, err

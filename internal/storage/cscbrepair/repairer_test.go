@@ -125,6 +125,29 @@ func TestPrepareObjectRejectsExecutionBoundToDifferentObject(t *testing.T) {
 	require.ErrorContains(t, err, "bound CSCB repair object changed")
 }
 
+func TestPrepareObjectReturnsCompletedManifestFromConcurrentWorkflow(t *testing.T) {
+	completed := validRepairCandidate()
+	completed.ID = 42
+	completed.State = StateCompleted
+	repository := &completedObjectRepository{manifest: completed}
+	repairer := NewRepairer(repository, &pendingObjectStore{}, "repair-bucket")
+	key := executionKey("completed-object")
+
+	manifest, err := repairer.PrepareObject(
+		context.Background(),
+		key,
+		completed.Tag,
+		completed.StartHeight,
+		completed.EndHeight,
+		1,
+		completed.OldConsolidatedObjectKey,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Same(t, completed, manifest)
+	require.Equal(t, key, repository.executionKey)
+}
+
 func TestListCandidatesDelegatesExactLimit(t *testing.T) {
 	repository := &candidateListRepository{
 		objectKeys: []string{"consolidated/dirty-b.cscb.zstd", "consolidated/dirty-a.cscb.zstd"},
@@ -332,6 +355,28 @@ type candidateListRepository struct {
 	limit      int
 }
 
+type completedObjectRepository struct {
+	Repository
+	manifest     *Manifest
+	executionKey string
+}
+
+func (r *completedObjectRepository) FindByExecutionKey(context.Context, string) (*Manifest, bool, error) {
+	return nil, false, nil
+}
+
+func (r *completedObjectRepository) FindByObjectKey(context.Context, uint32, string) (*Manifest, error) {
+	return r.manifest, nil
+}
+
+func (r *completedObjectRepository) BindExecutionKey(_ context.Context, executionKey string, repairID int64) (*Manifest, error) {
+	if repairID != r.manifest.ID {
+		return nil, errors.New("unexpected repair id")
+	}
+	r.executionKey = executionKey
+	return r.manifest, nil
+}
+
 func (r *candidateListRepository) ListCandidateObjectKeys(_ context.Context, _ uint32, _ uint64, _ uint64, limit int) ([]string, error) {
 	r.limit = limit
 	return r.objectKeys, nil
@@ -379,7 +424,7 @@ func (r *preparationRepository) FindPending(context.Context, uint32) (*Manifest,
 	return nil, nil
 }
 
-func (r *preparationRepository) FindPendingByObjectKey(_ context.Context, _ uint32, objectKey string) (*Manifest, error) {
+func (r *preparationRepository) FindByObjectKey(_ context.Context, _ uint32, objectKey string) (*Manifest, error) {
 	r.requestedObjectKey = objectKey
 	return nil, nil
 }
