@@ -711,6 +711,126 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Nil(next)
 
+	// Skipped canonical slots inside a CSCB's height span have no payload row.
+	// They must not be mistaken for unrelated canonical block data during restore.
+	gapStartHeight := height + 100
+	gapHeights := []uint64{gapStartHeight, gapStartHeight + 2}
+	gapBlocks := make([]*api.Block, 0, len(gapHeights))
+	gapSingleBlockKeys := make([]string, 0, len(gapHeights))
+	for i, gapHeight := range gapHeights {
+		gapBlock := storageutils.CloneBlockWithoutStoragePlacement(block)
+		gapBlock.Metadata.Height = gapHeight
+		gapBlock.Metadata.Hash = fmt.Sprintf("repair-gap-hash-%d-%d", unique, gapHeight)
+		if i == 0 {
+			gapBlock.Metadata.ParentHeight = gapHeight - 1
+			gapBlock.Metadata.ParentHash = fmt.Sprintf("repair-gap-parent-%d", unique)
+		} else {
+			gapBlock.Metadata.ParentHeight = gapHeights[i-1]
+			gapBlock.Metadata.ParentHash = gapBlocks[i-1].Metadata.Hash
+		}
+		gapSingleBlockKey, uploadErr := singleBlockUploader.Upload(ctx, gapBlock, api.Compression_GZIP)
+		require.NoError(uploadErr)
+		gapBlock.Metadata.ObjectKeyMain = gapSingleBlockKey
+		gapBlocks = append(gapBlocks, gapBlock)
+		gapSingleBlockKeys = append(gapSingleBlockKeys, gapSingleBlockKey)
+	}
+	skippedMetadata := &api.BlockMetadata{
+		Tag:     tag,
+		Height:  gapStartHeight + 1,
+		Skipped: true,
+	}
+	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{
+		gapBlocks[0].Metadata,
+		skippedMetadata,
+		gapBlocks[1].Metadata,
+	}, nil))
+	gapRecords, err := meta.GetBlocksMissingConsolidationShadow(ctx, tag, gapStartHeight, gapStartHeight+3, 3)
+	require.NoError(err)
+	require.Len(gapRecords, 2)
+	var skippedMetadataID int64
+	require.NoError(db.QueryRowContext(ctx, `
+		SELECT id FROM block_metadata
+		WHERE tag = $1 AND height = $2 AND skipped = TRUE`,
+		tag,
+		skippedMetadata.Height,
+	).Scan(&skippedMetadataID))
+	var gapRepairID int64
+	defer cleanupRepairMetadata(t, db, gapRecords[0].ID, nil)
+	defer cleanupRepairMetadata(t, db, gapRecords[1].ID, nil)
+	defer cleanupRepairMetadata(t, db, skippedMetadataID, nil)
+	defer cleanupRepairMetadata(t, db, 0, &gapRepairID)
+
+	gapPayloads := make([]blobstorage.ConsolidatedBlockPayload, 0, len(gapRecords))
+	for i, record := range gapRecords {
+		dirtyGapBlock := proto.Clone(gapBlocks[i]).(*api.Block)
+		dirtyGapBlock.Metadata.ObjectKeyMain = gapSingleBlockKeys[i]
+		dirtyGapBlock.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
+		require.True(storageutils.HasBlockStoragePlacement(dirtyGapBlock))
+		dirtyGapPayload, marshalErr := proto.Marshal(dirtyGapBlock)
+		require.NoError(marshalErr)
+		gapPayloads = append(gapPayloads, blobstorage.ConsolidatedBlockPayload{
+			Metadata:           record.Metadata,
+			MetadataID:         record.ID,
+			RawBlockPayload:    blobstorage.BytesPayloadSource(dirtyGapPayload),
+			UncompressedLength: uint64(len(dirtyGapPayload)),
+		})
+	}
+	gapDirtyKey, gapPlacements, err := blob.UploadConsolidated(ctx, gapPayloads)
+	require.NoError(err)
+	require.Len(gapPlacements, 2)
+	gapShadows := make([]*metastorage.ConsolidationShadowPlacement, 0, len(gapRecords))
+	for i, record := range gapRecords {
+		gapShadows = append(gapShadows, &metastorage.ConsolidationShadowPlacement{
+			BlockMetadataID:           record.ID,
+			Tag:                       tag,
+			Height:                    record.Metadata.Height,
+			Hash:                      record.Metadata.Hash,
+			SingleBlockObjectKeyMain:  gapSingleBlockKeys[i],
+			ConsolidatedObjectKeyMain: gapDirtyKey,
+			ObjectFormat:              gapPlacements[i].ObjectFormat,
+			ByteOffset:                gapPlacements[i].ByteOffset,
+			ByteLength:                gapPlacements[i].ByteLength,
+			UncompressedLength:        gapPlacements[i].UncompressedLength,
+		})
+	}
+	require.NoError(meta.PersistBlockConsolidationShadows(ctx, gapShadows))
+	promotion, err = meta.PromoteBlockConsolidationShadows(ctx, tag, gapStartHeight, gapStartHeight+3, 3, 72*time.Hour)
+	require.NoError(err)
+	require.Equal(uint64(2), promotion.Blocks)
+
+	gapExecutionKey := repairSHA256(fmt.Sprintf("repair-skipped-gap-%d", unique))
+	gapManifest, err := repairer.PrepareObject(
+		ctx,
+		gapExecutionKey,
+		tag,
+		gapStartHeight,
+		gapStartHeight+3,
+		3,
+		gapDirtyKey,
+		nil,
+	)
+	require.NoError(err)
+	gapRepairID = gapManifest.ID
+	require.Equal(gapStartHeight, gapManifest.StartHeight)
+	require.Equal(gapStartHeight+3, gapManifest.EndHeight)
+	require.Equal(uint64(2), gapManifest.CanonicalBlockCount)
+
+	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET skipped = FALSE WHERE id = $1`, skippedMetadataID)
+	require.NoError(err)
+	_, err = repairer.Restore(ctx, gapManifest.ID, nil)
+	require.ErrorContains(err, "CSCB repair range contains unrelated canonical metadata_id=")
+	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET skipped = TRUE WHERE id = $1`, skippedMetadataID)
+	require.NoError(err)
+	gapManifest, err = repairer.Restore(ctx, gapManifest.ID, nil)
+	require.NoError(err)
+	require.Equal(cscbrepair.StateRestored, gapManifest.State)
+	for i, gapHeight := range gapHeights {
+		activeGapBlock, getErr := meta.GetBlockByHeight(ctx, tag, gapHeight)
+		require.NoError(getErr)
+		require.Equal(gapSingleBlockKeys[i], activeGapBlock.ObjectKeyMain)
+		require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK, activeGapBlock.ObjectFormat)
+	}
+
 	// Pinned-key fencing is based on exact manifest identity, not a path naming
 	// convention or a caller-supplied CSCB format value.
 	nonstandardOldKey := fmt.Sprintf("custom-layout/dirty-object-%d", unique)

@@ -850,6 +850,7 @@ func (r *PostgresRepository) RestoreToSingleBlock(
 			WHERE cb.tag = $1
 				AND cb.height >= $2
 				AND cb.height < $3
+				AND bm.skipped = FALSE
 				AND NOT EXISTS (
 					SELECT 1 FROM cscb_repair_block block
 					WHERE block.repair_id = $4 AND block.block_metadata_id = bm.id
