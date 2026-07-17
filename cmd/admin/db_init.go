@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
-	"github.com/pressly/goose/v3"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
@@ -436,8 +435,8 @@ func grantFullAccess(db *sql.DB, username string, logger *zap.Logger) error {
 
 func runMigrations(ctx context.Context, host string, port int, user, password, dbName string, logger *zap.Logger) error {
 	// Connect to the network database to run migrations
-	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require",
-		host, port, dbName, user, password)
+	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require statement_timeout=%d",
+		host, port, dbName, user, password, defaultMigrationStatementTimeout.Milliseconds())
 
 	migrationDB, err := sql.Open("postgres", migrationDSN)
 	if err != nil {
@@ -454,15 +453,15 @@ func runMigrations(ctx context.Context, host string, port int, user, password, d
 		return xerrors.Errorf("failed to ping migration database: %w", err)
 	}
 
-	// Set dialect for goose
-	if err := goose.SetDialect("postgres"); err != nil {
+	if err := configureEmbeddedMigrations(); err != nil {
 		return xerrors.Errorf("failed to set goose dialect: %w", err)
 	}
 
-	// Run migrations using the file system path
-	migrationsDir := "/app/migrations"
-	if err := goose.UpContext(ctx, migrationDB, migrationsDir); err != nil {
-		return xerrors.Errorf("failed to run migrations: %w", err)
+	if err := withMigrationLock(ctx, migrationDB, defaultMigrationLockWaitTimeout, func() error {
+		_, err := runPendingMigrations(ctx, migrationDB, logger)
+		return err
+	}); err != nil {
+		return xerrors.Errorf("failed to run locked database migration: %w", err)
 	}
 
 	return nil

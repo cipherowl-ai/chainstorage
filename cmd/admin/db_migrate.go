@@ -24,6 +24,9 @@ import (
 
 const maxMigrationVersion int64 = 1<<63 - 1
 
+const defaultMigrationStatementTimeout = 2*time.Hour + 20*time.Minute
+const defaultMigrationLockWaitTimeout = 5 * time.Minute
+
 const migrationLockQuery = "SELECT pg_advisory_lock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
 const migrationUnlockQuery = "SELECT pg_advisory_unlock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
 
@@ -96,8 +99,8 @@ Example usage:
 	cmd.Flags().StringVar(&dbName, "db-name", "", "Database name (default: chainstorage_{blockchain}_{network})")
 	cmd.Flags().StringVar(&sslMode, "ssl-mode", "require", "SSL mode (disable, require, verify-ca, verify-full)")
 	cmd.Flags().DurationVar(&connectTimeout, "connect-timeout", 30*time.Second, "Connection timeout")
-	cmd.Flags().DurationVar(&statementTimeout, "statement-timeout", 4*time.Hour+40*time.Minute, "Maximum duration of one migration or grant statement")
-	cmd.Flags().DurationVar(&lockWaitTimeout, "lock-wait-timeout", 5*time.Minute, "Maximum time to wait for another migration invocation")
+	cmd.Flags().DurationVar(&statementTimeout, "statement-timeout", defaultMigrationStatementTimeout, "Maximum duration of one migration or grant statement")
+	cmd.Flags().DurationVar(&lockWaitTimeout, "lock-wait-timeout", defaultMigrationLockWaitTimeout, "Maximum time to wait for another migration invocation")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show pending migrations without applying them")
 
 	_ = cmd.MarkFlagRequired("master-user")
@@ -165,89 +168,68 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 
 	logger.Info("Successfully connected to database")
 
-	releaseLock, err := acquireMigrationLock(ctx, db, lockWaitTimeout)
-	if err != nil {
-		return xerrors.Errorf("failed to acquire database migration lock: %w", err)
-	}
-	defer releaseLock()
-
-	// Set up goose
-	goose.SetBaseFS(postgres.GetEmbeddedMigrations())
-	if err := goose.SetDialect("postgres"); err != nil {
+	if err := configureEmbeddedMigrations(); err != nil {
 		return xerrors.Errorf("failed to set goose dialect: %w", err)
 	}
 
 	if dryRun {
-		// Show pending migrations
-		logger.Info("Checking for pending migrations (dry run)")
+		return withMigrationLock(ctx, db, lockWaitTimeout, func() error {
+			// Show pending migrations
+			logger.Info("Checking for pending migrations (dry run)")
 
-		currentVersion, err := goose.GetDBVersion(db)
-		if err != nil {
-			return xerrors.Errorf("failed to get current database version: %w", err)
-		}
-
-		logger.Info("Current database version", zap.Int64("version", currentVersion))
-
-		migrations, err := collectDBMigrations()
-		if err != nil {
-			return xerrors.Errorf("failed to collect migrations: %w", err)
-		}
-
-		fmt.Printf("\n📋 Migration Status:\n")
-		fmt.Printf("Current version: %d\n\n", currentVersion)
-
-		hasPending := false
-		for _, migration := range migrations {
-			if migration.Version > currentVersion {
-				fmt.Printf("  [PENDING] %d: %s\n", migration.Version, migration.Source)
-				hasPending = true
-			} else {
-				fmt.Printf("  [APPLIED] %d: %s\n", migration.Version, migration.Source)
+			currentVersion, err := goose.GetDBVersion(db)
+			if err != nil {
+				return xerrors.Errorf("failed to get current database version: %w", err)
 			}
+
+			logger.Info("Current database version", zap.Int64("version", currentVersion))
+
+			migrations, err := collectDBMigrations()
+			if err != nil {
+				return xerrors.Errorf("failed to collect migrations: %w", err)
+			}
+
+			fmt.Printf("\n📋 Migration Status:\n")
+			fmt.Printf("Current version: %d\n\n", currentVersion)
+
+			hasPending := false
+			for _, migration := range migrations {
+				if migration.Version > currentVersion {
+					fmt.Printf("  [PENDING] %d: %s\n", migration.Version, migration.Source)
+					hasPending = true
+				} else {
+					fmt.Printf("  [APPLIED] %d: %s\n", migration.Version, migration.Source)
+				}
+			}
+
+			if !hasPending {
+				fmt.Printf("\n✅ No pending migrations. Database is up to date!\n")
+			} else {
+				fmt.Printf("\n⚠️  Pending migrations found. Run without --dry-run to apply them.\n")
+			}
+
+			return nil
+		})
+	}
+
+	var currentVersion int64
+	if err := withMigrationLock(ctx, db, lockWaitTimeout, func() error {
+		var err error
+		currentVersion, err = runPendingMigrations(ctx, db, logger)
+		if err != nil {
+			return err
 		}
 
-		if !hasPending {
-			fmt.Printf("\n✅ No pending migrations. Database is up to date!\n")
-		} else {
-			fmt.Printf("\n⚠️  Pending migrations found. Run without --dry-run to apply them.\n")
+		logger.Info("Reconciling runtime role privileges",
+			zap.String("worker_user", workerUser),
+			zap.String("server_user", serverUser))
+		if err := grantMigrationPrivileges(ctx, db, masterUser, workerUser, serverUser, dbName); err != nil {
+			return xerrors.Errorf("failed to reconcile runtime role privileges: %w", err)
 		}
 
 		return nil
-	}
-
-	currentVersion, err := goose.GetDBVersion(db)
-	if err != nil {
-		return xerrors.Errorf("failed to get current database version before migration: %w", err)
-	}
-	pendingIndexNames, err := pendingConcurrentIndexNames(currentVersion)
-	if err != nil {
-		return xerrors.Errorf("failed to inspect pending concurrent indexes: %w", err)
-	}
-
-	// CREATE INDEX CONCURRENTLY can leave an invalid index when its client is
-	// interrupted. Remove only indexes owned by still-pending migrations;
-	// otherwise CREATE INDEX ... IF NOT EXISTS skips the invalid relation and
-	// can incorrectly mark the migration as applied.
-	if err := dropInvalidIndexes(ctx, db, pendingIndexNames, logger); err != nil {
-		return xerrors.Errorf("failed to clean up invalid indexes: %w", err)
-	}
-
-	// Apply migrations
-	logger.Info("Applying database migrations")
-	if err := goose.UpContext(ctx, db, "db/migrations"); err != nil {
-		return xerrors.Errorf("failed to run migrations: %w", err)
-	}
-
-	logger.Info("Reconciling runtime role privileges",
-		zap.String("worker_user", workerUser),
-		zap.String("server_user", serverUser))
-	if err := grantMigrationPrivileges(ctx, db, masterUser, workerUser, serverUser, dbName); err != nil {
-		return xerrors.Errorf("failed to reconcile runtime role privileges: %w", err)
-	}
-
-	currentVersion, err = goose.GetDBVersion(db)
-	if err != nil {
-		return xerrors.Errorf("failed to get current database version: %w", err)
+	}); err != nil {
+		return xerrors.Errorf("failed to run locked database migration: %w", err)
 	}
 
 	logger.Info("Migrations completed successfully", zap.Int64("current_version", currentVersion))
@@ -255,6 +237,52 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 	fmt.Printf("Current version: %d\n", currentVersion)
 
 	return nil
+}
+
+func configureEmbeddedMigrations() error {
+	goose.SetBaseFS(postgres.GetEmbeddedMigrations())
+	return goose.SetDialect("postgres")
+}
+
+func withMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Duration, run func() error) error {
+	releaseLock, err := acquireMigrationLock(ctx, db, waitTimeout)
+	if err != nil {
+		return xerrors.Errorf("failed to acquire database migration lock: %w", err)
+	}
+	defer releaseLock()
+
+	return run()
+}
+
+func runPendingMigrations(ctx context.Context, db *sql.DB, logger *zap.Logger) (int64, error) {
+	currentVersion, err := goose.GetDBVersion(db)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to get current database version before migration: %w", err)
+	}
+	pendingIndexNames, err := pendingConcurrentIndexNames(currentVersion)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to inspect pending concurrent indexes: %w", err)
+	}
+
+	// CREATE INDEX CONCURRENTLY can leave an invalid index when its client is
+	// interrupted. Remove only indexes owned by still-pending migrations;
+	// otherwise CREATE INDEX ... IF NOT EXISTS skips the invalid relation and
+	// can incorrectly mark the migration as applied.
+	if err := dropInvalidIndexes(ctx, db, pendingIndexNames, logger); err != nil {
+		return 0, xerrors.Errorf("failed to clean up invalid indexes: %w", err)
+	}
+
+	logger.Info("Applying database migrations")
+	if err := goose.UpContext(ctx, db, "db/migrations"); err != nil {
+		return 0, xerrors.Errorf("failed to run migrations: %w", err)
+	}
+
+	currentVersion, err = goose.GetDBVersion(db)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to get current database version: %w", err)
+	}
+
+	return currentVersion, nil
 }
 
 func acquireMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Duration) (func(), error) {
