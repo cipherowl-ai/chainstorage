@@ -188,7 +188,7 @@ func (r *repairerImpl) inspectFencedCandidate(
 		if objectKeySHA256(block.SingleBlockObjectKey) != block.SingleBlockObjectKeySHA256 {
 			return nil, xerrors.Errorf("single-block object key audit digest changed at height %d", block.Height)
 		}
-		singleVersion, err := r.inspectExactObjectVersion(ctx, block.SingleBlockObjectKey)
+		singleVersion, err := r.inspectSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to pin single-block object at height %d: %w", block.Height, err)
 		}
@@ -237,7 +237,7 @@ func (r *repairerImpl) Restore(ctx context.Context, repairID int64, progress Pro
 	}
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
 			return nil, xerrors.Errorf("single-block object changed before restore at height %d: %w", block.Height, err)
 		}
 		reportProgress(progress, "restore_object_revalidated", i+1, len(manifest.Blocks), block.Height)
@@ -283,7 +283,7 @@ func (r *repairerImpl) VerifyRebuilt(ctx context.Context, repairID int64, progre
 	verifiedCanonical := 0
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
 			return nil, xerrors.Errorf("single-block object changed during repair at height %d: %w", block.Height, err)
 		}
 		payload := makePayloadCandidate(manifest, block, newObjectKey, newVersion)
@@ -358,7 +358,7 @@ func (r *repairerImpl) Complete(ctx context.Context, repairID int64, progress Pr
 	verifier := retirement.NewPinnedPayloadVerifier(r.store)
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
 			return nil, xerrors.Errorf("single-block object changed before completion at height %d: %w", block.Height, err)
 		}
 		payload := makePayloadCandidate(manifest, block, manifest.NewConsolidatedObjectKey, manifest.NewConsolidatedObjectVersion)
@@ -470,12 +470,126 @@ func (r *repairerImpl) inspectExactObjectVersion(ctx context.Context, key string
 	return result, nil
 }
 
+func (r *repairerImpl) inspectSingleBlockObjectVersion(ctx context.Context, key string) (ObjectVersion, error) {
+	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
+	if err != nil {
+		return ObjectVersion{}, err
+	}
+	current, err := currentSingleBlockObjectVersion(topology)
+	if err != nil {
+		return ObjectVersion{}, xerrors.Errorf("unsafe single-block object topology: key=%q: %w", key, err)
+	}
+	if len(topology.Versions) == 1 {
+		return current, nil
+	}
+
+	// Retries historically created redundant single-block versions. Verify every
+	// immutable version byte-for-byte before pinning the current one.
+	currentPayload, err := r.store.ReadObjectVersion(ctx, r.bucket, key, current.VersionID)
+	if err != nil {
+		return ObjectVersion{}, xerrors.Errorf("failed to read current single-block object version %q: %w", current.VersionID, err)
+	}
+	if uint64(len(currentPayload)) != current.Bytes {
+		return ObjectVersion{}, xerrors.Errorf(
+			"current single-block object version size changed: version=%q expected=%d actual=%d",
+			current.VersionID,
+			current.Bytes,
+			len(currentPayload),
+		)
+	}
+	currentDigest := sha256.Sum256(currentPayload)
+	for _, version := range topology.Versions {
+		if version.VersionID == current.VersionID {
+			continue
+		}
+		payload, err := r.store.ReadObjectVersion(ctx, r.bucket, key, version.VersionID)
+		if err != nil {
+			return ObjectVersion{}, xerrors.Errorf("failed to read historical single-block object version %q: %w", version.VersionID, err)
+		}
+		if uint64(len(payload)) != current.Bytes {
+			return ObjectVersion{}, xerrors.Errorf(
+				"historical single-block object version size changed: version=%q expected=%d actual=%d",
+				version.VersionID,
+				current.Bytes,
+				len(payload),
+			)
+		}
+		if sha256.Sum256(payload) != currentDigest {
+			return ObjectVersion{}, xerrors.Errorf(
+				"single-block object versions contain different payloads: current=%q historical=%q",
+				current.VersionID,
+				version.VersionID,
+			)
+		}
+	}
+	return current, nil
+}
+
 func (r *repairerImpl) requirePinnedObjectVersion(ctx context.Context, key string, expected ObjectVersion) error {
 	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
 	if err != nil {
 		return err
 	}
 	return requireExactTopology(topology, expected)
+}
+
+func (r *repairerImpl) requirePinnedSingleBlockObjectVersion(ctx context.Context, key string, expected ObjectVersion) error {
+	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
+	if err != nil {
+		return err
+	}
+	current, err := currentSingleBlockObjectVersion(topology)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return xerrors.Errorf(
+			"pinned single-block object current version changed: version=%q etag=%q bytes=%d",
+			current.VersionID,
+			current.ETag,
+			current.Bytes,
+		)
+	}
+	return nil
+}
+
+func currentSingleBlockObjectVersion(topology retirement.ObjectVersionTopology) (ObjectVersion, error) {
+	if len(topology.Versions) == 0 || len(topology.DeleteMarkers) != 0 {
+		return ObjectVersion{}, xerrors.Errorf(
+			"expected at least one data version and zero delete markers, got versions=%d delete_markers=%d",
+			len(topology.Versions),
+			len(topology.DeleteMarkers),
+		)
+	}
+
+	var current ObjectVersion
+	currentFound := false
+	for _, version := range topology.Versions {
+		candidate := ObjectVersion{VersionID: version.VersionID, ETag: version.ETag, Bytes: version.Bytes}
+		if !immutableVersionID(candidate.VersionID) || candidate.ETag == "" || candidate.Bytes == 0 {
+			return ObjectVersion{}, xerrors.Errorf("single-block object version is not immutable and complete: version=%q", candidate.VersionID)
+		}
+		if version.IsLatest {
+			if currentFound {
+				return ObjectVersion{}, xerrors.New("single-block object has multiple latest data versions")
+			}
+			current = candidate
+			currentFound = true
+		}
+	}
+	if !currentFound {
+		return ObjectVersion{}, xerrors.New("single-block object has no latest data version")
+	}
+	for _, version := range topology.Versions {
+		if version.ETag != current.ETag || version.Bytes != current.Bytes {
+			return ObjectVersion{}, xerrors.Errorf(
+				"single-block object versions have different metadata: current=%q version=%q",
+				current.VersionID,
+				version.VersionID,
+			)
+		}
+	}
+	return current, nil
 }
 
 func requireExactTopology(topology retirement.ObjectVersionTopology, expected ObjectVersion) error {

@@ -195,7 +195,10 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 				Versions: []retirement.ObjectVersion{{VersionID: "clean-cscb-version", ETag: "clean-cscb-etag", Bytes: uint64(len(cscbObject)), IsLatest: true}},
 			},
 			candidate.Blocks[0].SingleBlockObjectKey: {
-				Versions: []retirement.ObjectVersion{{VersionID: "single-version", ETag: "single-etag", Bytes: uint64(len(singleObject)), IsLatest: true}},
+				Versions: []retirement.ObjectVersion{
+					{VersionID: "single-current-version", ETag: "single-etag", Bytes: uint64(len(singleObject)), IsLatest: true},
+					{VersionID: "single-historical-version", ETag: "single-etag", Bytes: uint64(len(singleObject))},
+				},
 			},
 		},
 		objects: map[string][]byte{
@@ -221,6 +224,116 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	require.Nil(t, manifest.RestoredAt)
 	require.True(t, repository.inspectionRecorded)
 	require.True(t, repository.alreadyClean)
+}
+
+func TestInspectSingleBlockObjectVersionAllowsIdenticalDuplicateVersions(t *testing.T) {
+	payload := []byte("identical single-block payload")
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "same-etag", Bytes: uint64(len(payload)), IsLatest: true},
+			{VersionID: "historical-version", ETag: "same-etag", Bytes: uint64(len(payload))},
+		}},
+		objects: map[string][]byte{
+			"current-version":    payload,
+			"historical-version": append([]byte(nil), payload...),
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.NoError(t, err)
+	require.Equal(t, ObjectVersion{
+		VersionID: "current-version",
+		ETag:      "same-etag",
+		Bytes:     uint64(len(payload)),
+	}, version)
+	require.Equal(t, []string{"current-version", "historical-version"}, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.NoError(t, err)
+	require.Equal(t, "current-version", version.VersionID)
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicatePayloads(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			{VersionID: "historical-version", ETag: "same-etag", Bytes: 4},
+		}},
+		objects: map[string][]byte{
+			"current-version":    []byte("same"),
+			"historical-version": []byte("diff"),
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "versions contain different payloads")
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicateMetadata(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
+			{VersionID: "historical-version", ETag: "historical-etag", Bytes: 4},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "versions have different metadata")
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{
+			Versions: []retirement.ObjectVersion{
+				{VersionID: "current-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			},
+			DeleteMarkers: []retirement.ObjectDeleteMarker{{VersionID: "delete-marker"}},
+		},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "zero delete markers")
+}
+
+func TestRequirePinnedSingleBlockObjectVersionRejectsNewLatestVersion(t *testing.T) {
+	pinned := ObjectVersion{VersionID: "pinned-version", ETag: "same-etag", Bytes: 4}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: "new-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
+			{VersionID: pinned.VersionID, ETag: pinned.ETag, Bytes: pinned.Bytes},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	err := repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned)
+	require.ErrorContains(t, err, "current version changed")
+}
+
+func TestRequirePinnedSingleBlockObjectVersionAllowsHistoricalDuplicateRemoval(t *testing.T) {
+	pinned := ObjectVersion{VersionID: "pinned-version", ETag: "same-etag", Bytes: 4}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+			{VersionID: pinned.VersionID, ETag: pinned.ETag, Bytes: pinned.Bytes, IsLatest: true},
+		}},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	require.NoError(t, repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned))
 }
 
 func TestCompleteRejectsRetainedObjectTopologyDrift(t *testing.T) {
@@ -399,6 +512,35 @@ func executionKey(seed string) string {
 }
 
 type pendingObjectStore struct{ retirement.ObjectStore }
+
+type versionedObjectStore struct {
+	retirement.ObjectStore
+	topology       retirement.ObjectVersionTopology
+	objects        map[string][]byte
+	readVersionIDs []string
+}
+
+func (s *versionedObjectStore) ListObjectVersions(
+	context.Context,
+	string,
+	string,
+) (retirement.ObjectVersionTopology, error) {
+	return s.topology, nil
+}
+
+func (s *versionedObjectStore) ReadObjectVersion(
+	_ context.Context,
+	_ string,
+	_ string,
+	versionID string,
+) ([]byte, error) {
+	s.readVersionIDs = append(s.readVersionIDs, versionID)
+	payload, ok := s.objects[versionID]
+	if !ok {
+		return nil, errors.New("object version not found")
+	}
+	return append([]byte(nil), payload...), nil
+}
 
 type preparationRepository struct {
 	Repository
