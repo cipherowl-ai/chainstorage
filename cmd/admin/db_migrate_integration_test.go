@@ -32,7 +32,6 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 
 	masterUser := getEnvOrDefault("CHAINSTORAGE_AWS_POSTGRES_USER", "postgres")
 	masterPassword := getEnvOrDefault("CHAINSTORAGE_AWS_POSTGRES_PASSWORD", "postgres")
-	dbName := "chainstorage_solana_mainnet"
 
 	unique := time.Now().UnixNano()
 	workerUser := fmt.Sprintf("migration_worker_test_%d", unique)
@@ -42,13 +41,12 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 	indexName := fmt.Sprintf("migration_owner_idx_%d", unique)
 
 	masterDB := openIntegrationPostgres(t, host, port, "postgres", masterUser, masterPassword)
-	masterNetworkDB := openIntegrationPostgres(t, host, port, dbName, masterUser, masterPassword)
 	var migrationDB *sql.DB
 	t.Cleanup(func() {
 		if migrationDB != nil {
 			_ = migrationDB.Close()
 		}
-		_, _ = masterNetworkDB.ExecContext(
+		_, _ = masterDB.ExecContext(
 			context.Background(),
 			"DROP TABLE IF EXISTS public."+pq.QuoteIdentifier(tableName),
 		)
@@ -64,7 +62,6 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 			context.Background(),
 			"DROP ROLE IF EXISTS "+pq.QuoteIdentifier(workerUser),
 		)
-		_ = masterNetworkDB.Close()
 		_ = masterDB.Close()
 	})
 
@@ -83,14 +80,14 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 	_, err = masterDB.ExecContext(context.Background(), createRole)
 	require.NoError(t, err)
 
-	migrationDB = openIntegrationPostgres(t, host, port, dbName, migrationUser, migrationPassword)
+	migrationDB = openIntegrationPostgres(t, host, port, "postgres", migrationUser, migrationPassword)
 
-	_, err = masterNetworkDB.ExecContext(
+	_, err = masterDB.ExecContext(
 		context.Background(),
 		"CREATE TABLE public."+pq.QuoteIdentifier(tableName)+" (id BIGINT)",
 	)
 	require.NoError(t, err)
-	_, err = masterNetworkDB.ExecContext(
+	_, err = masterDB.ExecContext(
 		context.Background(),
 		fmt.Sprintf(
 			"ALTER TABLE public.%s OWNER TO %s",
