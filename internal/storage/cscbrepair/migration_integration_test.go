@@ -162,6 +162,36 @@ func requireReferenceIndex(t *testing.T, db *sql.DB, indexName string, column st
 
 func requireIndexPlans(t *testing.T, db *sql.DB) {
 	t.Helper()
+	const candidateListQuery = `
+		WITH overlapping_keys AS (
+			SELECT DISTINCT bm.object_key_main
+			FROM block_metadata bm
+			WHERE bm.tag = $1
+				AND bm.height >= $2
+				AND bm.height < $3
+				AND bm.object_format = $4
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+				AND NOT EXISTS (
+					SELECT 1
+					FROM cscb_repair_manifest repair
+					WHERE repair.tag = bm.tag
+						AND (
+							repair.old_consolidated_object_key_main = bm.object_key_main
+							OR repair.new_consolidated_object_key_main = bm.object_key_main
+						)
+				)
+		)
+		SELECT bm.object_key_main, MIN(bm.height), MAX(bm.height)
+		FROM block_metadata bm
+		JOIN overlapping_keys candidate ON candidate.object_key_main = bm.object_key_main
+		WHERE bm.tag = $1
+			AND bm.object_format = $4
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+		GROUP BY bm.object_key_main
+		ORDER BY MAX(bm.height) DESC, bm.object_key_main DESC
+		LIMIT $5`
 	const shadowOnlyCandidateQuery = `
 		SELECT shadow.consolidated_object_key_main, MIN(bm.height), MAX(bm.height)
 		FROM block_consolidation_shadow shadow
@@ -212,6 +242,8 @@ func requireIndexPlans(t *testing.T, db *sql.DB) {
 			AND object_format = $4
 			AND object_key_main IS NOT NULL
 			AND object_key_main <> ''`, "idx_block_metadata_cscb_repair_candidate", uint32(2), uint64(1000), uint64(2000), 1)
+	requireReferenceIndexPlan(t, db, candidateListQuery, "idx_block_metadata_cscb_repair_candidate", uint32(2), uint64(1000), uint64(2000), 1, 10)
+	requireReferenceIndexPlan(t, db, candidateListQuery, "idx_block_metadata_object_key_reference", uint32(2), uint64(1000), uint64(2000), 1, 10)
 	requireReferenceIndexPlan(t, db, shadowOnlyCandidateQuery, "idx_block_consolidation_shadow_tag_height", uint32(2), uint64(1000), uint64(2000), 1)
 	requireReferenceIndexPlan(t, db, shadowOnlyCandidateQuery, "block_metadata_pkey", uint32(2), uint64(1000), uint64(2000), 1)
 }
