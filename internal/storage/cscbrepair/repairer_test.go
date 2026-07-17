@@ -336,6 +336,83 @@ func TestRequirePinnedSingleBlockObjectVersionAllowsHistoricalDuplicateRemoval(t
 	require.NoError(t, repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned))
 }
 
+func TestRepairPhasesRejectSingleBlockTopologyDriftBeforeMutation(t *testing.T) {
+	phases := []struct {
+		name   string
+		state  State
+		invoke func(Repairer, int64) (*Manifest, error)
+	}{
+		{
+			name:  "restore",
+			state: StatePrepared,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.Restore(context.Background(), repairID, nil)
+			},
+		},
+		{
+			name:  "verify rebuilt",
+			state: StateRestored,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.VerifyRebuilt(context.Background(), repairID, nil)
+			},
+		},
+		{
+			name:  "complete",
+			state: StateVerified,
+			invoke: func(repairer Repairer, repairID int64) (*Manifest, error) {
+				return repairer.Complete(context.Background(), repairID, nil)
+			},
+		},
+	}
+	drifts := []struct {
+		name     string
+		topology func(ObjectVersion) retirement.ObjectVersionTopology
+	}{
+		{
+			name: "new latest version",
+			topology: func(pinned ObjectVersion) retirement.ObjectVersionTopology {
+				return retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
+					{VersionID: "new-version", ETag: pinned.ETag, Bytes: pinned.Bytes, IsLatest: true},
+					objectTopologyVersion(pinned),
+				}}
+			},
+		},
+		{
+			name: "delete marker",
+			topology: func(pinned ObjectVersion) retirement.ObjectVersionTopology {
+				return retirement.ObjectVersionTopology{
+					Versions:      []retirement.ObjectVersion{objectTopologyVersion(pinned)},
+					DeleteMarkers: []retirement.ObjectDeleteMarker{{VersionID: "delete-marker", IsLatest: true}},
+				}
+			},
+		},
+	}
+
+	for _, phase := range phases {
+		for _, drift := range drifts {
+			t.Run(phase.name+"/"+drift.name, func(t *testing.T) {
+				manifest := phaseBoundaryManifest(t, phase.state)
+				repository := &phaseBoundaryRepository{manifest: manifest}
+				store := &completionObjectStore{topologies: map[string]retirement.ObjectVersionTopology{
+					manifest.OldConsolidatedObjectKey: {
+						Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.OldConsolidatedObjectVersion)},
+					},
+					manifest.NewConsolidatedObjectKey: {
+						Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.NewConsolidatedObjectVersion)},
+					},
+					manifest.Blocks[0].SingleBlockObjectKey: drift.topology(manifest.Blocks[0].SingleBlockObjectVersion),
+				}}
+
+				_, err := phase.invoke(NewRepairer(repository, store, "repair-bucket"), manifest.ID)
+				require.ErrorContains(t, err, "single-block object changed")
+				require.False(t, repository.restoreCalled)
+				require.False(t, repository.recordVerifiedCalled)
+				require.False(t, repository.completeCalled)
+			})
+		}
+	}
+}
+
 func TestCompleteRejectsRetainedObjectTopologyDrift(t *testing.T) {
 	manifest := completionManifest(t)
 	repository := &completionRepository{manifest: manifest}
@@ -699,6 +776,37 @@ type completionRepository struct {
 	committed      bool
 }
 
+type phaseBoundaryRepository struct {
+	Repository
+	manifest             *Manifest
+	restoreCalled        bool
+	recordVerifiedCalled bool
+	completeCalled       bool
+}
+
+func (r *phaseBoundaryRepository) Get(context.Context, int64) (*Manifest, error) {
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) GetRebuilt(context.Context, int64) (*Manifest, error) {
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) RestoreToSingleBlock(context.Context, int64) (*Manifest, error) {
+	r.restoreCalled = true
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) RecordVerified(context.Context, int64, string, ObjectVersion) (*Manifest, error) {
+	r.recordVerifiedCalled = true
+	return r.manifest, nil
+}
+
+func (r *phaseBoundaryRepository) CompleteRetainingOldObject(context.Context, int64, string) (*Manifest, error) {
+	r.completeCalled = true
+	return r.manifest, nil
+}
+
 func (r *completionRepository) Get(context.Context, int64) (*Manifest, error) {
 	return r.manifest, nil
 }
@@ -769,6 +877,19 @@ func completionManifest(t *testing.T) *Manifest {
 		TotalBlockCount:              1,
 		Blocks:                       []Block{block},
 	}
+}
+
+func phaseBoundaryManifest(t *testing.T, state State) *Manifest {
+	t.Helper()
+	manifest := completionManifest(t)
+	manifest.State = state
+	manifest.CanonicalBlockCount = 1
+	manifest.NewConsolidatedObjectKey = "consolidated/clean.cscb.zstd"
+	manifest.NewConsolidatedObjectVersion = ObjectVersion{VersionID: "new-version", ETag: "new-etag", Bytes: 300}
+	manifest.Blocks[0].Canonical = true
+	manifest.Blocks[0].ActiveObjectKey = manifest.NewConsolidatedObjectKey
+	manifest.Blocks[0].NewConsolidatedObjectKey = manifest.NewConsolidatedObjectKey
+	return manifest
 }
 
 func completionSingleBlockPayload(t *testing.T, block Block) []byte {
