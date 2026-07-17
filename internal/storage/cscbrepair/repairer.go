@@ -31,6 +31,22 @@ func NewRepairer(repository Repository, store retirement.ObjectStore, bucket str
 	}
 }
 
+func (r *repairerImpl) ListCandidates(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	limit int,
+) ([]string, error) {
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		return nil, xerrors.New("CSCB repair candidate limit must be positive")
+	}
+	return r.repository.ListCandidateObjectKeys(ctx, tag, startHeight, endHeight, limit)
+}
+
 func (r *repairerImpl) PrepareNext(
 	ctx context.Context,
 	executionKey string,
@@ -38,6 +54,35 @@ func (r *repairerImpl) PrepareNext(
 	startHeight uint64,
 	endHeight uint64,
 	maxBlocks uint64,
+	progress Progress,
+) (*Manifest, error) {
+	return r.prepare(ctx, executionKey, tag, startHeight, endHeight, maxBlocks, "", progress)
+}
+
+func (r *repairerImpl) PrepareObject(
+	ctx context.Context,
+	executionKey string,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	maxBlocks uint64,
+	objectKey string,
+	progress Progress,
+) (*Manifest, error) {
+	if objectKey == "" {
+		return nil, xerrors.New("CSCB repair object key is required")
+	}
+	return r.prepare(ctx, executionKey, tag, startHeight, endHeight, maxBlocks, objectKey, progress)
+}
+
+func (r *repairerImpl) prepare(
+	ctx context.Context,
+	executionKey string,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	maxBlocks uint64,
+	objectKey string,
 	progress Progress,
 ) (*Manifest, error) {
 	if err := r.validate(); err != nil {
@@ -57,12 +102,24 @@ func (r *repairerImpl) PrepareNext(
 		if bound.Tag != tag {
 			return nil, xerrors.Errorf("bound CSCB repair tag changed: expected=%d actual=%d", tag, bound.Tag)
 		}
+		if objectKey != "" && bound.OldConsolidatedObjectKey != objectKey {
+			return nil, xerrors.Errorf(
+				"bound CSCB repair object changed: expected=%q actual=%q",
+				objectKey,
+				bound.OldConsolidatedObjectKey,
+			)
+		}
 		if err := validateApprovedManifest(bound, startHeight, endHeight, maxBlocks); err != nil {
 			return nil, xerrors.Errorf("bound CSCB repair does not fit the approved request: %w", err)
 		}
 		return r.inspectFencedCandidate(ctx, bound, progress)
 	}
-	pending, err := r.repository.FindPending(ctx, tag)
+	var pending *Manifest
+	if objectKey == "" {
+		pending, err = r.repository.FindPending(ctx, tag)
+	} else {
+		pending, err = r.repository.FindPendingByObjectKey(ctx, tag, objectKey)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -76,11 +133,19 @@ func (r *repairerImpl) PrepareNext(
 		}
 		return r.inspectFencedCandidate(ctx, bound, progress)
 	}
-	candidate, err := r.repository.FindNextCandidate(ctx, tag, startHeight, endHeight)
+	var candidate *Manifest
+	if objectKey == "" {
+		candidate, err = r.repository.FindNextCandidate(ctx, tag, startHeight, endHeight)
+	} else {
+		candidate, err = r.repository.FindCandidateByObjectKey(ctx, tag, objectKey)
+	}
 	if err != nil {
 		return nil, err
 	}
 	if candidate == nil {
+		if objectKey != "" {
+			return nil, xerrors.Errorf("CSCB repair candidate is no longer available: object=%q", objectKey)
+		}
 		return r.repository.BindNoCandidateExecution(ctx, executionKey, tag, startHeight, endHeight)
 	}
 	if err := validateCandidate(candidate, startHeight, endHeight, maxBlocks); err != nil {

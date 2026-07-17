@@ -177,6 +177,46 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRecordsAlreadyCleanOb
 	require.Equal([]string{"prepare"}, fake.calls)
 }
 
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBPreparesAssignedObject() {
+	require := testutil.Require(s.T())
+	oldKey := "consolidated/assigned-dirty.cscb.zstd"
+	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, "")
+	completed.Outcome = cscbrepair.OutcomeAlreadyCleanStorageNeutral
+	fake := &repairActivityFake{prepared: completed}
+	s.batchConsolidator.repairer = fake
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
+		Mode:               config.ConsolidationModeRepairExistingCSCB,
+		Tag:                2,
+		StartHeight:        900,
+		EndHeight:          1200,
+		MaxBlocks:          100,
+		RepairExecutionKey: testRepairExecutionKey,
+		RepairObjectKey:    oldKey,
+	})
+	require.NoError(err)
+	require.Equal(oldKey, response.OldObjectKey)
+	require.Equal([]string{"prepare_object"}, fake.calls)
+	require.Equal(oldKey, fake.objectKey)
+}
+
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBCandidateListing() {
+	require := testutil.Require(s.T())
+	objectKeys := []string{"consolidated/dirty-b.cscb.zstd", "consolidated/dirty-a.cscb.zstd"}
+	fake := &repairActivityFake{candidateObjectKeys: objectKeys}
+	s.batchConsolidator.repairer = fake
+
+	response, err := s.batchConsolidator.executeRepairCandidates(context.Background(), &BatchConsolidatorRepairCandidatesRequest{
+		Tag:         2,
+		StartHeight: 900,
+		EndHeight:   1200,
+		Limit:       2,
+	})
+	require.NoError(err)
+	require.Equal(objectKeys, response.ObjectKeys)
+	require.Equal(2, fake.candidateLimit)
+}
+
 func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string) *cscbrepair.Manifest {
 	return &cscbrepair.Manifest{
 		ID:                       42,
@@ -201,18 +241,33 @@ func repairActivityManifest(state cscbrepair.State, oldKey string, newKey string
 
 type repairActivityFake struct {
 	cscbrepair.Repairer
-	prepared     *cscbrepair.Manifest
-	restored     *cscbrepair.Manifest
-	verified     *cscbrepair.Manifest
-	completed    *cscbrepair.Manifest
-	calls        []string
-	executionKey string
+	prepared            *cscbrepair.Manifest
+	restored            *cscbrepair.Manifest
+	verified            *cscbrepair.Manifest
+	completed           *cscbrepair.Manifest
+	calls               []string
+	executionKey        string
+	objectKey           string
+	candidateObjectKeys []string
+	candidateLimit      int
 }
 
 func (f *repairActivityFake) PrepareNext(_ context.Context, executionKey string, _ uint32, _ uint64, _ uint64, _ uint64, _ cscbrepair.Progress) (*cscbrepair.Manifest, error) {
 	f.calls = append(f.calls, "prepare")
 	f.executionKey = executionKey
 	return f.prepared, nil
+}
+
+func (f *repairActivityFake) PrepareObject(_ context.Context, executionKey string, _ uint32, _ uint64, _ uint64, _ uint64, objectKey string, _ cscbrepair.Progress) (*cscbrepair.Manifest, error) {
+	f.calls = append(f.calls, "prepare_object")
+	f.executionKey = executionKey
+	f.objectKey = objectKey
+	return f.prepared, nil
+}
+
+func (f *repairActivityFake) ListCandidates(_ context.Context, _ uint32, _ uint64, _ uint64, limit int) ([]string, error) {
+	f.candidateLimit = limit
+	return f.candidateObjectKeys, nil
 }
 
 func (f *repairActivityFake) Restore(context.Context, int64, cscbrepair.Progress) (*cscbrepair.Manifest, error) {

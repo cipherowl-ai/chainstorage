@@ -101,6 +101,37 @@ func (r *PostgresRepository) FindPending(
 	return manifest, nil
 }
 
+func (r *PostgresRepository) FindPendingByObjectKey(
+	ctx context.Context,
+	tag uint32,
+	objectKey string,
+) (*Manifest, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if objectKey == "" {
+		return nil, xerrors.New("CSCB repair object key is required")
+	}
+	query := fmt.Sprintf(`
+			SELECT %s
+			FROM cscb_repair_manifest
+			WHERE tag = $1
+				AND old_consolidated_object_key_main = $2
+				AND state <> $3
+			LIMIT 1`, manifestColumns)
+	manifest, err := scanManifest(r.db.QueryRowContext(ctx, query, tag, objectKey, StateCompleted))
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, xerrors.Errorf("failed to find pending CSCB repair for object %q: %w", objectKey, err)
+	}
+	if err := loadManifestBlocks(ctx, r.db, manifest); err != nil {
+		return nil, err
+	}
+	return manifest, nil
+}
+
 func (r *PostgresRepository) FindNextCandidate(
 	ctx context.Context,
 	tag uint32,
@@ -128,6 +159,166 @@ func (r *PostgresRepository) FindNextCandidate(
 		return nil, err
 	}
 	return manifest, nil
+}
+
+func (r *PostgresRepository) FindCandidateByObjectKey(
+	ctx context.Context,
+	tag uint32,
+	objectKey string,
+) (*Manifest, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if objectKey == "" {
+		return nil, xerrors.New("CSCB repair object key is required")
+	}
+	return loadCandidateByKey(ctx, r.db, tag, objectKey)
+}
+
+func (r *PostgresRepository) ListCandidateObjectKeys(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	limit int,
+) ([]string, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if endHeight <= startHeight {
+		return nil, xerrors.New("valid CSCB repair range is required")
+	}
+	if limit <= 0 {
+		return nil, xerrors.New("CSCB repair candidate limit must be positive")
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to begin CSCB repair candidate listing: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockRepairTag(ctx, tx, tag); err != nil {
+		return nil, err
+	}
+
+	objectKeys := make([]string, 0, limit)
+	pendingRows, err := tx.QueryContext(ctx, `
+		SELECT old_consolidated_object_key_main, start_height, end_height
+		FROM cscb_repair_manifest
+		WHERE tag = $1
+			AND state <> $2
+		ORDER BY end_height DESC, old_consolidated_object_key_main DESC
+		LIMIT $3`, tag, StateCompleted, limit)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to list pending CSCB repair candidates: %w", err)
+	}
+	for pendingRows.Next() {
+		var objectKey string
+		var candidateStart, candidateEnd uint64
+		if err := pendingRows.Scan(&objectKey, &candidateStart, &candidateEnd); err != nil {
+			_ = pendingRows.Close()
+			return nil, xerrors.Errorf("failed to scan pending CSCB repair candidate: %w", err)
+		}
+		if candidateStart < startHeight || candidateEnd > endHeight {
+			_ = pendingRows.Close()
+			return nil, xerrors.Errorf(
+				"pending CSCB repair object %q exceeds approved range: object=[%d, %d) approved=[%d, %d)",
+				objectKey,
+				candidateStart,
+				candidateEnd,
+				startHeight,
+				endHeight,
+			)
+		}
+		objectKeys = append(objectKeys, objectKey)
+	}
+	if err := pendingRows.Err(); err != nil {
+		_ = pendingRows.Close()
+		return nil, xerrors.Errorf("failed to iterate pending CSCB repair candidates: %w", err)
+	}
+	if err := pendingRows.Close(); err != nil {
+		return nil, xerrors.Errorf("failed to close pending CSCB repair candidates: %w", err)
+	}
+
+	remaining := limit - len(objectKeys)
+	if remaining > 0 {
+		activeRows, err := tx.QueryContext(ctx, `
+			WITH overlapping_keys AS (
+				SELECT DISTINCT bm.object_key_main
+				FROM block_metadata bm
+				WHERE bm.tag = $1
+					AND bm.height >= $2
+					AND bm.height < $3
+					AND bm.object_format = $4
+					AND bm.object_key_main IS NOT NULL
+					AND bm.object_key_main <> ''
+					AND NOT EXISTS (
+						SELECT 1
+						FROM cscb_repair_manifest repair
+						WHERE repair.tag = bm.tag
+							AND (
+								repair.old_consolidated_object_key_main = bm.object_key_main
+								OR repair.new_consolidated_object_key_main = bm.object_key_main
+							)
+					)
+			)
+			SELECT bm.object_key_main, MIN(bm.height), MAX(bm.height)
+			FROM block_metadata bm
+			JOIN overlapping_keys candidate ON candidate.object_key_main = bm.object_key_main
+			WHERE bm.tag = $1
+				AND bm.object_format = $4
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+			GROUP BY bm.object_key_main
+			ORDER BY MAX(bm.height) DESC, bm.object_key_main DESC
+			LIMIT $5`,
+			tag,
+			startHeight,
+			endHeight,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			remaining,
+		)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to list active CSCB repair candidates: %w", err)
+		}
+		for activeRows.Next() {
+			var objectKey string
+			var minHeight, maxHeight uint64
+			if err := activeRows.Scan(&objectKey, &minHeight, &maxHeight); err != nil {
+				_ = activeRows.Close()
+				return nil, xerrors.Errorf("failed to scan active CSCB repair candidate: %w", err)
+			}
+			if minHeight < startHeight || maxHeight >= endHeight {
+				_ = activeRows.Close()
+				return nil, xerrors.Errorf(
+					"CSCB repair object %q crosses approved range: object=[%d, %d] approved=[%d, %d)",
+					objectKey,
+					minHeight,
+					maxHeight,
+					startHeight,
+					endHeight,
+				)
+			}
+			objectKeys = append(objectKeys, objectKey)
+		}
+		if err := activeRows.Err(); err != nil {
+			_ = activeRows.Close()
+			return nil, xerrors.Errorf("failed to iterate active CSCB repair candidates: %w", err)
+		}
+		if err := activeRows.Close(); err != nil {
+			return nil, xerrors.Errorf("failed to close active CSCB repair candidates: %w", err)
+		}
+	}
+
+	if len(objectKeys) == 0 {
+		if err := requireNoShadowOnlyCandidates(ctx, tx, tag, startHeight, endHeight); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, xerrors.Errorf("failed to commit CSCB repair candidate listing: %w", err)
+	}
+	return objectKeys, nil
 }
 
 func findNextCandidateObject(

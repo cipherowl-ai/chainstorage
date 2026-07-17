@@ -70,7 +70,10 @@ type (
 	Repository interface {
 		FindByExecutionKey(ctx context.Context, executionKey string) (*Manifest, bool, error)
 		FindPending(ctx context.Context, tag uint32) (*Manifest, error)
+		FindPendingByObjectKey(ctx context.Context, tag uint32, objectKey string) (*Manifest, error)
 		FindNextCandidate(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64) (*Manifest, error)
+		FindCandidateByObjectKey(ctx context.Context, tag uint32, objectKey string) (*Manifest, error)
+		ListCandidateObjectKeys(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit int) ([]string, error)
 		FenceCandidate(ctx context.Context, manifest *Manifest) (*Manifest, error)
 		RecordInspection(ctx context.Context, repairID int64, oldObject ObjectVersion, blocks []Block, alreadyClean bool) (*Manifest, error)
 		BindExecutionKey(ctx context.Context, executionKey string, repairID int64) (*Manifest, error)
@@ -83,7 +86,9 @@ type (
 	}
 
 	Repairer interface {
+		ListCandidates(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit int) ([]string, error)
 		PrepareNext(ctx context.Context, executionKey string, tag uint32, startHeight uint64, endHeight uint64, maxBlocks uint64, progress Progress) (*Manifest, error)
+		PrepareObject(ctx context.Context, executionKey string, tag uint32, startHeight uint64, endHeight uint64, maxBlocks uint64, objectKey string, progress Progress) (*Manifest, error)
 		Restore(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)
 		Get(ctx context.Context, repairID int64) (*Manifest, error)
 		VerifyRebuilt(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)

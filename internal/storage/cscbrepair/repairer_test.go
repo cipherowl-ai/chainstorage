@@ -82,6 +82,61 @@ func TestPrepareNextPersistsFenceBeforeS3InspectionAndRetriesSameManifest(t *tes
 	require.Equal(t, 2, store.listCalls)
 }
 
+func TestPrepareObjectSelectsOnlyAssignedObject(t *testing.T) {
+	inspectionErr := errors.New("S3 inspection stopped")
+	candidate := validRepairCandidate()
+	repository := &preparationRepository{candidate: candidate}
+	store := &preparationObjectStore{repository: repository, listErr: inspectionErr}
+	repairer := NewRepairer(repository, store, "repair-bucket")
+
+	_, err := repairer.PrepareObject(
+		context.Background(),
+		executionKey("assigned-object"),
+		candidate.Tag,
+		candidate.StartHeight,
+		candidate.EndHeight,
+		1,
+		candidate.OldConsolidatedObjectKey,
+		nil,
+	)
+	require.ErrorIs(t, err, inspectionErr)
+	require.Equal(t, candidate.OldConsolidatedObjectKey, repository.requestedObjectKey)
+	require.True(t, repository.fenced)
+	require.True(t, repository.bound)
+}
+
+func TestPrepareObjectRejectsExecutionBoundToDifferentObject(t *testing.T) {
+	bound := validRepairCandidate()
+	bound.ID = 41
+	bound.State = StatePrepared
+	repository := &boundRepairRepository{manifest: bound}
+	repairer := NewRepairer(repository, &pendingObjectStore{}, "repair-bucket")
+
+	_, err := repairer.PrepareObject(
+		context.Background(),
+		executionKey("bound-object"),
+		bound.Tag,
+		bound.StartHeight,
+		bound.EndHeight,
+		1,
+		"consolidated/different.cscb.zstd",
+		nil,
+	)
+	require.ErrorContains(t, err, "bound CSCB repair object changed")
+}
+
+func TestListCandidatesDelegatesExactLimit(t *testing.T) {
+	repository := &candidateListRepository{
+		objectKeys: []string{"consolidated/dirty-b.cscb.zstd", "consolidated/dirty-a.cscb.zstd"},
+	}
+	repairer := NewRepairer(repository, &pendingObjectStore{}, "repair-bucket")
+
+	objectKeys, err := repairer.ListCandidates(context.Background(), 2, 1000, 1200, 2)
+	require.NoError(t, err)
+	require.Equal(t, repository.objectKeys, objectKeys)
+	require.Equal(t, 2, repository.limit)
+}
+
 func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	candidate := validRepairCandidate()
 	candidate.Blocks[0].Hash = "clean-hash"
@@ -262,6 +317,26 @@ type pendingRepairRepository struct {
 	pending *Manifest
 }
 
+type boundRepairRepository struct {
+	Repository
+	manifest *Manifest
+}
+
+func (r *boundRepairRepository) FindByExecutionKey(context.Context, string) (*Manifest, bool, error) {
+	return r.manifest, true, nil
+}
+
+type candidateListRepository struct {
+	Repository
+	objectKeys []string
+	limit      int
+}
+
+func (r *candidateListRepository) ListCandidateObjectKeys(_ context.Context, _ uint32, _ uint64, _ uint64, limit int) ([]string, error) {
+	r.limit = limit
+	return r.objectKeys, nil
+}
+
 func (r *pendingRepairRepository) FindPending(context.Context, uint32) (*Manifest, error) {
 	return r.pending, nil
 }
@@ -290,6 +365,7 @@ type preparationRepository struct {
 	inspectionRecorded bool
 	alreadyClean       bool
 	fenceCalls         int
+	requestedObjectKey string
 }
 
 func (r *preparationRepository) FindByExecutionKey(_ context.Context, executionKey string) (*Manifest, bool, error) {
@@ -303,8 +379,21 @@ func (r *preparationRepository) FindPending(context.Context, uint32) (*Manifest,
 	return nil, nil
 }
 
+func (r *preparationRepository) FindPendingByObjectKey(_ context.Context, _ uint32, objectKey string) (*Manifest, error) {
+	r.requestedObjectKey = objectKey
+	return nil, nil
+}
+
 func (r *preparationRepository) FindNextCandidate(context.Context, uint32, uint64, uint64) (*Manifest, error) {
 	return r.candidate, nil
+}
+
+func (r *preparationRepository) FindCandidateByObjectKey(_ context.Context, _ uint32, objectKey string) (*Manifest, error) {
+	r.requestedObjectKey = objectKey
+	if r.candidate != nil && r.candidate.OldConsolidatedObjectKey == objectKey {
+		return r.candidate, nil
+	}
+	return nil, nil
 }
 
 func (r *preparationRepository) FenceCandidate(_ context.Context, manifest *Manifest) (*Manifest, error) {

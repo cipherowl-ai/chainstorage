@@ -165,9 +165,17 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(uint64(1), promotion.Blocks)
 
 	store := retirement.NewS3ObjectStore(rawS3)
-	repairer := cscbrepair.NewRepairer(cscbrepair.NewPostgresRepository(db), store, bucket)
+	repository := cscbrepair.NewPostgresRepository(db)
+	candidateKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	require.NoError(err)
+	require.Equal([]string{dirtyKey}, candidateKeys)
+	exactCandidate, err := repository.FindCandidateByObjectKey(ctx, tag, dirtyKey)
+	require.NoError(err)
+	require.Equal(dirtyKey, exactCandidate.OldConsolidatedObjectKey)
+
+	repairer := cscbrepair.NewRepairer(repository, store, bucket)
 	executionKey := repairSHA256(fmt.Sprintf("repair-main-%d", unique))
-	manifest, err := repairer.PrepareNext(ctx, executionKey, tag, height, height+1, 1, nil)
+	manifest, err := repairer.PrepareObject(ctx, executionKey, tag, height, height+1, 1, dirtyKey, nil)
 	require.NoError(err)
 	require.NotNil(manifest)
 	repairID = manifest.ID
@@ -175,6 +183,9 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
+	pendingKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	require.NoError(err)
+	require.Equal([]string{dirtyKey}, pendingKeys)
 
 	// The trigger must serialize any reference to the pinned key, even when a
 	// writer changes only object_format to a non-CSCB value. This closes the
