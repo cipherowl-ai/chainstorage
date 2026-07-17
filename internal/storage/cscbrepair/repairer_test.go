@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"testing"
 	"time"
@@ -261,6 +262,26 @@ func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing
 	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
 	require.NoError(t, err)
 	require.Equal(t, "current-version", version.VersionID)
+	require.Empty(t, store.readVersionIDs)
+}
+
+func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *testing.T) {
+	versions := make([]retirement.ObjectVersion, maxSingleBlockVersionsToInspect+1)
+	for i := range versions {
+		versions[i] = retirement.ObjectVersion{
+			VersionID: fmt.Sprintf("version-%d", i),
+			ETag:      "same-etag",
+			Bytes:     4,
+			IsLatest:  i == 0,
+		}
+	}
+	store := &versionedObjectStore{
+		topology: retirement.ObjectVersionTopology{Versions: versions},
+	}
+	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
+
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	require.ErrorContains(t, err, "too many single-block object versions to safely inspect")
 	require.Empty(t, store.readVersionIDs)
 }
 

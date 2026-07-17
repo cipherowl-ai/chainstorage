@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	completedOutcome    = "old_consolidated_object_retained_unreferenced"
-	alreadyCleanOutcome = OutcomeAlreadyCleanStorageNeutral
+	completedOutcome                = "old_consolidated_object_retained_unreferenced"
+	alreadyCleanOutcome             = OutcomeAlreadyCleanStorageNeutral
+	maxSingleBlockVersionsToInspect = 10
 )
 
 type repairerImpl struct {
@@ -481,6 +482,14 @@ func (r *repairerImpl) inspectSingleBlockObjectVersion(ctx context.Context, key 
 	}
 	if len(topology.Versions) == 1 {
 		return current, nil
+	}
+	if len(topology.Versions) > maxSingleBlockVersionsToInspect {
+		return ObjectVersion{}, xerrors.Errorf(
+			"too many single-block object versions to safely inspect: key=%q count=%d max=%d",
+			key,
+			len(topology.Versions),
+			maxSingleBlockVersionsToInspect,
+		)
 	}
 
 	// Retries historically created redundant single-block versions. Verify every
