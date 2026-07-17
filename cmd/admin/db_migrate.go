@@ -168,11 +168,10 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 
 	logger.Info("Successfully connected to database")
 
-	if err := configureEmbeddedMigrations(); err != nil {
-		return xerrors.Errorf("failed to set goose dialect: %w", err)
-	}
-
 	if dryRun {
+		if err := configureEmbeddedMigrations(); err != nil {
+			return xerrors.Errorf("failed to set goose dialect: %w", err)
+		}
 		return withMigrationLock(ctx, db, lockWaitTimeout, func() error {
 			// Show pending migrations
 			logger.Info("Checking for pending migrations (dry run)")
@@ -212,23 +211,17 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 		})
 	}
 
-	var currentVersion int64
-	if err := withMigrationLock(ctx, db, lockWaitTimeout, func() error {
-		var err error
-		currentVersion, err = runPendingMigrations(ctx, db, logger)
-		if err != nil {
-			return err
-		}
-
-		logger.Info("Reconciling runtime role privileges",
-			zap.String("worker_user", workerUser),
-			zap.String("server_user", serverUser))
-		if err := grantMigrationPrivileges(ctx, db, masterUser, workerUser, serverUser, dbName); err != nil {
-			return xerrors.Errorf("failed to reconcile runtime role privileges: %w", err)
-		}
-
-		return nil
-	}); err != nil {
+	currentVersion, err := runPrivilegedMigrations(
+		ctx,
+		db,
+		masterUser,
+		workerUser,
+		serverUser,
+		dbName,
+		lockWaitTimeout,
+		logger,
+	)
+	if err != nil {
 		return xerrors.Errorf("failed to run locked database migration: %w", err)
 	}
 
@@ -242,6 +235,67 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 func configureEmbeddedMigrations() error {
 	goose.SetBaseFS(postgres.GetEmbeddedMigrations())
 	return goose.SetDialect("postgres")
+}
+
+func runPrivilegedMigrations(
+	ctx context.Context,
+	db *sql.DB,
+	masterUser string,
+	workerUser string,
+	serverUser string,
+	dbName string,
+	lockWaitTimeout time.Duration,
+	logger *zap.Logger,
+) (int64, error) {
+	if err := configureEmbeddedMigrations(); err != nil {
+		return 0, xerrors.Errorf("failed to set goose dialect: %w", err)
+	}
+
+	var currentVersion int64
+	if err := withMigrationLock(ctx, db, lockWaitTimeout, func() error {
+		var err error
+		currentVersion, err = runMigrationSteps(
+			ctx,
+			db,
+			masterUser,
+			workerUser,
+			serverUser,
+			dbName,
+			func() (int64, error) {
+				return runPendingMigrations(ctx, db, logger)
+			},
+		)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	return currentVersion, nil
+}
+
+func runMigrationSteps(
+	ctx context.Context,
+	db migrationExecer,
+	masterUser string,
+	workerUser string,
+	serverUser string,
+	dbName string,
+	migrate func() (int64, error),
+) (int64, error) {
+	if err := ensureMigrationRoleMembership(ctx, db, masterUser, workerUser); err != nil {
+		return 0, xerrors.Errorf("failed to authorize migrations over worker-owned objects: %w", err)
+	}
+
+	currentVersion, err := migrate()
+	if err != nil {
+		return 0, err
+	}
+
+	if err := grantMigrationPrivileges(ctx, db, masterUser, workerUser, serverUser, dbName); err != nil {
+		return 0, xerrors.Errorf("failed to reconcile runtime role privileges: %w", err)
+	}
+
+	return currentVersion, nil
 }
 
 func withMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Duration, run func() error) error {
@@ -395,6 +449,23 @@ func grantMigrationPrivileges(ctx context.Context, db migrationExecer, masterUse
 	return nil
 }
 
+func ensureMigrationRoleMembership(ctx context.Context, db migrationExecer, masterUser, workerUser string) error {
+	if masterUser == workerUser {
+		return nil
+	}
+
+	query := fmt.Sprintf(
+		"GRANT %s TO %s",
+		pq.QuoteIdentifier(workerUser),
+		pq.QuoteIdentifier(masterUser),
+	)
+	if _, err := db.ExecContext(ctx, query); err != nil {
+		return xerrors.Errorf("failed query %q: %w", query, err)
+	}
+
+	return nil
+}
+
 func migrationPrivilegeQueries(masterUser, workerUser, serverUser, dbName string) []string {
 	master := pq.QuoteIdentifier(masterUser)
 	worker := pq.QuoteIdentifier(workerUser)
@@ -416,6 +487,8 @@ func migrationPrivilegeQueries(masterUser, workerUser, serverUser, dbName string
 		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT ALL PRIVILEGES ON FUNCTIONS TO %s", master, worker),
 		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON TABLES TO %s", master, server),
 		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON SEQUENCES TO %s", master, server),
+		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON TABLES TO %s", worker, server),
+		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON SEQUENCES TO %s", worker, server),
 	}
 }
 

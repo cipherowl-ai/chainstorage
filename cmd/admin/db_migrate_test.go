@@ -86,11 +86,12 @@ func TestRunDBMigrateRequiresRuntimeUsers(t *testing.T) {
 func TestMigrationPrivilegeQueriesCoverMasterOwnedObjects(t *testing.T) {
 	queries := migrationPrivilegeQueries("master-role", "worker-role", "server-role", "chainstorage-db")
 
-	require.Len(t, queries, 14)
+	require.Len(t, queries, 16)
 	require.Contains(t, queries, `GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO "worker-role"`)
 	require.Contains(t, queries, `GRANT SELECT ON ALL TABLES IN SCHEMA public TO "server-role"`)
 	require.Contains(t, queries, `ALTER DEFAULT PRIVILEGES FOR USER "master-role" IN SCHEMA public GRANT ALL PRIVILEGES ON TABLES TO "worker-role"`)
 	require.Contains(t, queries, `ALTER DEFAULT PRIVILEGES FOR USER "master-role" IN SCHEMA public GRANT SELECT ON TABLES TO "server-role"`)
+	require.Contains(t, queries, `ALTER DEFAULT PRIVILEGES FOR USER "worker-role" IN SCHEMA public GRANT SELECT ON TABLES TO "server-role"`)
 }
 
 func TestGrantMigrationPrivilegesFailsClosed(t *testing.T) {
@@ -100,4 +101,39 @@ func TestGrantMigrationPrivilegesFailsClosed(t *testing.T) {
 
 	require.ErrorContains(t, err, "injected grant failure")
 	require.Len(t, db.queries, 5)
+}
+
+func TestEnsureMigrationRoleMembershipQuotesRoleNames(t *testing.T) {
+	db := &recordingMigrationExecer{failAt: -1}
+
+	err := ensureMigrationRoleMembership(context.Background(), db, `master"role`, `worker"role`)
+
+	require.NoError(t, err)
+	require.Equal(t, []string{`GRANT "worker""role" TO "master""role"`}, db.queries)
+}
+
+func TestRunMigrationStepsFailsClosedOnPrivilegeGrant(t *testing.T) {
+	db := &recordingMigrationExecer{failAt: 1}
+	migrated := false
+
+	_, err := runMigrationSteps(
+		context.Background(),
+		db,
+		"master",
+		"worker",
+		"server",
+		"chainstorage",
+		func() (int64, error) {
+			migrated = true
+			return 42, nil
+		},
+	)
+
+	require.True(t, migrated)
+	require.ErrorContains(t, err, "failed to reconcile runtime role privileges")
+	require.ErrorContains(t, err, "injected grant failure")
+	require.Equal(t, []string{
+		`GRANT "worker" TO "master"`,
+		`GRANT ALL PRIVILEGES ON DATABASE "chainstorage" TO "worker"`,
+	}, db.queries)
 }
