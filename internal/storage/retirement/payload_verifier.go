@@ -32,6 +32,7 @@ type (
 	}
 
 	PinnedPayloadVerifier interface {
+		ReadSingleBlock(ctx context.Context, candidate Candidate) (*api.Block, PinnedPayloadInspection, error)
 		InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
 		InspectConsolidated(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
 	}
@@ -75,31 +76,39 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 }
 
 func (v *payloadVerifier) InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error) {
+	_, inspection, err := v.ReadSingleBlock(ctx, candidate)
+	return inspection, err
+}
+
+func (v *payloadVerifier) ReadSingleBlock(
+	ctx context.Context,
+	candidate Candidate,
+) (*api.Block, PinnedPayloadInspection, error) {
 	singleBlockCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
 	if err != nil {
-		return PinnedPayloadInspection{}, err
+		return nil, PinnedPayloadInspection{}, err
 	}
 	singleBlockPayload, err := storageutils.Decompress(singleBlockCompressed, storageutils.GetCompressionType(candidate.Key))
 	if err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
 	}
 	var singleBlockBlock api.Block
 	if err := proto.Unmarshal(singleBlockPayload, &singleBlockBlock); err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
 	}
 	if err := validatePayloadIdentity(&singleBlockBlock, candidate); err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
 	}
 	normalized := storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock)
 	digest, err := canonicalBlockDigest(normalized)
 	if err != nil {
-		return PinnedPayloadInspection{}, err
+		return nil, PinnedPayloadInspection{}, err
 	}
 	semanticDigest, err := semanticBlockDigest(normalized)
 	if err != nil {
-		return PinnedPayloadInspection{}, err
+		return nil, PinnedPayloadInspection{}, err
 	}
-	return PinnedPayloadInspection{
+	return &singleBlockBlock, PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
 		SemanticSHA256:      semanticDigest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(&singleBlockBlock),

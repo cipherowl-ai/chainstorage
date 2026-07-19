@@ -2,16 +2,20 @@ package activity
 
 import (
 	"context"
+	"testing"
+	"time"
 
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/cscbrepair"
-	"github.com/coinbase/chainstorage/internal/storage/metastorage"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVerifies() {
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRebuildsPinnedPayloadsAndPromotesAtomically() {
 	require := testutil.Require(s.T())
 	records, blocks := makeConsolidatorFixture(1, 1000)
 	request := &BatchConsolidatorRequest{
@@ -25,31 +29,24 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
 	prepared := repairActivityManifest(cscbrepair.StatePrepared, oldKey, "")
-	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
 	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
 	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
 	fake := &repairActivityFake{
 		prepared:  prepared,
-		restored:  restored,
 		verified:  verified,
 		completed: completed,
+		pinnedPayloads: []cscbrepair.PinnedPayload{{
+			BlockMetadataID: records[0].ID,
+			Metadata:        records[0].Metadata,
+			RawBlockPayload: marshalRepairBlock(s.T(), blocks[0]),
+		}},
 	}
 	s.batchConsolidator.repairer = fake
 	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
-	gomock.InOrder(
-		s.metaStorage.EXPECT().
-			GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
-			Return(records, nil),
-		s.blobStorage.EXPECT().Download(gomock.Any(), records[0].Metadata).Return(blocks[0], nil),
-		s.blobStorage.EXPECT().
-			UploadConsolidated(gomock.Any(), gomock.Any()).
-			Return(newKey, makeConsolidatorPlacements(records), nil),
-		s.metaStorage.EXPECT().PersistBlockConsolidationShadows(gomock.Any(), gomock.Any()).Return(nil),
-		s.metaStorage.EXPECT().
-			PromoteBlockConsolidationShadows(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100), config.DefaultSingleBlockObjectRetention).
-			Return(&metastorage.ConsolidationPromotionResult{Blocks: 1}, nil),
-	)
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), gomock.Any()).
+		Return(newKey, makeConsolidatorPlacements(records), nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
 	require.NoError(err)
@@ -63,22 +60,16 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRestoresRebuildsAndVe
 		OldObjectKey:       oldKey,
 		RepairedObjects:    1,
 	}, response)
-	require.Equal([]string{"prepare", "restore", "verify", "complete"}, fake.calls)
+	require.Equal([]string{"prepare", "visit_pinned", "verify_promote", "complete"}, fake.calls)
 	require.Equal(testRepairExecutionKey, fake.executionKey)
 }
 
-func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRejectsNonExactRebuildBeforeUpload() {
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRejectsMissingPinnedPayloadBeforeUpload() {
 	require := testutil.Require(s.T())
-	records, _ := makeConsolidatorFixture(1, 1000)
 	oldKey := "consolidated/dirty.cscb.zstd"
-	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
-	restored.Blocks[0].BlockMetadataID = 999
-	fake := &repairActivityFake{prepared: restored}
+	prepared := repairActivityManifest(cscbrepair.StatePrepared, oldKey, "")
+	fake := &repairActivityFake{prepared: prepared}
 	s.batchConsolidator.repairer = fake
-
-	s.metaStorage.EXPECT().
-		GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
-		Return(records, nil)
 
 	_, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
 		Mode:               config.ConsolidationModeRepairExistingCSCB,
@@ -88,28 +79,34 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRejectsNonExactRebuil
 		MaxBlocks:          100,
 		RepairExecutionKey: testRepairExecutionKey,
 	})
-	require.ErrorContains(err, "unexpected metadata_id=10")
-	require.Equal([]string{"prepare"}, fake.calls)
+	require.ErrorContains(err, "pinned payload count mismatch")
+	require.Equal([]string{"prepare", "visit_pinned"}, fake.calls)
 }
 
-func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesAfterShadowsPersisted() {
+func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesRestoredManifestWithPinnedPayload() {
 	require := testutil.Require(s.T())
+	records, blocks := makeConsolidatorFixture(1, 1000)
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
 	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
 	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
 	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
-	fake := &repairActivityFake{prepared: restored, verified: verified, completed: completed}
+	fake := &repairActivityFake{
+		prepared:  restored,
+		verified:  verified,
+		completed: completed,
+		pinnedPayloads: []cscbrepair.PinnedPayload{{
+			BlockMetadataID: records[0].ID,
+			Metadata:        records[0].Metadata,
+			RawBlockPayload: marshalRepairBlock(s.T(), blocks[0]),
+		}},
+	}
 	s.batchConsolidator.repairer = fake
+	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
 
-	gomock.InOrder(
-		s.metaStorage.EXPECT().
-			GetBlocksMissingConsolidationShadow(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100)).
-			Return(nil, nil),
-		s.metaStorage.EXPECT().
-			PromoteBlockConsolidationShadows(gomock.Any(), uint32(2), uint64(1000), uint64(1001), uint64(100), config.DefaultSingleBlockObjectRetention).
-			Return(&metastorage.ConsolidationPromotionResult{Blocks: 1}, nil),
-	)
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), gomock.Any()).
+		Return(newKey, makeConsolidatorPlacements(records), nil)
 
 	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), &BatchConsolidatorRequest{
 		Mode:               config.ConsolidationModeRepairExistingCSCB,
@@ -121,7 +118,7 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesAfterShadowsPe
 	})
 	require.NoError(err)
 	require.Equal(uint64(1), response.RepairedObjects)
-	require.Equal([]string{"prepare", "verify", "complete"}, fake.calls)
+	require.Equal([]string{"prepare", "visit_pinned", "verify_promote", "complete"}, fake.calls)
 }
 
 func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBCompletesAllNonCanonicalObjectWithoutRebuild() {
@@ -250,6 +247,7 @@ type repairActivityFake struct {
 	objectKey           string
 	candidateObjectKeys []string
 	candidateLimit      int
+	pinnedPayloads      []cscbrepair.PinnedPayload
 }
 
 func (f *repairActivityFake) PrepareNext(_ context.Context, executionKey string, _ uint32, _ uint64, _ uint64, _ uint64, _ cscbrepair.Progress) (*cscbrepair.Manifest, error) {
@@ -280,9 +278,43 @@ func (f *repairActivityFake) VerifyRebuilt(context.Context, int64, cscbrepair.Pr
 	return f.verified, nil
 }
 
+func (f *repairActivityFake) VisitPinnedPayloads(
+	_ context.Context,
+	_ int64,
+	_ cscbrepair.Progress,
+	visit func(cscbrepair.PinnedPayload) error,
+) error {
+	f.calls = append(f.calls, "visit_pinned")
+	for _, payload := range f.pinnedPayloads {
+		if err := visit(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *repairActivityFake) VerifyAndPromote(
+	context.Context,
+	int64,
+	string,
+	[]cscbrepair.RebuiltPlacement,
+	time.Duration,
+	cscbrepair.Progress,
+) (*cscbrepair.Manifest, error) {
+	f.calls = append(f.calls, "verify_promote")
+	return f.verified, nil
+}
+
 func (f *repairActivityFake) Complete(context.Context, int64, cscbrepair.Progress) (*cscbrepair.Manifest, error) {
 	f.calls = append(f.calls, "complete")
 	return f.completed, nil
 }
 
 const testRepairExecutionKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+func marshalRepairBlock(t *testing.T, block *api.Block) []byte {
+	t.Helper()
+	raw, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(block))
+	testutil.Require(t).NoError(err)
+	return raw
+}

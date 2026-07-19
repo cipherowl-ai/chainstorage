@@ -379,39 +379,49 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 	)
 	logger.Info("resuming CSCB repair")
 
-	if manifest.State == cscbrepair.StatePrepared {
+	if manifest.State == cscbrepair.StatePrepared && manifest.CanonicalBlockCount == 0 {
 		manifest, err = repairer.Restore(ctx, manifest.ID, progress)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to restore CSCB repair to single-block metadata: %w", err)
 		}
 	}
-	if manifest.State == cscbrepair.StateRestored && manifest.CanonicalBlockCount > 0 {
-		expectedRecords := make(map[int64]cscbrepair.Block, manifest.CanonicalBlockCount)
-		for _, block := range manifest.Blocks {
-			if block.Canonical {
-				expectedRecords[block.BlockMetadataID] = block
+	if (manifest.State == cscbrepair.StatePrepared || manifest.State == cscbrepair.StateRestored) &&
+		manifest.CanonicalBlockCount > 0 {
+		payloads, cleanup, err := a.buildPinnedRepairPayloads(ctx, repairer, manifest, progress)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		uploadCtx := blobstorage.WithConsolidatedUploadProgress(ctx, func(stage string, details ...any) {
+			heartbeatDetails := append([]any{"batch_consolidator.repair." + stage}, details...)
+			sdkactivity.RecordHeartbeat(ctx, heartbeatDetails...)
+		})
+		objectKey, uploadedPlacements, err := a.blobStorage.UploadConsolidated(uploadCtx, payloads)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to upload rebuilt normalized CSCB: %w", err)
+		}
+		placements := make([]cscbrepair.RebuiltPlacement, len(uploadedPlacements))
+		for i, placement := range uploadedPlacements {
+			placements[i] = cscbrepair.RebuiltPlacement{
+				BlockMetadataID:    placement.MetadataID,
+				Height:             placement.Height,
+				Hash:               placement.Hash,
+				ObjectFormat:       placement.ObjectFormat,
+				ByteOffset:         placement.ByteOffset,
+				ByteLength:         placement.ByteLength,
+				UncompressedLength: placement.UncompressedLength,
 			}
 		}
-		normalResponse, err := a.executeShadowDualWriteWithExpected(ctx, &BatchConsolidatorRequest{
-			Mode:        config.ConsolidationModeHistoricalBackfill,
-			Tag:         manifest.Tag,
-			StartHeight: manifest.StartHeight,
-			EndHeight:   manifest.EndHeight,
-			MaxBlocks:   request.MaxBlocks,
-		}, expectedRecords)
+		manifest, err = repairer.VerifyAndPromote(
+			ctx,
+			manifest.ID,
+			objectKey,
+			placements,
+			a.config.AWS.Storage.Consolidation.SingleBlockObjectRetention,
+			progress,
+		)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to rebuild normalized CSCB: %w", err)
-		}
-		if normalResponse.ScannedBlocks != 0 && normalResponse.ScannedBlocks != manifest.CanonicalBlockCount {
-			return nil, xerrors.Errorf(
-				"CSCB repair rebuilt unexpected canonical row count: expected=%d actual=%d",
-				manifest.CanonicalBlockCount,
-				normalResponse.ScannedBlocks,
-			)
-		}
-		manifest, err = repairer.VerifyRebuilt(ctx, manifest.ID, progress)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to verify rebuilt CSCB: %w", err)
+			return nil, xerrors.Errorf("failed to verify and atomically promote rebuilt CSCB: %w", err)
 		}
 	}
 	if manifest.State == cscbrepair.StateRestored || manifest.State == cscbrepair.StateVerified {
@@ -430,9 +440,13 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 		zap.String("new_object_key", manifest.NewConsolidatedObjectKey),
 		zap.String("old_object_outcome", manifest.Outcome),
 	)
-	consolidatedBlocks := manifest.CanonicalBlockCount
-	promotedBlocks := manifest.CanonicalBlockCount
+	consolidatedBlocks := manifest.TotalBlockCount
+	promotedBlocks := manifest.TotalBlockCount
 	objectKey := manifest.NewConsolidatedObjectKey
+	if objectKey == "" {
+		consolidatedBlocks = 0
+		promotedBlocks = 0
+	}
 	if manifest.Outcome == cscbrepair.OutcomeAlreadyCleanStorageNeutral {
 		consolidatedBlocks = 0
 		promotedBlocks = 0
@@ -888,6 +902,53 @@ func promotionSafeEndHeight(latestHeight uint64, safePromotionLag uint64) (uint6
 		return safeHeight, safeHeight, true
 	}
 	return safeHeight + 1, safeHeight, true
+}
+
+func (a *BatchConsolidator) buildPinnedRepairPayloads(
+	ctx context.Context,
+	repairer cscbrepair.Repairer,
+	manifest *cscbrepair.Manifest,
+	progress cscbrepair.Progress,
+) ([]blobstorage.ConsolidatedBlockPayload, func(), error) {
+	payloads := make([]blobstorage.ConsolidatedBlockPayload, 0, manifest.TotalBlockCount)
+	tempFiles := make([]string, 0, manifest.TotalBlockCount)
+	cleanup := func() {
+		for _, path := range tempFiles {
+			if path != "" {
+				_ = os.Remove(path)
+			}
+		}
+	}
+	err := repairer.VisitPinnedPayloads(ctx, manifest.ID, progress, func(pinned cscbrepair.PinnedPayload) error {
+		source, path, length, err := writeRawBlockPayloadTempFile(
+			pinned.RawBlockPayload,
+			a.config.AWS.Storage.Consolidation.LocalSpillDir,
+		)
+		if err != nil {
+			return err
+		}
+		tempFiles = append(tempFiles, path)
+		payloads = append(payloads, blobstorage.ConsolidatedBlockPayload{
+			Metadata:           pinned.Metadata,
+			MetadataID:         pinned.BlockMetadataID,
+			RawBlockPayload:    source,
+			UncompressedLength: length,
+		})
+		return nil
+	})
+	if err != nil {
+		cleanup()
+		return nil, nil, xerrors.Errorf("failed to build normalized CSCB from pinned versions: %w", err)
+	}
+	if uint64(len(payloads)) != manifest.TotalBlockCount {
+		cleanup()
+		return nil, nil, xerrors.Errorf(
+			"CSCB repair pinned payload count mismatch: expected=%d actual=%d",
+			manifest.TotalBlockCount,
+			len(payloads),
+		)
+	}
+	return payloads, cleanup, nil
 }
 
 func (a *BatchConsolidator) buildPayloads(
