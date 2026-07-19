@@ -173,14 +173,13 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 
 	decoder := json.NewDecoder(bytes.NewReader(solana.Header))
 	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
+	value, err := decodeUniqueJSONValue(decoder)
+	if err != nil {
 		return nil, xerrors.Errorf("failed to parse embedded Solana block JSON: %w", err)
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	if token, err := decoder.Token(); err != io.EOF {
 		if err == nil {
-			return nil, xerrors.New("embedded Solana block JSON contains multiple values")
+			return nil, xerrors.Errorf("embedded Solana block JSON contains multiple values: trailing=%v", token)
 		}
 		return nil, xerrors.Errorf("failed to finish parsing embedded Solana block JSON: %w", err)
 	}
@@ -191,6 +190,70 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 	canonical := proto.Clone(block).(*api.Block)
 	canonical.GetSolana().Header = canonicalHeader
 	return canonical, nil
+}
+
+func decodeUniqueJSONValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return token, nil
+	}
+
+	switch delim {
+	case '{':
+		object := make(map[string]any)
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil, xerrors.Errorf("JSON object key is not a string: %v", keyToken)
+			}
+			if _, exists := object[key]; exists {
+				return nil, xerrors.Errorf("duplicate JSON object key %q", key)
+			}
+			value, err := decodeUniqueJSONValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = value
+		}
+		if err := requireJSONClosingDelimiter(decoder, '}'); err != nil {
+			return nil, err
+		}
+		return object, nil
+	case '[':
+		array := make([]any, 0)
+		for decoder.More() {
+			value, err := decodeUniqueJSONValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		if err := requireJSONClosingDelimiter(decoder, ']'); err != nil {
+			return nil, err
+		}
+		return array, nil
+	default:
+		return nil, xerrors.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+func requireJSONClosingDelimiter(decoder *json.Decoder, expected json.Delim) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if token != expected {
+		return xerrors.Errorf("unexpected JSON closing delimiter %v; expected %q", token, expected)
+	}
+	return nil
 }
 
 func validatePayloadIdentity(block *api.Block, candidate Candidate) error {

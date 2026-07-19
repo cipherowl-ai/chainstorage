@@ -144,6 +144,20 @@ func TestSemanticBlockDigestRejectsMalformedSolanaJSON(t *testing.T) {
 	require.ErrorContains(t, err, "contains multiple values")
 }
 
+func TestSemanticBlockDigestRejectsDuplicateSolanaJSONKeys(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
+	tests := map[string]string{
+		"top level": `{"slot":429600000,"slot":429600001}`,
+		"nested":    `{"meta":{"slot":429600000,"slot":429600001}}`,
+	}
+	for name, header := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := semanticBlockDigest(solanaPayloadBlock(candidate, header))
+			require.ErrorContains(t, err, `duplicate JSON object key "slot"`)
+		})
+	}
+}
+
 func TestPayloadVerifier_RejectsSemanticAndSerializedMismatch(t *testing.T) {
 	require := require.New(t)
 	candidate, store, _ := retirementPayloadFixture(t)
