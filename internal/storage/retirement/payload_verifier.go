@@ -142,10 +142,9 @@ func canonicalBlockDigest(block *api.Block) (string, error) {
 }
 
 func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
-	canonical := proto.Clone(block).(*api.Block)
-	solana := canonical.GetSolana()
+	solana := block.GetSolana()
 	if solana == nil || len(solana.Header) == 0 {
-		return canonical, nil
+		return block, nil
 	}
 
 	decoder := json.NewDecoder(bytes.NewReader(solana.Header))
@@ -165,7 +164,8 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 	if err != nil {
 		return nil, xerrors.Errorf("failed to canonicalize embedded Solana block JSON: %w", err)
 	}
-	solana.Header = canonicalHeader
+	canonical := proto.Clone(block).(*api.Block)
+	canonical.GetSolana().Header = canonicalHeader
 	return canonical, nil
 }
 
