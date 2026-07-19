@@ -291,48 +291,27 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.ErrorContains(err, "failed to lock canonical retirement metadata")
 
-	manifest, err = repairer.Restore(ctx, manifest.ID, nil)
+	activeBeforeRebuild, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(cscbrepair.StateRestored, manifest.State)
-	require.NotNil(manifest.RestoredAt)
-	activeSingleBlock, err := meta.GetBlockByHeight(ctx, tag, height)
-	require.NoError(err)
-	require.Equal(singleBlockKey, activeSingleBlock.ObjectKeyMain)
-	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK, activeSingleBlock.ObjectFormat)
-	require.Zero(activeSingleBlock.ByteLength)
-	restoredBlock, err := blob.Download(ctx, activeSingleBlock)
-	require.NoError(err)
-	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate), storageutils.CloneBlockWithoutStoragePlacement(restoredBlock)))
-	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET object_key_main = $2 WHERE id = $1`, blockMetadataID, dirtyKey)
-	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
-	_, err = db.ExecContext(ctx, `
-		INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, single_block_object_key_main,
-			consolidated_object_key_main, object_format, byte_offset, byte_length,
-			uncompressed_length, validated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())`,
-		blockMetadataID,
-		tag,
-		height,
-		block.Metadata.Hash,
-		singleBlockKey,
-		dirtyKey,
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
-		manifest.Blocks[0].OldByteOffset,
-		manifest.Blocks[0].OldByteLength,
-		manifest.Blocks[0].OldUncompressedLength,
-	)
-	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
+	require.Equal(dirtyKey, activeBeforeRebuild.ObjectKeyMain)
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeBeforeRebuild.ObjectFormat)
 
-	records, err = meta.GetBlocksMissingConsolidationShadow(ctx, tag, height, height+1, 1)
-	require.NoError(err)
-	require.Len(records, 1)
-	cleanBlock, err := blob.Download(ctx, records[0].Metadata)
-	require.NoError(err)
-	cleanPayload, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(cleanBlock))
-	require.NoError(err)
+	var pinnedPayloads []cscbrepair.PinnedPayload
+	require.NoError(repairer.VisitPinnedPayloads(ctx, manifest.ID, nil, func(payload cscbrepair.PinnedPayload) error {
+		pinnedPayloads = append(pinnedPayloads, payload)
+		return nil
+	}))
+	require.Len(pinnedPayloads, 1)
+	var pinnedBlock api.Block
+	require.NoError(proto.Unmarshal(pinnedPayloads[0].RawBlockPayload, &pinnedBlock))
+	require.False(storageutils.HasBlockStoragePlacement(&pinnedBlock))
+	require.True(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(&pinnedBlock),
+	))
+	cleanPayload := pinnedPayloads[0].RawBlockPayload
 	cleanKey, cleanPlacements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{
-		Metadata:           records[0].Metadata,
+		Metadata:           pinnedPayloads[0].Metadata,
 		MetadataID:         blockMetadataID,
 		RawBlockPayload:    blobstorage.BytesPayloadSource(cleanPayload),
 		UncompressedLength: uint64(len(cleanPayload)),
@@ -341,21 +320,25 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NotEqual(dirtyKey, cleanKey)
 	require.Len(cleanPlacements, 1)
 	cleanPlacement := cleanPlacements[0]
-	require.NoError(meta.PersistBlockConsolidationShadows(ctx, []*metastorage.ConsolidationShadowPlacement{{
-		BlockMetadataID:           blockMetadataID,
-		Tag:                       tag,
-		Height:                    height,
-		Hash:                      block.Metadata.Hash,
-		SingleBlockObjectKeyMain:  singleBlockKey,
-		ConsolidatedObjectKeyMain: cleanKey,
-		ObjectFormat:              cleanPlacement.ObjectFormat,
-		ByteOffset:                cleanPlacement.ByteOffset,
-		ByteLength:                cleanPlacement.ByteLength,
-		UncompressedLength:        cleanPlacement.UncompressedLength,
-	}}))
-	promotion, err = meta.PromoteBlockConsolidationShadows(ctx, tag, height, height+1, 1, 72*time.Hour)
+	activeBeforePromotion, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(uint64(1), promotion.Blocks)
+	require.Equal(dirtyKey, activeBeforePromotion.ObjectKeyMain, "source CSCB must remain active until atomic promotion")
+
+	manifest, err = repairer.VerifyAndPromote(ctx, manifest.ID, cleanKey, []cscbrepair.RebuiltPlacement{{
+		BlockMetadataID:    cleanPlacement.MetadataID,
+		Height:             cleanPlacement.Height,
+		Hash:               cleanPlacement.Hash,
+		ObjectFormat:       cleanPlacement.ObjectFormat,
+		ByteOffset:         cleanPlacement.ByteOffset,
+		ByteLength:         cleanPlacement.ByteLength,
+		UncompressedLength: cleanPlacement.UncompressedLength,
+	}}, 72*time.Hour, nil)
+	require.NoError(err)
+	require.Equal(cscbrepair.StateVerified, manifest.State)
+	require.Equal(cleanKey, manifest.NewConsolidatedObjectKey)
+	require.NotZero(manifest.NewConsolidatedObjectVersion.Bytes)
+	require.NotNil(manifest.RestoredAt)
+	require.NotNil(manifest.VerifiedAt)
 	var retentionStartedAt, singleBlockDeleteAfter time.Time
 	require.NoError(db.QueryRowContext(ctx, `
 		SELECT single_block_retention_started_at, single_block_delete_after
@@ -363,13 +346,10 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&retentionStartedAt, &singleBlockDeleteAfter))
 	require.False(retentionStartedAt.Before(*manifest.RestoredAt))
 	require.WithinDuration(retentionStartedAt.Add(72*time.Hour), singleBlockDeleteAfter, time.Microsecond)
-
-	manifest, err = repairer.VerifyRebuilt(ctx, manifest.ID, nil)
+	activeAfterPromotion, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(cscbrepair.StateVerified, manifest.State)
-	require.Equal(cleanKey, manifest.NewConsolidatedObjectKey)
-	require.NotZero(manifest.NewConsolidatedObjectVersion.Bytes)
-	require.NotNil(manifest.VerifiedAt)
+	require.Equal(cleanKey, activeAfterPromotion.ObjectKeyMain)
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeAfterPromotion.ObjectFormat)
 
 	manifest, err = repairer.Complete(ctx, manifest.ID, nil)
 	require.NoError(err)

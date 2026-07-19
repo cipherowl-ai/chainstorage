@@ -1067,6 +1067,223 @@ func (r *PostgresRepository) RecordVerified(
 	return verified, nil
 }
 
+func (r *PostgresRepository) PromoteVerified(
+	ctx context.Context,
+	repairID int64,
+	objectKey string,
+	object ObjectVersion,
+	placements []RebuiltPlacement,
+	singleBlockObjectRetention time.Duration,
+) (*Manifest, error) {
+	if err := r.validateDB(); err != nil {
+		return nil, err
+	}
+	if objectKey == "" || object.VersionID == "" || object.ETag == "" || object.Bytes == 0 {
+		return nil, xerrors.New("verified CSCB object identity is required")
+	}
+	if singleBlockObjectRetention <= 0 {
+		return nil, xerrors.New("positive single-block object retention is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to begin atomic CSCB repair promotion: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	manifest, err := lockManifestForRepair(ctx, tx, repairID)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.State == StateVerified || manifest.State == StateCompleted {
+		if manifest.NewConsolidatedObjectKey != objectKey ||
+			manifest.NewConsolidatedObjectVersion != object {
+			return nil, xerrors.Errorf("verified CSCB repair identity changed for repair id %d", manifest.ID)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, xerrors.Errorf("failed to commit idempotent atomic CSCB repair promotion: %w", err)
+		}
+		return manifest, nil
+	}
+	if manifest.State != StatePrepared && manifest.State != StateRestored {
+		return nil, xerrors.Errorf(
+			"CSCB repair must be prepared or restored before atomic promotion: id=%d state=%s",
+			manifest.ID,
+			manifest.State,
+		)
+	}
+	placementsByID, err := validateRebuiltPlacements(manifest, objectKey, placements)
+	if err != nil {
+		return nil, err
+	}
+	if err := lockRepairRows(ctx, tx, manifest.Blocks); err != nil {
+		return nil, err
+	}
+	if err := lockConsolidatedObjectKeys(ctx, tx, manifest.OldConsolidatedObjectKey, objectKey); err != nil {
+		return nil, err
+	}
+	if err := requireNoUnexpectedOldReferences(ctx, tx, manifest.OldConsolidatedObjectKey, manifest.Blocks); err != nil {
+		return nil, err
+	}
+	var promotionTime time.Time
+	if err := tx.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&promotionTime); err != nil {
+		return nil, xerrors.Errorf("failed to capture CSCB repair promotion time: %w", err)
+	}
+	if manifest.State == StatePrepared {
+		const markRestored = `
+			UPDATE cscb_repair_manifest
+			SET state = $2,
+				restored_at = $3,
+				updated_at = $3
+			WHERE id = $1 AND state = $4`
+		result, err := tx.ExecContext(ctx, markRestored, manifest.ID, StateRestored, promotionTime, StatePrepared)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to mark CSCB repair restored during atomic promotion: %w", err)
+		}
+		if err := requireRowsAffected(result, 1, "mark CSCB repair restored during atomic promotion"); err != nil {
+			return nil, err
+		}
+		manifest.State = StateRestored
+		manifest.RestoredAt = &promotionTime
+	}
+	deleteAfter := promotionTime.Add(singleBlockObjectRetention)
+
+	for _, block := range manifest.Blocks {
+		placement := placementsByID[block.BlockMetadataID]
+		if err := validateRepairPromotionRow(ctx, tx, manifest, block, objectKey, placement); err != nil {
+			return nil, err
+		}
+
+		const upsertShadow = `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11, $11, $12)
+			ON CONFLICT (block_metadata_id) DO UPDATE SET
+				tag = EXCLUDED.tag,
+				height = EXCLUDED.height,
+				hash = EXCLUDED.hash,
+				single_block_object_key_main = EXCLUDED.single_block_object_key_main,
+				consolidated_object_key_main = EXCLUDED.consolidated_object_key_main,
+				object_format = EXCLUDED.object_format,
+				byte_offset = EXCLUDED.byte_offset,
+				byte_length = EXCLUDED.byte_length,
+				uncompressed_length = EXCLUDED.uncompressed_length,
+				validated_at = EXCLUDED.validated_at,
+				single_block_retention_started_at = EXCLUDED.single_block_retention_started_at,
+				single_block_delete_after = EXCLUDED.single_block_delete_after
+			WHERE block_consolidation_shadow.tag = EXCLUDED.tag
+				AND block_consolidation_shadow.height = EXCLUDED.height
+				AND block_consolidation_shadow.hash IS NOT DISTINCT FROM EXCLUDED.hash
+				AND block_consolidation_shadow.single_block_object_key_main = EXCLUDED.single_block_object_key_main
+				AND block_consolidation_shadow.single_block_object_deleted_at IS NULL
+			RETURNING block_metadata_id`
+		var shadowID int64
+		if err := tx.QueryRowContext(
+			ctx,
+			upsertShadow,
+			block.BlockMetadataID,
+			block.Tag,
+			block.Height,
+			block.Hash,
+			block.SingleBlockObjectKey,
+			objectKey,
+			int32(placement.ObjectFormat),
+			placement.ByteOffset,
+			placement.ByteLength,
+			placement.UncompressedLength,
+			promotionTime,
+			deleteAfter,
+		).Scan(&shadowID); err != nil {
+			return nil, xerrors.Errorf("failed to upsert repaired CSCB shadow for metadata_id=%d: %w", block.BlockMetadataID, err)
+		}
+
+		const promoteMetadata = `
+			UPDATE block_metadata
+			SET object_key_main = $5,
+				object_format = $6,
+				byte_offset = $7,
+				byte_length = $8,
+				uncompressed_length = $9
+			WHERE id = $1
+				AND tag = $2
+				AND height = $3
+				AND hash IS NOT DISTINCT FROM NULLIF($4, '')
+				AND skipped = FALSE
+				AND single_block_retention_fenced_at IS NULL`
+		result, err := tx.ExecContext(
+			ctx,
+			promoteMetadata,
+			block.BlockMetadataID,
+			block.Tag,
+			block.Height,
+			block.Hash,
+			objectKey,
+			int32(placement.ObjectFormat),
+			placement.ByteOffset,
+			placement.ByteLength,
+			placement.UncompressedLength,
+		)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to promote repaired CSCB metadata_id=%d: %w", block.BlockMetadataID, err)
+		}
+		if err := requireRowsAffected(result, 1, "promote repaired CSCB metadata"); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := requireNoOldReferences(ctx, tx, manifest.OldConsolidatedObjectKey); err != nil {
+		return nil, err
+	}
+	if err := requireExactRepairedReferences(ctx, tx, manifest, objectKey); err != nil {
+		return nil, err
+	}
+	const markVerified = `
+		UPDATE cscb_repair_manifest
+		SET state = $2,
+			new_consolidated_object_key_main = $3,
+			new_consolidated_object_version_id = $4,
+			new_consolidated_object_etag = $5,
+			new_consolidated_object_bytes = $6,
+			restored_at = COALESCE(restored_at, $7),
+			verified_at = $7,
+			updated_at = $7
+		WHERE id = $1 AND state = $8`
+	result, err := tx.ExecContext(
+		ctx,
+		markVerified,
+		manifest.ID,
+		StateVerified,
+		objectKey,
+		object.VersionID,
+		object.ETag,
+		object.Bytes,
+		promotionTime,
+		StateRestored,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to mark atomically promoted CSCB repair verified: %w", err)
+	}
+	if err := requireRowsAffected(result, 1, "mark atomically promoted CSCB repair verified"); err != nil {
+		return nil, err
+	}
+	verified, err := loadManifest(ctx, tx, manifest.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := loadRebuiltBlocks(ctx, tx, verified); err != nil {
+		return nil, err
+	}
+	if err := validateRebuiltMetadata(verified, objectKey); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, xerrors.Errorf("failed to commit atomic CSCB repair promotion: %w", err)
+	}
+	return verified, nil
+}
+
 func (r *PostgresRepository) CompleteRetainingOldObject(
 	ctx context.Context,
 	repairID int64,
@@ -1118,7 +1335,13 @@ func (r *PostgresRepository) CompleteRetainingOldObject(
 		return nil, err
 	}
 	if manifest.CanonicalBlockCount > 0 {
-		if err := requireExactNewReferences(ctx, tx, manifest, manifest.NewConsolidatedObjectKey); err != nil {
+		var err error
+		if allRepairRowsOnObject(manifest, manifest.NewConsolidatedObjectKey) {
+			err = requireExactRepairedReferences(ctx, tx, manifest, manifest.NewConsolidatedObjectKey)
+		} else {
+			err = requireExactNewReferences(ctx, tx, manifest, manifest.NewConsolidatedObjectKey)
+		}
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -1613,6 +1836,124 @@ func lockRepairRows(ctx context.Context, tx *sql.Tx, blocks []Block) error {
 	return shadowRows.Err()
 }
 
+func validateRepairPromotionRow(
+	ctx context.Context,
+	tx *sql.Tx,
+	manifest *Manifest,
+	block Block,
+	newObjectKey string,
+	placement RebuiltPlacement,
+) error {
+	const query = `
+		SELECT
+			EXISTS (
+				SELECT 1 FROM canonical_blocks cb
+				WHERE cb.block_metadata_id = bm.id AND cb.tag = bm.tag AND cb.height = bm.height
+			),
+			COALESCE(bm.object_key_main, ''),
+			bm.object_format,
+			bm.byte_offset,
+			bm.byte_length,
+			bm.uncompressed_length,
+			bm.skipped,
+			(bm.single_block_retention_fenced_at IS NOT NULL),
+			EXISTS (
+				SELECT 1 FROM block_single_block_retention retirement
+				WHERE retirement.block_metadata_id = bm.id
+			),
+			(shadow.block_metadata_id IS NOT NULL),
+			COALESCE(shadow.single_block_object_key_main, ''),
+			COALESCE(shadow.consolidated_object_key_main, ''),
+			shadow.object_format,
+			shadow.byte_offset,
+			shadow.byte_length,
+			shadow.uncompressed_length,
+			(shadow.single_block_object_deleted_at IS NOT NULL)
+		FROM block_metadata bm
+		LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+		WHERE bm.id = $1
+			AND bm.tag = $2
+			AND bm.height = $3
+			AND bm.hash IS NOT DISTINCT FROM NULLIF($4, '')`
+	var canonical, skipped, fenced, retirementManifest, shadowExists, singleBlockDeleted bool
+	var activeKey, shadowSingleKey, shadowConsolidatedKey string
+	var activeFormat int32
+	var activeOffset, activeLength, activeUncompressed sql.NullInt64
+	var shadowFormat, shadowOffset, shadowLength, shadowUncompressed sql.NullInt64
+	if err := tx.QueryRowContext(
+		ctx,
+		query,
+		block.BlockMetadataID,
+		block.Tag,
+		block.Height,
+		block.Hash,
+	).Scan(
+		&canonical,
+		&activeKey,
+		&activeFormat,
+		&activeOffset,
+		&activeLength,
+		&activeUncompressed,
+		&skipped,
+		&fenced,
+		&retirementManifest,
+		&shadowExists,
+		&shadowSingleKey,
+		&shadowConsolidatedKey,
+		&shadowFormat,
+		&shadowOffset,
+		&shadowLength,
+		&shadowUncompressed,
+		&singleBlockDeleted,
+	); err != nil {
+		if err == sql.ErrNoRows {
+			return xerrors.Errorf("CSCB repair metadata identity changed for metadata_id=%d", block.BlockMetadataID)
+		}
+		return xerrors.Errorf("failed to validate CSCB repair promotion row metadata_id=%d: %w", block.BlockMetadataID, err)
+	}
+	if canonical != block.Canonical || skipped || fenced || retirementManifest || singleBlockDeleted {
+		return xerrors.Errorf("CSCB repair promotion row is blocked or changed for metadata_id=%d", block.BlockMetadataID)
+	}
+	oldLayout := activeKey == manifest.OldConsolidatedObjectKey &&
+		activeFormat == int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH) &&
+		nullableUint64(activeOffset) == block.OldByteOffset &&
+		nullableUint64(activeLength) == block.OldByteLength &&
+		nullableUint64(activeUncompressed) == block.OldUncompressedLength
+	singleLayout := activeKey == block.SingleBlockObjectKey &&
+		activeFormat == int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK) &&
+		!activeOffset.Valid && !activeLength.Valid && !activeUncompressed.Valid
+	newLayout := activeKey == newObjectKey &&
+		activeFormat == int32(placement.ObjectFormat) &&
+		nullableUint64(activeOffset) == placement.ByteOffset &&
+		nullableUint64(activeLength) == placement.ByteLength &&
+		nullableUint64(activeUncompressed) == placement.UncompressedLength
+	if !oldLayout && !singleLayout && !newLayout {
+		return xerrors.Errorf("CSCB repair active placement changed for metadata_id=%d", block.BlockMetadataID)
+	}
+	if !shadowExists {
+		if !singleLayout {
+			return xerrors.Errorf("CSCB repair shadow is missing for metadata_id=%d", block.BlockMetadataID)
+		}
+		return nil
+	}
+	if shadowSingleKey != block.SingleBlockObjectKey || !shadowFormat.Valid ||
+		shadowFormat.Int64 != int64(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH) {
+		return xerrors.Errorf("CSCB repair shadow identity changed for metadata_id=%d", block.BlockMetadataID)
+	}
+	oldShadow := shadowConsolidatedKey == manifest.OldConsolidatedObjectKey &&
+		nullableUint64(shadowOffset) == block.OldByteOffset &&
+		nullableUint64(shadowLength) == block.OldByteLength &&
+		nullableUint64(shadowUncompressed) == block.OldUncompressedLength
+	newShadow := shadowConsolidatedKey == newObjectKey &&
+		nullableUint64(shadowOffset) == placement.ByteOffset &&
+		nullableUint64(shadowLength) == placement.ByteLength &&
+		nullableUint64(shadowUncompressed) == placement.UncompressedLength
+	if !oldShadow && !newShadow {
+		return xerrors.Errorf("CSCB repair shadow placement changed for metadata_id=%d", block.BlockMetadataID)
+	}
+	return nil
+}
+
 func compareCandidateRows(current *Manifest, pinned *Manifest) error {
 	if current == nil || pinned == nil {
 		return xerrors.New("CSCB repair candidate is required")
@@ -1655,7 +1996,13 @@ func validateRebuiltMetadata(manifest *Manifest, objectKey string) error {
 	}
 	canonicalCount := uint64(0)
 	for _, block := range manifest.Blocks {
-		if !block.Canonical {
+		if block.Canonical {
+			canonicalCount++
+		}
+		if block.ActiveObjectKey != objectKey {
+			if block.Canonical {
+				return xerrors.Errorf("canonical row is not on the rebuilt CSCB: metadata_id=%d", block.BlockMetadataID)
+			}
 			if block.ActiveObjectKey != block.SingleBlockObjectKey ||
 				block.ActiveObjectFormat != int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK) ||
 				block.NewConsolidatedObjectKey != "" ||
@@ -1669,9 +2016,7 @@ func validateRebuiltMetadata(manifest *Manifest, objectKey string) error {
 			}
 			continue
 		}
-		canonicalCount++
-		if block.ActiveObjectKey != objectKey ||
-			block.NewConsolidatedObjectKey != objectKey ||
+		if block.NewConsolidatedObjectKey != objectKey ||
 			block.ActiveObjectFormat != int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH) ||
 			block.NewByteLength == 0 ||
 			block.NewUncompressedLength == 0 ||
@@ -1770,6 +2115,71 @@ func requireExactNewReferences(ctx context.Context, q queryer, manifest *Manifes
 		return xerrors.Errorf("rebuilt CSCB %q has %d references outside the pinned canonical row set", objectKey, references)
 	}
 	return nil
+}
+
+func requireExactRepairedReferences(ctx context.Context, q queryer, manifest *Manifest, objectKey string) error {
+	ids := make([]int64, 0, len(manifest.Blocks))
+	for _, block := range manifest.Blocks {
+		ids = append(ids, block.BlockMetadataID)
+	}
+	if len(ids) == 0 || len(ids) != len(manifest.Blocks) {
+		return xerrors.Errorf(
+			"rebuilt CSCB expected reference count mismatch: expected=%d actual=%d",
+			len(manifest.Blocks),
+			len(ids),
+		)
+	}
+	const query = `
+		SELECT
+			(SELECT COUNT(*)
+			 FROM block_metadata
+			 WHERE object_key_main = $1
+				AND object_key_main <> ''
+				AND id = ANY($2))
+			+
+			(SELECT COUNT(*)
+			 FROM block_consolidation_shadow
+			 WHERE consolidated_object_key_main = $1
+				AND consolidated_object_key_main <> ''
+				AND block_metadata_id = ANY($2)),
+			(SELECT COUNT(*)
+			 FROM block_metadata
+			 WHERE object_key_main = $1
+				AND object_key_main <> ''
+				AND NOT (id = ANY($2)))
+			+
+			(SELECT COUNT(*)
+			 FROM block_consolidation_shadow
+			 WHERE consolidated_object_key_main = $1
+				AND consolidated_object_key_main <> ''
+				AND NOT (block_metadata_id = ANY($2)))`
+	var expectedReferences, unexpectedReferences uint64
+	if err := q.QueryRowContext(ctx, query, objectKey, pq.Array(ids)).Scan(&expectedReferences, &unexpectedReferences); err != nil {
+		return xerrors.Errorf("failed to count rebuilt CSCB references: %w", err)
+	}
+	want := uint64(len(ids) * 2)
+	if expectedReferences != want || unexpectedReferences != 0 {
+		return xerrors.Errorf(
+			"rebuilt CSCB %q reference mismatch: expected=%d actual=%d unexpected=%d",
+			objectKey,
+			want,
+			expectedReferences,
+			unexpectedReferences,
+		)
+	}
+	return nil
+}
+
+func allRepairRowsOnObject(manifest *Manifest, objectKey string) bool {
+	if manifest == nil || objectKey == "" || len(manifest.Blocks) == 0 {
+		return false
+	}
+	for _, block := range manifest.Blocks {
+		if block.ActiveObjectKey != objectKey || block.NewConsolidatedObjectKey != objectKey {
+			return false
+		}
+	}
+	return true
 }
 
 func requireNoOldReferences(ctx context.Context, q queryer, objectKey string) error {

@@ -3,6 +3,8 @@ package cscbrepair
 import (
 	"context"
 	"time"
+
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 type (
@@ -14,6 +16,22 @@ type (
 		VersionID string
 		ETag      string
 		Bytes     uint64
+	}
+
+	PinnedPayload struct {
+		BlockMetadataID int64
+		Metadata        *api.BlockMetadata
+		RawBlockPayload []byte
+	}
+
+	RebuiltPlacement struct {
+		BlockMetadataID    int64
+		Height             uint64
+		Hash               string
+		ObjectFormat       api.BlockObjectFormat
+		ByteOffset         uint64
+		ByteLength         uint64
+		UncompressedLength uint64
 	}
 
 	Block struct {
@@ -82,6 +100,7 @@ type (
 		RestoreToSingleBlock(ctx context.Context, repairID int64) (*Manifest, error)
 		GetRebuilt(ctx context.Context, repairID int64) (*Manifest, error)
 		RecordVerified(ctx context.Context, repairID int64, objectKey string, object ObjectVersion) (*Manifest, error)
+		PromoteVerified(ctx context.Context, repairID int64, objectKey string, object ObjectVersion, placements []RebuiltPlacement, singleBlockObjectRetention time.Duration) (*Manifest, error)
 		CompleteRetainingOldObject(ctx context.Context, repairID int64, outcome string) (*Manifest, error)
 	}
 
@@ -92,6 +111,8 @@ type (
 		Restore(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)
 		Get(ctx context.Context, repairID int64) (*Manifest, error)
 		VerifyRebuilt(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)
+		VisitPinnedPayloads(ctx context.Context, repairID int64, progress Progress, visit func(PinnedPayload) error) error
+		VerifyAndPromote(ctx context.Context, repairID int64, objectKey string, placements []RebuiltPlacement, singleBlockObjectRetention time.Duration, progress Progress) (*Manifest, error)
 		Complete(ctx context.Context, repairID int64, progress Progress) (*Manifest, error)
 	}
 )

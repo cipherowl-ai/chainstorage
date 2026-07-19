@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"strings"
 	"testing"
 	"time"
 
@@ -332,6 +333,122 @@ func TestRequirePinnedSingleBlockObjectVersionAllowsHistoricalDuplicateRemoval(t
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
 	require.NoError(t, repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned))
+}
+
+func TestRestoreZeroCanonicalRepairRejectsHistoricalSingleBlockVersion(t *testing.T) {
+	manifest := completionManifest(t)
+	manifest.State = StatePrepared
+	repository := &phaseBoundaryRepository{manifest: manifest}
+	store := &completionObjectStore{topologies: map[string]retirement.ObjectVersionTopology{
+		manifest.OldConsolidatedObjectKey: {
+			Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.OldConsolidatedObjectVersion)},
+		},
+		manifest.Blocks[0].SingleBlockObjectKey: {
+			Versions: []retirement.ObjectVersion{
+				objectTopologyVersion(manifest.Blocks[0].SingleBlockObjectVersion),
+				{VersionID: "historical-version", ETag: "historical-etag", Bytes: 99},
+			},
+		},
+	}}
+
+	_, err := NewRepairer(repository, store, manifest.Bucket).Restore(context.Background(), manifest.ID, nil)
+	require.ErrorContains(t, err, "expected one data version and zero delete markers")
+	require.False(t, repository.restoreCalled)
+}
+
+func TestVisitPinnedPayloadsReadsPinnedCurrentVersionAndStripsStoragePlacement(t *testing.T) {
+	manifest := phaseBoundaryManifest(t, StatePrepared)
+	block := &manifest.Blocks[0]
+	rawBlock := &api.Block{Metadata: &api.BlockMetadata{
+		Tag:                block.Tag,
+		Height:             block.Height,
+		Hash:               block.Hash,
+		ObjectKeyMain:      block.SingleBlockObjectKey,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
+		ByteOffset:         10,
+		ByteLength:         20,
+		UncompressedLength: 30,
+	}}
+	normalized := storageutils.CloneBlockWithoutStoragePlacement(rawBlock)
+	normalizedPayload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(normalized)
+	require.NoError(t, err)
+	digest := sha256.Sum256(normalizedPayload)
+	block.PayloadSHA256 = hex.EncodeToString(digest[:])
+	payload, err := proto.Marshal(rawBlock)
+	require.NoError(t, err)
+	compressed, err := storageutils.Compress(payload, api.Compression_GZIP)
+	require.NoError(t, err)
+	block.SingleBlockObjectVersion.Bytes = uint64(len(compressed))
+
+	repository := &phaseBoundaryRepository{manifest: manifest}
+	store := &completionObjectStore{
+		topologies: map[string]retirement.ObjectVersionTopology{
+			manifest.OldConsolidatedObjectKey: {
+				Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.OldConsolidatedObjectVersion)},
+			},
+			block.SingleBlockObjectKey: {
+				Versions: []retirement.ObjectVersion{
+					objectTopologyVersion(block.SingleBlockObjectVersion),
+					{VersionID: "historical-version", ETag: "historical-etag", Bytes: 99},
+				},
+			},
+		},
+		objects: map[string][]byte{block.SingleBlockObjectKey: compressed},
+	}
+
+	var pinned PinnedPayload
+	err = NewRepairer(repository, store, manifest.Bucket).VisitPinnedPayloads(
+		context.Background(),
+		manifest.ID,
+		nil,
+		func(payload PinnedPayload) error {
+			pinned = payload
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{block.SingleBlockObjectVersion.VersionID}, store.readVersionIDs)
+	require.Equal(t, block.BlockMetadataID, pinned.BlockMetadataID)
+	require.Equal(t, block.Tag, pinned.Metadata.GetTag())
+	require.Equal(t, block.Height, pinned.Metadata.GetHeight())
+	require.Equal(t, block.Hash, pinned.Metadata.GetHash())
+	var rebuilt api.Block
+	require.NoError(t, proto.Unmarshal(pinned.RawBlockPayload, &rebuilt))
+	require.False(t, storageutils.HasBlockStoragePlacement(&rebuilt))
+}
+
+func TestVisitPinnedPayloadsRejectsPersistedDigestMismatch(t *testing.T) {
+	manifest := phaseBoundaryManifest(t, StatePrepared)
+	block := &manifest.Blocks[0]
+	rawBlock := &api.Block{Metadata: &api.BlockMetadata{
+		Tag:    block.Tag,
+		Height: block.Height,
+		Hash:   block.Hash,
+	}}
+	payload, err := proto.Marshal(rawBlock)
+	require.NoError(t, err)
+	compressed, err := storageutils.Compress(payload, api.Compression_GZIP)
+	require.NoError(t, err)
+	block.SingleBlockObjectVersion.Bytes = uint64(len(compressed))
+	block.PayloadSHA256 = strings.Repeat("0", 64)
+
+	repository := &phaseBoundaryRepository{manifest: manifest}
+	store := &completionObjectStore{
+		topologies: map[string]retirement.ObjectVersionTopology{
+			manifest.OldConsolidatedObjectKey: {
+				Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.OldConsolidatedObjectVersion)},
+			},
+			block.SingleBlockObjectKey: {
+				Versions: []retirement.ObjectVersion{objectTopologyVersion(block.SingleBlockObjectVersion)},
+			},
+		},
+		objects: map[string][]byte{block.SingleBlockObjectKey: compressed},
+	}
+
+	err = NewRepairer(repository, store, manifest.Bucket).VisitPinnedPayloads(
+		context.Background(), manifest.ID, nil, func(PinnedPayload) error { return nil },
+	)
+	require.ErrorContains(t, err, "single-block payload digest changed before rebuild")
 }
 
 func TestRepairPhasesRejectSingleBlockTopologyDriftBeforeMutation(t *testing.T) {
@@ -913,8 +1030,9 @@ func (r *completionRepository) CompleteRetainingOldObject(
 
 type completionObjectStore struct {
 	retirement.ObjectStore
-	topologies map[string]retirement.ObjectVersionTopology
-	objects    map[string][]byte
+	topologies     map[string]retirement.ObjectVersionTopology
+	objects        map[string][]byte
+	readVersionIDs []string
 }
 
 func (s *completionObjectStore) ListObjectVersions(
@@ -929,8 +1047,9 @@ func (s *completionObjectStore) ReadObjectVersion(
 	_ context.Context,
 	_ string,
 	key string,
-	_ string,
+	versionID string,
 ) ([]byte, error) {
+	s.readVersionIDs = append(s.readVersionIDs, versionID)
 	return s.objects[key], nil
 }
 
