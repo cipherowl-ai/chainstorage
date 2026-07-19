@@ -13,9 +13,8 @@ import (
 )
 
 const (
-	completedOutcome                = "old_consolidated_object_retained_unreferenced"
-	alreadyCleanOutcome             = OutcomeAlreadyCleanStorageNeutral
-	maxSingleBlockVersionsToInspect = 10
+	completedOutcome    = "old_consolidated_object_retained_unreferenced"
+	alreadyCleanOutcome = OutcomeAlreadyCleanStorageNeutral
 )
 
 type repairerImpl struct {
@@ -489,47 +488,9 @@ func (r *repairerImpl) inspectSingleBlockObjectVersion(
 	if err != nil {
 		return ObjectVersion{}, xerrors.Errorf("unsafe single-block object topology: key=%q: %w", candidate.Key, err)
 	}
-	if len(topology.Versions) == 1 {
-		return current, nil
-	}
-	if len(topology.Versions) > maxSingleBlockVersionsToInspect {
-		return ObjectVersion{}, xerrors.Errorf(
-			"too many single-block object versions to safely inspect: key=%q count=%d max=%d",
-			candidate.Key,
-			len(topology.Versions),
-			maxSingleBlockVersionsToInspect,
-		)
-	}
-
-	// Retries historically created redundant single-block versions whose raw
-	// Solana JSON serialization can differ while representing the same block.
-	// Verify every immutable version through the semantic block digest before
-	// pinning the current one.
-	verifier := retirement.NewPinnedPayloadVerifier(r.store)
-	currentCandidate := candidate
-	currentCandidate.VersionID = current.VersionID
-	currentInspection, err := verifier.InspectSingleBlock(ctx, currentCandidate)
-	if err != nil {
-		return ObjectVersion{}, xerrors.Errorf("failed to read current single-block object version %q: %w", current.VersionID, err)
-	}
-	for _, version := range topology.Versions {
-		if version.VersionID == current.VersionID {
-			continue
-		}
-		historicalCandidate := candidate
-		historicalCandidate.VersionID = version.VersionID
-		historicalInspection, err := verifier.InspectSingleBlock(ctx, historicalCandidate)
-		if err != nil {
-			return ObjectVersion{}, xerrors.Errorf("failed to read historical single-block object version %q: %w", version.VersionID, err)
-		}
-		if historicalInspection.SemanticSHA256 != currentInspection.SemanticSHA256 {
-			return ObjectVersion{}, xerrors.Errorf(
-				"single-block object versions contain different semantic block payloads: current=%q historical=%q",
-				current.VersionID,
-				version.VersionID,
-			)
-		}
-	}
+	// Historical versions are not read by Chainstorage and are not repair
+	// inputs. The caller pins and verifies the current immutable version against
+	// the source CSCB before changing any metadata.
 	return current, nil
 }
 

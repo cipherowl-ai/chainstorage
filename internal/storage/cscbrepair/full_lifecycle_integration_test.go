@@ -121,11 +121,14 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 			Solana: &api.SolanaBlobdata{Header: []byte(`{"slot":9500000000,"transactions":["repair"]}`)},
 		},
 	}
-	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
+	historicalBlock := proto.Clone(block).(*api.Block)
+	historicalBlock.GetSolana().Header = []byte(`{"slot":9500000000,"transactions":["stale"]}`)
+	singleBlockKey, err := singleBlockUploader.Upload(ctx, historicalBlock, api.Compression_GZIP)
 	require.NoError(err)
 	semanticDuplicate := proto.Clone(block).(*api.Block)
 	semanticDuplicate.GetSolana().Header = []byte("{\n  \"transactions\": [\"repair\"],\n  \"slot\": 9500000000\n}")
 	require.JSONEq(string(block.GetSolana().Header), string(semanticDuplicate.GetSolana().Header))
+	require.NotEqual(string(historicalBlock.GetSolana().Header), string(semanticDuplicate.GetSolana().Header))
 	duplicateSingleBlockKey, err := singleBlockUploader.Upload(ctx, semanticDuplicate, api.Compression_GZIP)
 	require.NoError(err)
 	require.Equal(singleBlockKey, duplicateSingleBlockKey)

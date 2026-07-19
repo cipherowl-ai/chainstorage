@@ -228,10 +228,10 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	require.True(t, repository.alreadyClean)
 }
 
-func TestInspectSingleBlockObjectVersionAllowsSemanticallyIdenticalDuplicateVersions(t *testing.T) {
+func TestInspectSingleBlockObjectVersionPinsCurrentWithoutReadingHistoricalPayloads(t *testing.T) {
 	candidate := singleBlockVersionCandidate()
 	currentPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","transactions":[]}`)
-	historicalPayload := singleBlockVersionPayload(t, candidate, "{\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}")
+	historicalPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","transactions":["stale"]}`)
 	require.NotEqual(t, currentPayload, historicalPayload)
 	store := &versionedObjectStore{
 		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
@@ -252,7 +252,7 @@ func TestInspectSingleBlockObjectVersionAllowsSemanticallyIdenticalDuplicateVers
 		ETag:      "current-etag",
 		Bytes:     uint64(len(currentPayload)),
 	}, version)
-	require.Equal(t, []string{"current-version", "historical-version"}, store.readVersionIDs)
+	require.Empty(t, store.readVersionIDs)
 }
 
 func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing.T) {
@@ -270,9 +270,9 @@ func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing
 	require.Empty(t, store.readVersionIDs)
 }
 
-func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *testing.T) {
+func TestInspectSingleBlockObjectVersionAllowsManyImmutableVersionsWithoutReading(t *testing.T) {
 	candidate := singleBlockVersionCandidate()
-	versions := make([]retirement.ObjectVersion, maxSingleBlockVersionsToInspect+1)
+	versions := make([]retirement.ObjectVersion, 20)
 	for i := range versions {
 		versions[i] = retirement.ObjectVersion{
 			VersionID: fmt.Sprintf("version-%d", i),
@@ -286,29 +286,10 @@ func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *t
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
-	require.ErrorContains(t, err, "too many single-block object versions to safely inspect")
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
+	require.NoError(t, err)
+	require.Equal(t, "version-0", version.VersionID)
 	require.Empty(t, store.readVersionIDs)
-}
-
-func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicatePayloads(t *testing.T) {
-	candidate := singleBlockVersionCandidate()
-	currentPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","value":1}`)
-	historicalPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","value":2}`)
-	store := &versionedObjectStore{
-		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
-			{VersionID: "current-version", ETag: "current-etag", Bytes: uint64(len(currentPayload)), IsLatest: true},
-			{VersionID: "historical-version", ETag: "historical-etag", Bytes: uint64(len(historicalPayload))},
-		}},
-		objects: map[string][]byte{
-			"current-version":    currentPayload,
-			"historical-version": historicalPayload,
-		},
-	}
-	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
-
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
-	require.ErrorContains(t, err, "versions contain different semantic block payloads")
 }
 
 func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
