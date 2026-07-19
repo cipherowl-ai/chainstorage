@@ -29,11 +29,10 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRebuildsPinnedPayload
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
 	prepared := repairActivityManifest(cscbrepair.StatePrepared, oldKey, "")
-	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
 	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
 	fake := &repairActivityFake{
 		prepared:  prepared,
-		verified:  verified,
+		verified:  completed,
 		completed: completed,
 		pinnedPayloads: []cscbrepair.PinnedPayload{{
 			BlockMetadataID: records[0].ID,
@@ -60,7 +59,7 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBRebuildsPinnedPayload
 		OldObjectKey:       oldKey,
 		RepairedObjects:    1,
 	}, response)
-	require.Equal([]string{"prepare", "visit_pinned", "verify_promote", "complete"}, fake.calls)
+	require.Equal([]string{"prepare", "visit_pinned", "verify_promote"}, fake.calls)
 	require.Equal(testRepairExecutionKey, fake.executionKey)
 }
 
@@ -89,11 +88,10 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesRestoredManife
 	oldKey := "consolidated/dirty.cscb.zstd"
 	newKey := "consolidated/clean.cscb.zstd"
 	restored := repairActivityManifest(cscbrepair.StateRestored, oldKey, "")
-	verified := repairActivityManifest(cscbrepair.StateVerified, oldKey, newKey)
 	completed := repairActivityManifest(cscbrepair.StateCompleted, oldKey, newKey)
 	fake := &repairActivityFake{
 		prepared:  restored,
-		verified:  verified,
+		verified:  completed,
 		completed: completed,
 		pinnedPayloads: []cscbrepair.PinnedPayload{{
 			BlockMetadataID: records[0].ID,
@@ -118,7 +116,7 @@ func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBResumesRestoredManife
 	})
 	require.NoError(err)
 	require.Equal(uint64(1), response.RepairedObjects)
-	require.Equal([]string{"prepare", "visit_pinned", "verify_promote", "complete"}, fake.calls)
+	require.Equal([]string{"prepare", "visit_pinned", "verify_promote"}, fake.calls)
 }
 
 func (s *BatchConsolidatorTestSuite) TestRepairExistingCSCBCompletesAllNonCanonicalObjectWithoutRebuild() {
