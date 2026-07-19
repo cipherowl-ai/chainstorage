@@ -227,31 +227,35 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	require.True(t, repository.alreadyClean)
 }
 
-func TestInspectSingleBlockObjectVersionAllowsIdenticalDuplicateVersions(t *testing.T) {
-	payload := []byte("identical single-block payload")
+func TestInspectSingleBlockObjectVersionAllowsSemanticallyIdenticalDuplicateVersions(t *testing.T) {
+	candidate := singleBlockVersionCandidate()
+	currentPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","transactions":[]}`)
+	historicalPayload := singleBlockVersionPayload(t, candidate, "{\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}")
+	require.NotEqual(t, currentPayload, historicalPayload)
 	store := &versionedObjectStore{
 		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
-			{VersionID: "current-version", ETag: "same-etag", Bytes: uint64(len(payload)), IsLatest: true},
-			{VersionID: "historical-version", ETag: "same-etag", Bytes: uint64(len(payload))},
+			{VersionID: "current-version", ETag: "current-etag", Bytes: uint64(len(currentPayload)), IsLatest: true},
+			{VersionID: "historical-version", ETag: "historical-etag", Bytes: uint64(len(historicalPayload))},
 		}},
 		objects: map[string][]byte{
-			"current-version":    payload,
-			"historical-version": append([]byte(nil), payload...),
+			"current-version":    currentPayload,
+			"historical-version": historicalPayload,
 		},
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
 	require.NoError(t, err)
 	require.Equal(t, ObjectVersion{
 		VersionID: "current-version",
-		ETag:      "same-etag",
-		Bytes:     uint64(len(payload)),
+		ETag:      "current-etag",
+		Bytes:     uint64(len(currentPayload)),
 	}, version)
 	require.Equal(t, []string{"current-version", "historical-version"}, store.readVersionIDs)
 }
 
 func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing.T) {
+	candidate := singleBlockVersionCandidate()
 	store := &versionedObjectStore{
 		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
 			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
@@ -259,13 +263,14 @@ func TestInspectSingleBlockObjectVersionDoesNotReadSingleVersionTwice(t *testing
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	version, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
 	require.NoError(t, err)
 	require.Equal(t, "current-version", version.VersionID)
 	require.Empty(t, store.readVersionIDs)
 }
 
 func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *testing.T) {
+	candidate := singleBlockVersionCandidate()
 	versions := make([]retirement.ObjectVersion, maxSingleBlockVersionsToInspect+1)
 	for i := range versions {
 		versions[i] = retirement.ObjectVersion{
@@ -280,43 +285,33 @@ func TestInspectSingleBlockObjectVersionRejectsTooManyVersionsBeforeReading(t *t
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
 	require.ErrorContains(t, err, "too many single-block object versions to safely inspect")
 	require.Empty(t, store.readVersionIDs)
 }
 
 func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicatePayloads(t *testing.T) {
+	candidate := singleBlockVersionCandidate()
+	currentPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","value":1}`)
+	historicalPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","value":2}`)
 	store := &versionedObjectStore{
 		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
-			{VersionID: "current-version", ETag: "same-etag", Bytes: 4, IsLatest: true},
-			{VersionID: "historical-version", ETag: "same-etag", Bytes: 4},
+			{VersionID: "current-version", ETag: "current-etag", Bytes: uint64(len(currentPayload)), IsLatest: true},
+			{VersionID: "historical-version", ETag: "historical-etag", Bytes: uint64(len(historicalPayload))},
 		}},
 		objects: map[string][]byte{
-			"current-version":    []byte("same"),
-			"historical-version": []byte("diff"),
+			"current-version":    currentPayload,
+			"historical-version": historicalPayload,
 		},
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
-	require.ErrorContains(t, err, "versions contain different payloads")
-}
-
-func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicateMetadata(t *testing.T) {
-	store := &versionedObjectStore{
-		topology: retirement.ObjectVersionTopology{Versions: []retirement.ObjectVersion{
-			{VersionID: "current-version", ETag: "current-etag", Bytes: 4, IsLatest: true},
-			{VersionID: "historical-version", ETag: "historical-etag", Bytes: 4},
-		}},
-	}
-	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
-
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
-	require.ErrorContains(t, err, "versions have different metadata")
-	require.Empty(t, store.readVersionIDs)
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
+	require.ErrorContains(t, err, "versions contain different canonical block payloads")
 }
 
 func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
+	candidate := singleBlockVersionCandidate()
 	store := &versionedObjectStore{
 		topology: retirement.ObjectVersionTopology{
 			Versions: []retirement.ObjectVersion{
@@ -327,7 +322,7 @@ func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
 	}
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
-	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), "single/1000.zstd")
+	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
 	require.ErrorContains(t, err, "zero delete markers")
 }
 
@@ -544,6 +539,34 @@ func validRepairCandidate() *Manifest {
 			OldUncompressedLength:    200,
 		}},
 	}
+}
+
+func singleBlockVersionCandidate() retirement.Candidate {
+	return retirement.Candidate{
+		Bucket: "repair-bucket",
+		Key:    "single/1000.gzip",
+		Tag:    2,
+		Height: 1000,
+		Hash:   "block-hash",
+	}
+}
+
+func singleBlockVersionPayload(t *testing.T, candidate retirement.Candidate, header string) []byte {
+	t.Helper()
+	payload, err := proto.Marshal(&api.Block{
+		Metadata: &api.BlockMetadata{
+			Tag:    candidate.Tag,
+			Height: candidate.Height,
+			Hash:   candidate.Hash,
+		},
+		Blobdata: &api.Block_Solana{
+			Solana: &api.SolanaBlobdata{Header: []byte(header)},
+		},
+	})
+	require.NoError(t, err)
+	compressed, err := storageutils.Compress(payload, api.Compression_GZIP)
+	require.NoError(t, err)
+	return compressed
 }
 
 type pendingRepairRepository struct {

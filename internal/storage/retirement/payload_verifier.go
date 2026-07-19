@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"io"
 	"strconv"
 
 	"golang.org/x/xerrors"
@@ -127,12 +129,44 @@ func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Cand
 }
 
 func canonicalBlockDigest(block *api.Block) (string, error) {
-	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(block)
+	canonical, err := canonicalizeEmbeddedBlockPayload(block)
+	if err != nil {
+		return "", err
+	}
+	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(canonical)
 	if err != nil {
 		return "", xerrors.Errorf("failed to marshal canonical block payload: %w", err)
 	}
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
+	canonical := proto.Clone(block).(*api.Block)
+	solana := canonical.GetSolana()
+	if solana == nil || len(solana.Header) == 0 {
+		return canonical, nil
+	}
+
+	decoder := json.NewDecoder(bytes.NewReader(solana.Header))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, xerrors.Errorf("failed to parse embedded Solana block JSON: %w", err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, xerrors.New("embedded Solana block JSON contains multiple values")
+		}
+		return nil, xerrors.Errorf("failed to finish parsing embedded Solana block JSON: %w", err)
+	}
+	canonicalHeader, err := json.Marshal(value)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to canonicalize embedded Solana block JSON: %w", err)
+	}
+	solana.Header = canonicalHeader
+	return canonical, nil
 }
 
 func validatePayloadIdentity(block *api.Block, candidate Candidate) error {

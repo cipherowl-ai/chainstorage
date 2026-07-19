@@ -104,6 +104,40 @@ func TestPayloadVerifier_ParsesSupportedSingleBlockCompression(t *testing.T) {
 	}
 }
 
+func TestCanonicalBlockDigestCanonicalizesSolanaJSON(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
+	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","transactions":[],"slot":429600000}`)
+	second := solanaPayloadBlock(candidate, "{\n  \"slot\": 429600000,\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}")
+	require.NotEqual(t, first.GetSolana().GetHeader(), second.GetSolana().GetHeader())
+
+	firstDigest, err := canonicalBlockDigest(first)
+	require.NoError(t, err)
+	secondDigest, err := canonicalBlockDigest(second)
+	require.NoError(t, err)
+	require.Equal(t, firstDigest, secondDigest)
+}
+
+func TestCanonicalBlockDigestRejectsDifferentSolanaJSON(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
+	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600000}`)
+	second := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600001}`)
+
+	firstDigest, err := canonicalBlockDigest(first)
+	require.NoError(t, err)
+	secondDigest, err := canonicalBlockDigest(second)
+	require.NoError(t, err)
+	require.NotEqual(t, firstDigest, secondDigest)
+}
+
+func TestCanonicalBlockDigestRejectsMalformedSolanaJSON(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
+	_, err := canonicalBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":`))
+	require.ErrorContains(t, err, "failed to parse embedded Solana block JSON")
+
+	_, err = canonicalBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":"block-hash"} {}`))
+	require.ErrorContains(t, err, "contains multiple values")
+}
+
 func TestPayloadVerifier_RejectsSemanticAndSerializedMismatch(t *testing.T) {
 	require := require.New(t)
 	candidate, store, _ := retirementPayloadFixture(t)
@@ -201,6 +235,21 @@ func retirementPayloadFixture(t *testing.T) (Candidate, *fakeStore, []byte) {
 	store.objects[versionObjectKey(candidate.Key, candidate.VersionID)] = gzipPayload(t, payload)
 	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, payload)
 	return candidate, store, payload
+}
+
+func solanaPayloadBlock(candidate Candidate, header string) *api.Block {
+	return &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+		Network:    common.Network_NETWORK_SOLANA_MAINNET,
+		Metadata: &api.BlockMetadata{
+			Tag:    candidate.Tag,
+			Height: candidate.Height,
+			Hash:   candidate.Hash,
+		},
+		Blobdata: &api.Block_Solana{
+			Solana: &api.SolanaBlobdata{Header: []byte(header)},
+		},
+	}
 }
 
 func buildSingleBlockCSCB(t *testing.T, candidate Candidate, payload []byte) []byte {

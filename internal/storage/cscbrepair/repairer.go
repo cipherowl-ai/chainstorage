@@ -189,7 +189,13 @@ func (r *repairerImpl) inspectFencedCandidate(
 		if objectKeySHA256(block.SingleBlockObjectKey) != block.SingleBlockObjectKeySHA256 {
 			return nil, xerrors.Errorf("single-block object key audit digest changed at height %d", block.Height)
 		}
-		singleVersion, err := r.inspectSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey)
+		singleVersion, err := r.inspectSingleBlockObjectVersion(ctx, retirement.Candidate{
+			Bucket: manifest.Bucket,
+			Key:    block.SingleBlockObjectKey,
+			Height: block.Height,
+			Hash:   block.Hash,
+			Tag:    block.Tag,
+		})
 		if err != nil {
 			return nil, xerrors.Errorf("failed to pin single-block object at height %d: %w", block.Height, err)
 		}
@@ -471,14 +477,17 @@ func (r *repairerImpl) inspectExactObjectVersion(ctx context.Context, key string
 	return result, nil
 }
 
-func (r *repairerImpl) inspectSingleBlockObjectVersion(ctx context.Context, key string) (ObjectVersion, error) {
-	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
+func (r *repairerImpl) inspectSingleBlockObjectVersion(
+	ctx context.Context,
+	candidate retirement.Candidate,
+) (ObjectVersion, error) {
+	topology, err := r.store.ListObjectVersions(ctx, r.bucket, candidate.Key)
 	if err != nil {
 		return ObjectVersion{}, err
 	}
 	current, err := currentSingleBlockObjectVersion(topology)
 	if err != nil {
-		return ObjectVersion{}, xerrors.Errorf("unsafe single-block object topology: key=%q: %w", key, err)
+		return ObjectVersion{}, xerrors.Errorf("unsafe single-block object topology: key=%q: %w", candidate.Key, err)
 	}
 	if len(topology.Versions) == 1 {
 		return current, nil
@@ -486,46 +495,36 @@ func (r *repairerImpl) inspectSingleBlockObjectVersion(ctx context.Context, key 
 	if len(topology.Versions) > maxSingleBlockVersionsToInspect {
 		return ObjectVersion{}, xerrors.Errorf(
 			"too many single-block object versions to safely inspect: key=%q count=%d max=%d",
-			key,
+			candidate.Key,
 			len(topology.Versions),
 			maxSingleBlockVersionsToInspect,
 		)
 	}
 
-	// Retries historically created redundant single-block versions. Verify every
-	// immutable version byte-for-byte before pinning the current one.
-	currentPayload, err := r.store.ReadObjectVersion(ctx, r.bucket, key, current.VersionID)
+	// Retries historically created redundant single-block versions whose raw
+	// Solana JSON serialization can differ while representing the same block.
+	// Verify every immutable version through the canonical block digest before
+	// pinning the current one.
+	verifier := retirement.NewPinnedPayloadVerifier(r.store)
+	currentCandidate := candidate
+	currentCandidate.VersionID = current.VersionID
+	currentInspection, err := verifier.InspectSingleBlock(ctx, currentCandidate)
 	if err != nil {
 		return ObjectVersion{}, xerrors.Errorf("failed to read current single-block object version %q: %w", current.VersionID, err)
 	}
-	if uint64(len(currentPayload)) != current.Bytes {
-		return ObjectVersion{}, xerrors.Errorf(
-			"current single-block object version size changed: version=%q expected=%d actual=%d",
-			current.VersionID,
-			current.Bytes,
-			len(currentPayload),
-		)
-	}
-	currentDigest := sha256.Sum256(currentPayload)
 	for _, version := range topology.Versions {
 		if version.VersionID == current.VersionID {
 			continue
 		}
-		payload, err := r.store.ReadObjectVersion(ctx, r.bucket, key, version.VersionID)
+		historicalCandidate := candidate
+		historicalCandidate.VersionID = version.VersionID
+		historicalInspection, err := verifier.InspectSingleBlock(ctx, historicalCandidate)
 		if err != nil {
 			return ObjectVersion{}, xerrors.Errorf("failed to read historical single-block object version %q: %w", version.VersionID, err)
 		}
-		if uint64(len(payload)) != current.Bytes {
+		if historicalInspection.CanonicalSHA256 != currentInspection.CanonicalSHA256 {
 			return ObjectVersion{}, xerrors.Errorf(
-				"historical single-block object version size changed: version=%q expected=%d actual=%d",
-				version.VersionID,
-				current.Bytes,
-				len(payload),
-			)
-		}
-		if sha256.Sum256(payload) != currentDigest {
-			return ObjectVersion{}, xerrors.Errorf(
-				"single-block object versions contain different payloads: current=%q historical=%q",
+				"single-block object versions contain different canonical block payloads: current=%q historical=%q",
 				current.VersionID,
 				version.VersionID,
 			)
@@ -588,15 +587,6 @@ func currentSingleBlockObjectVersion(topology retirement.ObjectVersionTopology) 
 	}
 	if !currentFound {
 		return ObjectVersion{}, xerrors.New("single-block object has no latest data version")
-	}
-	for _, version := range topology.Versions {
-		if version.ETag != current.ETag || version.Bytes != current.Bytes {
-			return ObjectVersion{}, xerrors.Errorf(
-				"single-block object versions have different metadata: current=%q version=%q",
-				current.VersionID,
-				version.VersionID,
-			)
-		}
 	}
 	return current, nil
 }

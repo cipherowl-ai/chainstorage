@@ -123,23 +123,28 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	}
 	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 	require.NoError(err)
-	duplicateSingleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
+	semanticDuplicate := proto.Clone(block).(*api.Block)
+	semanticDuplicate.GetSolana().Header = []byte("{\n  \"transactions\": [\"repair\"],\n  \"slot\": 9500000000\n}")
+	require.JSONEq(string(block.GetSolana().Header), string(semanticDuplicate.GetSolana().Header))
+	duplicateSingleBlockKey, err := singleBlockUploader.Upload(ctx, semanticDuplicate, api.Compression_GZIP)
 	require.NoError(err)
 	require.Equal(singleBlockKey, duplicateSingleBlockKey)
 	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
 	require.Len(singleBlockTopology.Versions, 2)
 	require.Empty(singleBlockTopology.DeleteMarkers)
-	var currentSingleBlockVersionID, historicalSingleBlockVersionID string
+	var currentSingleBlockVersion, historicalSingleBlockVersion retirement.ObjectVersion
 	for _, version := range singleBlockTopology.Versions {
 		if version.IsLatest {
-			currentSingleBlockVersionID = version.VersionID
+			currentSingleBlockVersion = version
 		} else {
-			historicalSingleBlockVersionID = version.VersionID
+			historicalSingleBlockVersion = version
 		}
 	}
-	require.NotEmpty(currentSingleBlockVersionID)
-	require.NotEmpty(historicalSingleBlockVersionID)
+	require.NotEmpty(currentSingleBlockVersion.VersionID)
+	require.NotEmpty(historicalSingleBlockVersion.VersionID)
+	require.NotEqual(currentSingleBlockVersion.ETag, historicalSingleBlockVersion.ETag)
+	require.NotEqual(currentSingleBlockVersion.Bytes, historicalSingleBlockVersion.Bytes)
 	block.Metadata.ObjectKeyMain = singleBlockKey
 	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil))
 
@@ -206,7 +211,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Equal(cscbrepair.StatePrepared, manifest.State)
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
-	require.Equal(currentSingleBlockVersionID, manifest.Blocks[0].SingleBlockObjectVersion.VersionID)
+	require.Equal(currentSingleBlockVersion.VersionID, manifest.Blocks[0].SingleBlockObjectVersion.VersionID)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
 	pendingKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
 	require.NoError(err)
@@ -294,7 +299,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.Zero(activeSingleBlock.ByteLength)
 	restoredBlock, err := blob.Download(ctx, activeSingleBlock)
 	require.NoError(err)
-	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(restoredBlock)))
+	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate), storageutils.CloneBlockWithoutStoragePlacement(restoredBlock)))
 	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET object_key_main = $2 WHERE id = $1`, blockMetadataID, dirtyKey)
 	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
 	_, err = db.ExecContext(ctx, `
@@ -396,13 +401,13 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
 		Bucket:    aws.String(bucket),
 		Key:       aws.String(singleBlockKey),
-		VersionId: aws.String(historicalSingleBlockVersionID),
+		VersionId: aws.String(historicalSingleBlockVersion.VersionID),
 	})
 	require.NoError(err)
 	singleBlockTopology, err = store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
 	require.Len(singleBlockTopology.Versions, 1)
-	require.Equal(currentSingleBlockVersionID, singleBlockTopology.Versions[0].VersionID)
+	require.Equal(currentSingleBlockVersion.VersionID, singleBlockTopology.Versions[0].VersionID)
 
 	activeClean, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
@@ -413,7 +418,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	// CSCB neutrality is asserted independently above.
 	require.True(storageutils.HasBlockStoragePlacement(readClean))
 	require.True(proto.Equal(
-		storageutils.CloneBlockWithoutStoragePlacement(block),
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
 		storageutils.CloneBlockWithoutStoragePlacement(readClean),
 	))
 
@@ -512,7 +517,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	readAfterRetirement, err := blob.Download(ctx, activeAfterRetirement)
 	require.NoError(err)
 	require.True(proto.Equal(
-		storageutils.CloneBlockWithoutStoragePlacement(block),
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
 		storageutils.CloneBlockWithoutStoragePlacement(readAfterRetirement),
 	))
 
