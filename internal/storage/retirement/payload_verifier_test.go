@@ -104,37 +104,43 @@ func TestPayloadVerifier_ParsesSupportedSingleBlockCompression(t *testing.T) {
 	}
 }
 
-func TestCanonicalBlockDigestCanonicalizesSolanaJSON(t *testing.T) {
+func TestPayloadDigestsPreservePersistedFormatAndCanonicalizeSemanticComparison(t *testing.T) {
 	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
 	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","transactions":[],"slot":429600000}`)
 	second := solanaPayloadBlock(candidate, "{\n  \"slot\": 429600000,\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}")
 	require.NotEqual(t, first.GetSolana().GetHeader(), second.GetSolana().GetHeader())
 
-	firstDigest, err := canonicalBlockDigest(first)
+	firstPersistedDigest, err := canonicalBlockDigest(first)
 	require.NoError(t, err)
-	secondDigest, err := canonicalBlockDigest(second)
+	secondPersistedDigest, err := canonicalBlockDigest(second)
 	require.NoError(t, err)
-	require.Equal(t, firstDigest, secondDigest)
+	require.NotEqual(t, firstPersistedDigest, secondPersistedDigest)
+
+	firstSemanticDigest, err := semanticBlockDigest(first)
+	require.NoError(t, err)
+	secondSemanticDigest, err := semanticBlockDigest(second)
+	require.NoError(t, err)
+	require.Equal(t, firstSemanticDigest, secondSemanticDigest)
 }
 
-func TestCanonicalBlockDigestRejectsDifferentSolanaJSON(t *testing.T) {
+func TestSemanticBlockDigestRejectsDifferentSolanaJSON(t *testing.T) {
 	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
 	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600000}`)
 	second := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600001}`)
 
-	firstDigest, err := canonicalBlockDigest(first)
+	firstDigest, err := semanticBlockDigest(first)
 	require.NoError(t, err)
-	secondDigest, err := canonicalBlockDigest(second)
+	secondDigest, err := semanticBlockDigest(second)
 	require.NoError(t, err)
 	require.NotEqual(t, firstDigest, secondDigest)
 }
 
-func TestCanonicalBlockDigestRejectsMalformedSolanaJSON(t *testing.T) {
+func TestSemanticBlockDigestRejectsMalformedSolanaJSON(t *testing.T) {
 	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	_, err := canonicalBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":`))
+	_, err := semanticBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":`))
 	require.ErrorContains(t, err, "failed to parse embedded Solana block JSON")
 
-	_, err = canonicalBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":"block-hash"} {}`))
+	_, err = semanticBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":"block-hash"} {}`))
 	require.ErrorContains(t, err, "contains multiple values")
 }
 

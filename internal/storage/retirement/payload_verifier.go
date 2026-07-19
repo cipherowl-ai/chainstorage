@@ -27,6 +27,7 @@ type blockPayloadVerifier interface {
 type (
 	PinnedPayloadInspection struct {
 		CanonicalSHA256     string
+		SemanticSHA256      string
 		HasStoragePlacement bool
 	}
 
@@ -89,12 +90,18 @@ func (v *payloadVerifier) InspectSingleBlock(ctx context.Context, candidate Cand
 	if err := validatePayloadIdentity(&singleBlockBlock, candidate); err != nil {
 		return PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
 	}
-	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock))
+	normalized := storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock)
+	digest, err := canonicalBlockDigest(normalized)
+	if err != nil {
+		return PinnedPayloadInspection{}, err
+	}
+	semanticDigest, err := semanticBlockDigest(normalized)
 	if err != nil {
 		return PinnedPayloadInspection{}, err
 	}
 	return PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
+		SemanticSHA256:      semanticDigest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(&singleBlockBlock),
 	}, nil
 }
@@ -107,12 +114,18 @@ func (v *payloadVerifier) InspectConsolidated(ctx context.Context, candidate Can
 	if err := validatePayloadIdentity(cscbBlock, candidate); err != nil {
 		return PinnedPayloadInspection{}, xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
 	}
-	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(cscbBlock))
+	normalized := storageutils.CloneBlockWithoutStoragePlacement(cscbBlock)
+	digest, err := canonicalBlockDigest(normalized)
+	if err != nil {
+		return PinnedPayloadInspection{}, err
+	}
+	semanticDigest, err := semanticBlockDigest(normalized)
 	if err != nil {
 		return PinnedPayloadInspection{}, err
 	}
 	return PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
+		SemanticSHA256:      semanticDigest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(cscbBlock),
 	}, nil
 }
@@ -129,6 +142,17 @@ func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Cand
 }
 
 func canonicalBlockDigest(block *api.Block) (string, error) {
+	// This digest is persisted in retirement and repair manifests. Keep its
+	// deterministic-protobuf algorithm stable across upgrades and rollbacks.
+	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(block)
+	if err != nil {
+		return "", xerrors.Errorf("failed to marshal canonical block payload: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func semanticBlockDigest(block *api.Block) (string, error) {
 	canonical, err := canonicalizeEmbeddedBlockPayload(block)
 	if err != nil {
 		return "", err

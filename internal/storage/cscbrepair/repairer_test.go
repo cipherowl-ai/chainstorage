@@ -19,6 +19,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
 	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
+	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -307,7 +308,7 @@ func TestInspectSingleBlockObjectVersionRejectsDifferentDuplicatePayloads(t *tes
 	repairer := &repairerImpl{store: store, bucket: "repair-bucket"}
 
 	_, err := repairer.inspectSingleBlockObjectVersion(context.Background(), candidate)
-	require.ErrorContains(t, err, "versions contain different canonical block payloads")
+	require.ErrorContains(t, err, "versions contain different semantic block payloads")
 }
 
 func TestInspectSingleBlockObjectVersionRejectsDeleteMarker(t *testing.T) {
@@ -427,6 +428,63 @@ func TestRepairPhasesRejectSingleBlockTopologyDriftBeforeMutation(t *testing.T) 
 			})
 		}
 	}
+}
+
+func TestVerifyRebuiltResumesManifestWithPreSemanticSolanaDigest(t *testing.T) {
+	manifest := phaseBoundaryManifest(t, StateRestored)
+	block := &manifest.Blocks[0]
+	rawBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+		Network:    common.Network_NETWORK_SOLANA_MAINNET,
+		Metadata: &api.BlockMetadata{
+			Tag:    block.Tag,
+			Height: block.Height,
+			Hash:   block.Hash,
+		},
+		Blobdata: &api.Block_Solana{Solana: &api.SolanaBlobdata{
+			Header: []byte("{\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}"),
+		}},
+	}
+	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(rawBlock)
+	require.NoError(t, err)
+	preSemanticDigest := sha256.Sum256(payload)
+	block.PayloadSHA256 = hex.EncodeToString(preSemanticDigest[:])
+	block.NewByteOffset = 0
+	block.NewByteLength = uint64(len(payload))
+	block.NewUncompressedLength = uint64(len(payload))
+
+	singleObject, err := storageutils.Compress(payload, api.Compression_GZIP)
+	require.NoError(t, err)
+	block.SingleBlockObjectVersion.Bytes = uint64(len(singleObject))
+	newCSCB := buildRepairSingleBlockCSCB(t, retirement.Candidate{
+		BlockMetadataID: block.BlockMetadataID,
+		Tag:             block.Tag,
+		Height:          block.Height,
+		Hash:            block.Hash,
+		ByteOffset:      block.NewByteOffset,
+	}, payload)
+	manifest.NewConsolidatedObjectVersion.Bytes = uint64(len(newCSCB))
+
+	repository := &phaseBoundaryRepository{manifest: manifest}
+	store := &completionObjectStore{
+		topologies: map[string]retirement.ObjectVersionTopology{
+			manifest.NewConsolidatedObjectKey: {
+				Versions: []retirement.ObjectVersion{objectTopologyVersion(manifest.NewConsolidatedObjectVersion)},
+			},
+			block.SingleBlockObjectKey: {
+				Versions: []retirement.ObjectVersion{objectTopologyVersion(block.SingleBlockObjectVersion)},
+			},
+		},
+		objects: map[string][]byte{
+			manifest.NewConsolidatedObjectKey: newCSCB,
+			block.SingleBlockObjectKey:        singleObject,
+		},
+	}
+
+	_, err = NewRepairer(repository, store, manifest.Bucket).VerifyRebuilt(context.Background(), manifest.ID, nil)
+	require.NoError(t, err)
+	require.True(t, repository.recordVerifiedCalled)
+	require.Equal(t, hex.EncodeToString(preSemanticDigest[:]), block.PayloadSHA256)
 }
 
 func TestCompleteRejectsRetainedObjectTopologyDrift(t *testing.T) {
@@ -893,6 +951,28 @@ func (s *completionObjectStore) ReadObjectVersion(
 	_ string,
 ) ([]byte, error) {
 	return s.objects[key], nil
+}
+
+func (s *completionObjectStore) ReadObjectVersionRange(
+	_ context.Context,
+	_ string,
+	key string,
+	_ string,
+	offset uint64,
+	length uint64,
+) ([]byte, error) {
+	object, ok := s.objects[key]
+	if !ok {
+		return nil, errors.New("object not found")
+	}
+	end := offset + length
+	if end < offset || offset > uint64(len(object)) {
+		return nil, errors.New("object range out of bounds")
+	}
+	if end > uint64(len(object)) {
+		end = uint64(len(object))
+	}
+	return append([]byte(nil), object[offset:end]...), nil
 }
 
 func completionManifest(t *testing.T) *Manifest {

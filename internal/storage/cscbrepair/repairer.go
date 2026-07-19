@@ -210,7 +210,7 @@ func (r *repairerImpl) inspectFencedCandidate(
 			return nil, xerrors.Errorf("failed to verify source CSCB payload at height %d: %w", block.Height, err)
 		}
 		hasStoragePlacement = hasStoragePlacement || oldInspection.HasStoragePlacement
-		if singleInspection.CanonicalSHA256 != oldInspection.CanonicalSHA256 {
+		if singleInspection.SemanticSHA256 != oldInspection.SemanticSHA256 {
 			return nil, xerrors.Errorf("single-block and CSCB payloads differ at height %d", block.Height)
 		}
 		block.PayloadSHA256 = singleInspection.CanonicalSHA256
@@ -503,7 +503,7 @@ func (r *repairerImpl) inspectSingleBlockObjectVersion(
 
 	// Retries historically created redundant single-block versions whose raw
 	// Solana JSON serialization can differ while representing the same block.
-	// Verify every immutable version through the canonical block digest before
+	// Verify every immutable version through the semantic block digest before
 	// pinning the current one.
 	verifier := retirement.NewPinnedPayloadVerifier(r.store)
 	currentCandidate := candidate
@@ -522,9 +522,9 @@ func (r *repairerImpl) inspectSingleBlockObjectVersion(
 		if err != nil {
 			return ObjectVersion{}, xerrors.Errorf("failed to read historical single-block object version %q: %w", version.VersionID, err)
 		}
-		if historicalInspection.CanonicalSHA256 != currentInspection.CanonicalSHA256 {
+		if historicalInspection.SemanticSHA256 != currentInspection.SemanticSHA256 {
 			return ObjectVersion{}, xerrors.Errorf(
-				"single-block object versions contain different canonical block payloads: current=%q historical=%q",
+				"single-block object versions contain different semantic block payloads: current=%q historical=%q",
 				current.VersionID,
 				version.VersionID,
 			)
