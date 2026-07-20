@@ -192,6 +192,7 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 		}
 		return nil, xerrors.Errorf("failed to finish parsing embedded Solana block JSON: %w", err)
 	}
+	normalizeSolanaOptionalTransactionMetadata(value)
 	canonicalHeader, err := json.Marshal(value)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to canonicalize embedded Solana block JSON: %w", err)
@@ -199,6 +200,36 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 	canonical := proto.Clone(block).(*api.Block)
 	canonical.GetSolana().Header = canonicalHeader
 	return canonical, nil
+}
+
+func normalizeSolanaOptionalTransactionMetadata(value any) {
+	// Solana RPC providers omit these optional collections or emit them as []
+	// or null. Chainstorage's native parser treats all three as zero entries.
+	block, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	transactions, ok := block["transactions"].([]any)
+	if !ok {
+		return
+	}
+	for _, transactionValue := range transactions {
+		transaction, ok := transactionValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		metadata, ok := transaction["meta"].(map[string]any)
+		if !ok {
+			continue
+		}
+		for _, field := range []string{"innerInstructions", "logMessages"} {
+			value, exists := metadata[field]
+			items, isArray := value.([]any)
+			if !exists || value == nil || (isArray && len(items) == 0) {
+				metadata[field] = nil
+			}
+		}
+	}
 }
 
 func decodeUniqueJSONValue(decoder *json.Decoder) (any, error) {
