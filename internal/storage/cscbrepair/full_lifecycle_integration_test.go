@@ -253,10 +253,18 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	downloaded, err := blob.Download(ctx, records[0].Metadata)
 	require.NoError(err)
-	dirtyBlock := proto.Clone(downloaded).(*api.Block)
+	require.True(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(downloaded),
+	))
+	dirtyBlock := proto.Clone(historicalBlock).(*api.Block)
 	dirtyBlock.Metadata.ObjectKeyMain = singleBlockKey
 	dirtyBlock.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
 	require.True(storageutils.HasBlockStoragePlacement(dirtyBlock))
+	require.False(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(dirtyBlock),
+	))
 	dirtyPayload, err := proto.Marshal(dirtyBlock)
 	require.NoError(err)
 	dirtyKey, dirtyPlacements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{

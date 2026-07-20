@@ -222,9 +222,10 @@ func (r *repairerImpl) inspectFencedCandidate(
 			return nil, xerrors.Errorf("failed to verify source CSCB payload at height %d: %w", block.Height, err)
 		}
 		hasStoragePlacement = hasStoragePlacement || oldInspection.HasStoragePlacement
-		if singleInspection.SemanticSHA256 != oldInspection.SemanticSHA256 {
-			return nil, xerrors.Errorf("single-block and CSCB payloads differ at height %d", block.Height)
-		}
+		// The pinned current single-block version is the authoritative repair
+		// input. The old CSCB is decoded to verify its identity and classify its
+		// placement state, but its provider-specific payload rendering is not
+		// copied into the rebuilt object.
 		block.PayloadSHA256 = singleInspection.CanonicalSHA256
 		reportProgress(progress, "prepare_payload_verified", i+1, len(blocks), block.Height)
 	}
