@@ -19,7 +19,12 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
-const retirementInitialIndexReadSize = 64 * 1024
+const (
+	retirementInitialIndexReadSize             = 64 * 1024
+	voteAuthorizeCheckedBLSPayloadLength       = 8 + 48 + 96
+	voteAuthorizeCheckedBLSMinBase58DataLength = voteAuthorizeCheckedBLSPayloadLength
+	voteAuthorizeCheckedBLSMaxBase58DataLength = 208
+)
 
 type blockPayloadVerifier interface {
 	Verify(ctx context.Context, candidate Candidate) (string, error)
@@ -207,10 +212,9 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 
 func normalizeSolanaVoteAuthorizeCheckedBLSInstructions(value any) {
 	const (
-		voteProgramID                        = "Vote111111111111111111111111111111111111111"
-		voteAuthorizeChecked                 = uint32(7)
-		voteAuthorizeVoterWithBLS            = uint32(2)
-		voteAuthorizeCheckedBLSPayloadLength = 8 + 48 + 96
+		voteProgramID             = "Vote111111111111111111111111111111111111111"
+		voteAuthorizeChecked      = uint32(7)
+		voteAuthorizeVoterWithBLS = uint32(2)
 	)
 
 	block, ok := value.(map[string]any)
@@ -247,6 +251,9 @@ func normalizeSolanaVoteAuthorizeCheckedBLSInstructions(value any) {
 			accounts, accountsOK := solanaInstructionAccounts(instruction["accounts"], 4)
 			data, dataOK := instruction["data"].(string)
 			if !hasStackHeight || !validSolanaStackHeight(stackHeight) || !accountsOK || !dataOK {
+				continue
+			}
+			if len(data) < voteAuthorizeCheckedBLSMinBase58DataLength || len(data) > voteAuthorizeCheckedBLSMaxBase58DataLength {
 				continue
 			}
 			decoded, err := base58.Decode(data)

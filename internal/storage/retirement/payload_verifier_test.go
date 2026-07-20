@@ -201,6 +201,10 @@ func TestSemanticBlockDigestRejectsNonEquivalentSolanaVoteAuthorizeCheckedBLSRen
 			raw:    strings.Replace(solanaVoteAuthorizeCheckedBLSRawInstruction, `"stackHeight":1`, `"stackHeight":"1"`, 1),
 			parsed: solanaVoteAuthorizeCheckedBLSParsedInstruction,
 		},
+		"oversized raw data": {
+			raw:    strings.Replace(solanaVoteAuthorizeCheckedBLSRawInstruction, solanaVoteAuthorizeCheckedBLSRawData, strings.Repeat("1", voteAuthorizeCheckedBLSMaxBase58DataLength+1), 1),
+			parsed: solanaVoteAuthorizeCheckedBLSParsedInstruction,
+		},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -396,7 +400,9 @@ func solanaHeaderWithInstruction(instruction string) string {
 	return `{"transactions":[{"transaction":{"message":{"instructions":[` + instruction + `]}}}]}`
 }
 
-const solanaVoteAuthorizeCheckedBLSRawInstruction = `{"accounts":["2QE9X9X4tdDUTYic1DgBBJjU7cWUNPbKYGerCb9KqDQN","SysvarC1ock11111111111111111111111111111111","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS"],"data":"Hibzn6uTxrGAfqM93TpBdjnU15WCMYg6hLtmTcgq2jgx612W4YQxZF4EaT2RVuj2qkGtt4c78UB87YrjZ1Dxisjf5ty6Kzf4qNP7kmb8WSRt93SqLSGMD8o2p9zkPw1iPMuTPFNjo5VsiL4tDpgjNP7iHv6KEHcsKYn39Ep9nK9SgVNysWk353DVyyxGdTEQ3NRBTg5Bz6f6RS7","programId":"Vote111111111111111111111111111111111111111","stackHeight":1}`
+const solanaVoteAuthorizeCheckedBLSRawData = `Hibzn6uTxrGAfqM93TpBdjnU15WCMYg6hLtmTcgq2jgx612W4YQxZF4EaT2RVuj2qkGtt4c78UB87YrjZ1Dxisjf5ty6Kzf4qNP7kmb8WSRt93SqLSGMD8o2p9zkPw1iPMuTPFNjo5VsiL4tDpgjNP7iHv6KEHcsKYn39Ep9nK9SgVNysWk353DVyyxGdTEQ3NRBTg5Bz6f6RS7`
+
+const solanaVoteAuthorizeCheckedBLSRawInstruction = `{"accounts":["2QE9X9X4tdDUTYic1DgBBJjU7cWUNPbKYGerCb9KqDQN","SysvarC1ock11111111111111111111111111111111","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS"],"data":"` + solanaVoteAuthorizeCheckedBLSRawData + `","programId":"Vote111111111111111111111111111111111111111","stackHeight":1}`
 
 const solanaVoteAuthorizeCheckedBLSParsedInstruction = `{"parsed":{"info":{"authority":"CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","authorityType":{"VoterWithBLS":{"bls_proof_of_possession":[180,123,132,218,19,74,247,109,172,185,179,183,89,174,66,194,100,162,53,178,158,172,52,137,3,167,252,252,81,135,232,197,100,16,169,222,92,252,231,46,34,13,216,155,132,104,84,154,21,129,53,88,5,58,170,228,211,249,243,2,0,34,47,74,34,84,200,184,141,44,112,46,90,124,225,216,238,193,61,74,194,190,153,82,235,63,132,195,18,156,200,175,0,140,255,152],"bls_pubkey":[144,192,39,209,42,213,86,74,191,12,62,255,177,202,140,100,243,204,42,184,172,91,103,140,240,201,35,55,76,69,51,189,44,54,29,114,245,142,102,181,141,0,134,121,193,3,188,254]}},"clockSysvar":"SysvarC1ock11111111111111111111111111111111","newAuthority":"CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","voteAccount":"2QE9X9X4tdDUTYic1DgBBJjU7cWUNPbKYGerCb9KqDQN"},"type":"authorizeChecked"},"program":"vote","programId":"Vote111111111111111111111111111111111111111","stackHeight":1}`
 
