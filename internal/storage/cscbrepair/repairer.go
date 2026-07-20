@@ -120,7 +120,7 @@ func (r *repairerImpl) prepare(
 	}
 	var pending *Manifest
 	if objectKey == "" {
-		pending, err = r.repository.FindPending(ctx, tag)
+		pending, err = r.repository.FindPending(ctx, tag, startHeight, endHeight)
 	} else {
 		pending, err = r.repository.FindByObjectKey(ctx, tag, objectKey)
 	}

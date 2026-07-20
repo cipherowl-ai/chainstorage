@@ -37,6 +37,98 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
+func TestIntegrationCSCBRepairPendingRangeIsolation(t *testing.T) {
+	if os.Getenv("TEST_TYPE") != "integration" {
+		t.Skip("integration test")
+	}
+	require := require.New(t)
+	ctx := context.Background()
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_600_000_000 + unique%100_000_000)
+	startHeight := uint64(8_500_000_000 + unique%100_000_000)
+	endHeight := startHeight + 1_000
+
+	cfg, err := config.New(
+		config.WithEnvironment(config.EnvLocal),
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	configureRepairTestEnvironment(t, cfg.AWS.Postgres)
+	db, err := openRepairDB(ctx, cfg.AWS.Postgres)
+	require.NoError(err)
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	type pendingRange struct {
+		key   string
+		start uint64
+		end   uint64
+	}
+	insertPending := func(tag uint32, pending pendingRange) {
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO cscb_repair_manifest (
+				tag, state, bucket, old_consolidated_object_key_main,
+				start_height, end_height, canonical_block_count, total_block_count, row_set_sha256
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)`,
+			tag,
+			cscbrepair.StatePreparing,
+			"range-isolation-bucket",
+			pending.key,
+			pending.start,
+			pending.end,
+			repairSHA256(pending.key),
+		)
+		require.NoError(err)
+	}
+	inRangeKey := fmt.Sprintf("consolidated/in-range-%d.cscb.zstd", unique)
+	pendingRanges := []pendingRange{
+		{key: fmt.Sprintf("consolidated/below-%d.cscb.zstd", unique), start: startHeight - 1_000, end: startHeight},
+		{key: fmt.Sprintf("consolidated/above-%d.cscb.zstd", unique), start: endHeight, end: endHeight + 1_000},
+		{key: inRangeKey, start: startHeight, end: endHeight},
+	}
+	for _, pending := range pendingRanges {
+		insertPending(tag, pending)
+	}
+
+	repository := cscbrepair.NewPostgresRepository(db)
+	pending, err := repository.FindPending(ctx, tag, startHeight, endHeight)
+	require.NoError(err)
+	require.NotNil(pending)
+	require.Equal(inRangeKey, pending.OldConsolidatedObjectKey)
+
+	objectKeys, err := repository.ListCandidateObjectKeys(ctx, tag, startHeight, endHeight, 10)
+	require.NoError(err)
+	require.Equal([]string{inRangeKey}, objectKeys)
+
+	emptyStart := endHeight + 2_000
+	pending, err = repository.FindPending(ctx, tag, emptyStart, emptyStart+1_000)
+	require.NoError(err)
+	require.Nil(pending)
+	objectKeys, err = repository.ListCandidateObjectKeys(ctx, tag, emptyStart, emptyStart+1_000, 10)
+	require.NoError(err)
+	require.Empty(objectKeys)
+
+	crossingTag := tag + 1
+	crossingKey := fmt.Sprintf("consolidated/cross-right-%d.cscb.zstd", unique)
+	insertPending(crossingTag, pendingRange{
+		key:   crossingKey,
+		start: startHeight + 500,
+		end:   endHeight + 1,
+	})
+	pending, err = repository.FindPending(ctx, crossingTag, startHeight, endHeight)
+	require.NoError(err)
+	require.NotNil(pending)
+	require.Equal(crossingKey, pending.OldConsolidatedObjectKey)
+	_, err = repository.ListCandidateObjectKeys(ctx, crossingTag, startHeight, endHeight, 10)
+	require.ErrorContains(err, "exceeds approved range")
+}
+
 func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	if os.Getenv("TEST_TYPE") != "integration" {
 		t.Skip("integration test")
@@ -408,9 +500,12 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Equal(cleanKey, activeAfterPromotion.ObjectKeyMain)
 	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeAfterPromotion.ObjectFormat)
-	pendingAfterPromotion, err := repository.FindPending(ctx, tag)
+	pendingAfterPromotion, err := repository.FindPending(ctx, tag, height, height+1)
 	require.NoError(err)
 	require.Nil(pendingAfterPromotion, "rollback must not resume a mixed placement after atomic promotion")
+	candidatesAfterPromotion, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	require.NoError(err)
+	require.Empty(candidatesAfterPromotion, "rerunning a completed repair range must terminate without new work")
 
 	manifest, err = repairer.Complete(ctx, manifest.ID, nil)
 	require.NoError(err)
