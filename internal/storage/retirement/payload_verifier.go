@@ -5,8 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
-	"io"
 	"strconv"
 
 	"golang.org/x/xerrors"
@@ -27,7 +25,6 @@ type blockPayloadVerifier interface {
 type (
 	PinnedPayloadInspection struct {
 		CanonicalSHA256     string
-		SemanticSHA256      string
 		HasStoragePlacement bool
 	}
 
@@ -104,13 +101,8 @@ func (v *payloadVerifier) ReadSingleBlock(
 	if err != nil {
 		return nil, PinnedPayloadInspection{}, err
 	}
-	semanticDigest, err := semanticBlockDigest(normalized)
-	if err != nil {
-		return nil, PinnedPayloadInspection{}, err
-	}
 	return &singleBlockBlock, PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
-		SemanticSHA256:      semanticDigest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(&singleBlockBlock),
 	}, nil
 }
@@ -128,13 +120,8 @@ func (v *payloadVerifier) InspectConsolidated(ctx context.Context, candidate Can
 	if err != nil {
 		return PinnedPayloadInspection{}, err
 	}
-	semanticDigest, err := semanticBlockDigest(normalized)
-	if err != nil {
-		return PinnedPayloadInspection{}, err
-	}
 	return PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
-		SemanticSHA256:      semanticDigest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(cscbBlock),
 	}, nil
 }
@@ -159,141 +146,6 @@ func canonicalBlockDigest(block *api.Block) (string, error) {
 	}
 	digest := sha256.Sum256(payload)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func semanticBlockDigest(block *api.Block) (string, error) {
-	canonical, err := canonicalizeEmbeddedBlockPayload(block)
-	if err != nil {
-		return "", err
-	}
-	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(canonical)
-	if err != nil {
-		return "", xerrors.Errorf("failed to marshal canonical block payload: %w", err)
-	}
-	digest := sha256.Sum256(payload)
-	return hex.EncodeToString(digest[:]), nil
-}
-
-func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
-	solana := block.GetSolana()
-	if solana == nil || len(solana.Header) == 0 {
-		return block, nil
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(solana.Header))
-	decoder.UseNumber()
-	value, err := decodeUniqueJSONValue(decoder)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to parse embedded Solana block JSON: %w", err)
-	}
-	if token, err := decoder.Token(); err != io.EOF {
-		if err == nil {
-			return nil, xerrors.Errorf("embedded Solana block JSON contains multiple values: trailing=%v", token)
-		}
-		return nil, xerrors.Errorf("failed to finish parsing embedded Solana block JSON: %w", err)
-	}
-	normalizeSolanaOptionalTransactionMetadata(value)
-	canonicalHeader, err := json.Marshal(value)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to canonicalize embedded Solana block JSON: %w", err)
-	}
-	canonical := proto.Clone(block).(*api.Block)
-	canonical.GetSolana().Header = canonicalHeader
-	return canonical, nil
-}
-
-func normalizeSolanaOptionalTransactionMetadata(value any) {
-	// Solana RPC providers omit these optional collections or emit them as []
-	// or null. Chainstorage's native parser treats all three as zero entries.
-	block, ok := value.(map[string]any)
-	if !ok {
-		return
-	}
-	transactions, ok := block["transactions"].([]any)
-	if !ok {
-		return
-	}
-	for _, transactionValue := range transactions {
-		transaction, ok := transactionValue.(map[string]any)
-		if !ok {
-			continue
-		}
-		metadata, ok := transaction["meta"].(map[string]any)
-		if !ok {
-			continue
-		}
-		for _, field := range []string{"innerInstructions", "logMessages"} {
-			value, exists := metadata[field]
-			items, isArray := value.([]any)
-			if !exists || value == nil || (isArray && len(items) == 0) {
-				metadata[field] = nil
-			}
-		}
-	}
-}
-
-func decodeUniqueJSONValue(decoder *json.Decoder) (any, error) {
-	token, err := decoder.Token()
-	if err != nil {
-		return nil, err
-	}
-	delim, ok := token.(json.Delim)
-	if !ok {
-		return token, nil
-	}
-
-	switch delim {
-	case '{':
-		object := make(map[string]any)
-		for decoder.More() {
-			keyToken, err := decoder.Token()
-			if err != nil {
-				return nil, err
-			}
-			key, ok := keyToken.(string)
-			if !ok {
-				return nil, xerrors.Errorf("JSON object key is not a string: %v", keyToken)
-			}
-			if _, exists := object[key]; exists {
-				return nil, xerrors.Errorf("duplicate JSON object key %q", key)
-			}
-			value, err := decodeUniqueJSONValue(decoder)
-			if err != nil {
-				return nil, err
-			}
-			object[key] = value
-		}
-		if err := requireJSONClosingDelimiter(decoder, '}'); err != nil {
-			return nil, err
-		}
-		return object, nil
-	case '[':
-		array := make([]any, 0)
-		for decoder.More() {
-			value, err := decodeUniqueJSONValue(decoder)
-			if err != nil {
-				return nil, err
-			}
-			array = append(array, value)
-		}
-		if err := requireJSONClosingDelimiter(decoder, ']'); err != nil {
-			return nil, err
-		}
-		return array, nil
-	default:
-		return nil, xerrors.Errorf("unexpected JSON delimiter %q", delim)
-	}
-}
-
-func requireJSONClosingDelimiter(decoder *json.Decoder, expected json.Delim) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	if token != expected {
-		return xerrors.Errorf("unexpected JSON closing delimiter %v; expected %q", token, expected)
-	}
-	return nil
 }
 
 func validatePayloadIdentity(block *api.Block, candidate Candidate) error {

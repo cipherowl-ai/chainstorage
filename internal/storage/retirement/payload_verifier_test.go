@@ -104,116 +104,7 @@ func TestPayloadVerifier_ParsesSupportedSingleBlockCompression(t *testing.T) {
 	}
 }
 
-func TestPayloadDigestsPreservePersistedFormatAndCanonicalizeSemanticComparison(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","transactions":[],"slot":429600000}`)
-	second := solanaPayloadBlock(candidate, "{\n  \"slot\": 429600000,\n  \"transactions\": [],\n  \"blockhash\": \"block-hash\"\n}")
-	require.NotEqual(t, first.GetSolana().GetHeader(), second.GetSolana().GetHeader())
-
-	firstPersistedDigest, err := canonicalBlockDigest(first)
-	require.NoError(t, err)
-	secondPersistedDigest, err := canonicalBlockDigest(second)
-	require.NoError(t, err)
-	require.NotEqual(t, firstPersistedDigest, secondPersistedDigest)
-
-	firstSemanticDigest, err := semanticBlockDigest(first)
-	require.NoError(t, err)
-	secondSemanticDigest, err := semanticBlockDigest(second)
-	require.NoError(t, err)
-	require.Equal(t, firstSemanticDigest, secondSemanticDigest)
-}
-
-func TestSemanticBlockDigestCanonicalizesEmptyOptionalSolanaTransactionMetadata(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	emptyArrays := solanaPayloadBlock(candidate, `{
-		"blockhash":"block-hash",
-		"transactions":[{"meta":{"innerInstructions":[],"logMessages":[]}}]
-	}`)
-	nulls := solanaPayloadBlock(candidate, `{
-		"blockhash":"block-hash",
-		"transactions":[{"meta":{"innerInstructions":null,"logMessages":null}}]
-	}`)
-	omitted := solanaPayloadBlock(candidate, `{
-		"blockhash":"block-hash",
-		"transactions":[{"meta":{}}]
-	}`)
-
-	emptyArrayDigest, err := semanticBlockDigest(emptyArrays)
-	require.NoError(t, err)
-	nullDigest, err := semanticBlockDigest(nulls)
-	require.NoError(t, err)
-	omittedDigest, err := semanticBlockDigest(omitted)
-	require.NoError(t, err)
-	require.Equal(t, emptyArrayDigest, nullDigest)
-	require.Equal(t, emptyArrayDigest, omittedDigest)
-}
-
-func TestSemanticBlockDigestPreservesMeaningfulSolanaJSONDifferences(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	tests := map[string]struct {
-		first  string
-		second string
-	}{
-		"non-empty log messages": {
-			first:  `{"transactions":[{"meta":{"logMessages":["program success"]}}]}`,
-			second: `{"transactions":[{"meta":{"logMessages":null}}]}`,
-		},
-		"non-empty inner instructions": {
-			first:  `{"transactions":[{"meta":{"innerInstructions":[{"index":1,"instructions":[]}]}}]}`,
-			second: `{"transactions":[{"meta":{"innerInstructions":null}}]}`,
-		},
-		"unrelated null and empty array": {
-			first:  `{"transactions":[],"unknown":[]}`,
-			second: `{"transactions":[],"unknown":null}`,
-		},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			firstDigest, err := semanticBlockDigest(solanaPayloadBlock(candidate, test.first))
-			require.NoError(t, err)
-			secondDigest, err := semanticBlockDigest(solanaPayloadBlock(candidate, test.second))
-			require.NoError(t, err)
-			require.NotEqual(t, firstDigest, secondDigest)
-		})
-	}
-}
-
-func TestSemanticBlockDigestRejectsDifferentSolanaJSON(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	first := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600000}`)
-	second := solanaPayloadBlock(candidate, `{"blockhash":"block-hash","slot":429600001}`)
-
-	firstDigest, err := semanticBlockDigest(first)
-	require.NoError(t, err)
-	secondDigest, err := semanticBlockDigest(second)
-	require.NoError(t, err)
-	require.NotEqual(t, firstDigest, secondDigest)
-}
-
-func TestSemanticBlockDigestRejectsMalformedSolanaJSON(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	_, err := semanticBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":`))
-	require.ErrorContains(t, err, "failed to parse embedded Solana block JSON")
-
-	_, err = semanticBlockDigest(solanaPayloadBlock(candidate, `{"blockhash":"block-hash"} {}`))
-	require.ErrorContains(t, err, "contains multiple values")
-}
-
-func TestSemanticBlockDigestRejectsDuplicateSolanaJSONKeys(t *testing.T) {
-	candidate := Candidate{Tag: 2, Height: 429600000, Hash: "block-hash"}
-	tests := map[string]string{
-		"top level": `{"slot":429600000,"slot":429600001}`,
-		"nested":    `{"meta":{"slot":429600000,"slot":429600001}}`,
-	}
-	for name, header := range tests {
-		t.Run(name, func(t *testing.T) {
-			_, err := semanticBlockDigest(solanaPayloadBlock(candidate, header))
-			require.ErrorContains(t, err, `duplicate JSON object key "slot"`)
-		})
-	}
-}
-
-func TestPayloadVerifier_RejectsSemanticAndSerializedMismatch(t *testing.T) {
+func TestPayloadVerifier_RejectsSerializedMismatch(t *testing.T) {
 	require := require.New(t)
 	candidate, store, _ := retirementPayloadFixture(t)
 	different := &api.Block{
@@ -310,21 +201,6 @@ func retirementPayloadFixture(t *testing.T) (Candidate, *fakeStore, []byte) {
 	store.objects[versionObjectKey(candidate.Key, candidate.VersionID)] = gzipPayload(t, payload)
 	store.objects[versionObjectKey(candidate.ConsolidatedKey, candidate.CSCBVersionID)] = buildSingleBlockCSCB(t, candidate, payload)
 	return candidate, store, payload
-}
-
-func solanaPayloadBlock(candidate Candidate, header string) *api.Block {
-	return &api.Block{
-		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
-		Network:    common.Network_NETWORK_SOLANA_MAINNET,
-		Metadata: &api.BlockMetadata{
-			Tag:    candidate.Tag,
-			Height: candidate.Height,
-			Hash:   candidate.Hash,
-		},
-		Blobdata: &api.Block_Solana{
-			Solana: &api.SolanaBlobdata{Header: []byte(header)},
-		},
-	}
 }
 
 func buildSingleBlockCSCB(t *testing.T, candidate Candidate, payload []byte) []byte {

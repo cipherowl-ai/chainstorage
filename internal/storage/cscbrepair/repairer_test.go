@@ -229,6 +229,110 @@ func TestPrepareNextCompletesAlreadyCleanCSCBWithoutRestore(t *testing.T) {
 	require.True(t, repository.alreadyClean)
 }
 
+func TestPrepareNextUsesPinnedSingleBlockAsAuthoritativeRepairPayload(t *testing.T) {
+	candidate := validRepairCandidate()
+	candidate.Blocks[0].Hash = "repair-hash"
+	candidate.Blocks[0].OldByteOffset = 0
+
+	currentBlock := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
+		Network:    common.Network_NETWORK_SOLANA_MAINNET,
+		Metadata: &api.BlockMetadata{
+			Tag:           candidate.Tag,
+			Height:        candidate.Blocks[0].Height,
+			Hash:          candidate.Blocks[0].Hash,
+			ObjectKeyMain: candidate.Blocks[0].SingleBlockObjectKey,
+			ObjectFormat:  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK,
+		},
+		Blobdata: &api.Block_Solana{
+			Solana: &api.SolanaBlobdata{Header: []byte(`{"transactions":["current"]}`)},
+		},
+	}
+	oldBlock := proto.Clone(currentBlock).(*api.Block)
+	oldBlock.GetSolana().Header = []byte(`{"transactions":["stale"]}`)
+
+	currentPayload, err := proto.Marshal(currentBlock)
+	require.NoError(t, err)
+	currentObject, err := storageutils.Compress(currentPayload, api.Compression_GZIP)
+	require.NoError(t, err)
+	oldPayload, err := proto.Marshal(oldBlock)
+	require.NoError(t, err)
+	candidate.Blocks[0].OldByteLength = uint64(len(oldPayload))
+	candidate.Blocks[0].OldUncompressedLength = uint64(len(oldPayload))
+	oldObject := buildRepairSingleBlockCSCB(t, retirement.Candidate{
+		BlockMetadataID:    candidate.Blocks[0].BlockMetadataID,
+		Tag:                candidate.Tag,
+		Height:             candidate.Blocks[0].Height,
+		Hash:               candidate.Blocks[0].Hash,
+		ByteOffset:         0,
+		ByteLength:         uint64(len(oldPayload)),
+		UncompressedLength: uint64(len(oldPayload)),
+	}, oldPayload)
+
+	repository := &preparationRepository{candidate: candidate}
+	store := &preparationObjectStore{
+		repository: repository,
+		topologies: map[string]retirement.ObjectVersionTopology{
+			candidate.OldConsolidatedObjectKey: {
+				Versions: []retirement.ObjectVersion{{
+					VersionID: "old-cscb-version",
+					ETag:      "old-cscb-etag",
+					Bytes:     uint64(len(oldObject)),
+					IsLatest:  true,
+				}},
+			},
+			candidate.Blocks[0].SingleBlockObjectKey: {
+				Versions: []retirement.ObjectVersion{{
+					VersionID: "current-single-version",
+					ETag:      "current-single-etag",
+					Bytes:     uint64(len(currentObject)),
+					IsLatest:  true,
+				}},
+			},
+		},
+		objects: map[string][]byte{
+			candidate.OldConsolidatedObjectKey:       oldObject,
+			candidate.Blocks[0].SingleBlockObjectKey: currentObject,
+		},
+	}
+	repairer := NewRepairer(repository, store, "repair-bucket")
+
+	manifest, err := repairer.PrepareNext(
+		context.Background(),
+		executionKey("authoritative-single-block"),
+		candidate.Tag,
+		candidate.StartHeight,
+		candidate.EndHeight,
+		1,
+		nil,
+	)
+	require.NoError(t, err)
+	require.Equal(t, StatePrepared, manifest.State)
+	require.False(t, repository.alreadyClean)
+
+	currentNormalized := storageutils.CloneBlockWithoutStoragePlacement(currentBlock)
+	expectedPayload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(currentNormalized)
+	require.NoError(t, err)
+	expectedDigest := sha256.Sum256(expectedPayload)
+	require.Equal(t, hex.EncodeToString(expectedDigest[:]), manifest.Blocks[0].PayloadSHA256)
+
+	var pinned PinnedPayload
+	require.NoError(t, repairer.VisitPinnedPayloads(
+		context.Background(),
+		manifest.ID,
+		nil,
+		func(payload PinnedPayload) error {
+			pinned = payload
+			return nil
+		},
+	))
+	var rebuilt api.Block
+	require.NoError(t, proto.Unmarshal(pinned.RawBlockPayload, &rebuilt))
+	require.False(t, storageutils.HasBlockStoragePlacement(&rebuilt))
+	require.True(t, proto.Equal(currentNormalized, &rebuilt))
+	require.False(t, proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(oldBlock), &rebuilt))
+}
+
 func TestInspectSingleBlockObjectVersionPinsCurrentWithoutReadingHistoricalPayloads(t *testing.T) {
 	candidate := singleBlockVersionCandidate()
 	currentPayload := singleBlockVersionPayload(t, candidate, `{"blockhash":"block-hash","transactions":[]}`)
