@@ -772,7 +772,7 @@ func (r *candidateListRepository) ListCandidateObjectKeys(_ context.Context, _ u
 	return r.objectKeys, nil
 }
 
-func (r *pendingRepairRepository) FindPending(context.Context, uint32) (*Manifest, error) {
+func (r *pendingRepairRepository) FindPending(context.Context, uint32, uint64, uint64) (*Manifest, error) {
 	return r.pending, nil
 }
 
@@ -839,7 +839,7 @@ func (r *preparationRepository) FindByExecutionKey(_ context.Context, executionK
 	return nil, false, nil
 }
 
-func (r *preparationRepository) FindPending(context.Context, uint32) (*Manifest, error) {
+func (r *preparationRepository) FindPending(context.Context, uint32, uint64, uint64) (*Manifest, error) {
 	return nil, nil
 }
 

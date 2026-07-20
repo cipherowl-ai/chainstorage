@@ -79,18 +79,32 @@ func (r *PostgresRepository) FindByExecutionKey(
 func (r *PostgresRepository) FindPending(
 	ctx context.Context,
 	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
 ) (*Manifest, error) {
 	if err := r.validateDB(); err != nil {
 		return nil, err
+	}
+	if endHeight <= startHeight {
+		return nil, xerrors.New("valid CSCB repair range is required")
 	}
 	query := fmt.Sprintf(`
 			SELECT %s
 			FROM cscb_repair_manifest
 			WHERE tag = $1
 				AND state <> $2
+				AND end_height > $3
+				AND start_height < $4
 			ORDER BY id ASC
 			LIMIT 1`, manifestColumns)
-	manifest, err := scanManifest(r.db.QueryRowContext(ctx, query, tag, StateCompleted))
+	manifest, err := scanManifest(r.db.QueryRowContext(
+		ctx,
+		query,
+		tag,
+		StateCompleted,
+		startHeight,
+		endHeight,
+	))
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -199,8 +213,10 @@ func (r *PostgresRepository) ListCandidateObjectKeys(
 		FROM cscb_repair_manifest
 		WHERE tag = $1
 			AND state <> $2
+			AND end_height > $3
+			AND start_height < $4
 		ORDER BY end_height DESC, old_consolidated_object_key_main DESC
-		LIMIT $3`, tag, StateCompleted, limit)
+		LIMIT $5`, tag, StateCompleted, startHeight, endHeight, limit)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to list pending CSCB repair candidates: %w", err)
 	}
