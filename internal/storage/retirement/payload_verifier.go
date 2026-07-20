@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"io"
 	"strconv"
 
+	"github.com/mr-tron/base58"
 	"golang.org/x/xerrors"
 	"google.golang.org/protobuf/proto"
 
@@ -193,6 +195,7 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 		return nil, xerrors.Errorf("failed to finish parsing embedded Solana block JSON: %w", err)
 	}
 	normalizeSolanaOptionalTransactionMetadata(value)
+	normalizeSolanaVoteAuthorizeCheckedBLSInstructions(value)
 	canonicalHeader, err := json.Marshal(value)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to canonicalize embedded Solana block JSON: %w", err)
@@ -200,6 +203,120 @@ func canonicalizeEmbeddedBlockPayload(block *api.Block) (*api.Block, error) {
 	canonical := proto.Clone(block).(*api.Block)
 	canonical.GetSolana().Header = canonicalHeader
 	return canonical, nil
+}
+
+func normalizeSolanaVoteAuthorizeCheckedBLSInstructions(value any) {
+	const (
+		voteProgramID                        = "Vote111111111111111111111111111111111111111"
+		voteAuthorizeChecked                 = uint32(7)
+		voteAuthorizeVoterWithBLS            = uint32(2)
+		voteAuthorizeCheckedBLSPayloadLength = 8 + 48 + 96
+	)
+
+	block, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	transactions, ok := block["transactions"].([]any)
+	if !ok {
+		return
+	}
+	for _, transactionValue := range transactions {
+		transaction, ok := transactionValue.(map[string]any)
+		if !ok {
+			continue
+		}
+		transactionBody, ok := transaction["transaction"].(map[string]any)
+		if !ok {
+			continue
+		}
+		message, ok := transactionBody["message"].(map[string]any)
+		if !ok {
+			continue
+		}
+		instructions, ok := message["instructions"].([]any)
+		if !ok {
+			continue
+		}
+		for index, instructionValue := range instructions {
+			instruction, ok := instructionValue.(map[string]any)
+			if !ok || len(instruction) != 4 || instruction["programId"] != voteProgramID {
+				continue
+			}
+			stackHeight, hasStackHeight := instruction["stackHeight"]
+			accounts, accountsOK := solanaInstructionAccounts(instruction["accounts"], 4)
+			data, dataOK := instruction["data"].(string)
+			if !hasStackHeight || !validSolanaStackHeight(stackHeight) || !accountsOK || !dataOK {
+				continue
+			}
+			decoded, err := base58.Decode(data)
+			if err != nil || len(decoded) != voteAuthorizeCheckedBLSPayloadLength {
+				continue
+			}
+			// Older RPC nodes emitted the raw bincode instruction before their
+			// JSON parser learned the VoterWithBLS authorization variant.
+			if binary.LittleEndian.Uint32(decoded[0:4]) != voteAuthorizeChecked || binary.LittleEndian.Uint32(decoded[4:8]) != voteAuthorizeVoterWithBLS {
+				continue
+			}
+			authorityType := map[string]any{
+				"VoterWithBLS": map[string]any{
+					"bls_pubkey":              solanaByteNumbers(decoded[8:56]),
+					"bls_proof_of_possession": solanaByteNumbers(decoded[56:voteAuthorizeCheckedBLSPayloadLength]),
+				},
+			}
+			instructions[index] = map[string]any{
+				"parsed": map[string]any{
+					"info": map[string]any{
+						"authority":     accounts[2],
+						"authorityType": authorityType,
+						"clockSysvar":   accounts[1],
+						"newAuthority":  accounts[3],
+						"voteAccount":   accounts[0],
+					},
+					"type": "authorizeChecked",
+				},
+				"program":     "vote",
+				"programId":   voteProgramID,
+				"stackHeight": stackHeight,
+			}
+		}
+	}
+}
+
+func solanaInstructionAccounts(value any, expectedLength int) ([]string, bool) {
+	items, ok := value.([]any)
+	if !ok || len(items) != expectedLength {
+		return nil, false
+	}
+	accounts := make([]string, len(items))
+	for index, item := range items {
+		account, ok := item.(string)
+		if !ok {
+			return nil, false
+		}
+		accounts[index] = account
+	}
+	return accounts, true
+}
+
+func validSolanaStackHeight(value any) bool {
+	if value == nil {
+		return true
+	}
+	number, ok := value.(json.Number)
+	if !ok {
+		return false
+	}
+	_, err := strconv.ParseUint(string(number), 10, 32)
+	return err == nil
+}
+
+func solanaByteNumbers(value []byte) []any {
+	numbers := make([]any, len(value))
+	for index, item := range value {
+		numbers[index] = json.Number(strconv.FormatUint(uint64(item), 10))
+	}
+	return numbers
 }
 
 func normalizeSolanaOptionalTransactionMetadata(value any) {

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"hash/crc32"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -146,6 +147,70 @@ func TestSemanticBlockDigestCanonicalizesEmptyOptionalSolanaTransactionMetadata(
 	require.NoError(t, err)
 	require.Equal(t, emptyArrayDigest, nullDigest)
 	require.Equal(t, emptyArrayDigest, omittedDigest)
+}
+
+func TestSemanticBlockDigestCanonicalizesSolanaVoteAuthorizeCheckedBLSRendering(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 431635272, Hash: "block-hash"}
+	raw := solanaPayloadBlock(candidate, solanaHeaderWithInstruction(solanaVoteAuthorizeCheckedBLSRawInstruction))
+	parsed := solanaPayloadBlock(candidate, solanaHeaderWithInstruction(solanaVoteAuthorizeCheckedBLSParsedInstruction))
+
+	rawPersistedDigest, err := canonicalBlockDigest(raw)
+	require.NoError(t, err)
+	parsedPersistedDigest, err := canonicalBlockDigest(parsed)
+	require.NoError(t, err)
+	require.NotEqual(t, rawPersistedDigest, parsedPersistedDigest)
+
+	rawSemanticDigest, err := semanticBlockDigest(raw)
+	require.NoError(t, err)
+	parsedSemanticDigest, err := semanticBlockDigest(parsed)
+	require.NoError(t, err)
+	require.Equal(t, rawSemanticDigest, parsedSemanticDigest)
+}
+
+func TestSemanticBlockDigestRejectsNonEquivalentSolanaVoteAuthorizeCheckedBLSRendering(t *testing.T) {
+	candidate := Candidate{Tag: 2, Height: 431635272, Hash: "block-hash"}
+	tests := map[string]struct {
+		raw    string
+		parsed string
+	}{
+		"account mismatch": {
+			raw:    solanaVoteAuthorizeCheckedBLSRawInstruction,
+			parsed: strings.Replace(solanaVoteAuthorizeCheckedBLSParsedInstruction, `"authority":"CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS"`, `"authority":"different"`, 1),
+		},
+		"BLS public key mismatch": {
+			raw:    solanaVoteAuthorizeCheckedBLSRawInstruction,
+			parsed: strings.Replace(solanaVoteAuthorizeCheckedBLSParsedInstruction, `"bls_pubkey":[144,`, `"bls_pubkey":[145,`, 1),
+		},
+		"parsed type mismatch": {
+			raw:    solanaVoteAuthorizeCheckedBLSRawInstruction,
+			parsed: strings.Replace(solanaVoteAuthorizeCheckedBLSParsedInstruction, `"type":"authorizeChecked"`, `"type":"authorize"`, 1),
+		},
+		"stack height mismatch": {
+			raw:    solanaVoteAuthorizeCheckedBLSRawInstruction,
+			parsed: strings.Replace(solanaVoteAuthorizeCheckedBLSParsedInstruction, `"stackHeight":1`, `"stackHeight":2`, 1),
+		},
+		"unsupported raw discriminator": {
+			raw:    strings.Replace(solanaVoteAuthorizeCheckedBLSRawInstruction, `"data":"Hibz`, `"data":"Jibz`, 1),
+			parsed: solanaVoteAuthorizeCheckedBLSParsedInstruction,
+		},
+		"unexpected raw field": {
+			raw:    strings.Replace(solanaVoteAuthorizeCheckedBLSRawInstruction, `"stackHeight":1}`, `"stackHeight":1,"unexpected":true}`, 1),
+			parsed: solanaVoteAuthorizeCheckedBLSParsedInstruction,
+		},
+		"non-numeric raw stack height": {
+			raw:    strings.Replace(solanaVoteAuthorizeCheckedBLSRawInstruction, `"stackHeight":1`, `"stackHeight":"1"`, 1),
+			parsed: solanaVoteAuthorizeCheckedBLSParsedInstruction,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			rawDigest, err := semanticBlockDigest(solanaPayloadBlock(candidate, solanaHeaderWithInstruction(test.raw)))
+			require.NoError(t, err)
+			parsedDigest, err := semanticBlockDigest(solanaPayloadBlock(candidate, solanaHeaderWithInstruction(test.parsed)))
+			require.NoError(t, err)
+			require.NotEqual(t, rawDigest, parsedDigest)
+		})
+	}
 }
 
 func TestSemanticBlockDigestPreservesMeaningfulSolanaJSONDifferences(t *testing.T) {
@@ -326,6 +391,14 @@ func solanaPayloadBlock(candidate Candidate, header string) *api.Block {
 		},
 	}
 }
+
+func solanaHeaderWithInstruction(instruction string) string {
+	return `{"transactions":[{"transaction":{"message":{"instructions":[` + instruction + `]}}}]}`
+}
+
+const solanaVoteAuthorizeCheckedBLSRawInstruction = `{"accounts":["2QE9X9X4tdDUTYic1DgBBJjU7cWUNPbKYGerCb9KqDQN","SysvarC1ock11111111111111111111111111111111","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS"],"data":"Hibzn6uTxrGAfqM93TpBdjnU15WCMYg6hLtmTcgq2jgx612W4YQxZF4EaT2RVuj2qkGtt4c78UB87YrjZ1Dxisjf5ty6Kzf4qNP7kmb8WSRt93SqLSGMD8o2p9zkPw1iPMuTPFNjo5VsiL4tDpgjNP7iHv6KEHcsKYn39Ep9nK9SgVNysWk353DVyyxGdTEQ3NRBTg5Bz6f6RS7","programId":"Vote111111111111111111111111111111111111111","stackHeight":1}`
+
+const solanaVoteAuthorizeCheckedBLSParsedInstruction = `{"parsed":{"info":{"authority":"CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","authorityType":{"VoterWithBLS":{"bls_proof_of_possession":[180,123,132,218,19,74,247,109,172,185,179,183,89,174,66,194,100,162,53,178,158,172,52,137,3,167,252,252,81,135,232,197,100,16,169,222,92,252,231,46,34,13,216,155,132,104,84,154,21,129,53,88,5,58,170,228,211,249,243,2,0,34,47,74,34,84,200,184,141,44,112,46,90,124,225,216,238,193,61,74,194,190,153,82,235,63,132,195,18,156,200,175,0,140,255,152],"bls_pubkey":[144,192,39,209,42,213,86,74,191,12,62,255,177,202,140,100,243,204,42,184,172,91,103,140,240,201,35,55,76,69,51,189,44,54,29,114,245,142,102,181,141,0,134,121,193,3,188,254]}},"clockSysvar":"SysvarC1ock11111111111111111111111111111111","newAuthority":"CpuDNi3iVoHXbaT8gHpzKe6rqeBasoYjEKi21q7NRVJS","voteAccount":"2QE9X9X4tdDUTYic1DgBBJjU7cWUNPbKYGerCb9KqDQN"},"type":"authorizeChecked"},"program":"vote","programId":"Vote111111111111111111111111111111111111111","stackHeight":1}`
 
 func buildSingleBlockCSCB(t *testing.T, candidate Candidate, payload []byte) []byte {
 	t.Helper()
