@@ -447,7 +447,7 @@ func (r *repairerImpl) VerifyAndPromote(
 	if err := r.requirePinnedObjectVersion(ctx, objectKey, newVersion); err != nil {
 		return nil, xerrors.Errorf("rebuilt CSCB changed before atomic promotion: %w", err)
 	}
-	verified, err := r.repository.PromoteVerified(
+	completed, err := r.repository.PromoteCompleted(
 		ctx,
 		manifest.ID,
 		objectKey,
@@ -456,10 +456,10 @@ func (r *repairerImpl) VerifyAndPromote(
 		singleBlockObjectRetention,
 	)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to atomically promote verified CSCB repair: %w", err)
+		return nil, xerrors.Errorf("failed to atomically promote and complete CSCB repair: %w", err)
 	}
-	reportProgress(progress, "promoted_verified", len(verified.Blocks), len(verified.Blocks), verified.EndHeight-1)
-	return verified, nil
+	reportProgress(progress, "promoted_completed", len(completed.Blocks), len(completed.Blocks), completed.EndHeight-1)
+	return completed, nil
 }
 
 func (r *repairerImpl) VerifyRebuilt(ctx context.Context, repairID int64, progress Progress) (*Manifest, error) {
@@ -723,12 +723,9 @@ func (r *repairerImpl) requirePinnedSingleBlockObjectVersion(ctx context.Context
 
 func (r *repairerImpl) requirePinnedSingleBlockObjectVersionForManifest(
 	ctx context.Context,
-	manifest *Manifest,
+	_ *Manifest,
 	block *Block,
 ) error {
-	if manifest.CanonicalBlockCount == 0 {
-		return r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion)
-	}
 	return r.requirePinnedSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion)
 }
 

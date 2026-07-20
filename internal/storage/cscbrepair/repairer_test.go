@@ -335,7 +335,7 @@ func TestRequirePinnedSingleBlockObjectVersionAllowsHistoricalDuplicateRemoval(t
 	require.NoError(t, repairer.requirePinnedSingleBlockObjectVersion(context.Background(), "single/1000.zstd", pinned))
 }
 
-func TestRestoreZeroCanonicalRepairRejectsHistoricalSingleBlockVersion(t *testing.T) {
+func TestRestoreZeroCanonicalRepairResumesWithHistoricalSingleBlockVersion(t *testing.T) {
 	manifest := completionManifest(t)
 	manifest.State = StatePrepared
 	repository := &phaseBoundaryRepository{manifest: manifest}
@@ -352,8 +352,8 @@ func TestRestoreZeroCanonicalRepairRejectsHistoricalSingleBlockVersion(t *testin
 	}}
 
 	_, err := NewRepairer(repository, store, manifest.Bucket).Restore(context.Background(), manifest.ID, nil)
-	require.ErrorContains(t, err, "expected one data version and zero delete markers")
-	require.False(t, repository.restoreCalled)
+	require.NoError(t, err)
+	require.True(t, repository.restoreCalled)
 }
 
 func TestVisitPinnedPayloadsReadsPinnedCurrentVersionAndStripsStoragePlacement(t *testing.T) {

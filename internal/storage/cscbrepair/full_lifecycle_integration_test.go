@@ -1,6 +1,7 @@
 package cscbrepair_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -207,10 +208,65 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	repairer := cscbrepair.NewRepairer(repository, store, bucket)
 	executionKey := repairSHA256(fmt.Sprintf("repair-main-%d", unique))
-	manifest, err := repairer.PrepareObject(ctx, executionKey, tag, height, height+1, 1, dirtyKey, nil)
+
+	// A writer that acquired the upload guard before repair preparation must
+	// finish its S3 PUT before the repair can fence and pin the current version.
+	preFenceGuard, err := meta.AcquireSingleBlockUploadGuard(ctx, tag, height, block.Metadata.Hash)
 	require.NoError(err)
+	require.False(preFenceGuard.RetirementFenced())
+	oldCurrentSingleBlockVersion := currentSingleBlockVersion
+	guardedPayload, err := store.ReadObjectVersion(ctx, bucket, singleBlockKey, oldCurrentSingleBlockVersion.VersionID)
+	require.NoError(err)
+	type prepareResult struct {
+		manifest *cscbrepair.Manifest
+		err      error
+	}
+	prepared := make(chan prepareResult, 1)
+	go func() {
+		preparedManifest, prepareErr := repairer.PrepareObject(
+			ctx,
+			executionKey,
+			tag,
+			height,
+			height+1,
+			1,
+			dirtyKey,
+			nil,
+		)
+		prepared <- prepareResult{manifest: preparedManifest, err: prepareErr}
+	}()
+	select {
+	case result := <-prepared:
+		require.Failf("repair preparation bypassed in-flight upload guard", "result=%+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	guardedPut, err := rawS3.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(singleBlockKey),
+		Body:   bytes.NewReader(guardedPayload),
+	})
+	require.NoError(err)
+	require.NotNil(guardedPut.VersionId)
+	require.NoError(preFenceGuard.Release())
+	preparedResult := <-prepared
+	require.NoError(preparedResult.err)
+	manifest := preparedResult.manifest
 	require.NotNil(manifest)
 	repairID = manifest.ID
+	postWriterTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	for _, version := range postWriterTopology.Versions {
+		if version.VersionID == aws.ToString(guardedPut.VersionId) {
+			currentSingleBlockVersion = version
+		}
+	}
+	require.Equal(aws.ToString(guardedPut.VersionId), currentSingleBlockVersion.VersionID)
+	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(singleBlockKey),
+		VersionId: aws.String(oldCurrentSingleBlockVersion.VersionID),
+	})
+	require.NoError(err)
 	require.Equal(cscbrepair.StatePrepared, manifest.State)
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
@@ -334,22 +390,27 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 		UncompressedLength: cleanPlacement.UncompressedLength,
 	}}, 72*time.Hour, nil)
 	require.NoError(err)
-	require.Equal(cscbrepair.StateVerified, manifest.State)
+	require.Equal(cscbrepair.StateCompleted, manifest.State)
 	require.Equal(cleanKey, manifest.NewConsolidatedObjectKey)
 	require.NotZero(manifest.NewConsolidatedObjectVersion.Bytes)
 	require.NotNil(manifest.RestoredAt)
 	require.NotNil(manifest.VerifiedAt)
+	require.NotNil(manifest.CompletedAt)
+	require.Equal("old_consolidated_object_retained_unreferenced", manifest.Outcome)
 	var retentionStartedAt, singleBlockDeleteAfter time.Time
 	require.NoError(db.QueryRowContext(ctx, `
 		SELECT single_block_retention_started_at, single_block_delete_after
 		FROM block_consolidation_shadow
 		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&retentionStartedAt, &singleBlockDeleteAfter))
 	require.False(retentionStartedAt.Before(*manifest.RestoredAt))
-	require.WithinDuration(retentionStartedAt.Add(72*time.Hour), singleBlockDeleteAfter, time.Microsecond)
+	require.WithinDuration(retentionStartedAt.Add(73*time.Hour), singleBlockDeleteAfter, time.Microsecond)
 	activeAfterPromotion, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
 	require.Equal(cleanKey, activeAfterPromotion.ObjectKeyMain)
 	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeAfterPromotion.ObjectFormat)
+	pendingAfterPromotion, err := repository.FindPending(ctx, tag)
+	require.NoError(err)
+	require.Nil(pendingAfterPromotion, "rollback must not resume a mixed placement after atomic promotion")
 
 	manifest, err = repairer.Complete(ctx, manifest.ID, nil)
 	require.NoError(err)

@@ -100,7 +100,7 @@ type (
 		RestoreToSingleBlock(ctx context.Context, repairID int64) (*Manifest, error)
 		GetRebuilt(ctx context.Context, repairID int64) (*Manifest, error)
 		RecordVerified(ctx context.Context, repairID int64, objectKey string, object ObjectVersion) (*Manifest, error)
-		PromoteVerified(ctx context.Context, repairID int64, objectKey string, object ObjectVersion, placements []RebuiltPlacement, singleBlockObjectRetention time.Duration) (*Manifest, error)
+		PromoteCompleted(ctx context.Context, repairID int64, objectKey string, object ObjectVersion, placements []RebuiltPlacement, singleBlockObjectRetention time.Duration) (*Manifest, error)
 		CompleteRetainingOldObject(ctx context.Context, repairID int64, outcome string) (*Manifest, error)
 	}
 

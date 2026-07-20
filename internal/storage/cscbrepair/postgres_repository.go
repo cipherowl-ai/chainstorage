@@ -25,6 +25,8 @@ const manifestColumns = `
 	outcome, prepared_at, restored_at, verified_at,
 	completed_at`
 
+const repairPromotionRetentionCommitGrace = time.Hour
+
 type (
 	PostgresRepository struct {
 		db *sql.DB
@@ -1067,7 +1069,7 @@ func (r *PostgresRepository) RecordVerified(
 	return verified, nil
 }
 
-func (r *PostgresRepository) PromoteVerified(
+func (r *PostgresRepository) PromoteCompleted(
 	ctx context.Context,
 	repairID int64,
 	objectKey string,
@@ -1094,10 +1096,10 @@ func (r *PostgresRepository) PromoteVerified(
 	if err != nil {
 		return nil, err
 	}
-	if manifest.State == StateVerified || manifest.State == StateCompleted {
+	if manifest.State == StateCompleted {
 		if manifest.NewConsolidatedObjectKey != objectKey ||
 			manifest.NewConsolidatedObjectVersion != object {
-			return nil, xerrors.Errorf("verified CSCB repair identity changed for repair id %d", manifest.ID)
+			return nil, xerrors.Errorf("completed CSCB repair identity changed for repair id %d", manifest.ID)
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, xerrors.Errorf("failed to commit idempotent atomic CSCB repair promotion: %w", err)
@@ -1145,7 +1147,7 @@ func (r *PostgresRepository) PromoteVerified(
 		manifest.State = StateRestored
 		manifest.RestoredAt = &promotionTime
 	}
-	deleteAfter := promotionTime.Add(singleBlockObjectRetention)
+	deleteAfter := promotionTime.Add(singleBlockObjectRetention + repairPromotionRetentionCommitGrace)
 
 	for _, block := range manifest.Blocks {
 		placement := placementsByID[block.BlockMetadataID]
@@ -1268,20 +1270,42 @@ func (r *PostgresRepository) PromoteVerified(
 	if err := requireRowsAffected(result, 1, "mark atomically promoted CSCB repair verified"); err != nil {
 		return nil, err
 	}
-	verified, err := loadManifest(ctx, tx, manifest.ID, false)
+	const markCompleted = `
+		UPDATE cscb_repair_manifest
+		SET state = $2,
+			outcome = $3,
+			completed_at = $4,
+			updated_at = $4
+		WHERE id = $1 AND state = $5`
+	result, err = tx.ExecContext(
+		ctx,
+		markCompleted,
+		manifest.ID,
+		StateCompleted,
+		completedOutcome,
+		promotionTime,
+		StateVerified,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to complete atomically promoted CSCB repair: %w", err)
+	}
+	if err := requireRowsAffected(result, 1, "complete atomically promoted CSCB repair"); err != nil {
+		return nil, err
+	}
+	completed, err := loadManifest(ctx, tx, manifest.ID, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := loadRebuiltBlocks(ctx, tx, verified); err != nil {
+	if err := loadRebuiltBlocks(ctx, tx, completed); err != nil {
 		return nil, err
 	}
-	if err := validateRebuiltMetadata(verified, objectKey); err != nil {
+	if err := validateRebuiltMetadata(completed, objectKey); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, xerrors.Errorf("failed to commit atomic CSCB repair promotion: %w", err)
 	}
-	return verified, nil
+	return completed, nil
 }
 
 func (r *PostgresRepository) CompleteRetainingOldObject(
