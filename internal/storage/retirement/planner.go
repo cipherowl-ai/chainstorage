@@ -1195,7 +1195,7 @@ func validPinnedVersionIDs(validationVersionID string, versionIDs []string, mark
 		return false
 	}
 	seen := make(map[string]struct{}, len(versionIDs)+len(markerIDs))
-	for _, versionID := range append(append([]string(nil), versionIDs...), markerIDs...) {
+	for _, versionID := range versionIDs {
 		if !isImmutableVersionID(versionID) {
 			return false
 		}
@@ -1203,6 +1203,15 @@ func validPinnedVersionIDs(validationVersionID string, versionIDs []string, mark
 			return false
 		}
 		seen[versionID] = struct{}{}
+	}
+	for _, markerID := range markerIDs {
+		if !isImmutableVersionID(markerID) {
+			return false
+		}
+		if _, duplicate := seen[markerID]; duplicate {
+			return false
+		}
+		seen[markerID] = struct{}{}
 	}
 	return true
 }
