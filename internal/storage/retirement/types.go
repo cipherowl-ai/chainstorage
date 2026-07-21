@@ -101,33 +101,34 @@ type (
 	}
 
 	RetirementManifest struct {
-		BlockMetadataID                int64
-		Tag                            uint32
-		Height                         uint64
-		Hash                           string
-		State                          string
-		Bucket                         string
-		SingleBlockObjectKey           string
-		SingleBlockObjectKeySHA256     string
-		SingleBlockObjectVersionIDs    []string
-		SingleBlockObjectETag          string
-		SingleBlockObjectBytes         uint64
-		ConsolidatedObjectKey          string
-		ConsolidatedObjectVersionID    string
-		ConsolidatedObjectETag         string
-		ConsolidatedByteOffset         uint64
-		ConsolidatedByteLength         uint64
-		ConsolidatedUncompressedLength uint64
-		PayloadSHA256                  string
-		Outcome                        string
-		AttemptCount                   int
-		ClaimToken                     string
-		ClaimExpiresAt                 *time.Time
-		PreparedAt                     time.Time
-		DeleteStartedAt                *time.Time
-		LastAttemptAt                  *time.Time
-		DeletedAt                      *time.Time
-		VerifiedAt                     *time.Time
+		BlockMetadataID                   int64
+		Tag                               uint32
+		Height                            uint64
+		Hash                              string
+		State                             string
+		Bucket                            string
+		SingleBlockObjectKey              string
+		SingleBlockObjectKeySHA256        string
+		SingleBlockObjectVersionIDs       []string
+		SingleBlockDeleteMarkerVersionIDs []string
+		SingleBlockObjectETag             string
+		SingleBlockObjectBytes            uint64
+		ConsolidatedObjectKey             string
+		ConsolidatedObjectVersionID       string
+		ConsolidatedObjectETag            string
+		ConsolidatedByteOffset            uint64
+		ConsolidatedByteLength            uint64
+		ConsolidatedUncompressedLength    uint64
+		PayloadSHA256                     string
+		Outcome                           string
+		AttemptCount                      int
+		ClaimToken                        string
+		ClaimExpiresAt                    *time.Time
+		PreparedAt                        time.Time
+		DeleteStartedAt                   *time.Time
+		LastAttemptAt                     *time.Time
+		DeletedAt                         *time.Time
+		VerifiedAt                        *time.Time
 	}
 
 	PlanRequest struct {
@@ -193,36 +194,38 @@ type (
 	}
 
 	Candidate struct {
-		Bucket               string     `json:"bucket"`
-		Key                  string     `json:"key"`
-		VersionID            string     `json:"version_id,omitempty"`
-		Height               uint64     `json:"height"`
-		Hash                 string     `json:"hash"`
-		SingleBlockBytes     uint64     `json:"single_block_bytes"`
-		ConsolidatedKey      string     `json:"consolidated_key"`
-		BlockMetadataID      int64      `json:"block_metadata_id"`
-		Tag                  uint32     `json:"tag"`
-		SingleBlockETag      string     `json:"single_block_etag,omitempty"`
-		SingleBlockKeySHA256 string     `json:"single_block_key_sha256,omitempty"`
-		SingleBlockVersions  int        `json:"single_block_version_count"`
-		DeleteMarkers        int        `json:"delete_marker_count"`
-		CSCBVersionID        string     `json:"cscb_version_id,omitempty"`
-		CSCBETag             string     `json:"cscb_etag,omitempty"`
-		CSCBWriteOncePolicy  bool       `json:"cscb_write_once_policy_verified"`
-		PayloadSHA256        string     `json:"payload_sha256,omitempty"`
-		ByteOffset           uint64     `json:"byte_offset,omitempty"`
-		ByteLength           uint64     `json:"byte_length,omitempty"`
-		UncompressedLength   uint64     `json:"uncompressed_length,omitempty"`
-		RetirementState      string     `json:"retirement_state,omitempty"`
-		RetirementAttempts   int        `json:"retirement_attempts,omitempty"`
-		RetirementOutcome    string     `json:"retirement_outcome,omitempty"`
-		ValidatedAt          *time.Time `json:"validated_at"`
-		RetiredAt            *time.Time `json:"retired_at"`
-		EligibleAt           *time.Time `json:"eligible_at"`
-		SingleBlockDeletedAt *time.Time `json:"single_block_deleted_at,omitempty"`
-		RetirementVerifiedAt *time.Time `json:"retirement_verified_at,omitempty"`
-		Action               string     `json:"action"`
-		SkipReason           string     `json:"skip_reason"`
+		Bucket                 string     `json:"bucket"`
+		Key                    string     `json:"key"`
+		VersionID              string     `json:"version_id,omitempty"`
+		VersionIDs             []string   `json:"single_block_version_ids,omitempty"`
+		DeleteMarkerVersionIDs []string   `json:"single_block_delete_marker_version_ids,omitempty"`
+		Height                 uint64     `json:"height"`
+		Hash                   string     `json:"hash"`
+		SingleBlockBytes       uint64     `json:"single_block_bytes"`
+		ConsolidatedKey        string     `json:"consolidated_key"`
+		BlockMetadataID        int64      `json:"block_metadata_id"`
+		Tag                    uint32     `json:"tag"`
+		SingleBlockETag        string     `json:"single_block_etag,omitempty"`
+		SingleBlockKeySHA256   string     `json:"single_block_key_sha256,omitempty"`
+		SingleBlockVersions    int        `json:"single_block_version_count"`
+		DeleteMarkers          int        `json:"delete_marker_count"`
+		CSCBVersionID          string     `json:"cscb_version_id,omitempty"`
+		CSCBETag               string     `json:"cscb_etag,omitempty"`
+		CSCBWriteOncePolicy    bool       `json:"cscb_write_once_policy_verified"`
+		PayloadSHA256          string     `json:"payload_sha256,omitempty"`
+		ByteOffset             uint64     `json:"byte_offset,omitempty"`
+		ByteLength             uint64     `json:"byte_length,omitempty"`
+		UncompressedLength     uint64     `json:"uncompressed_length,omitempty"`
+		RetirementState        string     `json:"retirement_state,omitempty"`
+		RetirementAttempts     int        `json:"retirement_attempts,omitempty"`
+		RetirementOutcome      string     `json:"retirement_outcome,omitempty"`
+		ValidatedAt            *time.Time `json:"validated_at"`
+		RetiredAt              *time.Time `json:"retired_at"`
+		EligibleAt             *time.Time `json:"eligible_at"`
+		SingleBlockDeletedAt   *time.Time `json:"single_block_deleted_at,omitempty"`
+		RetirementVerifiedAt   *time.Time `json:"retirement_verified_at,omitempty"`
+		Action                 string     `json:"action"`
+		SkipReason             string     `json:"skip_reason"`
 	}
 )
 
