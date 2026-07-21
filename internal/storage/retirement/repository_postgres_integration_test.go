@@ -104,25 +104,26 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	repo := NewPostgresRepository(db)
 	preparedAt := time.Now().UTC().Add(7 * 24 * time.Hour)
 	manifest := RetirementManifest{
-		BlockMetadataID:                blockMetadataID,
-		Tag:                            tag,
-		Height:                         height,
-		Hash:                           hash,
-		State:                          RetirementStateEligible,
-		Bucket:                         "integration-bucket",
-		SingleBlockObjectKey:           singleBlockKey,
-		SingleBlockObjectKeySHA256:     keySHA256(singleBlockKey),
-		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
-		SingleBlockObjectETag:          "single-block-etag",
-		SingleBlockObjectBytes:         256,
-		ConsolidatedObjectKey:          cscbKey,
-		ConsolidatedObjectVersionID:    "cscb-v1",
-		ConsolidatedObjectETag:         "cscb-etag",
-		ConsolidatedByteOffset:         0,
-		ConsolidatedByteLength:         128,
-		ConsolidatedUncompressedLength: 128,
-		PayloadSHA256:                  keySHA256("payload"),
-		PreparedAt:                     preparedAt,
+		BlockMetadataID:                   blockMetadataID,
+		Tag:                               tag,
+		Height:                            height,
+		Hash:                              hash,
+		State:                             RetirementStateEligible,
+		Bucket:                            "integration-bucket",
+		SingleBlockObjectKey:              singleBlockKey,
+		SingleBlockObjectKeySHA256:        keySHA256(singleBlockKey),
+		SingleBlockObjectVersionIDs:       []string{"single-block-v2", "single-block-v1"},
+		SingleBlockDeleteMarkerVersionIDs: []string{"delete-marker-v1"},
+		SingleBlockObjectETag:             "single-block-etag",
+		SingleBlockObjectBytes:            256,
+		ConsolidatedObjectKey:             cscbKey,
+		ConsolidatedObjectVersionID:       "cscb-v1",
+		ConsolidatedObjectETag:            "cscb-etag",
+		ConsolidatedByteOffset:            0,
+		ConsolidatedByteLength:            128,
+		ConsolidatedUncompressedLength:    128,
+		PayloadSHA256:                     keySHA256("payload"),
+		PreparedAt:                        preparedAt,
 	}
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO block_single_block_retention (
@@ -206,6 +207,9 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET consolidated_object_etag = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change pinned retirement manifest fields")
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET single_block_delete_marker_version_ids = ARRAY['mutated-marker'] WHERE block_metadata_id = $1`, blockMetadataID)
+	require.Error(err)
+	require.Contains(err.Error(), "cannot change pinned retirement delete-marker versions")
 
 	startedAt := preparedAt.Add(24 * time.Hour)
 	claimToken := "integration-claim"
@@ -297,7 +301,8 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Equal(RetirementStateDeletedVerified, row.Retirement.State)
 	require.Empty(row.Retirement.SingleBlockObjectKey)
 	require.Equal(keySHA256(singleBlockKey), row.Retirement.SingleBlockObjectKeySHA256)
-	require.Equal([]string{"single-block-v1"}, row.Retirement.SingleBlockObjectVersionIDs)
+	require.Equal([]string{"single-block-v2", "single-block-v1"}, row.Retirement.SingleBlockObjectVersionIDs)
+	require.Equal([]string{"delete-marker-v1"}, row.Retirement.SingleBlockDeleteMarkerVersionIDs)
 	require.Empty(row.Retirement.SingleBlockObjectETag)
 	require.Empty(row.Retirement.ClaimToken)
 	require.Nil(row.Retirement.ClaimExpiresAt)

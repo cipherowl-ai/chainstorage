@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/pressly/goose/v3"
@@ -53,6 +55,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	cfg.AWS.Bucket = bucket
 	cfg.AWS.IsLocalStack = true
 	cfg.AWS.IsResetLocal = true
+	localStackEndpoint := retirementLocalStackEndpoint(t, cfg.AWS.Postgres)
 	cfg.Chain.BlockStartHeight = height
 
 	db, err := openLifecycleDB(ctx, cfg.AWS.Postgres)
@@ -77,6 +80,7 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 		chains3.Module,
 		metastorage.Module,
 		blobstorage.Module,
+		fx.Replace(newRetirementLocalStackConfig(ctx, localStackEndpoint)),
 		fx.Populate(&meta, &blob, &singleBlockUploader, &s3Session),
 	)
 	defer app.Close()
@@ -112,6 +116,14 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
 	require.NoError(err)
 	require.NotEmpty(singleBlockKey)
+	singleBlockObject, err := rawS3.GetObject(ctx, &awss3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(singleBlockKey),
+	})
+	require.NoError(err)
+	singleBlockBytes, err := io.ReadAll(singleBlockObject.Body)
+	require.NoError(err)
+	require.NoError(singleBlockObject.Body.Close())
 	block.Metadata.ObjectKeyMain = singleBlockKey
 	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil))
 
@@ -173,6 +185,18 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(parsedCSCB)))
 
+	_, err = rawS3.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(singleBlockKey),
+		Body:   bytes.NewReader(singleBlockBytes),
+	})
+	require.NoError(err)
+	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(singleBlockKey),
+	})
+	require.NoError(err)
+
 	policy := retentionSafeBucketPolicy(bucket)
 	_, err = rawS3.PutBucketPolicy(ctx, &awss3.PutBucketPolicyInput{Bucket: aws.String(bucket), Policy: aws.String(policy)})
 	require.NoError(err)
@@ -205,6 +229,8 @@ func TestIntegrationRetirementFullStorageLifecycle(t *testing.T) {
 	require.Len(report.Items, 1)
 	require.Equal(retirement.ActionDeleteObjectVersion, report.Items[0].Action)
 	require.Empty(report.Items[0].SkipReason)
+	require.Equal(2, report.Items[0].SingleBlockVersions)
+	require.Equal(1, report.Items[0].DeleteMarkers)
 	require.True(report.SafetyGates.CSCBWriteOncePolicyVerified)
 
 	snapshot, err := store.InspectObjectRetentionSafety(ctx, bucket, consolidatedKey)
@@ -325,6 +351,36 @@ func openLifecycleDB(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, 
 		return nil, err
 	}
 	return db, nil
+}
+
+func retirementLocalStackEndpoint(t *testing.T, postgres *config.PostgresConfig) string {
+	t.Helper()
+	switch postgres.Host {
+	case "localhost", "127.0.0.1", "::1":
+		return "http://localhost:4566"
+	case "postgres":
+		return "http://localstack:4566"
+	default:
+		t.Fatalf("refusing to run retirement lifecycle test against PostgreSQL host %q", postgres.Host)
+		return ""
+	}
+}
+
+func newRetirementLocalStackConfig(ctx context.Context, endpoint string) aws.Config {
+	cfg, err := awsconfig.LoadDefaultConfig(
+		ctx,
+		awsconfig.WithRegion("us-east-1"),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
+		awsconfig.WithEndpointResolverWithOptions(
+			aws.EndpointResolverWithOptionsFunc(func(string, string, ...interface{}) (aws.Endpoint, error) {
+				return aws.Endpoint{URL: endpoint, HostnameImmutable: true}, nil
+			}),
+		),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("failed to configure LocalStack: %v", err))
+	}
+	return cfg
 }
 
 func retentionSafeBucketPolicy(bucket string) string {
