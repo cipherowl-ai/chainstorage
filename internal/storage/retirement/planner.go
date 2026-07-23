@@ -25,7 +25,7 @@ const (
 	cscbCompressionScopeMetadataValue = "batch-chunked"
 	retirementClaimTokenBytes         = 16
 	retirementClaimLease              = 15 * time.Minute
-	retirementSafetyQuiescencePeriod  = 15 * time.Minute
+	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
 	s3MutableNullVersionID            = "null"
 	versionedDeleteMode               = "exact_pinned_versions_and_delete_markers"
 )
@@ -178,8 +178,8 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !req.ClientMigrationApproved {
-			markCandidateBlocked(&item, SkipFileClientsNotApproved)
+		if !req.DirectStorageClientsGuarded {
+			markCandidateBlocked(&item, SkipDirectStorageClientsNotGuarded)
 			report.Items = append(report.Items, item)
 			continue
 		}
@@ -349,8 +349,8 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipActiveFallbackOrReadErrors
 		return item
 	}
-	if !req.ClientMigrationApproved {
-		item.SkipReason = SkipFileClientsNotApproved
+	if !req.DirectStorageClientsGuarded {
+		item.SkipReason = SkipDirectStorageClientsNotGuarded
 		return item
 	}
 	if req.Execute && !req.SingleBlockWritersGuarded {
@@ -577,10 +577,10 @@ func (p *Planner) verifyCSCBRetentionSafety(ctx context.Context, item *Candidate
 		return SkipCSCBWriteOncePolicyUnverified, inspectionErr
 	}
 	item.CSCBWriteOncePolicy = true
-	if observedAt.Sub(firstObservedAt) < retirementSafetyQuiescencePeriod {
+	if observedAt.Sub(firstObservedAt) < RetentionSafetyQuiescencePeriod {
 		return SkipCSCBSafetyQuiescenceActive, xerrors.Errorf(
 			"CSCB retention safety configuration has not remained stable for %s: bucket=%s key=%s first_observed_at=%s observed_at=%s",
-			retirementSafetyQuiescencePeriod,
+			RetentionSafetyQuiescencePeriod,
 			item.Bucket,
 			item.ConsolidatedKey,
 			firstObservedAt.Format(time.RFC3339Nano),
@@ -891,7 +891,7 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -924,7 +924,7 @@ func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -1035,7 +1035,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		report.StartHeight != req.StartHeight ||
 		report.EndHeight != req.EndHeight ||
 		report.Approval != req.Approval ||
-		report.SafetyGates.ClientMigrationApproved != req.ClientMigrationApproved ||
+		report.SafetyGates.DirectStorageClientsGuarded != req.DirectStorageClientsGuarded ||
 		report.SafetyGates.SingleBlockWritersGuarded != req.SingleBlockWritersGuarded ||
 		report.SafetyGates.FallbackReadErrors != req.FallbackErrorCount ||
 		report.SafetyGates.ProductionDeleteEnabled != req.ProductionDeleteEnabled ||
@@ -1044,7 +1044,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		!report.SafetyGates.CSCBWriteOncePolicyVerified {
 		return xerrors.New("retirement report does not match the execution request")
 	}
-	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved || !req.SingleBlockWritersGuarded {
+	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.DirectStorageClientsGuarded || !req.SingleBlockWritersGuarded {
 		return xerrors.New("retirement execution safety gates are not satisfied")
 	}
 	for _, item := range report.Items {
@@ -1332,12 +1332,12 @@ func newReport(req PlanRequest) *Report {
 		EndHeight:   req.EndHeight,
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
-			ClientMigrationApproved:   req.ClientMigrationApproved,
-			SingleBlockWritersGuarded: req.SingleBlockWritersGuarded,
-			FallbackReadErrors:        req.FallbackErrorCount,
-			VersionedDeleteMode:       versionedDeleteMode,
-			CSCBWriteOncePolicyMode:   cscbWriteOncePolicyMode,
-			ProductionDeleteEnabled:   req.ProductionDeleteEnabled,
+			DirectStorageClientsGuarded: req.DirectStorageClientsGuarded,
+			SingleBlockWritersGuarded:   req.SingleBlockWritersGuarded,
+			FallbackReadErrors:          req.FallbackErrorCount,
+			VersionedDeleteMode:         versionedDeleteMode,
+			CSCBWriteOncePolicyMode:     cscbWriteOncePolicyMode,
+			ProductionDeleteEnabled:     req.ProductionDeleteEnabled,
 		},
 		Items: make([]Candidate, 0),
 	}

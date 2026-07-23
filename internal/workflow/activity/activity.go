@@ -34,6 +34,8 @@ const (
 	ActivityBatchConsolidatorLatestBlock = "activity.batch_consolidator.latest_block"
 	ActivityBatchConsolidatorPlan        = "activity.batch_consolidator.plan"
 	ActivityBatchConsolidatorCursor      = "activity.batch_consolidator.cursor"
+	ActivitySingleBlockRetentionSelect   = "activity.single_block_retention.select"
+	ActivitySingleBlockRetentionProcess  = "activity.single_block_retention.process"
 	loggerMsg                            = "activity.request"
 
 	resultTypeTag     = "result_type"

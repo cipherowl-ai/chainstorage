@@ -132,22 +132,22 @@ type (
 	}
 
 	PlanRequest struct {
-		Environment               string
-		Blockchain                string
-		Network                   string
-		Sidechain                 string
-		Bucket                    string
-		Tag                       uint32
-		StartHeight               uint64
-		EndHeight                 uint64
-		Limit                     uint64
-		Now                       time.Time
-		Execute                   bool
-		ProductionDeleteEnabled   bool
-		ClientMigrationApproved   bool
-		SingleBlockWritersGuarded bool
-		FallbackErrorCount        uint64
-		Approval                  Approval
+		Environment                 string
+		Blockchain                  string
+		Network                     string
+		Sidechain                   string
+		Bucket                      string
+		Tag                         uint32
+		StartHeight                 uint64
+		EndHeight                   uint64
+		Limit                       uint64
+		Now                         time.Time
+		Execute                     bool
+		ProductionDeleteEnabled     bool
+		DirectStorageClientsGuarded bool
+		SingleBlockWritersGuarded   bool
+		FallbackErrorCount          uint64
+		Approval                    Approval
 	}
 
 	Approval struct {
@@ -174,7 +174,7 @@ type (
 	}
 
 	SafetyGates struct {
-		ClientMigrationApproved     bool   `json:"client_migration_approved"`
+		DirectStorageClientsGuarded bool   `json:"direct_storage_clients_guarded"`
 		SingleBlockWritersGuarded   bool   `json:"single_block_writers_guarded"`
 		FallbackReadErrors          uint64 `json:"fallback_read_errors"`
 		VersionedDeleteMode         string `json:"versioned_delete_mode"`
@@ -247,7 +247,7 @@ const (
 	SkipRetentionPeriodActive            = "retention_period_active"
 	SkipChainRangeNotApproved            = "chain_range_not_approved"
 	SkipActiveFallbackOrReadErrors       = "active_fallback_or_read_errors"
-	SkipFileClientsNotApproved           = "file_clients_not_approved"
+	SkipDirectStorageClientsNotGuarded   = "direct_storage_clients_not_guarded"
 	SkipSingleBlockWritersNotGuarded     = "single_block_writers_not_guarded"
 	SkipMissingCSCBObject                = "missing_cscb_object"
 	SkipSingleBlockObjectMissing         = "single_block_object_missing"

@@ -27,36 +27,38 @@ import (
 
 type (
 	Manager struct {
-		config            *config.Config
-		logger            *zap.Logger
-		runtime           cadence.Runtime
-		backfiller        *Backfiller
-		poller            *Poller
-		benchmarker       *Benchmarker
-		monitor           *Monitor
-		streamer          *Streamer
-		crossValidator    *CrossValidator
-		eventBackfiller   *EventBackfiller
-		replicator        *Replicator
-		migrator          *Migrator
-		batchConsolidator *BatchConsolidator
+		config               *config.Config
+		logger               *zap.Logger
+		runtime              cadence.Runtime
+		backfiller           *Backfiller
+		poller               *Poller
+		benchmarker          *Benchmarker
+		monitor              *Monitor
+		streamer             *Streamer
+		crossValidator       *CrossValidator
+		eventBackfiller      *EventBackfiller
+		replicator           *Replicator
+		migrator             *Migrator
+		batchConsolidator    *BatchConsolidator
+		singleBlockRetention *SingleBlockRetention
 	}
 
 	ManagerParams struct {
 		fx.In
 		fxparams.Params
-		Lifecycle         fx.Lifecycle
-		Runtime           cadence.Runtime
-		Backfiller        *Backfiller
-		Poller            *Poller
-		Benchmarker       *Benchmarker
-		Monitor           *Monitor
-		Streamer          *Streamer
-		CrossValidator    *CrossValidator
-		EventBackfiller   *EventBackfiller
-		Replicator        *Replicator
-		Migrator          *Migrator
-		BatchConsolidator *BatchConsolidator
+		Lifecycle            fx.Lifecycle
+		Runtime              cadence.Runtime
+		Backfiller           *Backfiller
+		Poller               *Poller
+		Benchmarker          *Benchmarker
+		Monitor              *Monitor
+		Streamer             *Streamer
+		CrossValidator       *CrossValidator
+		EventBackfiller      *EventBackfiller
+		Replicator           *Replicator
+		Migrator             *Migrator
+		BatchConsolidator    *BatchConsolidator
+		SingleBlockRetention *SingleBlockRetention
 	}
 
 	InstrumentedRequest interface {
@@ -83,19 +85,20 @@ const (
 
 func NewManager(params ManagerParams) *Manager {
 	mgr := &Manager{
-		config:            params.Config,
-		logger:            log.WithPackage(params.Logger),
-		runtime:           params.Runtime,
-		backfiller:        params.Backfiller,
-		poller:            params.Poller,
-		benchmarker:       params.Benchmarker,
-		monitor:           params.Monitor,
-		streamer:          params.Streamer,
-		crossValidator:    params.CrossValidator,
-		eventBackfiller:   params.EventBackfiller,
-		replicator:        params.Replicator,
-		migrator:          params.Migrator,
-		batchConsolidator: params.BatchConsolidator,
+		config:               params.Config,
+		logger:               log.WithPackage(params.Logger),
+		runtime:              params.Runtime,
+		backfiller:           params.Backfiller,
+		poller:               params.Poller,
+		benchmarker:          params.Benchmarker,
+		monitor:              params.Monitor,
+		streamer:             params.Streamer,
+		crossValidator:       params.CrossValidator,
+		eventBackfiller:      params.EventBackfiller,
+		replicator:           params.Replicator,
+		migrator:             params.Migrator,
+		batchConsolidator:    params.BatchConsolidator,
+		singleBlockRetention: params.SingleBlockRetention,
 	}
 
 	params.Lifecycle.Append(fx.Hook{

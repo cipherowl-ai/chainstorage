@@ -84,7 +84,7 @@ func (r *fakeRepo) ObserveRetentionSafety(
 	if !ok {
 		observation = fakeSafetyObservation{
 			configurationSHA256: configurationSHA256,
-			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+			firstObservedAt:     observedAt.Add(-RetentionSafetyQuiescencePeriod),
 		}
 	} else if observation.configurationSHA256 != configurationSHA256 {
 		observation.configurationSHA256 = configurationSHA256
@@ -571,7 +571,7 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 	})
 }
 
-func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
+func TestPlannerPlan_FallbackAndDirectStorageClientGates(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
@@ -585,12 +585,12 @@ func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
 		require.Equal(SkipActiveFallbackOrReadErrors, report.Items[0].SkipReason)
 	})
 
-	t.Run("file clients not approved", func(t *testing.T) {
+	t.Run("direct storage clients not guarded", func(t *testing.T) {
 		req := testRequest(now, false)
-		req.ClientMigrationApproved = false
+		req.DirectStorageClientsGuarded = false
 		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, newFakeStore()).Plan(context.Background(), req)
 		require.NoError(err)
-		require.Equal(SkipFileClientsNotApproved, report.Items[0].SkipReason)
+		require.Equal(SkipDirectStorageClientsNotGuarded, report.Items[0].SkipReason)
 	})
 }
 
@@ -922,7 +922,7 @@ func TestPlannerApply_RequiresStableRetentionSafetyConfigurationBeforeDelete(t *
 	repo.safetyObservations = map[string]fakeSafetyObservation{
 		req.Bucket + "\x00" + key: {
 			configurationSHA256: keySHA256("previous-safe-configuration"),
-			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+			firstObservedAt:     observedAt.Add(-RetentionSafetyQuiescencePeriod),
 		},
 	}
 	newConfigurationSHA256 := keySHA256("new-safe-configuration")
@@ -1676,17 +1676,17 @@ func newMultiVersionExecutableTestFixture(t *testing.T) (
 
 func testRequest(now time.Time, execute bool) PlanRequest {
 	return PlanRequest{
-		Environment:               "production",
-		Blockchain:                "solana",
-		Network:                   "mainnet",
-		Bucket:                    "co-chainstorage-solana-mainnet-prod",
-		Tag:                       0,
-		StartHeight:               428058000,
-		EndHeight:                 428059000,
-		Now:                       now,
-		Execute:                   execute,
-		ClientMigrationApproved:   true,
-		SingleBlockWritersGuarded: true,
+		Environment:                 "production",
+		Blockchain:                  "solana",
+		Network:                     "mainnet",
+		Bucket:                      "co-chainstorage-solana-mainnet-prod",
+		Tag:                         0,
+		StartHeight:                 428058000,
+		EndHeight:                   428059000,
+		Now:                         now,
+		Execute:                     execute,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
 		Approval: Approval{
 			Chain:       "solana-mainnet",
 			StartHeight: 428058000,
