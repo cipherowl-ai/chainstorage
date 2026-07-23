@@ -108,7 +108,23 @@ func TestSummarizeSingleBlockRetentionReportIdentifiesFirstIncompleteHeight(t *t
 		Reason: retirement.SkipCSCBSafetyQuiescenceActive,
 		Rows:   2,
 	}}, result.Blockers)
-	require.True(t, onlyRetentionSafetyQuiescence(result))
+	require.True(t, setSingleBlockRetentionRetry(result))
+	require.Equal(t, retirement.RetentionSafetyQuiescencePeriod, result.RetryAfter)
+	require.Equal(t, retirement.SkipCSCBSafetyQuiescenceActive, result.RetryReason)
+}
+
+func TestSetSingleBlockRetentionRetryDefersActiveClaim(t *testing.T) {
+	result := &SingleBlockRetentionRangeResult{
+		DeferredRows: 1,
+		Blockers: []SingleBlockRetentionReasonCount{{
+			Reason: retirement.SkipRetirementClaimActive,
+			Rows:   1,
+		}},
+	}
+
+	require.True(t, setSingleBlockRetentionRetry(result))
+	require.Equal(t, retirement.RetirementClaimLease, result.RetryAfter)
+	require.Equal(t, retirement.SkipRetirementClaimActive, result.RetryReason)
 }
 
 func TestSummarizeSingleBlockRetentionReportRejectsMixedConsolidatedObjects(t *testing.T) {
@@ -210,6 +226,10 @@ func TestValidateSingleBlockRetentionProcessRequestRequiresExecutionGates(t *tes
 	require.ErrorContains(t, err, "single-block writer")
 
 	base.SingleBlockWritersGuarded = true
+	err = validateSingleBlockRetentionProcessRequest(cfg, base)
+	require.ErrorContains(t, err, "explicit fallback-disabled")
+
+	base.FallbackReadsValidated = true
 	base.FallbackErrorCount = 1
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
 	require.ErrorContains(t, err, "zero fallback")

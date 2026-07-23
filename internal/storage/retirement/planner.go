@@ -24,7 +24,7 @@ const (
 	cscbFormatMetadataValue           = "cscb"
 	cscbCompressionScopeMetadataValue = "batch-chunked"
 	retirementClaimTokenBytes         = 16
-	retirementClaimLease              = 15 * time.Minute
+	RetirementClaimLease              = 15 * time.Minute
 	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
 	s3MutableNullVersionID            = "null"
 	versionedDeleteMode               = "exact_pinned_versions_and_delete_markers"
@@ -178,7 +178,7 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !req.DirectStorageClientsGuarded {
+		if req.Execute && !req.DirectStorageClientsGuarded {
 			markCandidateBlocked(&item, SkipDirectStorageClientsNotGuarded)
 			report.Items = append(report.Items, item)
 			continue
@@ -349,7 +349,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipActiveFallbackOrReadErrors
 		return item
 	}
-	if !req.DirectStorageClientsGuarded {
+	if req.Execute && !req.DirectStorageClientsGuarded {
 		item.SkipReason = SkipDirectStorageClientsNotGuarded
 		return item
 	}
@@ -641,7 +641,7 @@ func (p *Planner) withRetirementClaim(
 		return SkipMetadataChanged, err
 	}
 	claimedAt := time.Now().UTC()
-	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(retirementClaimLease)); err != nil {
+	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(RetirementClaimLease)); err != nil {
 		if errors.Is(err, ErrRetirementClaimUnavailable) {
 			return SkipRetirementClaimActive, nil
 		}
@@ -678,7 +678,7 @@ func (p *Planner) withRetirementClaim(
 
 func (p *Planner) renewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
 	renewedAt := time.Now().UTC()
-	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(retirementClaimLease))
+	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(RetirementClaimLease))
 }
 
 func (p *Planner) deletePinnedSingleBlockTopology(

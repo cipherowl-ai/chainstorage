@@ -585,8 +585,21 @@ func TestPlannerPlan_FallbackAndDirectStorageClientGates(t *testing.T) {
 		require.Equal(SkipActiveFallbackOrReadErrors, report.Items[0].SkipReason)
 	})
 
-	t.Run("direct storage clients not guarded", func(t *testing.T) {
+	t.Run("dry run does not require direct storage client assertion", func(t *testing.T) {
 		req := testRequest(now, false)
+		req.DirectStorageClientsGuarded = false
+		store := newFakeStore()
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+		store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), req)
+		require.NoError(err)
+		require.Equal(ActionReportOnly, report.Items[0].Action)
+		require.Empty(report.Items[0].SkipReason)
+		require.False(report.SafetyGates.DirectStorageClientsGuarded)
+	})
+
+	t.Run("execution requires direct storage client assertion", func(t *testing.T) {
+		req := testRequest(now, true)
 		req.DirectStorageClientsGuarded = false
 		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, newFakeStore()).Plan(context.Background(), req)
 		require.NoError(err)

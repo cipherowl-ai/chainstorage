@@ -40,6 +40,7 @@ type (
 		ProductionDeleteEnabled     bool
 		DirectStorageClientsGuarded bool
 		SingleBlockWritersGuarded   bool
+		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
 	}
 
@@ -51,28 +52,30 @@ type (
 	}
 
 	SingleBlockRetentionResult struct {
-		StartedAt             time.Time                                   `json:"started_at"`
-		CompletedAt           time.Time                                   `json:"completed_at"`
-		Tag                   uint32                                      `json:"tag"`
-		SelectionStartHeight  uint64                                      `json:"selection_start_height"`
-		SelectionEndHeight    uint64                                      `json:"selection_end_height"`
-		Execute               bool                                        `json:"execute"`
-		SelectedObjectRanges  uint64                                      `json:"selected_object_ranges"`
-		MoreEligibleRanges    bool                                        `json:"more_eligible_ranges"`
-		ProcessedObjectRanges uint64                                      `json:"processed_object_ranges"`
-		CompletedObjectRanges []SingleBlockRetentionCompletedRange        `json:"completed_object_ranges,omitempty"`
-		RangeResults          []*activity.SingleBlockRetentionRangeResult `json:"range_results,omitempty"`
-		ScannedRows           uint64                                      `json:"scanned_rows"`
-		PlannedRows           uint64                                      `json:"planned_rows"`
-		DeletedVerifiedRows   uint64                                      `json:"deleted_verified_rows"`
-		AlreadyRetiredRows    uint64                                      `json:"already_retired_rows"`
-		SkippedSlots          uint64                                      `json:"skipped_slots"`
-		DeferredRows          uint64                                      `json:"deferred_rows"`
-		FailedRows            uint64                                      `json:"failed_rows"`
-		DeletedVersions       uint64                                      `json:"deleted_versions"`
-		DeletedMarkers        uint64                                      `json:"deleted_markers"`
-		RetiredBytes          uint64                                      `json:"retired_bytes"`
-		FailureMessage        string                                      `json:"failure_message,omitempty"`
+		StartedAt              time.Time                                   `json:"started_at"`
+		CompletedAt            time.Time                                   `json:"completed_at"`
+		Tag                    uint32                                      `json:"tag"`
+		SelectionStartHeight   uint64                                      `json:"selection_start_height"`
+		SelectionEndHeight     uint64                                      `json:"selection_end_height"`
+		Execute                bool                                        `json:"execute"`
+		FallbackReadsValidated bool                                        `json:"fallback_reads_validated"`
+		FallbackErrorCount     uint64                                      `json:"fallback_error_count"`
+		SelectedObjectRanges   uint64                                      `json:"selected_object_ranges"`
+		MoreEligibleRanges     bool                                        `json:"more_eligible_ranges"`
+		ProcessedObjectRanges  uint64                                      `json:"processed_object_ranges"`
+		CompletedObjectRanges  []SingleBlockRetentionCompletedRange        `json:"completed_object_ranges,omitempty"`
+		RangeResults           []*activity.SingleBlockRetentionRangeResult `json:"range_results,omitempty"`
+		ScannedRows            uint64                                      `json:"scanned_rows"`
+		PlannedRows            uint64                                      `json:"planned_rows"`
+		DeletedVerifiedRows    uint64                                      `json:"deleted_verified_rows"`
+		AlreadyRetiredRows     uint64                                      `json:"already_retired_rows"`
+		SkippedSlots           uint64                                      `json:"skipped_slots"`
+		DeferredRows           uint64                                      `json:"deferred_rows"`
+		FailedRows             uint64                                      `json:"failed_rows"`
+		DeletedVersions        uint64                                      `json:"deleted_versions"`
+		DeletedMarkers         uint64                                      `json:"deleted_markers"`
+		RetiredBytes           uint64                                      `json:"retired_bytes"`
+		FailureMessage         string                                      `json:"failure_message,omitempty"`
 	}
 )
 
@@ -117,6 +120,8 @@ func (w *SingleBlockRetention) execute(
 	result := &SingleBlockRetentionResult{StartedAt: workflow.Now(ctx).UTC()}
 	if request != nil {
 		result.Execute = request.Execute
+		result.FallbackReadsValidated = request.FallbackReadsValidated
+		result.FallbackErrorCount = request.FallbackErrorCount
 	}
 	err := w.executeWorkflow(ctx, request, func() error {
 		var cfg config.SingleBlockRetentionWorkflowConfig
@@ -189,6 +194,7 @@ func (w *SingleBlockRetention) execute(
 				ProductionDeleteEnabled:     request.ProductionDeleteEnabled,
 				DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
 				SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
+				FallbackReadsValidated:      request.FallbackReadsValidated,
 				FallbackErrorCount:          request.FallbackErrorCount,
 			}
 			rangeResult, err := w.activity.Process(activityCtx, processRequest)
@@ -211,7 +217,7 @@ func (w *SingleBlockRetention) execute(
 					)
 				}
 				logger.Info(
-					"single-block retention cohort deferred for safety quiescence",
+					"single-block retention cohort deferred for bounded retry",
 					zap.String("consolidated_object_key", cohort.ConsolidatedObjectKey),
 					zap.Uint64("start_height", cohort.StartHeight),
 					zap.Uint64("end_height", cohort.EndHeight),
@@ -219,7 +225,7 @@ func (w *SingleBlockRetention) execute(
 					zap.String("retry_reason", rangeResult.RetryReason),
 				)
 				if err := workflow.Sleep(ctx, rangeResult.RetryAfter); err != nil {
-					return xerrors.Errorf("failed to wait for retention safety quiescence: %w", err)
+					return xerrors.Errorf("failed to wait before retention retry: %w", err)
 				}
 				rangeResult, err = w.activity.Process(activityCtx, processRequest)
 				if err != nil {
@@ -236,7 +242,7 @@ func (w *SingleBlockRetention) execute(
 			if request.Execute {
 				if rangeResult.RetryAfter > 0 {
 					return xerrors.Errorf(
-						"retention cohort %q remained deferred after safety-quiescence retry: %s",
+						"retention cohort %q remained deferred after bounded retry: %s",
 						cohort.ConsolidatedObjectKey,
 						rangeResult.RetryReason,
 					)
@@ -320,6 +326,9 @@ func validateSingleBlockRetentionExecutionRequest(
 	}
 	if !request.SingleBlockWritersGuarded {
 		return xerrors.New("retention execution requires every single-block writer to honor the retirement fence")
+	}
+	if !request.FallbackReadsValidated {
+		return xerrors.New("retention execution requires explicit fallback-disabled read validation")
 	}
 	if request.FallbackErrorCount != 0 {
 		return xerrors.Errorf("retention execution requires zero fallback read errors, got %d", request.FallbackErrorCount)

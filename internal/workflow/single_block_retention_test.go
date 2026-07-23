@@ -141,6 +141,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 		}, nil)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			require.True(s.T(), request.FallbackReadsValidated)
 			return &activity.SingleBlockRetentionRangeResult{
 				Cohort:                   request.Cohort,
 				ScannedRows:              request.Cohort.RowCount,
@@ -157,6 +158,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
 	})
 	require.NoError(s.T(), err)
 
@@ -216,6 +218,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce()
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
 	})
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 2, attempt)
@@ -240,8 +243,25 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenRangeIsIncompl
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
 	})
 	require.ErrorContains(s.T(), err, "did not finish")
+}
+
+func TestValidateSingleBlockRetentionExecutionRequestRequiresFallbackObservation(t *testing.T) {
+	request := &SingleBlockRetentionRequest{
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+	}
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"explicit fallback-disabled read validation",
+	)
+
+	request.FallbackReadsValidated = true
+	require.NoError(t, validateSingleBlockRetentionExecutionRequest(request))
 }
 
 func testRetentionCohort(key string, start uint64, end uint64) retirement.RetentionCohort {

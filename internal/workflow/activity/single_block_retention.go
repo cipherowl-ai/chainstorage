@@ -59,6 +59,7 @@ type (
 		ProductionDeleteEnabled     bool
 		DirectStorageClientsGuarded bool
 		SingleBlockWritersGuarded   bool
+		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
 	}
 
@@ -192,22 +193,23 @@ func (a *SingleBlockRetention) executeProcess(
 
 	if request.Execute {
 		reconcileReport, reconcileErr := planner.Reconcile(ctx, req)
+		var reconcileResult *SingleBlockRetentionRangeResult
+		if reconcileReport != nil {
+			reconcileResult, err = summarizeSingleBlockRetentionReport(request.Cohort, reconcileReport)
+			if err != nil {
+				return nil, err
+			}
+			if setSingleBlockRetentionRetry(reconcileResult) {
+				return reconcileResult, nil
+			}
+		}
 		if reconcileErr != nil {
-			if reconcileReport == nil {
+			if reconcileResult == nil {
 				return nil, xerrors.Errorf("failed to reconcile retention cohort: %w", reconcileErr)
 			}
-			result, summaryErr := summarizeSingleBlockRetentionReport(request.Cohort, reconcileReport)
-			if summaryErr != nil {
-				return nil, summaryErr
-			}
-			if onlyRetentionSafetyQuiescence(result) {
-				result.RetryAfter = retirement.RetentionSafetyQuiescencePeriod
-				result.RetryReason = retirement.SkipCSCBSafetyQuiescenceActive
-				return result, nil
-			}
-			result.FailureMessage = reconcileErr.Error()
+			reconcileResult.FailureMessage = reconcileErr.Error()
 			logger.Error("failed to reconcile single-block retention cohort", zap.Error(reconcileErr))
-			return result, nil
+			return reconcileResult, nil
 		}
 	}
 
@@ -224,9 +226,7 @@ func (a *SingleBlockRetention) executeProcess(
 			if summaryErr != nil {
 				return nil, summaryErr
 			}
-			if onlyRetentionSafetyQuiescence(result) {
-				result.RetryAfter = retirement.RetentionSafetyQuiescencePeriod
-				result.RetryReason = retirement.SkipCSCBSafetyQuiescenceActive
+			if setSingleBlockRetentionRetry(result) {
 				return result, nil
 			}
 			result.FailureMessage = applyErr.Error()
@@ -238,6 +238,9 @@ func (a *SingleBlockRetention) executeProcess(
 	result, err := summarizeSingleBlockRetentionReport(request.Cohort, report)
 	if err != nil {
 		return nil, err
+	}
+	if request.Execute && setSingleBlockRetentionRetry(result) {
+		return result, nil
 	}
 	logger.Info(
 		"processed single-block retention cohort",
@@ -355,6 +358,9 @@ func validateSingleBlockRetentionProcessRequest(
 	}
 	if !request.SingleBlockWritersGuarded {
 		return xerrors.New("retention execution requires every single-block writer to honor the retirement fence")
+	}
+	if !request.FallbackReadsValidated {
+		return xerrors.New("retention execution requires explicit fallback-disabled read validation")
 	}
 	if request.FallbackErrorCount != 0 {
 		return xerrors.Errorf("retention execution requires zero fallback read errors, got %d", request.FallbackErrorCount)
@@ -556,12 +562,20 @@ func isDeferredRetentionReason(reason string) bool {
 	}
 }
 
-func onlyRetentionSafetyQuiescence(result *SingleBlockRetentionRangeResult) bool {
-	return result != nil &&
-		result.FailedRows == 0 &&
-		result.DeferredRows > 0 &&
-		len(result.Blockers) == 1 &&
-		result.Blockers[0].Reason == retirement.SkipCSCBSafetyQuiescenceActive
+func setSingleBlockRetentionRetry(result *SingleBlockRetentionRangeResult) bool {
+	if result == nil || result.FailedRows != 0 || result.DeferredRows == 0 || len(result.Blockers) != 1 {
+		return false
+	}
+	switch result.Blockers[0].Reason {
+	case retirement.SkipCSCBSafetyQuiescenceActive:
+		result.RetryAfter = retirement.RetentionSafetyQuiescencePeriod
+	case retirement.SkipRetirementClaimActive:
+		result.RetryAfter = retirement.RetirementClaimLease
+	default:
+		return false
+	}
+	result.RetryReason = result.Blockers[0].Reason
+	return true
 }
 
 func uint64Pointer(value uint64) *uint64 {

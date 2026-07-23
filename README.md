@@ -726,8 +726,9 @@ The workflow is manual-only while production retention is being verified; no
 recurring cron or Temporal Schedule starts it. Each explicit run is bounded by
 `MaxObjectRanges`, and `MoreEligibleRanges` reports whether the selected range
 still has a backlog. Omitting `Execute` keeps the run read-only. Execution
-requires Postgres metadata plus versioned S3 storage. API and SDK clients
-continue to use the same Chainstorage interface; the
+requires Postgres metadata plus versioned S3 storage and an explicit
+`FallbackReadsValidated` assertion with zero `FallbackErrorCount`. API and SDK
+clients continue to use the same Chainstorage interface; the
 `DirectStorageClientsGuarded` execution gate applies only to consumers that
 bypass Chainstorage and access object storage directly.
 
