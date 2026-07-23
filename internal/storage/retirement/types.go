@@ -266,6 +266,7 @@ const (
 	SkipRetirementClaimActive            = "retirement_claim_active"
 	SkipProductionDeletionDisabled       = "production_deletion_disabled"
 	SkipNotAttemptedAfterFailure         = "not_attempted_after_failure"
+	SkipRetentionRunCanceled             = "retention_run_canceled"
 	SkipObjectInspectionFailed           = "object_inspection_failed"
 	SkipVersionedDeleteFailed            = "versioned_delete_failed"
 

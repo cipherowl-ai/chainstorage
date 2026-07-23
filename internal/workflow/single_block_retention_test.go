@@ -133,15 +133,19 @@ func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDel
 }
 
 func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges() {
-	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
-	second := testRetentionCohort("consolidated/200-210.cscb.zstd", 200, 210)
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
-			Cohorts: []retirement.RetentionCohort{first, second},
+			Cohorts: []retirement.RetentionCohort{cohort},
 		}, nil)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
 			require.True(s.T(), request.FallbackReadsValidated)
+			// The operator approval must reach the activity verbatim, never
+			// rewritten to whatever cohort was selected.
+			require.Equal(s.T(), "solana-mainnet", request.ApprovedChain)
+			require.Equal(s.T(), uint64(100), request.ApprovedStartHeight)
+			require.Equal(s.T(), uint64(110), request.ApprovedEndHeight)
 			return &activity.SingleBlockRetentionRangeResult{
 				Cohort:                   request.Cohort,
 				ScannedRows:              request.Cohort.RowCount,
@@ -155,35 +159,60 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
 		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   110,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
 		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           110,
 	})
 	require.NoError(s.T(), err)
 
 	var result SingleBlockRetentionResult
 	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
 	require.True(s.T(), result.Execute)
-	require.Equal(s.T(), uint64(2), result.SelectedObjectRanges)
-	require.Equal(s.T(), uint64(2), result.ProcessedObjectRanges)
-	require.Equal(s.T(), uint64(20), result.DeletedVerifiedRows)
-	require.Equal(s.T(), uint64(20), result.DeletedVersions)
-	require.Equal(s.T(), uint64(2000), result.RetiredBytes)
+	require.Equal(s.T(), "solana-mainnet", result.ApprovedChain)
+	require.Equal(s.T(), uint64(100), result.ApprovedStartHeight)
+	require.Equal(s.T(), uint64(110), result.ApprovedEndHeight)
+	require.Equal(s.T(), uint64(1), result.SelectedObjectRanges)
+	require.Equal(s.T(), uint64(1), result.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(10), result.DeletedVerifiedRows)
+	require.Equal(s.T(), uint64(10), result.DeletedVersions)
+	require.Equal(s.T(), uint64(1000), result.RetiredBytes)
 	require.Equal(s.T(), []SingleBlockRetentionCompletedRange{
 		{
-			ConsolidatedObjectKey: first.ConsolidatedObjectKey,
+			ConsolidatedObjectKey: cohort.ConsolidatedObjectKey,
 			StartHeight:           100,
 			EndHeight:             110,
 			EligibleRows:          10,
 		},
-		{
-			ConsolidatedObjectKey: second.ConsolidatedObjectKey,
-			StartHeight:           200,
-			EndHeight:             210,
-			EligibleRows:          10,
-		},
 	}, result.CompletedObjectRanges)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenCohortDoesNotMatchApprovedRange() {
+	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	second := testRetentionCohort("consolidated/200-210.cscb.zstd", 200, 210)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{first, second},
+		}, nil)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   210,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           210,
+	})
+	require.ErrorContains(s.T(), err, "does not exactly match the approved range")
 }
 
 func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce() {
@@ -215,10 +244,15 @@ func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce()
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
 		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   110,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
 		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           110,
 	})
 	require.NoError(s.T(), err)
 	require.Equal(s.T(), 2, attempt)
@@ -240,28 +274,103 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenRangeIsIncompl
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
 		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   110,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
 		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           110,
 	})
 	require.ErrorContains(s.T(), err, "did not finish")
 }
 
-func TestValidateSingleBlockRetentionExecutionRequestRequiresFallbackObservation(t *testing.T) {
-	request := &SingleBlockRetentionRequest{
-		Execute:                     true,
-		DirectStorageClientsGuarded: true,
-		SingleBlockWritersGuarded:   true,
+func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
+	validRequest := func() *SingleBlockRetentionRequest {
+		return &SingleBlockRetentionRequest{
+			StartHeight:                 100,
+			EndHeight:                   110,
+			Execute:                     true,
+			DirectStorageClientsGuarded: true,
+			SingleBlockWritersGuarded:   true,
+			FallbackReadsValidated:      true,
+			ApprovedChain:               "solana-mainnet",
+			ApprovedStartHeight:         100,
+			ApprovedEndHeight:           110,
+		}
 	}
+	require.NoError(t, validateSingleBlockRetentionExecutionRequest(validRequest()))
+
+	request := validRequest()
+	request.StartHeight = 0
+	request.EndHeight = 0
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"explicit exact selection range",
+	)
+
+	request = validRequest()
+	request.ApprovedChain = ""
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"operator approval chain",
+	)
+
+	request = validRequest()
+	request.ApprovedStartHeight = 110
+	request.ApprovedEndHeight = 110
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"valid exact approved range",
+	)
+
+	request = validRequest()
+	request.ApprovedEndHeight = 109
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"must exactly match the selection range",
+	)
+
+	request = validRequest()
+	request.FallbackReadsValidated = false
 	require.ErrorContains(
 		t,
 		validateSingleBlockRetentionExecutionRequest(request),
 		"explicit fallback-disabled read validation",
 	)
 
-	request.FallbackReadsValidated = true
-	require.NoError(t, validateSingleBlockRetentionExecutionRequest(request))
+	request = validRequest()
+	request.FallbackErrorCount = 3
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"zero fallback read errors",
+	)
+}
+
+func TestValidateApprovedSingleBlockRetentionCohort(t *testing.T) {
+	request := &SingleBlockRetentionRequest{
+		ApprovedStartHeight: 100,
+		ApprovedEndHeight:   110,
+	}
+	require.NoError(t, validateApprovedSingleBlockRetentionCohort(
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		request,
+	))
+	require.ErrorContains(
+		t,
+		validateApprovedSingleBlockRetentionCohort(
+			testRetentionCohort("consolidated/100-109.cscb.zstd", 100, 109),
+			request,
+		),
+		"does not exactly match the approved range",
+	)
 }
 
 func testRetentionCohort(key string, start uint64, end uint64) retirement.RetentionCohort {

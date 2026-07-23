@@ -42,6 +42,14 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
+		// Approved* are the operator's separate exact-range deletion approval.
+		// Execution requires them, requires the selection range to equal the
+		// approved range, and passes them through unchanged; approval is never
+		// derived from whatever cohort the selector discovers. Read-only runs
+		// may omit them.
+		ApprovedChain       string
+		ApprovedStartHeight uint64
+		ApprovedEndHeight   uint64
 	}
 
 	SingleBlockRetentionCompletedRange struct {
@@ -58,6 +66,9 @@ type (
 		SelectionStartHeight   uint64                                      `json:"selection_start_height"`
 		SelectionEndHeight     uint64                                      `json:"selection_end_height"`
 		Execute                bool                                        `json:"execute"`
+		ApprovedChain          string                                      `json:"approved_chain,omitempty"`
+		ApprovedStartHeight    uint64                                      `json:"approved_start_height,omitempty"`
+		ApprovedEndHeight      uint64                                      `json:"approved_end_height,omitempty"`
 		FallbackReadsValidated bool                                        `json:"fallback_reads_validated"`
 		FallbackErrorCount     uint64                                      `json:"fallback_error_count"`
 		SelectedObjectRanges   uint64                                      `json:"selected_object_ranges"`
@@ -120,6 +131,9 @@ func (w *SingleBlockRetention) execute(
 	result := &SingleBlockRetentionResult{StartedAt: workflow.Now(ctx).UTC()}
 	if request != nil {
 		result.Execute = request.Execute
+		result.ApprovedChain = request.ApprovedChain
+		result.ApprovedStartHeight = request.ApprovedStartHeight
+		result.ApprovedEndHeight = request.ApprovedEndHeight
 		result.FallbackReadsValidated = request.FallbackReadsValidated
 		result.FallbackErrorCount = request.FallbackErrorCount
 	}
@@ -187,6 +201,11 @@ func (w *SingleBlockRetention) execute(
 			); err != nil {
 				return err
 			}
+			if request.Execute {
+				if err := validateApprovedSingleBlockRetentionCohort(cohort, request); err != nil {
+					return err
+				}
+			}
 			processRequest := &activity.SingleBlockRetentionProcessRequest{
 				Tag:                         tag,
 				Cohort:                      cohort,
@@ -196,6 +215,9 @@ func (w *SingleBlockRetention) execute(
 				SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
 				FallbackReadsValidated:      request.FallbackReadsValidated,
 				FallbackErrorCount:          request.FallbackErrorCount,
+				ApprovedChain:               request.ApprovedChain,
+				ApprovedStartHeight:         request.ApprovedStartHeight,
+				ApprovedEndHeight:           request.ApprovedEndHeight,
 			}
 			rangeResult, err := w.activity.Process(activityCtx, processRequest)
 			if err != nil {
@@ -321,6 +343,28 @@ func validateSingleBlockRetentionExecutionRequest(
 	if err := validateSingleBlockRetentionSelectionRange(request.StartHeight, request.EndHeight); err != nil {
 		return err
 	}
+	if request.EndHeight == 0 {
+		return xerrors.New("retention execution requires an explicit exact selection range; unbounded execution is not allowed")
+	}
+	if request.ApprovedChain == "" {
+		return xerrors.New("retention execution requires an explicit operator approval chain")
+	}
+	if request.ApprovedEndHeight <= request.ApprovedStartHeight {
+		return xerrors.Errorf(
+			"retention execution requires a valid exact approved range, got [%d, %d)",
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
+		)
+	}
+	if request.ApprovedStartHeight != request.StartHeight || request.ApprovedEndHeight != request.EndHeight {
+		return xerrors.Errorf(
+			"retention execution approved range [%d, %d) must exactly match the selection range [%d, %d)",
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
+			request.StartHeight,
+			request.EndHeight,
+		)
+	}
 	if !request.DirectStorageClientsGuarded {
 		return xerrors.New("retention execution requires direct storage clients to be guarded or out of scope")
 	}
@@ -342,6 +386,27 @@ func validateSingleBlockRetentionSelectionRange(startHeight uint64, endHeight ui
 	}
 	if endHeight != 0 && endHeight <= startHeight {
 		return xerrors.Errorf("invalid single-block retention range [%d, %d)", startHeight, endHeight)
+	}
+	return nil
+}
+
+// validateApprovedSingleBlockRetentionCohort fails an execution run closed
+// when the selector discovers a cohort other than the exact object range the
+// operator approved, instead of letting the discovered work redefine the
+// approval.
+func validateApprovedSingleBlockRetentionCohort(
+	cohort retirement.RetentionCohort,
+	request *SingleBlockRetentionRequest,
+) error {
+	if cohort.StartHeight != request.ApprovedStartHeight || cohort.EndHeight != request.ApprovedEndHeight {
+		return xerrors.Errorf(
+			"selected retention cohort %q [%d, %d) does not exactly match the approved range [%d, %d); approve the exact cohort range before execution",
+			cohort.ConsolidatedObjectKey,
+			cohort.StartHeight,
+			cohort.EndHeight,
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
+		)
 	}
 	return nil
 }

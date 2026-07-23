@@ -36,15 +36,37 @@ type Planner struct {
 	repo            Repository
 	store           ObjectStore
 	verifierFactory func() blockPayloadVerifier
+	heartbeat       func(ctx context.Context, details ...any)
 }
 
-func NewPlanner(repo Repository, store ObjectStore) *Planner {
-	return &Planner{
+type PlannerOption func(*Planner)
+
+// WithHeartbeat wires a liveness callback invoked from the long-running
+// row/version loops, so a Temporal activity heartbeat timeout can bound the
+// planner and deliver cancellation between destructive steps.
+func WithHeartbeat(heartbeat func(ctx context.Context, details ...any)) PlannerOption {
+	return func(p *Planner) {
+		p.heartbeat = heartbeat
+	}
+}
+
+func NewPlanner(repo Repository, store ObjectStore, opts ...PlannerOption) *Planner {
+	p := &Planner{
 		repo:  repo,
 		store: store,
 		verifierFactory: func() blockPayloadVerifier {
 			return newPayloadVerifier(store)
 		},
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+func (p *Planner) recordHeartbeat(ctx context.Context, details ...any) {
+	if p.heartbeat != nil {
+		p.heartbeat(ctx, details...)
 	}
 }
 
@@ -63,6 +85,10 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	writeOncePolicies := make(map[string]bool)
 	verifier := p.verifierFactory()
 	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, xerrors.Errorf("single-block retention plan canceled at height %d: %w", row.Height, err)
+		}
+		p.recordHeartbeat(ctx, "retirement.plan.row", row.Height)
 		item := p.planRow(ctx, req, row, cscbHeads, singleBlockTopologies, writeOncePolicies, verifier)
 		report.Items = append(report.Items, item)
 	}
@@ -104,11 +130,20 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 		if item.Action != ActionDeleteObjectVersion {
 			continue
 		}
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement apply canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.apply.row", item.Height)
 		reason, err := p.applyCandidate(ctx, req, item, verifier)
 		if reason != "" {
 			if item.RetirementState != RetirementStateDeletedPendingVerification {
@@ -148,12 +183,21 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	halted := false
 	for _, manifest := range manifests {
 		item := candidateFromManifest(manifest)
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement reconciliation canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			report.Items = append(report.Items, item)
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.reconcile.manifest", item.Height)
 		if manifest.Bucket != req.Bucket || !requestAllowsCandidate(req, item) ||
 			manifest.State != RetirementStateEligible &&
 				manifest.State != RetirementStateDeleting &&
@@ -168,7 +212,7 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !approvalMatches(req) {
+		if approvalGateBlocked(req) {
 			markCandidateBlocked(&item, SkipChainRangeNotApproved)
 			report.Items = append(report.Items, item)
 			continue
@@ -341,7 +385,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
-	if !approvalMatches(req) {
+	if approvalGateBlocked(req) {
 		item.SkipReason = SkipChainRangeNotApproved
 		return item
 	}
@@ -664,7 +708,10 @@ func (p *Planner) withRetirementClaim(
 		if outcome == "" {
 			outcome = SkipMetadataChanged
 		}
-		if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+		// Record the interruption outcome even when the failure is a
+		// cancellation, so a stopped run leaves a durable trace instead of an
+		// unexplained claim that only expires by lease.
+		if outcomeErr := p.repo.RecordRetirementOutcome(context.WithoutCancel(ctx), item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
 		}
 	}()
@@ -706,6 +753,14 @@ func (p *Planner) deletePinnedSingleBlockTopology(
 		remainingMarkers[marker.VersionID] = struct{}{}
 	}
 	deleteVersion := func(versionID string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return SkipRetentionRunCanceled, xerrors.Errorf(
+				"single-block version deletion canceled before version %s: %w",
+				versionID,
+				err,
+			)
+		}
+		p.recordHeartbeat(ctx, "retirement.delete.version", item.Height, versionID)
 		if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
 			return SkipRetirementClaimActive, err
 		}
@@ -1448,6 +1503,18 @@ func approvalMatches(req PlanRequest) bool {
 		req.Approval.EndHeight == req.EndHeight
 }
 
+// approvalGateBlocked reports whether the operator approval blocks this
+// request. Execution always requires an exact chain/range approval. A
+// read-only run may omit the approval entirely so it can still reach the S3
+// safety inspection, but a supplied approval is validated even on dry runs so
+// the report predicts the execute-time gate.
+func approvalGateBlocked(req PlanRequest) bool {
+	if !req.Execute && req.Approval == (Approval{}) {
+		return false
+	}
+	return !approvalMatches(req)
+}
+
 func actualChain(req PlanRequest) string {
 	parts := []string{req.Blockchain, req.Network}
 	if req.Sidechain != "" {
@@ -1458,6 +1525,13 @@ func actualChain(req PlanRequest) string {
 
 func normalizeApprovalChain(value string) string {
 	return strings.ToLower(strings.ReplaceAll(value, "_", "-"))
+}
+
+// NormalizeApprovalChain exposes the approval chain normalization so callers
+// can fail fast on an operator approval that names the wrong chain before a
+// plan request is even built.
+func NormalizeApprovalChain(value string) string {
+	return normalizeApprovalChain(value)
 }
 
 func isProduction(env string) bool {

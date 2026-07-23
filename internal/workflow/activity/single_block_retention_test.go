@@ -236,10 +236,59 @@ func TestValidateSingleBlockRetentionProcessRequestRequiresExecutionGates(t *tes
 
 	base.FallbackErrorCount = 0
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
+	require.ErrorContains(t, err, "operator approval chain")
+
+	base.ApprovedChain = "wrong-chain"
+	base.ApprovedStartHeight = 100
+	base.ApprovedEndHeight = 101
+	err = validateSingleBlockRetentionProcessRequest(cfg, base)
+	require.ErrorContains(t, err, "approval names chain")
+
+	base.ApprovedChain = singleBlockRetentionExpectedChain(cfg)
+	base.ApprovedEndHeight = 102
+	err = validateSingleBlockRetentionProcessRequest(cfg, base)
+	require.ErrorContains(t, err, "does not exactly match cohort")
+
+	base.ApprovedEndHeight = 101
+	err = validateSingleBlockRetentionProcessRequest(cfg, base)
 	require.ErrorContains(t, err, "production-delete")
 
 	base.ProductionDeleteEnabled = true
 	require.NoError(t, validateSingleBlockRetentionProcessRequest(cfg, base))
+}
+
+func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.T) {
+	cfg, err := config.New(
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+	require.NoError(t, err)
+	a := &SingleBlockRetention{config: cfg}
+	cohort := retirement.RetentionCohort{
+		ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+		StartHeight:           100,
+		EndHeight:             110,
+		RowCount:              10,
+		EligibleAt:            time.Now().Add(-time.Hour),
+	}
+
+	executeReq := a.planRequest(&SingleBlockRetentionProcessRequest{
+		Cohort:              cohort,
+		Execute:             true,
+		ApprovedChain:       "solana-mainnet",
+		ApprovedStartHeight: 100,
+		ApprovedEndHeight:   110,
+	})
+	require.Equal(t, retirement.Approval{
+		Chain:       "solana-mainnet",
+		StartHeight: 100,
+		EndHeight:   110,
+	}, executeReq.Approval)
+
+	// An omitted operator approval stays omitted; it is never synthesized
+	// from the selected cohort.
+	dryRunReq := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
+	require.Equal(t, retirement.Approval{}, dryRunReq.Approval)
 }
 
 func TestSingleBlockRetentionChainNamesUseOperatorCompatibleComponents(t *testing.T) {

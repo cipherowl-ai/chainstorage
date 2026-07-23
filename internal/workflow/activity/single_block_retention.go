@@ -61,6 +61,13 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
+		// Approved* carry the operator's explicit exact-range deletion
+		// approval verbatim. They are never derived from the selected cohort;
+		// execution fails closed unless they name this chain and exactly the
+		// cohort range being processed.
+		ApprovedChain       string
+		ApprovedStartHeight uint64
+		ApprovedEndHeight   uint64
 	}
 
 	SingleBlockRetentionReasonCount struct {
@@ -291,16 +298,21 @@ func (a *SingleBlockRetention) getComponents(
 	}
 	repo := retirement.NewPostgresRepository(db)
 	a.selector = retirement.NewSelector(repo)
-	a.planner = retirement.NewPlanner(repo, retirement.NewS3ObjectStore(a.s3Client))
+	// Heartbeat from the planner's row/version loops so the configured
+	// activity heartbeat timeout bounds destructive work and Temporal can
+	// deliver cancellation between steps instead of only at the end.
+	a.planner = retirement.NewPlanner(
+		repo,
+		retirement.NewS3ObjectStore(a.s3Client),
+		retirement.WithHeartbeat(func(ctx context.Context, details ...any) {
+			sdkactivity.RecordHeartbeat(ctx, details...)
+		}),
+	)
 	return a.selector, a.planner, nil
 }
 
 func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) retirement.PlanRequest {
 	blockchain, network, sidechain := singleBlockRetentionChainNames(a.config)
-	chainParts := []string{blockchain, network}
-	if sidechain != "" {
-		chainParts = append(chainParts, sidechain)
-	}
 	tag := a.config.GetEffectiveBlockTag(request.Tag)
 	return retirement.PlanRequest{
 		Environment:                 string(a.config.Env()),
@@ -317,12 +329,24 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
 		SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
 		FallbackErrorCount:          request.FallbackErrorCount,
+		// The approval is the operator's assertion passed through unchanged.
+		// The planner independently re-verifies it against the actual chain
+		// and the exact range under deletion.
 		Approval: retirement.Approval{
-			Chain:       strings.Join(chainParts, "-"),
-			StartHeight: request.Cohort.StartHeight,
-			EndHeight:   request.Cohort.EndHeight,
+			Chain:       request.ApprovedChain,
+			StartHeight: request.ApprovedStartHeight,
+			EndHeight:   request.ApprovedEndHeight,
 		},
 	}
+}
+
+func singleBlockRetentionExpectedChain(cfg *config.Config) string {
+	blockchain, network, sidechain := singleBlockRetentionChainNames(cfg)
+	parts := []string{blockchain, network}
+	if sidechain != "" {
+		parts = append(parts, sidechain)
+	}
+	return strings.Join(parts, "-")
 }
 
 func singleBlockRetentionChainNames(cfg *config.Config) (string, string, string) {
@@ -364,6 +388,29 @@ func validateSingleBlockRetentionProcessRequest(
 	}
 	if request.FallbackErrorCount != 0 {
 		return xerrors.Errorf("retention execution requires zero fallback read errors, got %d", request.FallbackErrorCount)
+	}
+	if request.ApprovedChain == "" {
+		return xerrors.New("retention execution requires an explicit operator approval chain")
+	}
+	if cfg != nil {
+		expectedChain := singleBlockRetentionExpectedChain(cfg)
+		if retirement.NormalizeApprovalChain(request.ApprovedChain) != retirement.NormalizeApprovalChain(expectedChain) {
+			return xerrors.Errorf(
+				"retention execution approval names chain %q, expected %q",
+				request.ApprovedChain,
+				expectedChain,
+			)
+		}
+	}
+	if request.ApprovedStartHeight != cohort.StartHeight || request.ApprovedEndHeight != cohort.EndHeight {
+		return xerrors.Errorf(
+			"retention execution approval range [%d, %d) does not exactly match cohort %q [%d, %d)",
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
+			cohort.ConsolidatedObjectKey,
+			cohort.StartHeight,
+			cohort.EndHeight,
+		)
 	}
 	if cfg != nil && isProductionRetentionEnvironment(cfg.Env()) && !request.ProductionDeleteEnabled {
 		return xerrors.New("production retention execution requires explicit production-delete enablement")

@@ -257,6 +257,7 @@ workflows:
     workflow_identity: workflow.replicator
     workflow_run_timeout: 24h
   single_block_retention:
+    activity_heartbeat_timeout: 5m
     activity_retry:
       backoff_coefficient: 2
       initial_interval: 10s
