@@ -24,8 +24,8 @@ const (
 	cscbFormatMetadataValue           = "cscb"
 	cscbCompressionScopeMetadataValue = "batch-chunked"
 	retirementClaimTokenBytes         = 16
-	retirementClaimLease              = 15 * time.Minute
-	retirementSafetyQuiescencePeriod  = 15 * time.Minute
+	RetirementClaimLease              = 15 * time.Minute
+	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
 	s3MutableNullVersionID            = "null"
 	versionedDeleteMode               = "exact_pinned_versions_and_delete_markers"
 )
@@ -36,15 +36,37 @@ type Planner struct {
 	repo            Repository
 	store           ObjectStore
 	verifierFactory func() blockPayloadVerifier
+	heartbeat       func(ctx context.Context, details ...any)
 }
 
-func NewPlanner(repo Repository, store ObjectStore) *Planner {
-	return &Planner{
+type PlannerOption func(*Planner)
+
+// WithHeartbeat wires a liveness callback invoked from the long-running
+// row/version loops, so a Temporal activity heartbeat timeout can bound the
+// planner and deliver cancellation between destructive steps.
+func WithHeartbeat(heartbeat func(ctx context.Context, details ...any)) PlannerOption {
+	return func(p *Planner) {
+		p.heartbeat = heartbeat
+	}
+}
+
+func NewPlanner(repo Repository, store ObjectStore, opts ...PlannerOption) *Planner {
+	p := &Planner{
 		repo:  repo,
 		store: store,
 		verifierFactory: func() blockPayloadVerifier {
 			return newPayloadVerifier(store)
 		},
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+func (p *Planner) recordHeartbeat(ctx context.Context, details ...any) {
+	if p.heartbeat != nil {
+		p.heartbeat(ctx, details...)
 	}
 }
 
@@ -63,6 +85,10 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	writeOncePolicies := make(map[string]bool)
 	verifier := p.verifierFactory()
 	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, xerrors.Errorf("single-block retention plan canceled at height %d: %w", row.Height, err)
+		}
+		p.recordHeartbeat(ctx, "retirement.plan.row", row.Height)
 		item := p.planRow(ctx, req, row, cscbHeads, singleBlockTopologies, writeOncePolicies, verifier)
 		report.Items = append(report.Items, item)
 	}
@@ -104,11 +130,20 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 		if item.Action != ActionDeleteObjectVersion {
 			continue
 		}
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement apply canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.apply.row", item.Height)
 		reason, err := p.applyCandidate(ctx, req, item, verifier)
 		if reason != "" {
 			if item.RetirementState != RetirementStateDeletedPendingVerification {
@@ -148,12 +183,21 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	halted := false
 	for _, manifest := range manifests {
 		item := candidateFromManifest(manifest)
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement reconciliation canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			report.Items = append(report.Items, item)
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.reconcile.manifest", item.Height)
 		if manifest.Bucket != req.Bucket || !requestAllowsCandidate(req, item) ||
 			manifest.State != RetirementStateEligible &&
 				manifest.State != RetirementStateDeleting &&
@@ -168,7 +212,7 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !approvalMatches(req) {
+		if approvalGateBlocked(req) {
 			markCandidateBlocked(&item, SkipChainRangeNotApproved)
 			report.Items = append(report.Items, item)
 			continue
@@ -178,8 +222,8 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !req.ClientMigrationApproved {
-			markCandidateBlocked(&item, SkipFileClientsNotApproved)
+		if req.Execute && !req.DirectStorageClientsGuarded {
+			markCandidateBlocked(&item, SkipDirectStorageClientsNotGuarded)
 			report.Items = append(report.Items, item)
 			continue
 		}
@@ -341,7 +385,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
-	if !approvalMatches(req) {
+	if approvalGateBlocked(req) {
 		item.SkipReason = SkipChainRangeNotApproved
 		return item
 	}
@@ -349,8 +393,8 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipActiveFallbackOrReadErrors
 		return item
 	}
-	if !req.ClientMigrationApproved {
-		item.SkipReason = SkipFileClientsNotApproved
+	if req.Execute && !req.DirectStorageClientsGuarded {
+		item.SkipReason = SkipDirectStorageClientsNotGuarded
 		return item
 	}
 	if req.Execute && !req.SingleBlockWritersGuarded {
@@ -577,10 +621,10 @@ func (p *Planner) verifyCSCBRetentionSafety(ctx context.Context, item *Candidate
 		return SkipCSCBWriteOncePolicyUnverified, inspectionErr
 	}
 	item.CSCBWriteOncePolicy = true
-	if observedAt.Sub(firstObservedAt) < retirementSafetyQuiescencePeriod {
+	if observedAt.Sub(firstObservedAt) < RetentionSafetyQuiescencePeriod {
 		return SkipCSCBSafetyQuiescenceActive, xerrors.Errorf(
 			"CSCB retention safety configuration has not remained stable for %s: bucket=%s key=%s first_observed_at=%s observed_at=%s",
-			retirementSafetyQuiescencePeriod,
+			RetentionSafetyQuiescencePeriod,
 			item.Bucket,
 			item.ConsolidatedKey,
 			firstObservedAt.Format(time.RFC3339Nano),
@@ -641,7 +685,7 @@ func (p *Planner) withRetirementClaim(
 		return SkipMetadataChanged, err
 	}
 	claimedAt := time.Now().UTC()
-	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(retirementClaimLease)); err != nil {
+	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(RetirementClaimLease)); err != nil {
 		if errors.Is(err, ErrRetirementClaimUnavailable) {
 			return SkipRetirementClaimActive, nil
 		}
@@ -664,7 +708,10 @@ func (p *Planner) withRetirementClaim(
 		if outcome == "" {
 			outcome = SkipMetadataChanged
 		}
-		if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+		// Record the interruption outcome even when the failure is a
+		// cancellation, so a stopped run leaves a durable trace instead of an
+		// unexplained claim that only expires by lease.
+		if outcomeErr := p.repo.RecordRetirementOutcome(context.WithoutCancel(ctx), item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
 		}
 	}()
@@ -678,7 +725,7 @@ func (p *Planner) withRetirementClaim(
 
 func (p *Planner) renewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
 	renewedAt := time.Now().UTC()
-	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(retirementClaimLease))
+	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(RetirementClaimLease))
 }
 
 func (p *Planner) deletePinnedSingleBlockTopology(
@@ -706,6 +753,14 @@ func (p *Planner) deletePinnedSingleBlockTopology(
 		remainingMarkers[marker.VersionID] = struct{}{}
 	}
 	deleteVersion := func(versionID string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return SkipRetentionRunCanceled, xerrors.Errorf(
+				"single-block version deletion canceled before version %s: %w",
+				versionID,
+				err,
+			)
+		}
+		p.recordHeartbeat(ctx, "retirement.delete.version", item.Height, versionID)
 		if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
 			return SkipRetirementClaimActive, err
 		}
@@ -891,7 +946,7 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -924,7 +979,7 @@ func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -1035,7 +1090,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		report.StartHeight != req.StartHeight ||
 		report.EndHeight != req.EndHeight ||
 		report.Approval != req.Approval ||
-		report.SafetyGates.ClientMigrationApproved != req.ClientMigrationApproved ||
+		report.SafetyGates.DirectStorageClientsGuarded != req.DirectStorageClientsGuarded ||
 		report.SafetyGates.SingleBlockWritersGuarded != req.SingleBlockWritersGuarded ||
 		report.SafetyGates.FallbackReadErrors != req.FallbackErrorCount ||
 		report.SafetyGates.ProductionDeleteEnabled != req.ProductionDeleteEnabled ||
@@ -1044,7 +1099,7 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		!report.SafetyGates.CSCBWriteOncePolicyVerified {
 		return xerrors.New("retirement report does not match the execution request")
 	}
-	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved || !req.SingleBlockWritersGuarded {
+	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.DirectStorageClientsGuarded || !req.SingleBlockWritersGuarded {
 		return xerrors.New("retirement execution safety gates are not satisfied")
 	}
 	for _, item := range report.Items {
@@ -1332,12 +1387,12 @@ func newReport(req PlanRequest) *Report {
 		EndHeight:   req.EndHeight,
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
-			ClientMigrationApproved:   req.ClientMigrationApproved,
-			SingleBlockWritersGuarded: req.SingleBlockWritersGuarded,
-			FallbackReadErrors:        req.FallbackErrorCount,
-			VersionedDeleteMode:       versionedDeleteMode,
-			CSCBWriteOncePolicyMode:   cscbWriteOncePolicyMode,
-			ProductionDeleteEnabled:   req.ProductionDeleteEnabled,
+			DirectStorageClientsGuarded: req.DirectStorageClientsGuarded,
+			SingleBlockWritersGuarded:   req.SingleBlockWritersGuarded,
+			FallbackReadErrors:          req.FallbackErrorCount,
+			VersionedDeleteMode:         versionedDeleteMode,
+			CSCBWriteOncePolicyMode:     cscbWriteOncePolicyMode,
+			ProductionDeleteEnabled:     req.ProductionDeleteEnabled,
 		},
 		Items: make([]Candidate, 0),
 	}
@@ -1448,6 +1503,18 @@ func approvalMatches(req PlanRequest) bool {
 		req.Approval.EndHeight == req.EndHeight
 }
 
+// approvalGateBlocked reports whether the operator approval blocks this
+// request. Execution always requires an exact chain/range approval. A
+// read-only run may omit the approval entirely so it can still reach the S3
+// safety inspection, but a supplied approval is validated even on dry runs so
+// the report predicts the execute-time gate.
+func approvalGateBlocked(req PlanRequest) bool {
+	if !req.Execute && req.Approval == (Approval{}) {
+		return false
+	}
+	return !approvalMatches(req)
+}
+
 func actualChain(req PlanRequest) string {
 	parts := []string{req.Blockchain, req.Network}
 	if req.Sidechain != "" {
@@ -1458,6 +1525,13 @@ func actualChain(req PlanRequest) string {
 
 func normalizeApprovalChain(value string) string {
 	return strings.ToLower(strings.ReplaceAll(value, "_", "-"))
+}
+
+// NormalizeApprovalChain exposes the approval chain normalization so callers
+// can fail fast on an operator approval that names the wrong chain before a
+// plan request is even built.
+func NormalizeApprovalChain(value string) string {
+	return normalizeApprovalChain(value)
 }
 
 func isProduction(env string) bool {

@@ -263,6 +263,19 @@ workflows:
     task_list: default
     workflow_identity: workflow.replicator
     workflow_run_timeout: 24h
+  single_block_retention:
+    activity_heartbeat_timeout: 5m
+    activity_retry:
+      backoff_coefficient: 2
+      initial_interval: 10s
+      maximum_attempts: 3
+      maximum_interval: 3m
+    activity_schedule_to_close_timeout: 12h
+    activity_start_to_close_timeout: 6h
+    max_object_ranges: 1
+    task_list: default
+    workflow_identity: workflow.single_block_retention
+    workflow_run_timeout: 24h
   streamer:
     activity_retry:
       backoff_coefficient: 2

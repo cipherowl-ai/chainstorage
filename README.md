@@ -716,6 +716,29 @@ Start the replicator workflow:
 go run ./cmd/admin workflow start --workflow replicator --input '{"Tag": 0, "StartHeight": 1000000, "EndHeight": 1001000}' --blockchain ethereum --network mainnet --env local
 ```
 
+Inspect currently due single-block retention cohorts in an exact repaired range
+without deleting:
+```shell
+go run ./cmd/admin workflow start --workflow single_block_retention --input '{"Tag": 0, "StartHeight": 100000, "EndHeight": 110000, "MaxObjectRanges": 10}' --blockchain solana --network mainnet --env local
+```
+
+The workflow is manual-only while production retention is being verified; no
+recurring cron or Temporal Schedule starts it. Each explicit run is bounded by
+`MaxObjectRanges`, and `MoreEligibleRanges` reports whether the selected range
+still has a backlog. Omitting `Execute` keeps the run read-only. Execution
+requires Postgres metadata plus versioned S3 storage, an explicit
+`FallbackReadsValidated` assertion with zero `FallbackErrorCount`, and a
+separate operator approval (`ApprovedChain`, `ApprovedStartHeight`,
+`ApprovedEndHeight`) that must exactly match both the selection range and the
+selected cohort; the approval is passed through unchanged and is never derived
+from whatever cohort the selector discovers, so unbounded execution requests
+are rejected. API and SDK clients continue to use the same Chainstorage
+interface; the `DirectStorageClientsGuarded` execution gate applies only to
+consumers that bypass Chainstorage and access object storage directly. The
+process activity heartbeats from the row and per-version delete loops under a
+bounded heartbeat timeout, so stopping the workflow cancels destructive work
+between steps instead of letting it run to completion.
+
 Stop the monitor workflow:
 ```shell
 go run ./cmd/admin workflow stop --workflow monitor --blockchain ethereum --network mainnet --env local
