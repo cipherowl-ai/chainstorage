@@ -3,6 +3,7 @@ package retirement
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -59,6 +60,37 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 	return scanRetentionCohorts(rows, true)
 }
 
+const (
+	// dueRetentionCohortOrderingByDueTime retires whatever has been due longest
+	// first. It is the right policy for an unbounded selection, where the caller
+	// is asking "find the most overdue work anywhere".
+	dueRetentionCohortOrderingByDueTime = "due.eligible_at, MIN(shadow.height), due.consolidated_object_key_main"
+	// dueRetentionCohortOrderingByHeight walks a caller-supplied range in height
+	// order so the selection is deterministic and prefix-shaped.
+	dueRetentionCohortOrderingByHeight = "MIN(shadow.height), due.consolidated_object_key_main"
+)
+
+// dueRetentionCohortOrdering picks the cohort ordering for a selection. Both
+// return values are compile-time constants and never caller input.
+//
+// When an explicit height range is supplied, selection must be deterministic:
+// a run takes the lowest eligible cohorts in the range and repeated runs walk it
+// monotonically until MoreEligibleRanges reports false. Ordering by eligible_at
+// there would instead return a due-time-ordered *subset* of the range, which
+// breaks both retention gates that operators rely on. First, an operator
+// approving [start, end) cannot predict which cohorts a run will touch, which
+// reintroduces the "approval does not match the selected work" problem. Second,
+// eligible_at advances as retention clocks tick and as repairs re-stamp
+// single_block_delete_after, so the same approved range can resolve to a
+// different subset later — meaning a clean dry run would no longer predict what
+// an execute run over that range deletes.
+func dueRetentionCohortOrdering(endHeight uint64) string {
+	if endHeight > 0 {
+		return dueRetentionCohortOrderingByHeight
+	}
+	return dueRetentionCohortOrderingByDueTime
+}
+
 func (r *PostgresRepository) ListDueRetentionCohorts(
 	ctx context.Context,
 	tag uint32,
@@ -72,7 +104,7 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	if limit <= 0 {
 		return nil, nil
 	}
-	const query = `
+	const queryTemplate = `
 		WITH due_keys AS (
 			SELECT
 				shadow.consolidated_object_key_main,
@@ -129,8 +161,9 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 			)
 		GROUP BY due.consolidated_object_key_main, due.eligible_at
 		HAVING MAX(shadow.single_block_delete_after) <= CURRENT_TIMESTAMP
-		ORDER BY due.eligible_at, MIN(shadow.height), due.consolidated_object_key_main
+		ORDER BY %s
 		LIMIT $5`
+	query := fmt.Sprintf(queryTemplate, dueRetentionCohortOrdering(endHeight))
 	rows, err := r.db.QueryContext(
 		ctx,
 		query,

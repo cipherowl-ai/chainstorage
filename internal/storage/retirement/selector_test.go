@@ -149,3 +149,8 @@ func TestSelectorReportsRemainingBacklog(t *testing.T) {
 	require.Len(t, cohorts, 1)
 	require.Equal(t, "consolidated/a.cscb.zstd", cohorts[0].ConsolidatedObjectKey)
 }
+
+func TestDueRetentionCohortOrdering(t *testing.T) {
+	require.Equal(t, dueRetentionCohortOrderingByHeight, dueRetentionCohortOrdering(100))
+	require.Equal(t, dueRetentionCohortOrderingByDueTime, dueRetentionCohortOrdering(0))
+}
