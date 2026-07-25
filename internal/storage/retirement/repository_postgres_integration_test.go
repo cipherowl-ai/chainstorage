@@ -469,6 +469,148 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
 }
 
+// TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight seeds three
+// cohorts whose due-time order is the exact reverse of their height order, so
+// the two orderings cannot be confused for one another.
+//
+// A bounded selection must walk the supplied range by height, and when the limit
+// truncates it must keep the *lowest* cohorts, so that repeated runs advance
+// monotonically and an approved range maps to a predictable set of cohorts. An
+// unbounded selection must still drain the most-overdue work first.
+func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	const cohortCount = 3
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_100_000_000 + unique%100_000_000)
+	startHeight := uint64(8_100_000_000 + unique%100_000_000)
+	blockMetadataIDs := make([]int64, 0, cohortCount)
+	cohortKeys := make([]string, 0, cohortCount)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, blockMetadataID := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, blockMetadataID)
+		}
+	}()
+
+	now := time.Now().UTC()
+	for index := 0; index < cohortCount; index++ {
+		height := startHeight + uint64(index)
+		consolidatedKey := fmt.Sprintf("consolidated/ordering-%d-%d.cscb.gzip", unique, index)
+		cohortKeys = append(cohortKeys, consolidatedKey)
+		// Later heights are more overdue, so due-time order reverses height order.
+		deleteAfter := now.Add(-time.Duration(index+1) * time.Hour)
+
+		var blockMetadataID int64
+		err = db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, $7, $8, $9)
+			RETURNING id`,
+			height,
+			tag,
+			height-1,
+			consolidatedKey,
+			now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			0,
+			128,
+			128,
+		).Scan(&blockMetadataID)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, blockMetadataID)
+
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)`,
+			height,
+			blockMetadataID,
+			tag,
+		)
+		require.NoError(err)
+
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			blockMetadataID,
+			tag,
+			height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			consolidatedKey,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			0,
+			128,
+			128,
+			now.Add(-96*time.Hour),
+			now.Add(-96*time.Hour),
+			deleteAfter,
+		)
+		require.NoError(err)
+	}
+
+	endHeight := startHeight + cohortCount
+
+	repo := NewPostgresRepository(db)
+	bounded, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, 10)
+	require.NoError(err)
+	require.Len(bounded, cohortCount)
+	boundedHeights := make([]uint64, 0, len(bounded))
+	for _, cohort := range bounded {
+		boundedHeights = append(boundedHeights, cohort.StartHeight)
+	}
+	require.Equal(
+		[]uint64{startHeight, startHeight + 1, startHeight + 2},
+		boundedHeights,
+		"a bounded selection must be ordered by height, not by due time",
+	)
+
+	truncated, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, 2)
+	require.NoError(err)
+	require.Len(truncated, 2)
+	require.Equal(
+		[]string{cohortKeys[0], cohortKeys[1]},
+		[]string{truncated[0].ConsolidatedObjectKey, truncated[1].ConsolidatedObjectKey},
+		"a truncated bounded selection must keep the lowest cohorts so repeated runs advance monotonically",
+	)
+
+	unbounded, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	require.NoError(err)
+	require.Len(unbounded, cohortCount)
+	unboundedHeights := make([]uint64, 0, len(unbounded))
+	for _, cohort := range unbounded {
+		unboundedHeights = append(unboundedHeights, cohort.StartHeight)
+	}
+	require.Equal(
+		[]uint64{startHeight + 2, startHeight + 1, startHeight},
+		unboundedHeights,
+		"an unbounded selection must still drain the most overdue cohorts first",
+	)
+}
+
 func openRetirementIntegrationDB(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s",
 		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode)
