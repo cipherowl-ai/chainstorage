@@ -1,6 +1,7 @@
 package cscbrepair_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -35,6 +36,98 @@ import (
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
+
+func TestIntegrationCSCBRepairPendingRangeIsolation(t *testing.T) {
+	if os.Getenv("TEST_TYPE") != "integration" {
+		t.Skip("integration test")
+	}
+	require := require.New(t)
+	ctx := context.Background()
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_600_000_000 + unique%100_000_000)
+	startHeight := uint64(8_500_000_000 + unique%100_000_000)
+	endHeight := startHeight + 1_000
+
+	cfg, err := config.New(
+		config.WithEnvironment(config.EnvLocal),
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	configureRepairTestEnvironment(t, cfg.AWS.Postgres)
+	db, err := openRepairDB(ctx, cfg.AWS.Postgres)
+	require.NoError(err)
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	type pendingRange struct {
+		key   string
+		start uint64
+		end   uint64
+	}
+	insertPending := func(tag uint32, pending pendingRange) {
+		_, err := db.ExecContext(ctx, `
+			INSERT INTO cscb_repair_manifest (
+				tag, state, bucket, old_consolidated_object_key_main,
+				start_height, end_height, canonical_block_count, total_block_count, row_set_sha256
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, 0, $7)`,
+			tag,
+			cscbrepair.StatePreparing,
+			"range-isolation-bucket",
+			pending.key,
+			pending.start,
+			pending.end,
+			repairSHA256(pending.key),
+		)
+		require.NoError(err)
+	}
+	inRangeKey := fmt.Sprintf("consolidated/in-range-%d.cscb.zstd", unique)
+	pendingRanges := []pendingRange{
+		{key: fmt.Sprintf("consolidated/below-%d.cscb.zstd", unique), start: startHeight - 1_000, end: startHeight},
+		{key: fmt.Sprintf("consolidated/above-%d.cscb.zstd", unique), start: endHeight, end: endHeight + 1_000},
+		{key: inRangeKey, start: startHeight, end: endHeight},
+	}
+	for _, pending := range pendingRanges {
+		insertPending(tag, pending)
+	}
+
+	repository := cscbrepair.NewPostgresRepository(db)
+	pending, err := repository.FindPending(ctx, tag, startHeight, endHeight)
+	require.NoError(err)
+	require.NotNil(pending)
+	require.Equal(inRangeKey, pending.OldConsolidatedObjectKey)
+
+	objectKeys, err := repository.ListCandidateObjectKeys(ctx, tag, startHeight, endHeight, 10)
+	require.NoError(err)
+	require.Equal([]string{inRangeKey}, objectKeys)
+
+	emptyStart := endHeight + 2_000
+	pending, err = repository.FindPending(ctx, tag, emptyStart, emptyStart+1_000)
+	require.NoError(err)
+	require.Nil(pending)
+	objectKeys, err = repository.ListCandidateObjectKeys(ctx, tag, emptyStart, emptyStart+1_000, 10)
+	require.NoError(err)
+	require.Empty(objectKeys)
+
+	crossingTag := tag + 1
+	crossingKey := fmt.Sprintf("consolidated/cross-right-%d.cscb.zstd", unique)
+	insertPending(crossingTag, pendingRange{
+		key:   crossingKey,
+		start: startHeight + 500,
+		end:   endHeight + 1,
+	})
+	pending, err = repository.FindPending(ctx, crossingTag, startHeight, endHeight)
+	require.NoError(err)
+	require.NotNil(pending)
+	require.Equal(crossingKey, pending.OldConsolidatedObjectKey)
+	_, err = repository.ListCandidateObjectKeys(ctx, crossingTag, startHeight, endHeight, 10)
+	require.ErrorContains(err, "exceeds approved range")
+}
 
 func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	if os.Getenv("TEST_TYPE") != "integration" {
@@ -104,6 +197,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.NoError(err)
 	defer cleanupRepairBucket(t, rawS3, bucket)
+	store := retirement.NewS3ObjectStore(rawS3)
 
 	block := &api.Block{
 		Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,
@@ -120,8 +214,33 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 			Solana: &api.SolanaBlobdata{Header: []byte(`{"slot":9500000000,"transactions":["repair"]}`)},
 		},
 	}
-	singleBlockKey, err := singleBlockUploader.Upload(ctx, block, api.Compression_GZIP)
+	historicalBlock := proto.Clone(block).(*api.Block)
+	historicalBlock.GetSolana().Header = []byte(`{"slot":9500000000,"transactions":["stale"]}`)
+	singleBlockKey, err := singleBlockUploader.Upload(ctx, historicalBlock, api.Compression_GZIP)
 	require.NoError(err)
+	semanticDuplicate := proto.Clone(block).(*api.Block)
+	semanticDuplicate.GetSolana().Header = []byte("{\n  \"transactions\": [\"repair\"],\n  \"slot\": 9500000000\n}")
+	require.JSONEq(string(block.GetSolana().Header), string(semanticDuplicate.GetSolana().Header))
+	require.NotEqual(string(historicalBlock.GetSolana().Header), string(semanticDuplicate.GetSolana().Header))
+	duplicateSingleBlockKey, err := singleBlockUploader.Upload(ctx, semanticDuplicate, api.Compression_GZIP)
+	require.NoError(err)
+	require.Equal(singleBlockKey, duplicateSingleBlockKey)
+	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	require.Len(singleBlockTopology.Versions, 2)
+	require.Empty(singleBlockTopology.DeleteMarkers)
+	var currentSingleBlockVersion, historicalSingleBlockVersion retirement.ObjectVersion
+	for _, version := range singleBlockTopology.Versions {
+		if version.IsLatest {
+			currentSingleBlockVersion = version
+		} else {
+			historicalSingleBlockVersion = version
+		}
+	}
+	require.NotEmpty(currentSingleBlockVersion.VersionID)
+	require.NotEmpty(historicalSingleBlockVersion.VersionID)
+	require.NotEqual(currentSingleBlockVersion.ETag, historicalSingleBlockVersion.ETag)
+	require.NotEqual(currentSingleBlockVersion.Bytes, historicalSingleBlockVersion.Bytes)
 	block.Metadata.ObjectKeyMain = singleBlockKey
 	require.NoError(meta.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block.Metadata}, nil))
 
@@ -134,10 +253,18 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	downloaded, err := blob.Download(ctx, records[0].Metadata)
 	require.NoError(err)
-	dirtyBlock := proto.Clone(downloaded).(*api.Block)
+	require.True(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(downloaded),
+	))
+	dirtyBlock := proto.Clone(historicalBlock).(*api.Block)
 	dirtyBlock.Metadata.ObjectKeyMain = singleBlockKey
 	dirtyBlock.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
 	require.True(storageutils.HasBlockStoragePlacement(dirtyBlock))
+	require.False(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(dirtyBlock),
+	))
 	dirtyPayload, err := proto.Marshal(dirtyBlock)
 	require.NoError(err)
 	dirtyKey, dirtyPlacements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{
@@ -165,7 +292,6 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	require.Equal(uint64(1), promotion.Blocks)
 
-	store := retirement.NewS3ObjectStore(rawS3)
 	repository := cscbrepair.NewPostgresRepository(db)
 	candidateLockTx, err := db.BeginTx(ctx, nil)
 	require.NoError(err)
@@ -182,13 +308,69 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 
 	repairer := cscbrepair.NewRepairer(repository, store, bucket)
 	executionKey := repairSHA256(fmt.Sprintf("repair-main-%d", unique))
-	manifest, err := repairer.PrepareObject(ctx, executionKey, tag, height, height+1, 1, dirtyKey, nil)
+
+	// A writer that acquired the upload guard before repair preparation must
+	// finish its S3 PUT before the repair can fence and pin the current version.
+	preFenceGuard, err := meta.AcquireSingleBlockUploadGuard(ctx, tag, height, block.Metadata.Hash)
 	require.NoError(err)
+	require.False(preFenceGuard.RetirementFenced())
+	oldCurrentSingleBlockVersion := currentSingleBlockVersion
+	guardedPayload, err := store.ReadObjectVersion(ctx, bucket, singleBlockKey, oldCurrentSingleBlockVersion.VersionID)
+	require.NoError(err)
+	type prepareResult struct {
+		manifest *cscbrepair.Manifest
+		err      error
+	}
+	prepared := make(chan prepareResult, 1)
+	go func() {
+		preparedManifest, prepareErr := repairer.PrepareObject(
+			ctx,
+			executionKey,
+			tag,
+			height,
+			height+1,
+			1,
+			dirtyKey,
+			nil,
+		)
+		prepared <- prepareResult{manifest: preparedManifest, err: prepareErr}
+	}()
+	select {
+	case result := <-prepared:
+		require.Failf("repair preparation bypassed in-flight upload guard", "result=%+v", result)
+	case <-time.After(100 * time.Millisecond):
+	}
+	guardedPut, err := rawS3.PutObject(ctx, &awss3.PutObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(singleBlockKey),
+		Body:   bytes.NewReader(guardedPayload),
+	})
+	require.NoError(err)
+	require.NotNil(guardedPut.VersionId)
+	require.NoError(preFenceGuard.Release())
+	preparedResult := <-prepared
+	require.NoError(preparedResult.err)
+	manifest := preparedResult.manifest
 	require.NotNil(manifest)
 	repairID = manifest.ID
+	postWriterTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	for _, version := range postWriterTopology.Versions {
+		if version.VersionID == aws.ToString(guardedPut.VersionId) {
+			currentSingleBlockVersion = version
+		}
+	}
+	require.Equal(aws.ToString(guardedPut.VersionId), currentSingleBlockVersion.VersionID)
+	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(singleBlockKey),
+		VersionId: aws.String(oldCurrentSingleBlockVersion.VersionID),
+	})
+	require.NoError(err)
 	require.Equal(cscbrepair.StatePrepared, manifest.State)
 	require.Equal(dirtyKey, manifest.OldConsolidatedObjectKey)
 	require.Len(manifest.Blocks, 1)
+	require.Equal(currentSingleBlockVersion.VersionID, manifest.Blocks[0].SingleBlockObjectVersion.VersionID)
 	require.Len(manifest.Blocks[0].PayloadSHA256, 64)
 	pendingKeys, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
 	require.NoError(err)
@@ -265,48 +447,27 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.ErrorContains(err, "failed to lock canonical retirement metadata")
 
-	manifest, err = repairer.Restore(ctx, manifest.ID, nil)
+	activeBeforeRebuild, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(cscbrepair.StateRestored, manifest.State)
-	require.NotNil(manifest.RestoredAt)
-	activeSingleBlock, err := meta.GetBlockByHeight(ctx, tag, height)
-	require.NoError(err)
-	require.Equal(singleBlockKey, activeSingleBlock.ObjectKeyMain)
-	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK, activeSingleBlock.ObjectFormat)
-	require.Zero(activeSingleBlock.ByteLength)
-	restoredBlock, err := blob.Download(ctx, activeSingleBlock)
-	require.NoError(err)
-	require.True(proto.Equal(storageutils.CloneBlockWithoutStoragePlacement(block), storageutils.CloneBlockWithoutStoragePlacement(restoredBlock)))
-	_, err = db.ExecContext(ctx, `UPDATE block_metadata SET object_key_main = $2 WHERE id = $1`, blockMetadataID, dirtyKey)
-	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
-	_, err = db.ExecContext(ctx, `
-		INSERT INTO block_consolidation_shadow (
-			block_metadata_id, tag, height, hash, single_block_object_key_main,
-			consolidated_object_key_main, object_format, byte_offset, byte_length,
-			uncompressed_length, validated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())`,
-		blockMetadataID,
-		tag,
-		height,
-		block.Metadata.Hash,
-		singleBlockKey,
-		dirtyKey,
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
-		manifest.Blocks[0].OldByteOffset,
-		manifest.Blocks[0].OldByteLength,
-		manifest.Blocks[0].OldUncompressedLength,
-	)
-	require.ErrorContains(err, "cannot reference a pinned old CSCB object")
+	require.Equal(dirtyKey, activeBeforeRebuild.ObjectKeyMain)
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeBeforeRebuild.ObjectFormat)
 
-	records, err = meta.GetBlocksMissingConsolidationShadow(ctx, tag, height, height+1, 1)
-	require.NoError(err)
-	require.Len(records, 1)
-	cleanBlock, err := blob.Download(ctx, records[0].Metadata)
-	require.NoError(err)
-	cleanPayload, err := proto.Marshal(storageutils.CloneBlockWithoutStoragePlacement(cleanBlock))
-	require.NoError(err)
+	var pinnedPayloads []cscbrepair.PinnedPayload
+	require.NoError(repairer.VisitPinnedPayloads(ctx, manifest.ID, nil, func(payload cscbrepair.PinnedPayload) error {
+		pinnedPayloads = append(pinnedPayloads, payload)
+		return nil
+	}))
+	require.Len(pinnedPayloads, 1)
+	var pinnedBlock api.Block
+	require.NoError(proto.Unmarshal(pinnedPayloads[0].RawBlockPayload, &pinnedBlock))
+	require.False(storageutils.HasBlockStoragePlacement(&pinnedBlock))
+	require.True(proto.Equal(
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
+		storageutils.CloneBlockWithoutStoragePlacement(&pinnedBlock),
+	))
+	cleanPayload := pinnedPayloads[0].RawBlockPayload
 	cleanKey, cleanPlacements, err := blob.UploadConsolidated(ctx, []blobstorage.ConsolidatedBlockPayload{{
-		Metadata:           records[0].Metadata,
+		Metadata:           pinnedPayloads[0].Metadata,
 		MetadataID:         blockMetadataID,
 		RawBlockPayload:    blobstorage.BytesPayloadSource(cleanPayload),
 		UncompressedLength: uint64(len(cleanPayload)),
@@ -315,35 +476,44 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NotEqual(dirtyKey, cleanKey)
 	require.Len(cleanPlacements, 1)
 	cleanPlacement := cleanPlacements[0]
-	require.NoError(meta.PersistBlockConsolidationShadows(ctx, []*metastorage.ConsolidationShadowPlacement{{
-		BlockMetadataID:           blockMetadataID,
-		Tag:                       tag,
-		Height:                    height,
-		Hash:                      block.Metadata.Hash,
-		SingleBlockObjectKeyMain:  singleBlockKey,
-		ConsolidatedObjectKeyMain: cleanKey,
-		ObjectFormat:              cleanPlacement.ObjectFormat,
-		ByteOffset:                cleanPlacement.ByteOffset,
-		ByteLength:                cleanPlacement.ByteLength,
-		UncompressedLength:        cleanPlacement.UncompressedLength,
-	}}))
-	promotion, err = meta.PromoteBlockConsolidationShadows(ctx, tag, height, height+1, 1, 72*time.Hour)
+	activeBeforePromotion, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(uint64(1), promotion.Blocks)
+	require.Equal(dirtyKey, activeBeforePromotion.ObjectKeyMain, "source CSCB must remain active until atomic promotion")
+
+	manifest, err = repairer.VerifyAndPromote(ctx, manifest.ID, cleanKey, []cscbrepair.RebuiltPlacement{{
+		BlockMetadataID:    cleanPlacement.MetadataID,
+		Height:             cleanPlacement.Height,
+		Hash:               cleanPlacement.Hash,
+		ObjectFormat:       cleanPlacement.ObjectFormat,
+		ByteOffset:         cleanPlacement.ByteOffset,
+		ByteLength:         cleanPlacement.ByteLength,
+		UncompressedLength: cleanPlacement.UncompressedLength,
+	}}, 72*time.Hour, nil)
+	require.NoError(err)
+	require.Equal(cscbrepair.StateCompleted, manifest.State)
+	require.Equal(cleanKey, manifest.NewConsolidatedObjectKey)
+	require.NotZero(manifest.NewConsolidatedObjectVersion.Bytes)
+	require.NotNil(manifest.RestoredAt)
+	require.NotNil(manifest.VerifiedAt)
+	require.NotNil(manifest.CompletedAt)
+	require.Equal("old_consolidated_object_retained_unreferenced", manifest.Outcome)
 	var retentionStartedAt, singleBlockDeleteAfter time.Time
 	require.NoError(db.QueryRowContext(ctx, `
 		SELECT single_block_retention_started_at, single_block_delete_after
 		FROM block_consolidation_shadow
 		WHERE block_metadata_id = $1`, blockMetadataID).Scan(&retentionStartedAt, &singleBlockDeleteAfter))
 	require.False(retentionStartedAt.Before(*manifest.RestoredAt))
-	require.WithinDuration(retentionStartedAt.Add(72*time.Hour), singleBlockDeleteAfter, time.Microsecond)
-
-	manifest, err = repairer.VerifyRebuilt(ctx, manifest.ID, nil)
+	require.WithinDuration(retentionStartedAt.Add(73*time.Hour), singleBlockDeleteAfter, time.Microsecond)
+	activeAfterPromotion, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
-	require.Equal(cscbrepair.StateVerified, manifest.State)
-	require.Equal(cleanKey, manifest.NewConsolidatedObjectKey)
-	require.NotZero(manifest.NewConsolidatedObjectVersion.Bytes)
-	require.NotNil(manifest.VerifiedAt)
+	require.Equal(cleanKey, activeAfterPromotion.ObjectKeyMain)
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, activeAfterPromotion.ObjectFormat)
+	pendingAfterPromotion, err := repository.FindPending(ctx, tag, height, height+1)
+	require.NoError(err)
+	require.Nil(pendingAfterPromotion, "rollback must not resume a mixed placement after atomic promotion")
+	candidatesAfterPromotion, err := repository.ListCandidateObjectKeys(ctx, tag, height, height+1, 10)
+	require.NoError(err)
+	require.Empty(candidatesAfterPromotion, "rerunning a completed repair range must terminate without new work")
 
 	manifest, err = repairer.Complete(ctx, manifest.ID, nil)
 	require.NoError(err)
@@ -372,9 +542,19 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	})
 	require.NoError(err)
 	require.False(rawClean.HasStoragePlacement)
-	singleBlockTopology, err := store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	singleBlockTopology, err = store.ListObjectVersions(ctx, bucket, singleBlockKey)
+	require.NoError(err)
+	require.Len(singleBlockTopology.Versions, 2)
+	_, err = rawS3.DeleteObject(ctx, &awss3.DeleteObjectInput{
+		Bucket:    aws.String(bucket),
+		Key:       aws.String(singleBlockKey),
+		VersionId: aws.String(historicalSingleBlockVersion.VersionID),
+	})
+	require.NoError(err)
+	singleBlockTopology, err = store.ListObjectVersions(ctx, bucket, singleBlockKey)
 	require.NoError(err)
 	require.Len(singleBlockTopology.Versions, 1)
+	require.Equal(currentSingleBlockVersion.VersionID, singleBlockTopology.Versions[0].VersionID)
 
 	activeClean, err := meta.GetBlockByHeight(ctx, tag, height)
 	require.NoError(err)
@@ -385,7 +565,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	// CSCB neutrality is asserted independently above.
 	require.True(storageutils.HasBlockStoragePlacement(readClean))
 	require.True(proto.Equal(
-		storageutils.CloneBlockWithoutStoragePlacement(block),
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
 		storageutils.CloneBlockWithoutStoragePlacement(readClean),
 	))
 
@@ -425,18 +605,18 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	require.NoError(err)
 	retirementPlanner := retirement.NewPlanner(retirement.NewPostgresRepository(db), store)
 	retirementRequest := retirement.PlanRequest{
-		Environment:               "local",
-		Blockchain:                "solana",
-		Network:                   "mainnet",
-		Bucket:                    bucket,
-		Tag:                       tag,
-		StartHeight:               height,
-		EndHeight:                 height + 1,
-		Limit:                     1,
-		Now:                       time.Now().UTC(),
-		Execute:                   true,
-		ClientMigrationApproved:   true,
-		SingleBlockWritersGuarded: true,
+		Environment:                 "local",
+		Blockchain:                  "solana",
+		Network:                     "mainnet",
+		Bucket:                      bucket,
+		Tag:                         tag,
+		StartHeight:                 height,
+		EndHeight:                   height + 1,
+		Limit:                       1,
+		Now:                         time.Now().UTC(),
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
 		Approval: retirement.Approval{
 			Chain:       "solana-mainnet",
 			StartHeight: height,
@@ -484,7 +664,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 	readAfterRetirement, err := blob.Download(ctx, activeAfterRetirement)
 	require.NoError(err)
 	require.True(proto.Equal(
-		storageutils.CloneBlockWithoutStoragePlacement(block),
+		storageutils.CloneBlockWithoutStoragePlacement(semanticDuplicate),
 		storageutils.CloneBlockWithoutStoragePlacement(readAfterRetirement),
 	))
 

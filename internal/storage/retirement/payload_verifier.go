@@ -29,6 +29,7 @@ type (
 	}
 
 	PinnedPayloadVerifier interface {
+		ReadSingleBlock(ctx context.Context, candidate Candidate) (*api.Block, PinnedPayloadInspection, error)
 		InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
 		InspectConsolidated(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error)
 	}
@@ -72,26 +73,35 @@ func (v *payloadVerifier) Verify(ctx context.Context, candidate Candidate) (stri
 }
 
 func (v *payloadVerifier) InspectSingleBlock(ctx context.Context, candidate Candidate) (PinnedPayloadInspection, error) {
+	_, inspection, err := v.ReadSingleBlock(ctx, candidate)
+	return inspection, err
+}
+
+func (v *payloadVerifier) ReadSingleBlock(
+	ctx context.Context,
+	candidate Candidate,
+) (*api.Block, PinnedPayloadInspection, error) {
 	singleBlockCompressed, err := v.store.ReadObjectVersion(ctx, candidate.Bucket, candidate.Key, candidate.VersionID)
 	if err != nil {
-		return PinnedPayloadInspection{}, err
+		return nil, PinnedPayloadInspection{}, err
 	}
 	singleBlockPayload, err := storageutils.Decompress(singleBlockCompressed, storageutils.GetCompressionType(candidate.Key))
 	if err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("failed to decompress pinned single-block object: %w", err)
 	}
 	var singleBlockBlock api.Block
 	if err := proto.Unmarshal(singleBlockPayload, &singleBlockBlock); err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("failed to parse pinned single-block block payload: %w", err)
 	}
 	if err := validatePayloadIdentity(&singleBlockBlock, candidate); err != nil {
-		return PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
+		return nil, PinnedPayloadInspection{}, xerrors.Errorf("pinned single-block block identity mismatch: %w", err)
 	}
-	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock))
+	normalized := storageutils.CloneBlockWithoutStoragePlacement(&singleBlockBlock)
+	digest, err := canonicalBlockDigest(normalized)
 	if err != nil {
-		return PinnedPayloadInspection{}, err
+		return nil, PinnedPayloadInspection{}, err
 	}
-	return PinnedPayloadInspection{
+	return &singleBlockBlock, PinnedPayloadInspection{
 		CanonicalSHA256:     digest,
 		HasStoragePlacement: storageutils.HasBlockStoragePlacement(&singleBlockBlock),
 	}, nil
@@ -105,7 +115,8 @@ func (v *payloadVerifier) InspectConsolidated(ctx context.Context, candidate Can
 	if err := validatePayloadIdentity(cscbBlock, candidate); err != nil {
 		return PinnedPayloadInspection{}, xerrors.Errorf("pinned CSCB block identity mismatch: %w", err)
 	}
-	digest, err := canonicalBlockDigest(storageutils.CloneBlockWithoutStoragePlacement(cscbBlock))
+	normalized := storageutils.CloneBlockWithoutStoragePlacement(cscbBlock)
+	digest, err := canonicalBlockDigest(normalized)
 	if err != nil {
 		return PinnedPayloadInspection{}, err
 	}
@@ -127,6 +138,8 @@ func (v *payloadVerifier) VerifyConsolidated(ctx context.Context, candidate Cand
 }
 
 func canonicalBlockDigest(block *api.Block) (string, error) {
+	// This digest is persisted in retirement and repair manifests. Keep its
+	// deterministic-protobuf algorithm stable across upgrades and rollbacks.
 	payload, err := (proto.MarshalOptions{Deterministic: true}).Marshal(block)
 	if err != nil {
 		return "", xerrors.Errorf("failed to marshal canonical block payload: %w", err)

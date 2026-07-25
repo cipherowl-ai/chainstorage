@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,9 +24,10 @@ const (
 	cscbFormatMetadataValue           = "cscb"
 	cscbCompressionScopeMetadataValue = "batch-chunked"
 	retirementClaimTokenBytes         = 16
-	retirementClaimLease              = 15 * time.Minute
-	retirementSafetyQuiescencePeriod  = 15 * time.Minute
+	RetirementClaimLease              = 15 * time.Minute
+	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
 	s3MutableNullVersionID            = "null"
+	versionedDeleteMode               = "exact_pinned_versions_and_delete_markers"
 )
 
 var unverifiedRetentionSafetySHA256 = keySHA256("unverified-retention-safety-configuration")
@@ -34,15 +36,37 @@ type Planner struct {
 	repo            Repository
 	store           ObjectStore
 	verifierFactory func() blockPayloadVerifier
+	heartbeat       func(ctx context.Context, details ...any)
 }
 
-func NewPlanner(repo Repository, store ObjectStore) *Planner {
-	return &Planner{
+type PlannerOption func(*Planner)
+
+// WithHeartbeat wires a liveness callback invoked from the long-running
+// row/version loops, so a Temporal activity heartbeat timeout can bound the
+// planner and deliver cancellation between destructive steps.
+func WithHeartbeat(heartbeat func(ctx context.Context, details ...any)) PlannerOption {
+	return func(p *Planner) {
+		p.heartbeat = heartbeat
+	}
+}
+
+func NewPlanner(repo Repository, store ObjectStore, opts ...PlannerOption) *Planner {
+	p := &Planner{
 		repo:  repo,
 		store: store,
 		verifierFactory: func() blockPayloadVerifier {
 			return newPayloadVerifier(store)
 		},
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+func (p *Planner) recordHeartbeat(ctx context.Context, details ...any) {
+	if p.heartbeat != nil {
+		p.heartbeat(ctx, details...)
 	}
 }
 
@@ -61,6 +85,10 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	writeOncePolicies := make(map[string]bool)
 	verifier := p.verifierFactory()
 	for _, row := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, xerrors.Errorf("single-block retention plan canceled at height %d: %w", row.Height, err)
+		}
+		p.recordHeartbeat(ctx, "retirement.plan.row", row.Height)
 		item := p.planRow(ctx, req, row, cscbHeads, singleBlockTopologies, writeOncePolicies, verifier)
 		report.Items = append(report.Items, item)
 	}
@@ -102,11 +130,20 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 		if item.Action != ActionDeleteObjectVersion {
 			continue
 		}
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement apply canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.apply.row", item.Height)
 		reason, err := p.applyCandidate(ctx, req, item, verifier)
 		if reason != "" {
 			if item.RetirementState != RetirementStateDeletedPendingVerification {
@@ -146,22 +183,36 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	halted := false
 	for _, manifest := range manifests {
 		item := candidateFromManifest(manifest)
+		if !halted {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				if firstErr == nil {
+					firstErr = xerrors.Errorf("single-block retirement reconciliation canceled: %w", ctxErr)
+				}
+				halted = true
+			}
+		}
 		if halted {
 			item.Action = ActionSkip
 			item.SkipReason = SkipNotAttemptedAfterFailure
 			report.Items = append(report.Items, item)
 			continue
 		}
+		p.recordHeartbeat(ctx, "retirement.reconcile.manifest", item.Height)
 		if manifest.Bucket != req.Bucket || !requestAllowsCandidate(req, item) ||
 			manifest.State != RetirementStateEligible &&
 				manifest.State != RetirementStateDeleting &&
 				manifest.State != RetirementStateDeletedPendingVerification ||
-			!isSHA256Hex(manifest.SingleBlockObjectKeySHA256) || !isSHA256Hex(manifest.PayloadSHA256) {
+			!isSHA256Hex(manifest.SingleBlockObjectKeySHA256) || !isSHA256Hex(manifest.PayloadSHA256) ||
+			!validPinnedVersionIDs(
+				firstString(manifest.SingleBlockObjectVersionIDs),
+				manifest.SingleBlockObjectVersionIDs,
+				manifest.SingleBlockDeleteMarkerVersionIDs,
+			) {
 			markCandidateBlocked(&item, SkipMetadataChanged)
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !approvalMatches(req) {
+		if approvalGateBlocked(req) {
 			markCandidateBlocked(&item, SkipChainRangeNotApproved)
 			report.Items = append(report.Items, item)
 			continue
@@ -171,8 +222,8 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
-		if !req.ClientMigrationApproved {
-			markCandidateBlocked(&item, SkipFileClientsNotApproved)
+		if req.Execute && !req.DirectStorageClientsGuarded {
+			markCandidateBlocked(&item, SkipDirectStorageClientsNotGuarded)
 			report.Items = append(report.Items, item)
 			continue
 		}
@@ -256,6 +307,10 @@ func (p *Planner) planRow(
 			}
 			item.Key = ""
 			item.VersionID = firstString(row.Retirement.SingleBlockObjectVersionIDs)
+			item.VersionIDs = append([]string(nil), row.Retirement.SingleBlockObjectVersionIDs...)
+			item.DeleteMarkerVersionIDs = append([]string(nil), row.Retirement.SingleBlockDeleteMarkerVersionIDs...)
+			item.SingleBlockVersions = len(item.VersionIDs)
+			item.DeleteMarkers = len(item.DeleteMarkerVersionIDs)
 			item.SingleBlockETag = row.Retirement.SingleBlockObjectETag
 			item.SingleBlockBytes = row.Retirement.SingleBlockObjectBytes
 			item.ConsolidatedKey = row.Retirement.ConsolidatedObjectKey
@@ -275,6 +330,10 @@ func (p *Planner) planRow(
 			}
 			item.Key = ""
 			item.VersionID = firstString(row.Retirement.SingleBlockObjectVersionIDs)
+			item.VersionIDs = append([]string(nil), row.Retirement.SingleBlockObjectVersionIDs...)
+			item.DeleteMarkerVersionIDs = append([]string(nil), row.Retirement.SingleBlockDeleteMarkerVersionIDs...)
+			item.SingleBlockVersions = len(item.VersionIDs)
+			item.DeleteMarkers = len(item.DeleteMarkerVersionIDs)
 			item.SingleBlockBytes = row.Retirement.SingleBlockObjectBytes
 			item.ConsolidatedKey = row.Retirement.ConsolidatedObjectKey
 			item.CSCBVersionID = row.Retirement.ConsolidatedObjectVersionID
@@ -326,7 +385,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
-	if !approvalMatches(req) {
+	if approvalGateBlocked(req) {
 		item.SkipReason = SkipChainRangeNotApproved
 		return item
 	}
@@ -334,8 +393,8 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipActiveFallbackOrReadErrors
 		return item
 	}
-	if !req.ClientMigrationApproved {
-		item.SkipReason = SkipFileClientsNotApproved
+	if req.Execute && !req.DirectStorageClientsGuarded {
+		item.SkipReason = SkipDirectStorageClientsNotGuarded
 		return item
 	}
 	if req.Execute && !req.SingleBlockWritersGuarded {
@@ -359,18 +418,16 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipSingleBlockObjectMissing
 		return item
 	}
-	if len(topology.Versions) != 1 || len(topology.DeleteMarkers) != 0 || !topology.Versions[0].IsLatest {
-		item.SkipReason = SkipUnsafeSingleBlockVersionTopology
+	version, versionIDs, deleteMarkerVersionIDs, reason := pinSingleBlockTopology(topology)
+	if reason != "" {
+		item.SkipReason = reason
 		return item
 	}
-	version := topology.Versions[0]
 	item.VersionID = version.VersionID
+	item.VersionIDs = versionIDs
+	item.DeleteMarkerVersionIDs = deleteMarkerVersionIDs
 	item.SingleBlockETag = version.ETag
 	item.SingleBlockBytes = version.Bytes
-	if !isImmutableVersionID(item.VersionID) || item.SingleBlockETag == "" {
-		item.SkipReason = SkipSingleBlockVersionIDUnavailable
-		return item
-	}
 
 	head, ok := cscbHeads[shadow.ConsolidatedObjectKey]
 	if !ok {
@@ -455,8 +512,8 @@ func (p *Planner) applyCandidate(ctx context.Context, req PlanRequest, item *Can
 		if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
 			return reason, err
 		}
-		if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
-			return SkipVersionedDeleteFailed, err
+		if reason, err := p.deletePinnedSingleBlockTopology(ctx, item, claimToken); err != nil {
+			return reason, err
 		}
 		return p.completeObjectDeletion(ctx, req, item, claimToken, item.PayloadSHA256)
 	})
@@ -490,6 +547,9 @@ func (p *Planner) reconcileManifest(
 		if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
 			return SkipMetadataChanged, xerrors.Errorf("single-block object is absent before any delete attempt: block_metadata_id=%d", manifest.BlockMetadataID)
 		}
+		if !topologyMatchesManifest(topology, manifest) {
+			return SkipUnsafeSingleBlockVersionTopology, xerrors.Errorf("eligible retirement topology changed: block_metadata_id=%d", manifest.BlockMetadataID)
+		}
 	}
 	return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
 		topology, err := p.store.ListObjectVersions(ctx, manifest.Bucket, manifest.SingleBlockObjectKey)
@@ -505,18 +565,23 @@ func (p *Planner) reconcileManifest(
 			}
 			return p.completeObjectDeletion(ctx, req, item, claimToken, manifest.PayloadSHA256)
 		}
-		if !topologyMatchesManifest(topology, manifest) {
+		if manifest.State == RetirementStateEligible && !topologyMatchesManifest(topology, manifest) ||
+			manifest.State == RetirementStateDeleting && !topologyIsPinnedSubset(topology, manifest) {
 			return SkipUnsafeSingleBlockVersionTopology, xerrors.Errorf("pending retirement topology changed: block_metadata_id=%d", manifest.BlockMetadataID)
 		}
 		verifier := p.verifierFactory()
-		payloadSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
+		verify := p.revalidateCandidate
+		if manifest.State == RetirementStateDeleting {
+			verify = p.revalidateConsolidatedCandidate
+		}
+		payloadSHA256, reason, err := verify(ctx, req, *item, verifier)
 		if err != nil {
 			return reason, err
 		}
 		if payloadSHA256 != manifest.PayloadSHA256 {
 			return SkipSingleBlockPayloadMismatch, xerrors.Errorf("pending retirement payload digest changed: block_metadata_id=%d", manifest.BlockMetadataID)
 		}
-		preDeleteSHA256, reason, err := p.revalidateCandidate(ctx, req, *item, verifier)
+		preDeleteSHA256, reason, err := verify(ctx, req, *item, verifier)
 		if err != nil {
 			return reason, err
 		}
@@ -529,8 +594,8 @@ func (p *Planner) reconcileManifest(
 		if reason, err := p.verifyCSCBRetentionSafety(ctx, item); err != nil {
 			return reason, err
 		}
-		if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, item.VersionID); err != nil {
-			return SkipVersionedDeleteFailed, err
+		if reason, err := p.deletePinnedSingleBlockTopology(ctx, item, claimToken); err != nil {
+			return reason, err
 		}
 		return p.completeObjectDeletion(ctx, req, item, claimToken, manifest.PayloadSHA256)
 	})
@@ -556,10 +621,10 @@ func (p *Planner) verifyCSCBRetentionSafety(ctx context.Context, item *Candidate
 		return SkipCSCBWriteOncePolicyUnverified, inspectionErr
 	}
 	item.CSCBWriteOncePolicy = true
-	if observedAt.Sub(firstObservedAt) < retirementSafetyQuiescencePeriod {
+	if observedAt.Sub(firstObservedAt) < RetentionSafetyQuiescencePeriod {
 		return SkipCSCBSafetyQuiescenceActive, xerrors.Errorf(
 			"CSCB retention safety configuration has not remained stable for %s: bucket=%s key=%s first_observed_at=%s observed_at=%s",
-			retirementSafetyQuiescencePeriod,
+			RetentionSafetyQuiescencePeriod,
 			item.Bucket,
 			item.ConsolidatedKey,
 			firstObservedAt.Format(time.RFC3339Nano),
@@ -620,7 +685,7 @@ func (p *Planner) withRetirementClaim(
 		return SkipMetadataChanged, err
 	}
 	claimedAt := time.Now().UTC()
-	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(retirementClaimLease)); err != nil {
+	if err := p.repo.ClaimRetirement(ctx, item.BlockMetadataID, claimToken, claimedAt, claimedAt.Add(RetirementClaimLease)); err != nil {
 		if errors.Is(err, ErrRetirementClaimUnavailable) {
 			return SkipRetirementClaimActive, nil
 		}
@@ -643,7 +708,10 @@ func (p *Planner) withRetirementClaim(
 		if outcome == "" {
 			outcome = SkipMetadataChanged
 		}
-		if outcomeErr := p.repo.RecordRetirementOutcome(ctx, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+		// Record the interruption outcome even when the failure is a
+		// cancellation, so a stopped run leaves a durable trace instead of an
+		// unexplained claim that only expires by lease.
+		if outcomeErr := p.repo.RecordRetirementOutcome(context.WithoutCancel(ctx), item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
 		}
 	}()
@@ -657,7 +725,75 @@ func (p *Planner) withRetirementClaim(
 
 func (p *Planner) renewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
 	renewedAt := time.Now().UTC()
-	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(retirementClaimLease))
+	return p.repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, renewedAt.Add(RetirementClaimLease))
+}
+
+func (p *Planner) deletePinnedSingleBlockTopology(
+	ctx context.Context,
+	item *Candidate,
+	claimToken string,
+) (string, error) {
+	topology, err := p.store.ListObjectVersions(ctx, item.Bucket, item.Key)
+	if err != nil {
+		return SkipObjectInspectionFailed, err
+	}
+	if !topologyIsPinnedCandidateSubset(topology, *item) {
+		return SkipUnsafeSingleBlockVersionTopology, xerrors.Errorf(
+			"single-block object version topology changed before exact deletion: block_metadata_id=%d",
+			item.BlockMetadataID,
+		)
+	}
+
+	remainingVersions := make(map[string]struct{}, len(topology.Versions))
+	for _, version := range topology.Versions {
+		remainingVersions[version.VersionID] = struct{}{}
+	}
+	remainingMarkers := make(map[string]struct{}, len(topology.DeleteMarkers))
+	for _, marker := range topology.DeleteMarkers {
+		remainingMarkers[marker.VersionID] = struct{}{}
+	}
+	deleteVersion := func(versionID string) (string, error) {
+		if err := ctx.Err(); err != nil {
+			return SkipRetentionRunCanceled, xerrors.Errorf(
+				"single-block version deletion canceled before version %s: %w",
+				versionID,
+				err,
+			)
+		}
+		p.recordHeartbeat(ctx, "retirement.delete.version", item.Height, versionID)
+		if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claimToken); err != nil {
+			return SkipRetirementClaimActive, err
+		}
+		if err := p.store.DeleteObjectVersion(ctx, item.Bucket, item.Key, versionID); err != nil {
+			return SkipVersionedDeleteFailed, err
+		}
+		return "", nil
+	}
+
+	// Keep the payload-validation version available until every older data
+	// version is gone, then remove delete markers only after all data versions.
+	for _, versionID := range item.VersionIDs[1:] {
+		if _, ok := remainingVersions[versionID]; !ok {
+			continue
+		}
+		if reason, err := deleteVersion(versionID); err != nil {
+			return reason, err
+		}
+	}
+	if _, ok := remainingVersions[item.VersionID]; ok {
+		if reason, err := deleteVersion(item.VersionID); err != nil {
+			return reason, err
+		}
+	}
+	for _, versionID := range item.DeleteMarkerVersionIDs {
+		if _, ok := remainingMarkers[versionID]; !ok {
+			continue
+		}
+		if reason, err := deleteVersion(versionID); err != nil {
+			return reason, err
+		}
+	}
+	return "", nil
 }
 
 func (p *Planner) completeObjectDeletion(
@@ -810,7 +946,7 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -843,7 +979,7 @@ func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate
 		!row.Skipped &&
 		approvalMatches(req) &&
 		req.FallbackErrorCount == 0 &&
-		req.ClientMigrationApproved &&
+		req.DirectStorageClientsGuarded &&
 		req.SingleBlockWritersGuarded &&
 		requestAllowsCandidate(req, candidate) &&
 		row.BlockMetadataID == candidate.BlockMetadataID &&
@@ -872,8 +1008,9 @@ func pendingRetirementMatchesCandidate(row MetadataRow, candidate Candidate) boo
 		manifest.Bucket == candidate.Bucket &&
 		manifest.SingleBlockObjectKey == candidate.Key &&
 		manifest.SingleBlockObjectKeySHA256 == candidate.SingleBlockKeySHA256 &&
-		len(manifest.SingleBlockObjectVersionIDs) == 1 &&
-		manifest.SingleBlockObjectVersionIDs[0] == candidate.VersionID &&
+		sameStrings(manifest.SingleBlockObjectVersionIDs, candidate.VersionIDs) &&
+		sameStrings(manifest.SingleBlockDeleteMarkerVersionIDs, candidate.DeleteMarkerVersionIDs) &&
+		firstString(manifest.SingleBlockObjectVersionIDs) == candidate.VersionID &&
 		manifest.SingleBlockObjectETag == candidate.SingleBlockETag &&
 		manifest.SingleBlockObjectBytes == candidate.SingleBlockBytes &&
 		manifest.ConsolidatedObjectKey == candidate.ConsolidatedKey &&
@@ -953,16 +1090,16 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 		report.StartHeight != req.StartHeight ||
 		report.EndHeight != req.EndHeight ||
 		report.Approval != req.Approval ||
-		report.SafetyGates.ClientMigrationApproved != req.ClientMigrationApproved ||
+		report.SafetyGates.DirectStorageClientsGuarded != req.DirectStorageClientsGuarded ||
 		report.SafetyGates.SingleBlockWritersGuarded != req.SingleBlockWritersGuarded ||
 		report.SafetyGates.FallbackReadErrors != req.FallbackErrorCount ||
 		report.SafetyGates.ProductionDeleteEnabled != req.ProductionDeleteEnabled ||
-		report.SafetyGates.VersionedDeleteMode != "exact_single_object_version_only" ||
+		report.SafetyGates.VersionedDeleteMode != versionedDeleteMode ||
 		report.SafetyGates.CSCBWriteOncePolicyMode != cscbWriteOncePolicyMode ||
 		!report.SafetyGates.CSCBWriteOncePolicyVerified {
 		return xerrors.New("retirement report does not match the execution request")
 	}
-	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.ClientMigrationApproved || !req.SingleBlockWritersGuarded {
+	if !approvalMatches(req) || req.FallbackErrorCount != 0 || !req.DirectStorageClientsGuarded || !req.SingleBlockWritersGuarded {
 		return xerrors.New("retirement execution safety gates are not satisfied")
 	}
 	for _, item := range report.Items {
@@ -970,8 +1107,9 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 			continue
 		}
 		if !requestAllowsCandidate(req, item) || item.BlockMetadataID <= 0 || item.Key == "" ||
-			item.SingleBlockKeySHA256 != keySHA256(item.Key) || !isImmutableVersionID(item.VersionID) || item.SingleBlockETag == "" ||
-			item.SingleBlockBytes == 0 || item.SingleBlockVersions != 1 || item.DeleteMarkers != 0 ||
+			item.SingleBlockKeySHA256 != keySHA256(item.Key) ||
+			!validPinnedVersionIDs(item.VersionID, item.VersionIDs, item.DeleteMarkerVersionIDs) || item.SingleBlockETag == "" ||
+			item.SingleBlockBytes == 0 || item.SingleBlockVersions != len(item.VersionIDs) || item.DeleteMarkers != len(item.DeleteMarkerVersionIDs) ||
 			item.ConsolidatedKey == "" || !isImmutableVersionID(item.CSCBVersionID) || item.CSCBETag == "" ||
 			!item.CSCBWriteOncePolicy ||
 			item.ByteLength == 0 || item.UncompressedLength == 0 || !isSHA256Hex(item.PayloadSHA256) {
@@ -982,24 +1120,155 @@ func validateApplyReport(req PlanRequest, report *Report) error {
 }
 
 func topologyMatchesCandidate(topology ObjectVersionTopology, candidate Candidate) bool {
-	return len(topology.Versions) == 1 &&
-		len(topology.DeleteMarkers) == 0 &&
-		topology.Versions[0].IsLatest &&
-		isImmutableVersionID(topology.Versions[0].VersionID) &&
-		topology.Versions[0].VersionID == candidate.VersionID &&
-		topology.Versions[0].ETag == candidate.SingleBlockETag &&
-		topology.Versions[0].Bytes == candidate.SingleBlockBytes
+	version, versionIDs, markerIDs, reason := pinSingleBlockTopology(topology)
+	return reason == "" &&
+		version.VersionID == candidate.VersionID &&
+		version.ETag == candidate.SingleBlockETag &&
+		version.Bytes == candidate.SingleBlockBytes &&
+		sameStrings(versionIDs, candidate.VersionIDs) &&
+		sameStrings(markerIDs, candidate.DeleteMarkerVersionIDs)
 }
 
 func topologyMatchesManifest(topology ObjectVersionTopology, manifest RetirementManifest) bool {
-	return len(manifest.SingleBlockObjectVersionIDs) == 1 &&
-		isImmutableVersionID(manifest.SingleBlockObjectVersionIDs[0]) &&
-		len(topology.Versions) == 1 &&
-		len(topology.DeleteMarkers) == 0 &&
-		topology.Versions[0].IsLatest &&
-		topology.Versions[0].VersionID == manifest.SingleBlockObjectVersionIDs[0] &&
-		topology.Versions[0].ETag == manifest.SingleBlockObjectETag &&
-		topology.Versions[0].Bytes == manifest.SingleBlockObjectBytes
+	return topologyMatchesCandidate(topology, candidateFromManifest(manifest))
+}
+
+func topologyIsPinnedSubset(topology ObjectVersionTopology, manifest RetirementManifest) bool {
+	return topologyIsPinnedCandidateSubset(topology, candidateFromManifest(manifest))
+}
+
+func topologyIsPinnedCandidateSubset(topology ObjectVersionTopology, candidate Candidate) bool {
+	if !validPinnedVersionIDs(candidate.VersionID, candidate.VersionIDs, candidate.DeleteMarkerVersionIDs) {
+		return false
+	}
+	versionIDs := make(map[string]struct{}, len(candidate.VersionIDs))
+	for _, versionID := range candidate.VersionIDs {
+		versionIDs[versionID] = struct{}{}
+	}
+	markerIDs := make(map[string]struct{}, len(candidate.DeleteMarkerVersionIDs))
+	for _, versionID := range candidate.DeleteMarkerVersionIDs {
+		markerIDs[versionID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(topology.Versions)+len(topology.DeleteMarkers))
+	for _, version := range topology.Versions {
+		if !isImmutableVersionID(version.VersionID) {
+			return false
+		}
+		if _, ok := versionIDs[version.VersionID]; !ok {
+			return false
+		}
+		if _, duplicate := seen[version.VersionID]; duplicate {
+			return false
+		}
+		seen[version.VersionID] = struct{}{}
+		if version.VersionID == candidate.VersionID &&
+			(version.ETag != candidate.SingleBlockETag || version.Bytes != candidate.SingleBlockBytes) {
+			return false
+		}
+	}
+	for _, marker := range topology.DeleteMarkers {
+		if !isImmutableVersionID(marker.VersionID) {
+			return false
+		}
+		if _, ok := markerIDs[marker.VersionID]; !ok {
+			return false
+		}
+		if _, duplicate := seen[marker.VersionID]; duplicate {
+			return false
+		}
+		seen[marker.VersionID] = struct{}{}
+	}
+	return true
+}
+
+func pinSingleBlockTopology(topology ObjectVersionTopology) (ObjectVersion, []string, []string, string) {
+	if len(topology.Versions) == 0 {
+		return ObjectVersion{}, nil, nil, SkipUnsafeSingleBlockVersionTopology
+	}
+	seen := make(map[string]struct{}, len(topology.Versions)+len(topology.DeleteMarkers))
+	latestVersion := -1
+	latestEntries := 0
+	for i, version := range topology.Versions {
+		if !isImmutableVersionID(version.VersionID) {
+			return ObjectVersion{}, nil, nil, SkipSingleBlockVersionIDUnavailable
+		}
+		if _, duplicate := seen[version.VersionID]; duplicate {
+			return ObjectVersion{}, nil, nil, SkipUnsafeSingleBlockVersionTopology
+		}
+		seen[version.VersionID] = struct{}{}
+		if version.IsLatest {
+			latestEntries++
+			latestVersion = i
+		}
+	}
+	for _, marker := range topology.DeleteMarkers {
+		if !isImmutableVersionID(marker.VersionID) {
+			return ObjectVersion{}, nil, nil, SkipSingleBlockVersionIDUnavailable
+		}
+		if _, duplicate := seen[marker.VersionID]; duplicate {
+			return ObjectVersion{}, nil, nil, SkipUnsafeSingleBlockVersionTopology
+		}
+		seen[marker.VersionID] = struct{}{}
+		if marker.IsLatest {
+			latestEntries++
+		}
+	}
+	if latestEntries != 1 {
+		return ObjectVersion{}, nil, nil, SkipUnsafeSingleBlockVersionTopology
+	}
+	if latestVersion < 0 {
+		// ListObjectVersions returns data versions newest first. When a delete
+		// marker is current, the first data version is the last readable payload.
+		latestVersion = 0
+	}
+	selected := topology.Versions[latestVersion]
+	if selected.ETag == "" || selected.Bytes == 0 {
+		return ObjectVersion{}, nil, nil, SkipSingleBlockVersionIDUnavailable
+	}
+
+	versionIDs := make([]string, 0, len(topology.Versions))
+	versionIDs = append(versionIDs, selected.VersionID)
+	remainder := make([]string, 0, len(topology.Versions)-1)
+	for i, version := range topology.Versions {
+		if i != latestVersion {
+			remainder = append(remainder, version.VersionID)
+		}
+	}
+	sort.Strings(remainder)
+	versionIDs = append(versionIDs, remainder...)
+	markerIDs := make([]string, 0, len(topology.DeleteMarkers))
+	for _, marker := range topology.DeleteMarkers {
+		markerIDs = append(markerIDs, marker.VersionID)
+	}
+	sort.Strings(markerIDs)
+	return selected, versionIDs, markerIDs, ""
+}
+
+func validPinnedVersionIDs(validationVersionID string, versionIDs []string, markerIDs []string) bool {
+	if len(versionIDs) == 0 || versionIDs[0] != validationVersionID || !isImmutableVersionID(validationVersionID) ||
+		!sort.StringsAreSorted(versionIDs[1:]) || !sort.StringsAreSorted(markerIDs) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(versionIDs)+len(markerIDs))
+	for _, versionID := range versionIDs {
+		if !isImmutableVersionID(versionID) {
+			return false
+		}
+		if _, duplicate := seen[versionID]; duplicate {
+			return false
+		}
+		seen[versionID] = struct{}{}
+	}
+	for _, markerID := range markerIDs {
+		if !isImmutableVersionID(markerID) {
+			return false
+		}
+		if _, duplicate := seen[markerID]; duplicate {
+			return false
+		}
+		seen[markerID] = struct{}{}
+	}
+	return true
 }
 
 func isImmutableVersionID(versionID string) bool {
@@ -1008,54 +1277,58 @@ func isImmutableVersionID(versionID string) bool {
 
 func manifestFromCandidate(candidate Candidate, preparedAt time.Time) RetirementManifest {
 	return RetirementManifest{
-		BlockMetadataID:                candidate.BlockMetadataID,
-		Tag:                            candidate.Tag,
-		Height:                         candidate.Height,
-		Hash:                           candidate.Hash,
-		State:                          RetirementStateEligible,
-		Bucket:                         candidate.Bucket,
-		SingleBlockObjectKey:           candidate.Key,
-		SingleBlockObjectKeySHA256:     keySHA256(candidate.Key),
-		SingleBlockObjectVersionIDs:    []string{candidate.VersionID},
-		SingleBlockObjectETag:          candidate.SingleBlockETag,
-		SingleBlockObjectBytes:         candidate.SingleBlockBytes,
-		ConsolidatedObjectKey:          candidate.ConsolidatedKey,
-		ConsolidatedObjectVersionID:    candidate.CSCBVersionID,
-		ConsolidatedObjectETag:         candidate.CSCBETag,
-		ConsolidatedByteOffset:         candidate.ByteOffset,
-		ConsolidatedByteLength:         candidate.ByteLength,
-		ConsolidatedUncompressedLength: candidate.UncompressedLength,
-		PayloadSHA256:                  candidate.PayloadSHA256,
-		PreparedAt:                     preparedAt,
+		BlockMetadataID:                   candidate.BlockMetadataID,
+		Tag:                               candidate.Tag,
+		Height:                            candidate.Height,
+		Hash:                              candidate.Hash,
+		State:                             RetirementStateEligible,
+		Bucket:                            candidate.Bucket,
+		SingleBlockObjectKey:              candidate.Key,
+		SingleBlockObjectKeySHA256:        keySHA256(candidate.Key),
+		SingleBlockObjectVersionIDs:       append([]string(nil), candidate.VersionIDs...),
+		SingleBlockDeleteMarkerVersionIDs: append([]string(nil), candidate.DeleteMarkerVersionIDs...),
+		SingleBlockObjectETag:             candidate.SingleBlockETag,
+		SingleBlockObjectBytes:            candidate.SingleBlockBytes,
+		ConsolidatedObjectKey:             candidate.ConsolidatedKey,
+		ConsolidatedObjectVersionID:       candidate.CSCBVersionID,
+		ConsolidatedObjectETag:            candidate.CSCBETag,
+		ConsolidatedByteOffset:            candidate.ByteOffset,
+		ConsolidatedByteLength:            candidate.ByteLength,
+		ConsolidatedUncompressedLength:    candidate.UncompressedLength,
+		PayloadSHA256:                     candidate.PayloadSHA256,
+		PreparedAt:                        preparedAt,
 	}
 }
 
 func candidateFromManifest(manifest RetirementManifest) Candidate {
 	candidate := Candidate{
-		Bucket:               manifest.Bucket,
-		Key:                  manifest.SingleBlockObjectKey,
-		VersionID:            firstString(manifest.SingleBlockObjectVersionIDs),
-		BlockMetadataID:      manifest.BlockMetadataID,
-		Tag:                  manifest.Tag,
-		Height:               manifest.Height,
-		Hash:                 manifest.Hash,
-		SingleBlockBytes:     manifest.SingleBlockObjectBytes,
-		SingleBlockETag:      manifest.SingleBlockObjectETag,
-		SingleBlockKeySHA256: manifest.SingleBlockObjectKeySHA256,
-		SingleBlockVersions:  len(manifest.SingleBlockObjectVersionIDs),
-		ConsolidatedKey:      manifest.ConsolidatedObjectKey,
-		CSCBVersionID:        manifest.ConsolidatedObjectVersionID,
-		CSCBETag:             manifest.ConsolidatedObjectETag,
-		ByteOffset:           manifest.ConsolidatedByteOffset,
-		ByteLength:           manifest.ConsolidatedByteLength,
-		UncompressedLength:   manifest.ConsolidatedUncompressedLength,
-		PayloadSHA256:        manifest.PayloadSHA256,
-		RetirementState:      manifest.State,
-		RetirementAttempts:   manifest.AttemptCount,
-		RetirementOutcome:    manifest.Outcome,
-		SingleBlockDeletedAt: manifest.DeletedAt,
-		RetirementVerifiedAt: manifest.VerifiedAt,
-		Action:               ActionDeleteObjectVersion,
+		Bucket:                 manifest.Bucket,
+		Key:                    manifest.SingleBlockObjectKey,
+		VersionID:              firstString(manifest.SingleBlockObjectVersionIDs),
+		VersionIDs:             append([]string(nil), manifest.SingleBlockObjectVersionIDs...),
+		DeleteMarkerVersionIDs: append([]string(nil), manifest.SingleBlockDeleteMarkerVersionIDs...),
+		BlockMetadataID:        manifest.BlockMetadataID,
+		Tag:                    manifest.Tag,
+		Height:                 manifest.Height,
+		Hash:                   manifest.Hash,
+		SingleBlockBytes:       manifest.SingleBlockObjectBytes,
+		SingleBlockETag:        manifest.SingleBlockObjectETag,
+		SingleBlockKeySHA256:   manifest.SingleBlockObjectKeySHA256,
+		SingleBlockVersions:    len(manifest.SingleBlockObjectVersionIDs),
+		DeleteMarkers:          len(manifest.SingleBlockDeleteMarkerVersionIDs),
+		ConsolidatedKey:        manifest.ConsolidatedObjectKey,
+		CSCBVersionID:          manifest.ConsolidatedObjectVersionID,
+		CSCBETag:               manifest.ConsolidatedObjectETag,
+		ByteOffset:             manifest.ConsolidatedByteOffset,
+		ByteLength:             manifest.ConsolidatedByteLength,
+		UncompressedLength:     manifest.ConsolidatedUncompressedLength,
+		PayloadSHA256:          manifest.PayloadSHA256,
+		RetirementState:        manifest.State,
+		RetirementAttempts:     manifest.AttemptCount,
+		RetirementOutcome:      manifest.Outcome,
+		SingleBlockDeletedAt:   manifest.DeletedAt,
+		RetirementVerifiedAt:   manifest.VerifiedAt,
+		Action:                 ActionDeleteObjectVersion,
 	}
 	if manifest.State == RetirementStateDeletedPendingVerification {
 		candidate.Action = ActionDeletedObjectVersion
@@ -1114,12 +1387,12 @@ func newReport(req PlanRequest) *Report {
 		EndHeight:   req.EndHeight,
 		Approval:    req.Approval,
 		SafetyGates: SafetyGates{
-			ClientMigrationApproved:   req.ClientMigrationApproved,
-			SingleBlockWritersGuarded: req.SingleBlockWritersGuarded,
-			FallbackReadErrors:        req.FallbackErrorCount,
-			VersionedDeleteMode:       "exact_single_object_version_only",
-			CSCBWriteOncePolicyMode:   cscbWriteOncePolicyMode,
-			ProductionDeleteEnabled:   req.ProductionDeleteEnabled,
+			DirectStorageClientsGuarded: req.DirectStorageClientsGuarded,
+			SingleBlockWritersGuarded:   req.SingleBlockWritersGuarded,
+			FallbackReadErrors:          req.FallbackErrorCount,
+			VersionedDeleteMode:         versionedDeleteMode,
+			CSCBWriteOncePolicyMode:     cscbWriteOncePolicyMode,
+			ProductionDeleteEnabled:     req.ProductionDeleteEnabled,
 		},
 		Items: make([]Candidate, 0),
 	}
@@ -1230,6 +1503,18 @@ func approvalMatches(req PlanRequest) bool {
 		req.Approval.EndHeight == req.EndHeight
 }
 
+// approvalGateBlocked reports whether the operator approval blocks this
+// request. Execution always requires an exact chain/range approval. A
+// read-only run may omit the approval entirely so it can still reach the S3
+// safety inspection, but a supplied approval is validated even on dry runs so
+// the report predicts the execute-time gate.
+func approvalGateBlocked(req PlanRequest) bool {
+	if !req.Execute && req.Approval == (Approval{}) {
+		return false
+	}
+	return !approvalMatches(req)
+}
+
 func actualChain(req PlanRequest) string {
 	parts := []string{req.Blockchain, req.Network}
 	if req.Sidechain != "" {
@@ -1240,6 +1525,13 @@ func actualChain(req PlanRequest) string {
 
 func normalizeApprovalChain(value string) string {
 	return strings.ToLower(strings.ReplaceAll(value, "_", "-"))
+}
+
+// NormalizeApprovalChain exposes the approval chain normalization so callers
+// can fail fast on an operator approval that names the wrong chain before a
+// plan request is even built.
+func NormalizeApprovalChain(value string) string {
+	return normalizeApprovalChain(value)
 }
 
 func isProduction(env string) bool {

@@ -84,7 +84,7 @@ func (r *fakeRepo) ObserveRetentionSafety(
 	if !ok {
 		observation = fakeSafetyObservation{
 			configurationSHA256: configurationSHA256,
-			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+			firstObservedAt:     observedAt.Add(-RetentionSafetyQuiescencePeriod),
 		}
 	} else if observation.configurationSHA256 != configurationSHA256 {
 		observation.configurationSHA256 = configurationSHA256
@@ -279,6 +279,7 @@ type fakeStore struct {
 	policyHook    func(key string, call int) (RetentionSafetySnapshot, error)
 	deleted       []Candidate
 	deleteMutates bool
+	deleteErrors  map[string]error
 	listHook      func(key string, call int) ObjectVersionTopology
 	headHook      func(key string, call int) ObjectHead
 }
@@ -294,6 +295,7 @@ func newFakeStore() *fakeStore {
 		policyCalls:  make(map[string]int),
 		policyErrors: make(map[string]error),
 		policyHashes: make(map[string]string),
+		deleteErrors: make(map[string]error),
 	}
 }
 
@@ -346,14 +348,36 @@ func (s *fakeStore) ReadObjectVersionRange(ctx context.Context, bucket string, k
 }
 
 func (s *fakeStore) DeleteObjectVersion(ctx context.Context, bucket string, key string, versionID string) error {
+	if err := s.deleteErrors[versionID]; err != nil {
+		return err
+	}
 	s.deleted = append(s.deleted, Candidate{
 		Bucket:    bucket,
 		Key:       key,
 		VersionID: versionID,
 	})
 	if s.deleteMutates {
-		delete(s.topologies, key)
-		delete(s.heads, key)
+		topology := s.topologies[key]
+		versions := topology.Versions[:0]
+		for _, version := range topology.Versions {
+			if version.VersionID != versionID {
+				versions = append(versions, version)
+			}
+		}
+		topology.Versions = versions
+		markers := topology.DeleteMarkers[:0]
+		for _, marker := range topology.DeleteMarkers {
+			if marker.VersionID != versionID {
+				markers = append(markers, marker)
+			}
+		}
+		topology.DeleteMarkers = markers
+		if len(topology.Versions) == 0 && len(topology.DeleteMarkers) == 0 {
+			delete(s.topologies, key)
+			delete(s.heads, key)
+		} else {
+			s.topologies[key] = topology
+		}
 	}
 	return nil
 }
@@ -545,9 +569,37 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 		require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 		require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 	})
+
+	t.Run("dry run may omit approval and still reaches safety inspection", func(t *testing.T) {
+		row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		store := newFakeStore()
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+		store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+		req := testRequest(now, false)
+		req.Approval = Approval{}
+		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), req)
+		require.NoError(err)
+		require.Len(report.Items, 1)
+		require.Equal(ActionReportOnly, report.Items[0].Action)
+		require.Empty(report.Items[0].SkipReason)
+	})
+
+	t.Run("execution never derives an approval from omitted operator input", func(t *testing.T) {
+		row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+		store := newFakeStore()
+		req := testRequest(now, true)
+		req.ProductionDeleteEnabled = true
+		req.Approval = Approval{}
+		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), req)
+		require.NoError(err)
+		require.Len(report.Items, 1)
+		require.Equal(ActionSkip, report.Items[0].Action)
+		require.Equal(SkipChainRangeNotApproved, report.Items[0].SkipReason)
+		require.Zero(store.versionCalls[row.SingleBlockObjectKey])
+	})
 }
 
-func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
+func TestPlannerPlan_FallbackAndDirectStorageClientGates(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
@@ -561,12 +613,25 @@ func TestPlannerPlan_FallbackAndClientMigrationGates(t *testing.T) {
 		require.Equal(SkipActiveFallbackOrReadErrors, report.Items[0].SkipReason)
 	})
 
-	t.Run("file clients not approved", func(t *testing.T) {
+	t.Run("dry run does not require direct storage client assertion", func(t *testing.T) {
 		req := testRequest(now, false)
-		req.ClientMigrationApproved = false
+		req.DirectStorageClientsGuarded = false
+		store := newFakeStore()
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+		store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), req)
+		require.NoError(err)
+		require.Equal(ActionReportOnly, report.Items[0].Action)
+		require.Empty(report.Items[0].SkipReason)
+		require.False(report.SafetyGates.DirectStorageClientsGuarded)
+	})
+
+	t.Run("execution requires direct storage client assertion", func(t *testing.T) {
+		req := testRequest(now, true)
+		req.DirectStorageClientsGuarded = false
 		report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, newFakeStore()).Plan(context.Background(), req)
 		require.NoError(err)
-		require.Equal(SkipFileClientsNotApproved, report.Items[0].SkipReason)
+		require.Equal(SkipDirectStorageClientsNotGuarded, report.Items[0].SkipReason)
 	})
 }
 
@@ -645,7 +710,7 @@ func TestPlannerPlan_PromotedRowUsesShadowSingleBlockKeyAndRetireAfter(t *testin
 	require.Empty(report.Items[0].SkipReason)
 }
 
-func TestPlannerPlan_VersionedDeleteMarkerBehavior(t *testing.T) {
+func TestPlannerPlan_RejectsMarkerOnlyTopology(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
@@ -664,39 +729,69 @@ func TestPlannerPlan_VersionedDeleteMarkerBehavior(t *testing.T) {
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
-func TestPlannerPlan_RejectsNonSingletonSingleBlockTopology(t *testing.T) {
+func TestPlannerPlan_AcceptsImmutableMultiVersionTopology(t *testing.T) {
+	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	validatedAt := now.Add(-8 * 24 * time.Hour)
-	for _, test := range []struct {
-		name     string
-		topology ObjectVersionTopology
-	}{
-		{
-			name: "older version exists",
-			topology: ObjectVersionTopology{Versions: []ObjectVersion{
-				{VersionID: "single-block-v2", ETag: "etag-v2", Bytes: 42, IsLatest: true},
-				{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 41, IsLatest: false},
-			}},
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+	store := newFakeStore()
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{
+		Versions: []ObjectVersion{
+			{VersionID: "single-block-v2", ETag: "etag-v2", Bytes: 42, IsLatest: true},
+			{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 41},
 		},
-		{
-			name: "single version is not latest",
-			topology: ObjectVersionTopology{Versions: []ObjectVersion{
-				{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 42, IsLatest: false},
-			}},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			require := require.New(t)
-			row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
-			store := newFakeStore()
-			store.topologies[row.SingleBlockObjectKey] = test.topology
-			report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
-			require.NoError(err)
-			require.Equal(ActionSkip, report.Items[0].Action)
-			require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
-			require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
-		})
+		DeleteMarkers: []ObjectDeleteMarker{{VersionID: "delete-marker-v1"}},
 	}
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(ActionReportOnly, report.Items[0].Action)
+	require.Empty(report.Items[0].SkipReason)
+	require.Equal("single-block-v2", report.Items[0].VersionID)
+	require.Equal(2, report.Items[0].SingleBlockVersions)
+	require.Equal(1, report.Items[0].DeleteMarkers)
+}
+
+func TestPlannerPlan_AcceptsCurrentDeleteMarkerWithHistoricalDataVersions(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{
+		Versions: []ObjectVersion{
+			{VersionID: "single-block-v2", ETag: "etag-v2", Bytes: 42},
+			{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 41},
+		},
+		DeleteMarkers: []ObjectDeleteMarker{{VersionID: "delete-marker-v3", IsLatest: true}},
+	}
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(ActionReportOnly, report.Items[0].Action)
+	require.Empty(report.Items[0].SkipReason)
+	require.Equal("single-block-v2", report.Items[0].VersionID)
+	require.Equal([]string{"single-block-v2", "single-block-v1"}, report.Items[0].VersionIDs)
+	require.Equal([]string{"delete-marker-v3"}, report.Items[0].DeleteMarkerVersionIDs)
+}
+
+func TestPlannerPlan_RejectsTopologyWithoutLatestEntry(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	store := newFakeStore()
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{Versions: []ObjectVersion{{
+		VersionID: "single-block-v1",
+		ETag:      "etag-v1",
+		Bytes:     42,
+	}}}
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, report.Items[0].SkipReason)
+	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
 func TestPlannerPlan_RejectsMutableNullVersionIDs(t *testing.T) {
@@ -718,6 +813,15 @@ func TestPlannerPlan_RejectsMutableNullVersionIDs(t *testing.T) {
 	report, err = testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
 	require.NoError(err)
 	require.Equal(SkipMissingCSCBObject, report.Items[0].SkipReason)
+
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{
+		Versions:      []ObjectVersion{{VersionID: "single-block-v1", ETag: "single-block-etag", Bytes: 42, IsLatest: true}},
+		DeleteMarkers: []ObjectDeleteMarker{{VersionID: "null"}},
+	}
+	store.heads[row.PrimaryObjectKey] = cscbObjectHead(1024, 1024)
+	report, err = testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+	require.NoError(err)
+	require.Equal(SkipSingleBlockVersionIDUnavailable, report.Items[0].SkipReason)
 }
 
 func TestPlannerPlan_RequiresIndependentPayloadComparison(t *testing.T) {
@@ -859,7 +963,7 @@ func TestPlannerApply_RequiresStableRetentionSafetyConfigurationBeforeDelete(t *
 	repo.safetyObservations = map[string]fakeSafetyObservation{
 		req.Bucket + "\x00" + key: {
 			configurationSHA256: keySHA256("previous-safe-configuration"),
-			firstObservedAt:     observedAt.Add(-retirementSafetyQuiescencePeriod),
+			firstObservedAt:     observedAt.Add(-RetentionSafetyQuiescencePeriod),
 		},
 	}
 	newConfigurationSHA256 := keySHA256("new-safe-configuration")
@@ -940,6 +1044,102 @@ func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.
 	require.Equal(4, store.policyCalls[cscbKey])
 }
 
+func TestPlannerHeartbeatsFromRowAndVersionLoops(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{row}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[row.PrimaryObjectKey] = cscbHead
+	store.versionHeads[versionObjectKey(row.PrimaryObjectKey, cscbHead.VersionID)] = cscbHead
+	planner := testPlanner(repo, store)
+	var beats []string
+	WithHeartbeat(func(_ context.Context, details ...any) {
+		require.NotEmpty(details)
+		label, ok := details[0].(string)
+		require.True(ok)
+		beats = append(beats, label)
+	})(planner)
+
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Contains(beats, "retirement.plan.row")
+
+	require.NoError(planner.Apply(context.Background(), req, report))
+	require.Contains(beats, "retirement.apply.row")
+	require.Contains(beats, "retirement.delete.version")
+}
+
+func TestPlannerApply_RefusesToStartWhenAlreadyCanceled(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", "consolidated/canary.cscb.zstd", now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{row}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[row.PrimaryObjectKey] = cscbHead
+	store.versionHeads[versionObjectKey(row.PrimaryObjectKey, cscbHead.VersionID)] = cscbHead
+	planner := testPlanner(repo, store)
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Equal(ActionDeleteObjectVersion, report.Items[0].Action)
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = planner.Apply(canceledCtx, req, report)
+	require.ErrorIs(err, context.Canceled)
+	require.Empty(store.deleted)
+	require.Equal(ActionSkip, report.Items[0].Action)
+	require.Equal(SkipNotAttemptedAfterFailure, report.Items[0].SkipReason)
+}
+
+func TestPlannerApply_HaltsBetweenRowsOnCancellation(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cscbKey := "consolidated/shared.cscb.zstd"
+	first := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	second := testRow(428058001, "hash-428058001", "single-block/428058001.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{first, second}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	for _, row := range repo.rows {
+		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	}
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[cscbKey] = cscbHead
+	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	planner := testPlanner(repo, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Cancellation arrives while the first row is deleting; the second row
+	// must never be attempted.
+	WithHeartbeat(func(_ context.Context, details ...any) {
+		if len(details) > 0 && details[0] == "retirement.delete.version" {
+			cancel()
+		}
+	})(planner)
+
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+
+	err = planner.Apply(ctx, req, report)
+	require.ErrorIs(err, context.Canceled)
+	require.Len(store.deleted, 1)
+	require.Equal(ActionSkip, report.Items[1].Action)
+	require.Equal(SkipNotAttemptedAfterFailure, report.Items[1].SkipReason)
+}
+
 func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -990,6 +1190,90 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	require.NotNil(finalReport.Items[0].RetirementVerifiedAt)
 	require.Empty(finalReport.Items[0].Key)
 	require.Equal(keySHA256(row.SingleBlockObjectKey), manifest.SingleBlockObjectKeySHA256)
+}
+
+func TestPlannerApply_DeletesEveryPinnedVersionAndDeleteMarker(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newMultiVersionExecutableTestFixture(t)
+
+	err := planner.Apply(context.Background(), req, report)
+	require.NoError(err)
+	require.Equal(ActionDeletedVerified, report.Items[0].Action)
+	require.Len(store.deleted, 3)
+	require.Equal([]string{"single-block-v1", "single-block-v2", "delete-marker-v1"}, []string{
+		store.deleted[0].VersionID,
+		store.deleted[1].VersionID,
+		store.deleted[2].VersionID,
+	})
+	require.Empty(store.topologies[row.SingleBlockObjectKey].Versions)
+	require.Empty(store.topologies[row.SingleBlockObjectKey].DeleteMarkers)
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	manifest := repo.manifests[row.BlockMetadataID]
+	require.Equal(RetirementStateDeletedVerified, manifest.State)
+	require.Equal([]string{"single-block-v2", "single-block-v1"}, manifest.SingleBlockObjectVersionIDs)
+	require.Equal([]string{"delete-marker-v1"}, manifest.SingleBlockDeleteMarkerVersionIDs)
+}
+
+func TestPlannerReconcile_ResumesPartiallyDeletedPinnedTopology(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newMultiVersionExecutableTestFixture(t)
+	store.deleteErrors["single-block-v2"] = errors.New("temporary S3 failure")
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Equal([]string{"single-block-v1"}, []string{store.deleted[0].VersionID})
+	require.Equal(RetirementStateDeleting, repo.manifests[row.BlockMetadataID].State)
+	require.Len(store.topologies[row.SingleBlockObjectKey].Versions, 1)
+	require.Len(store.topologies[row.SingleBlockObjectKey].DeleteMarkers, 1)
+	require.Equal(row.SingleBlockObjectKey, repo.rows[0].SingleBlockObjectKey)
+
+	delete(store.deleteErrors, "single-block-v2")
+	manifest := repo.manifests[row.BlockMetadataID]
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	manifest.ClaimExpiresAt = &expiredAt
+	repo.manifests[row.BlockMetadataID] = manifest
+	repo.updateManifestRow(manifest)
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Equal(ActionDeletedVerified, reconcileReport.Items[0].Action)
+	require.Equal([]string{"single-block-v1", "single-block-v2", "delete-marker-v1"}, []string{
+		store.deleted[0].VersionID,
+		store.deleted[1].VersionID,
+		store.deleted[2].VersionID,
+	})
+	require.Empty(repo.rows[0].SingleBlockObjectKey)
+	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
+	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
+}
+
+func TestPlannerReconcile_RejectsUnpinnedVersionAfterPartialDeletion(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newMultiVersionExecutableTestFixture(t)
+	store.deleteErrors["single-block-v2"] = errors.New("temporary S3 failure")
+	require.Error(planner.Apply(context.Background(), req, report))
+
+	delete(store.deleteErrors, "single-block-v2")
+	topology := store.topologies[row.SingleBlockObjectKey]
+	topology.Versions = append(topology.Versions, ObjectVersion{
+		VersionID: "unpinned-v3",
+		ETag:      "unpinned-etag",
+		Bytes:     40,
+	})
+	store.topologies[row.SingleBlockObjectKey] = topology
+	manifest := repo.manifests[row.BlockMetadataID]
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	manifest.ClaimExpiresAt = &expiredAt
+	repo.manifests[row.BlockMetadataID] = manifest
+	repo.updateManifestRow(manifest)
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.Error(err)
+	require.Equal(ActionSkip, reconcileReport.Items[0].Action)
+	require.Equal(SkipUnsafeSingleBlockVersionTopology, reconcileReport.Items[0].SkipReason)
+	require.Len(store.deleted, 1)
+	require.Equal(row.SingleBlockObjectKey, repo.rows[0].SingleBlockObjectKey)
 }
 
 func TestPlannerApply_RejectsTamperedReportBeforeManifestWrite(t *testing.T) {
@@ -1485,19 +1769,61 @@ func newExecutableTestFixture(t *testing.T) (
 	return row, repo, store, planner, verifier, req, report
 }
 
+func newMultiVersionExecutableTestFixture(t *testing.T) (
+	MetadataRow,
+	*fakeRepo,
+	*fakeStore,
+	*Planner,
+	*fakePayloadVerifier,
+	PlanRequest,
+	*Report,
+) {
+	t.Helper()
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	row := testRow(
+		428058000,
+		"hash-428058000",
+		"single-block/428058000.zstd",
+		"consolidated/canary.cscb.zstd",
+		now.Add(-8*24*time.Hour),
+	)
+	repo := &fakeRepo{rows: []MetadataRow{row}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	store.topologies[row.SingleBlockObjectKey] = ObjectVersionTopology{
+		Versions: []ObjectVersion{
+			{VersionID: "single-block-v2", ETag: "etag-v2", Bytes: 42, IsLatest: true},
+			{VersionID: "single-block-v1", ETag: "etag-v1", Bytes: 41},
+		},
+		DeleteMarkers: []ObjectDeleteMarker{{VersionID: "delete-marker-v1"}},
+	}
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[row.PrimaryObjectKey] = cscbHead
+	store.versionHeads[versionObjectKey(row.PrimaryObjectKey, cscbHead.VersionID)] = cscbHead
+	planner, verifier := newTestPlanner(repo, store)
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(ActionDeleteObjectVersion, report.Items[0].Action)
+	return row, repo, store, planner, verifier, req, report
+}
+
 func testRequest(now time.Time, execute bool) PlanRequest {
 	return PlanRequest{
-		Environment:               "production",
-		Blockchain:                "solana",
-		Network:                   "mainnet",
-		Bucket:                    "co-chainstorage-solana-mainnet-prod",
-		Tag:                       0,
-		StartHeight:               428058000,
-		EndHeight:                 428059000,
-		Now:                       now,
-		Execute:                   execute,
-		ClientMigrationApproved:   true,
-		SingleBlockWritersGuarded: true,
+		Environment:                 "production",
+		Blockchain:                  "solana",
+		Network:                     "mainnet",
+		Bucket:                      "co-chainstorage-solana-mainnet-prod",
+		Tag:                         0,
+		StartHeight:                 428058000,
+		EndHeight:                   428059000,
+		Now:                         now,
+		Execute:                     execute,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
 		Approval: Approval{
 			Chain:       "solana-mainnet",
 			StartHeight: 428058000,

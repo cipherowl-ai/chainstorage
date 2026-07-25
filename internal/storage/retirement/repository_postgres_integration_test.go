@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,25 +105,26 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	repo := NewPostgresRepository(db)
 	preparedAt := time.Now().UTC().Add(7 * 24 * time.Hour)
 	manifest := RetirementManifest{
-		BlockMetadataID:                blockMetadataID,
-		Tag:                            tag,
-		Height:                         height,
-		Hash:                           hash,
-		State:                          RetirementStateEligible,
-		Bucket:                         "integration-bucket",
-		SingleBlockObjectKey:           singleBlockKey,
-		SingleBlockObjectKeySHA256:     keySHA256(singleBlockKey),
-		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
-		SingleBlockObjectETag:          "single-block-etag",
-		SingleBlockObjectBytes:         256,
-		ConsolidatedObjectKey:          cscbKey,
-		ConsolidatedObjectVersionID:    "cscb-v1",
-		ConsolidatedObjectETag:         "cscb-etag",
-		ConsolidatedByteOffset:         0,
-		ConsolidatedByteLength:         128,
-		ConsolidatedUncompressedLength: 128,
-		PayloadSHA256:                  keySHA256("payload"),
-		PreparedAt:                     preparedAt,
+		BlockMetadataID:                   blockMetadataID,
+		Tag:                               tag,
+		Height:                            height,
+		Hash:                              hash,
+		State:                             RetirementStateEligible,
+		Bucket:                            "integration-bucket",
+		SingleBlockObjectKey:              singleBlockKey,
+		SingleBlockObjectKeySHA256:        keySHA256(singleBlockKey),
+		SingleBlockObjectVersionIDs:       []string{"single-block-v2", "single-block-v1"},
+		SingleBlockDeleteMarkerVersionIDs: []string{"delete-marker-v1"},
+		SingleBlockObjectETag:             "single-block-etag",
+		SingleBlockObjectBytes:            256,
+		ConsolidatedObjectKey:             cscbKey,
+		ConsolidatedObjectVersionID:       "cscb-v1",
+		ConsolidatedObjectETag:            "cscb-etag",
+		ConsolidatedByteOffset:            0,
+		ConsolidatedByteLength:            128,
+		ConsolidatedUncompressedLength:    128,
+		PayloadSHA256:                     keySHA256("payload"),
+		PreparedAt:                        preparedAt,
 	}
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO block_single_block_retention (
@@ -206,6 +208,9 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET consolidated_object_etag = 'mutated' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change pinned retirement manifest fields")
+	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET single_block_delete_marker_version_ids = ARRAY['mutated-marker'] WHERE block_metadata_id = $1`, blockMetadataID)
+	require.Error(err)
+	require.Contains(err.Error(), "cannot change pinned retirement delete-marker versions")
 
 	startedAt := preparedAt.Add(24 * time.Hour)
 	claimToken := "integration-claim"
@@ -297,7 +302,8 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Equal(RetirementStateDeletedVerified, row.Retirement.State)
 	require.Empty(row.Retirement.SingleBlockObjectKey)
 	require.Equal(keySHA256(singleBlockKey), row.Retirement.SingleBlockObjectKeySHA256)
-	require.Equal([]string{"single-block-v1"}, row.Retirement.SingleBlockObjectVersionIDs)
+	require.Equal([]string{"single-block-v2", "single-block-v1"}, row.Retirement.SingleBlockObjectVersionIDs)
+	require.Equal([]string{"delete-marker-v1"}, row.Retirement.SingleBlockDeleteMarkerVersionIDs)
 	require.Empty(row.Retirement.SingleBlockObjectETag)
 	require.Empty(row.Retirement.ClaimToken)
 	require.Nil(row.Retirement.ClaimExpiresAt)
@@ -316,6 +322,151 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, 0)
 	require.NoError(err)
 	require.Empty(pending)
+}
+
+func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_100_000_000 + unique%100_000_000)
+	startHeight := uint64(8_100_000_000 + unique%100_000_000)
+	dueKey := fmt.Sprintf("consolidated/due-%d.cscb.gzip", unique)
+	futureKey := fmt.Sprintf("consolidated/future-%d.cscb.gzip", unique)
+	blockMetadataIDs := make([]int64, 0, 3)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest DISABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_manifest WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest ENABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention DISABLE TRIGGER block_single_block_retention_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention ENABLE TRIGGER block_single_block_retention_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, blockMetadataID := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, blockMetadataID)
+		}
+	}()
+
+	now := time.Now().UTC()
+	for index := 0; index < 3; index++ {
+		height := startHeight + uint64(index)
+		consolidatedKey := dueKey
+		deleteAfter := now.Add(-time.Hour)
+		if index == 2 {
+			consolidatedKey = futureKey
+			deleteAfter = now.Add(time.Hour)
+		}
+		var blockMetadataID int64
+		err = db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, $7, $8, $9)
+			RETURNING id`,
+			height,
+			tag,
+			height-1,
+			consolidatedKey,
+			now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			uint64(index*128),
+			128,
+			128,
+		).Scan(&blockMetadataID)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, blockMetadataID)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)`,
+			height,
+			blockMetadataID,
+			tag,
+		)
+		require.NoError(err)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			blockMetadataID,
+			tag,
+			height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			consolidatedKey,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			uint64(index*128),
+			128,
+			128,
+			now.Add(-96*time.Hour),
+			now.Add(-96*time.Hour),
+			deleteAfter,
+		)
+		require.NoError(err)
+	}
+
+	repo := NewPostgresRepository(db)
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	require.NoError(err)
+	require.Len(cohorts, 1)
+	require.Equal([]RetentionCohort{{
+		ConsolidatedObjectKey: dueKey,
+		StartHeight:           startHeight,
+		EndHeight:             startHeight + 2,
+		RowCount:              2,
+		EligibleAt:            cohorts[0].EligibleAt,
+	}}, cohorts)
+	require.WithinDuration(now.Add(-time.Hour), cohorts[0].EligibleAt, time.Second)
+
+	bounded, err := repo.ListDueRetentionCohorts(
+		ctx,
+		tag,
+		startHeight+1,
+		startHeight+2,
+		10,
+	)
+	require.NoError(err)
+	require.Len(bounded, 1)
+	require.Equal(startHeight+1, bounded[0].StartHeight)
+	require.Equal(startHeight+2, bounded[0].EndHeight)
+	require.Equal(uint64(1), bounded[0].RowCount)
+
+	_, err = db.ExecContext(ctx, `
+		INSERT INTO cscb_repair_manifest (
+			tag, state, bucket, old_consolidated_object_key_main,
+			start_height, end_height, canonical_block_count, total_block_count,
+			row_set_sha256
+		) VALUES ($1, 'preparing', $2, $3, $4, $5, 2, 2, $6)`,
+		tag,
+		"integration-bucket",
+		dueKey,
+		startHeight,
+		startHeight+2,
+		strings.Repeat("a", 64),
+	)
+	require.NoError(err)
+	cohorts, err = repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	require.NoError(err)
+	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
 }
 
 func openRetirementIntegrationDB(ctx context.Context, cfg *config.PostgresConfig) (*sql.DB, error) {

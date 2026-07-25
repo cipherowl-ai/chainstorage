@@ -6,10 +6,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 
 	"golang.org/x/xerrors"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
+	storageutils "github.com/coinbase/chainstorage/internal/storage/utils"
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 const (
@@ -116,7 +120,7 @@ func (r *repairerImpl) prepare(
 	}
 	var pending *Manifest
 	if objectKey == "" {
-		pending, err = r.repository.FindPending(ctx, tag)
+		pending, err = r.repository.FindPending(ctx, tag, startHeight, endHeight)
 	} else {
 		pending, err = r.repository.FindByObjectKey(ctx, tag, objectKey)
 	}
@@ -188,7 +192,22 @@ func (r *repairerImpl) inspectFencedCandidate(
 		if objectKeySHA256(block.SingleBlockObjectKey) != block.SingleBlockObjectKeySHA256 {
 			return nil, xerrors.Errorf("single-block object key audit digest changed at height %d", block.Height)
 		}
-		singleVersion, err := r.inspectExactObjectVersion(ctx, block.SingleBlockObjectKey)
+		singleBlockCandidate := retirement.Candidate{
+			Bucket: manifest.Bucket,
+			Key:    block.SingleBlockObjectKey,
+			Height: block.Height,
+			Hash:   block.Hash,
+			Tag:    block.Tag,
+		}
+		var singleVersion ObjectVersion
+		if manifest.CanonicalBlockCount == 0 {
+			// A zero-canonical repair leaves active metadata on an unversioned
+			// single-block key. It is only safe when no historical version can
+			// become current later.
+			singleVersion, err = r.inspectExactObjectVersion(ctx, block.SingleBlockObjectKey)
+		} else {
+			singleVersion, err = r.inspectSingleBlockObjectVersion(ctx, singleBlockCandidate)
+		}
 		if err != nil {
 			return nil, xerrors.Errorf("failed to pin single-block object at height %d: %w", block.Height, err)
 		}
@@ -203,9 +222,10 @@ func (r *repairerImpl) inspectFencedCandidate(
 			return nil, xerrors.Errorf("failed to verify source CSCB payload at height %d: %w", block.Height, err)
 		}
 		hasStoragePlacement = hasStoragePlacement || oldInspection.HasStoragePlacement
-		if singleInspection.CanonicalSHA256 != oldInspection.CanonicalSHA256 {
-			return nil, xerrors.Errorf("single-block and CSCB payloads differ at height %d", block.Height)
-		}
+		// The pinned current single-block version is the authoritative repair
+		// input. The old CSCB is decoded to verify its identity and classify its
+		// placement state, but its provider-specific payload rendering is not
+		// copied into the rebuilt object.
 		block.PayloadSHA256 = singleInspection.CanonicalSHA256
 		reportProgress(progress, "prepare_payload_verified", i+1, len(blocks), block.Height)
 	}
@@ -237,7 +257,7 @@ func (r *repairerImpl) Restore(ctx context.Context, repairID int64, progress Pro
 	}
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersionForManifest(ctx, manifest, block); err != nil {
 			return nil, xerrors.Errorf("single-block object changed before restore at height %d: %w", block.Height, err)
 		}
 		reportProgress(progress, "restore_object_revalidated", i+1, len(manifest.Blocks), block.Height)
@@ -255,6 +275,192 @@ func (r *repairerImpl) Get(ctx context.Context, repairID int64) (*Manifest, erro
 		return nil, err
 	}
 	return r.repository.Get(ctx, repairID)
+}
+
+func (r *repairerImpl) VisitPinnedPayloads(
+	ctx context.Context,
+	repairID int64,
+	progress Progress,
+	visit func(PinnedPayload) error,
+) error {
+	if err := r.validate(); err != nil {
+		return err
+	}
+	if visit == nil {
+		return xerrors.New("pinned payload visitor is required")
+	}
+	manifest, err := r.repository.Get(ctx, repairID)
+	if err != nil {
+		return err
+	}
+	if manifest.State != StatePrepared && manifest.State != StateRestored {
+		return xerrors.Errorf(
+			"CSCB repair must be prepared or restored before loading pinned payloads: id=%d state=%s",
+			manifest.ID,
+			manifest.State,
+		)
+	}
+	if manifest.CanonicalBlockCount == 0 {
+		return xerrors.Errorf("zero-canonical CSCB repair does not produce a rebuilt object: id=%d", manifest.ID)
+	}
+	if err := r.requirePinnedObjectVersion(
+		ctx,
+		manifest.OldConsolidatedObjectKey,
+		manifest.OldConsolidatedObjectVersion,
+	); err != nil {
+		return xerrors.Errorf("CSCB repair source changed before rebuild: %w", err)
+	}
+
+	verifier := retirement.NewPinnedPayloadVerifier(r.store)
+	for i := range manifest.Blocks {
+		block := &manifest.Blocks[i]
+		if err := r.requirePinnedSingleBlockObjectVersion(
+			ctx,
+			block.SingleBlockObjectKey,
+			block.SingleBlockObjectVersion,
+		); err != nil {
+			return xerrors.Errorf("single-block object changed before rebuild at height %d: %w", block.Height, err)
+		}
+		candidate := makePayloadCandidate(
+			manifest,
+			block,
+			manifest.OldConsolidatedObjectKey,
+			manifest.OldConsolidatedObjectVersion,
+		)
+		pinnedBlock, inspection, err := verifier.ReadSingleBlock(ctx, candidate)
+		if err != nil {
+			return xerrors.Errorf("failed to read pinned single-block payload at height %d: %w", block.Height, err)
+		}
+		if inspection.CanonicalSHA256 != block.PayloadSHA256 {
+			return xerrors.Errorf("single-block payload digest changed before rebuild at height %d", block.Height)
+		}
+		normalized := storageutils.CloneBlockWithoutStoragePlacement(pinnedBlock)
+		raw, err := (proto.MarshalOptions{Deterministic: true}).Marshal(normalized)
+		if err != nil {
+			return xerrors.Errorf("failed to marshal pinned block at height %d: %w", block.Height, err)
+		}
+		metadata, ok := proto.Clone(normalized.GetMetadata()).(*api.BlockMetadata)
+		if !ok || metadata == nil {
+			return xerrors.Errorf("pinned block metadata is missing at height %d", block.Height)
+		}
+		if err := visit(PinnedPayload{
+			BlockMetadataID: block.BlockMetadataID,
+			Metadata:        metadata,
+			RawBlockPayload: raw,
+		}); err != nil {
+			return xerrors.Errorf("failed to stage pinned payload at height %d: %w", block.Height, err)
+		}
+		reportProgress(progress, "pinned_payload_loaded", i+1, len(manifest.Blocks), block.Height)
+	}
+	return nil
+}
+
+func (r *repairerImpl) VerifyAndPromote(
+	ctx context.Context,
+	repairID int64,
+	objectKey string,
+	placements []RebuiltPlacement,
+	singleBlockObjectRetention time.Duration,
+	progress Progress,
+) (*Manifest, error) {
+	if err := r.validate(); err != nil {
+		return nil, err
+	}
+	if singleBlockObjectRetention <= 0 {
+		return nil, xerrors.New("positive single-block object retention is required")
+	}
+	manifest, err := r.repository.Get(ctx, repairID)
+	if err != nil {
+		return nil, err
+	}
+	if manifest.State == StateVerified || manifest.State == StateCompleted {
+		return manifest, nil
+	}
+	if manifest.State != StatePrepared && manifest.State != StateRestored {
+		return nil, xerrors.Errorf(
+			"CSCB repair must be prepared or restored before promotion: id=%d state=%s",
+			manifest.ID,
+			manifest.State,
+		)
+	}
+	if manifest.CanonicalBlockCount == 0 {
+		return nil, xerrors.Errorf("zero-canonical CSCB repair cannot promote a rebuilt object: id=%d", manifest.ID)
+	}
+	if objectKey == "" || objectKey == manifest.OldConsolidatedObjectKey {
+		return nil, xerrors.Errorf("rebuilt CSCB object key is invalid: %q", objectKey)
+	}
+	newVersion, err := r.inspectExactObjectVersion(ctx, objectKey)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to pin rebuilt CSCB object: %w", err)
+	}
+	placementsByID, err := validateRebuiltPlacements(manifest, objectKey, placements)
+	if err != nil {
+		return nil, err
+	}
+
+	verifier := retirement.NewPinnedPayloadVerifier(r.store)
+	for i := range manifest.Blocks {
+		block := &manifest.Blocks[i]
+		if err := r.requirePinnedSingleBlockObjectVersion(
+			ctx,
+			block.SingleBlockObjectKey,
+			block.SingleBlockObjectVersion,
+		); err != nil {
+			return nil, xerrors.Errorf("single-block object changed during rebuild at height %d: %w", block.Height, err)
+		}
+		placement := placementsByID[block.BlockMetadataID]
+		candidate := retirement.Candidate{
+			Bucket:             manifest.Bucket,
+			Key:                block.SingleBlockObjectKey,
+			VersionID:          block.SingleBlockObjectVersion.VersionID,
+			Height:             block.Height,
+			Hash:               block.Hash,
+			ConsolidatedKey:    objectKey,
+			Tag:                block.Tag,
+			CSCBVersionID:      newVersion.VersionID,
+			ByteOffset:         placement.ByteOffset,
+			ByteLength:         placement.ByteLength,
+			UncompressedLength: placement.UncompressedLength,
+		}
+		singleInspection, err := verifier.InspectSingleBlock(ctx, candidate)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to re-read pinned single-block payload at height %d: %w", block.Height, err)
+		}
+		if singleInspection.CanonicalSHA256 != block.PayloadSHA256 {
+			return nil, xerrors.Errorf("single-block payload digest changed during rebuild at height %d", block.Height)
+		}
+		cleanInspection, err := verifier.InspectConsolidated(ctx, candidate)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to verify rebuilt CSCB payload at height %d: %w", block.Height, err)
+		}
+		if cleanInspection.HasStoragePlacement || cleanInspection.CanonicalSHA256 != block.PayloadSHA256 {
+			return nil, xerrors.Errorf("rebuilt CSCB payload is not storage-neutral and identical at height %d", block.Height)
+		}
+		reportProgress(progress, "rebuilt_payload_verified", i+1, len(manifest.Blocks), block.Height)
+	}
+	if err := r.requirePinnedObjectVersion(
+		ctx,
+		manifest.OldConsolidatedObjectKey,
+		manifest.OldConsolidatedObjectVersion,
+	); err != nil {
+		return nil, xerrors.Errorf("CSCB repair source changed before atomic promotion: %w", err)
+	}
+	if err := r.requirePinnedObjectVersion(ctx, objectKey, newVersion); err != nil {
+		return nil, xerrors.Errorf("rebuilt CSCB changed before atomic promotion: %w", err)
+	}
+	completed, err := r.repository.PromoteCompleted(
+		ctx,
+		manifest.ID,
+		objectKey,
+		newVersion,
+		placements,
+		singleBlockObjectRetention,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to atomically promote and complete CSCB repair: %w", err)
+	}
+	reportProgress(progress, "promoted_completed", len(completed.Blocks), len(completed.Blocks), completed.EndHeight-1)
+	return completed, nil
 }
 
 func (r *repairerImpl) VerifyRebuilt(ctx context.Context, repairID int64, progress Progress) (*Manifest, error) {
@@ -283,7 +489,7 @@ func (r *repairerImpl) VerifyRebuilt(ctx context.Context, repairID int64, progre
 	verifiedCanonical := 0
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersionForManifest(ctx, manifest, block); err != nil {
 			return nil, xerrors.Errorf("single-block object changed during repair at height %d: %w", block.Height, err)
 		}
 		payload := makePayloadCandidate(manifest, block, newObjectKey, newVersion)
@@ -358,7 +564,7 @@ func (r *repairerImpl) Complete(ctx context.Context, repairID int64, progress Pr
 	verifier := retirement.NewPinnedPayloadVerifier(r.store)
 	for i := range manifest.Blocks {
 		block := &manifest.Blocks[i]
-		if err := r.requirePinnedObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion); err != nil {
+		if err := r.requirePinnedSingleBlockObjectVersionForManifest(ctx, manifest, block); err != nil {
 			return nil, xerrors.Errorf("single-block object changed before completion at height %d: %w", block.Height, err)
 		}
 		payload := makePayloadCandidate(manifest, block, manifest.NewConsolidatedObjectKey, manifest.NewConsolidatedObjectVersion)
@@ -369,7 +575,7 @@ func (r *repairerImpl) Complete(ctx context.Context, repairID int64, progress Pr
 		if singleInspection.CanonicalSHA256 != block.PayloadSHA256 {
 			return nil, xerrors.Errorf("single-block payload digest changed before completion at height %d", block.Height)
 		}
-		if block.Canonical {
+		if manifest.NewConsolidatedObjectKey != "" && block.ActiveObjectKey == manifest.NewConsolidatedObjectKey {
 			cleanInspection, err := verifier.InspectConsolidated(ctx, payload)
 			if err != nil {
 				return nil, xerrors.Errorf("failed to verify rebuilt CSCB payload before completion at height %d: %w", block.Height, err)
@@ -470,12 +676,88 @@ func (r *repairerImpl) inspectExactObjectVersion(ctx context.Context, key string
 	return result, nil
 }
 
+func (r *repairerImpl) inspectSingleBlockObjectVersion(
+	ctx context.Context,
+	candidate retirement.Candidate,
+) (ObjectVersion, error) {
+	topology, err := r.store.ListObjectVersions(ctx, r.bucket, candidate.Key)
+	if err != nil {
+		return ObjectVersion{}, err
+	}
+	current, err := currentSingleBlockObjectVersion(topology)
+	if err != nil {
+		return ObjectVersion{}, xerrors.Errorf("unsafe single-block object topology: key=%q: %w", candidate.Key, err)
+	}
+	// Historical versions are not read by Chainstorage and are not repair
+	// inputs. The caller pins and verifies the current immutable version against
+	// the source CSCB before changing any metadata.
+	return current, nil
+}
+
 func (r *repairerImpl) requirePinnedObjectVersion(ctx context.Context, key string, expected ObjectVersion) error {
 	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
 	if err != nil {
 		return err
 	}
 	return requireExactTopology(topology, expected)
+}
+
+func (r *repairerImpl) requirePinnedSingleBlockObjectVersion(ctx context.Context, key string, expected ObjectVersion) error {
+	topology, err := r.store.ListObjectVersions(ctx, r.bucket, key)
+	if err != nil {
+		return err
+	}
+	current, err := currentSingleBlockObjectVersion(topology)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return xerrors.Errorf(
+			"pinned single-block object current version changed: version=%q etag=%q bytes=%d",
+			current.VersionID,
+			current.ETag,
+			current.Bytes,
+		)
+	}
+	return nil
+}
+
+func (r *repairerImpl) requirePinnedSingleBlockObjectVersionForManifest(
+	ctx context.Context,
+	_ *Manifest,
+	block *Block,
+) error {
+	return r.requirePinnedSingleBlockObjectVersion(ctx, block.SingleBlockObjectKey, block.SingleBlockObjectVersion)
+}
+
+func currentSingleBlockObjectVersion(topology retirement.ObjectVersionTopology) (ObjectVersion, error) {
+	if len(topology.Versions) == 0 || len(topology.DeleteMarkers) != 0 {
+		return ObjectVersion{}, xerrors.Errorf(
+			"expected at least one data version and zero delete markers, got versions=%d delete_markers=%d",
+			len(topology.Versions),
+			len(topology.DeleteMarkers),
+		)
+	}
+
+	var current ObjectVersion
+	currentFound := false
+	for _, version := range topology.Versions {
+		candidate := ObjectVersion{VersionID: version.VersionID, ETag: version.ETag, Bytes: version.Bytes}
+		if !immutableVersionID(candidate.VersionID) || candidate.ETag == "" || candidate.Bytes == 0 {
+			return ObjectVersion{}, xerrors.Errorf("single-block object version is not immutable and complete: version=%q", candidate.VersionID)
+		}
+		if version.IsLatest {
+			if currentFound {
+				return ObjectVersion{}, xerrors.New("single-block object has multiple latest data versions")
+			}
+			current = candidate
+			currentFound = true
+		}
+	}
+	if !currentFound {
+		return ObjectVersion{}, xerrors.New("single-block object has no latest data version")
+	}
+	return current, nil
 }
 
 func requireExactTopology(topology retirement.ObjectVersionTopology, expected ObjectVersion) error {
@@ -523,6 +805,45 @@ func rebuiltObjectKey(manifest *Manifest) (string, error) {
 		return "", xerrors.Errorf("rebuilt CSCB reused dirty object key %q", objectKey)
 	}
 	return objectKey, nil
+}
+
+func validateRebuiltPlacements(
+	manifest *Manifest,
+	objectKey string,
+	placements []RebuiltPlacement,
+) (map[int64]RebuiltPlacement, error) {
+	if manifest == nil || len(placements) != len(manifest.Blocks) {
+		return nil, xerrors.Errorf(
+			"rebuilt CSCB placement count mismatch: expected=%d actual=%d",
+			len(manifest.Blocks),
+			len(placements),
+		)
+	}
+	blocksByID := make(map[int64]Block, len(manifest.Blocks))
+	for _, block := range manifest.Blocks {
+		blocksByID[block.BlockMetadataID] = block
+	}
+	placementsByID := make(map[int64]RebuiltPlacement, len(placements))
+	for _, placement := range placements {
+		block, ok := blocksByID[placement.BlockMetadataID]
+		if !ok {
+			return nil, xerrors.Errorf("rebuilt CSCB returned unexpected metadata_id=%d", placement.BlockMetadataID)
+		}
+		if _, ok := placementsByID[placement.BlockMetadataID]; ok {
+			return nil, xerrors.Errorf("rebuilt CSCB returned duplicate metadata_id=%d", placement.BlockMetadataID)
+		}
+		if placement.Height != block.Height || placement.Hash != block.Hash ||
+			placement.ObjectFormat != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH ||
+			placement.ByteLength == 0 || placement.UncompressedLength == 0 {
+			return nil, xerrors.Errorf(
+				"rebuilt CSCB placement is invalid for metadata_id=%d object=%q",
+				placement.BlockMetadataID,
+				objectKey,
+			)
+		}
+		placementsByID[placement.BlockMetadataID] = placement
+	}
+	return placementsByID, nil
 }
 
 func makePayloadCandidate(

@@ -47,6 +47,7 @@ const metadataRowColumns = `
 	retirement.single_block_object_key_main,
 	retirement.single_block_object_key_sha256,
 	retirement.single_block_object_version_ids,
+	retirement.single_block_delete_marker_version_ids,
 	retirement.single_block_object_etag,
 	retirement.single_block_object_bytes,
 	retirement.consolidated_object_key_main,
@@ -228,14 +229,19 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		INSERT INTO block_single_block_retention (
 			block_metadata_id, tag, height, hash, state, bucket,
 			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_delete_marker_version_ids,
 			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
 			payload_sha256, outcome, prepared_at, updated_at
 		)
 		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9, $10, $11,
-			$12, $13, $14, $15, $16, $17, $18, $19, $20, $20)
+			$12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $21)
 		ON CONFLICT (block_metadata_id) DO NOTHING`
+	deleteMarkerVersionIDs := manifest.SingleBlockDeleteMarkerVersionIDs
+	if deleteMarkerVersionIDs == nil {
+		deleteMarkerVersionIDs = []string{}
+	}
 	if _, err := tx.ExecContext(ctx, insert,
 		manifest.BlockMetadataID,
 		manifest.Tag,
@@ -246,6 +252,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		manifest.SingleBlockObjectKey,
 		manifest.SingleBlockObjectKeySHA256,
 		pq.Array(manifest.SingleBlockObjectVersionIDs),
+		pq.Array(deleteMarkerVersionIDs),
 		manifest.SingleBlockObjectETag,
 		manifest.SingleBlockObjectBytes,
 		manifest.ConsolidatedObjectKey,
@@ -842,6 +849,7 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 		SELECT
 			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
 			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_delete_marker_version_ids,
 			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
@@ -915,6 +923,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var retirementSingleBlockKey sql.NullString
 	var retirementSingleBlockKeySHA256 sql.NullString
 	var retirementVersionIDs pq.StringArray
+	var retirementDeleteMarkerVersionIDs pq.StringArray
 	var retirementSingleBlockETag sql.NullString
 	var retirementSingleBlockBytes sql.NullInt64
 	var retirementConsolidatedKey sql.NullString
@@ -967,6 +976,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&retirementSingleBlockKey,
 		&retirementSingleBlockKeySHA256,
 		&retirementVersionIDs,
+		&retirementDeleteMarkerVersionIDs,
 		&retirementSingleBlockETag,
 		&retirementSingleBlockBytes,
 		&retirementConsolidatedKey,
@@ -1014,33 +1024,34 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	}
 	if retirementBlockMetadataID.Valid {
 		row.Retirement = &RetirementManifest{
-			BlockMetadataID:                retirementBlockMetadataID.Int64,
-			Tag:                            row.Tag,
-			Height:                         row.Height,
-			Hash:                           row.Hash,
-			State:                          retirementState.String,
-			Bucket:                         retirementBucket.String,
-			SingleBlockObjectKey:           retirementSingleBlockKey.String,
-			SingleBlockObjectKeySHA256:     retirementSingleBlockKeySHA256.String,
-			SingleBlockObjectVersionIDs:    append([]string(nil), retirementVersionIDs...),
-			SingleBlockObjectETag:          retirementSingleBlockETag.String,
-			SingleBlockObjectBytes:         nullableUint64(retirementSingleBlockBytes),
-			ConsolidatedObjectKey:          retirementConsolidatedKey.String,
-			ConsolidatedObjectVersionID:    retirementConsolidatedVersionID.String,
-			ConsolidatedObjectETag:         retirementConsolidatedETag.String,
-			ConsolidatedByteOffset:         nullableUint64(retirementByteOffset),
-			ConsolidatedByteLength:         nullableUint64(retirementByteLength),
-			ConsolidatedUncompressedLength: nullableUint64(retirementUncompressedLength),
-			PayloadSHA256:                  retirementPayloadSHA256.String,
-			Outcome:                        retirementOutcome.String,
-			AttemptCount:                   int(retirementAttemptCount.Int64),
-			ClaimToken:                     retirementClaimToken.String,
-			ClaimExpiresAt:                 nullableTime(retirementClaimExpiresAt),
-			PreparedAt:                     retirementPreparedAt.Time,
-			DeleteStartedAt:                nullableTime(retirementDeleteStartedAt),
-			LastAttemptAt:                  nullableTime(retirementLastAttemptAt),
-			DeletedAt:                      nullableTime(retirementDeletedAt),
-			VerifiedAt:                     nullableTime(retirementVerifiedAt),
+			BlockMetadataID:                   retirementBlockMetadataID.Int64,
+			Tag:                               row.Tag,
+			Height:                            row.Height,
+			Hash:                              row.Hash,
+			State:                             retirementState.String,
+			Bucket:                            retirementBucket.String,
+			SingleBlockObjectKey:              retirementSingleBlockKey.String,
+			SingleBlockObjectKeySHA256:        retirementSingleBlockKeySHA256.String,
+			SingleBlockObjectVersionIDs:       append([]string(nil), retirementVersionIDs...),
+			SingleBlockDeleteMarkerVersionIDs: append([]string(nil), retirementDeleteMarkerVersionIDs...),
+			SingleBlockObjectETag:             retirementSingleBlockETag.String,
+			SingleBlockObjectBytes:            nullableUint64(retirementSingleBlockBytes),
+			ConsolidatedObjectKey:             retirementConsolidatedKey.String,
+			ConsolidatedObjectVersionID:       retirementConsolidatedVersionID.String,
+			ConsolidatedObjectETag:            retirementConsolidatedETag.String,
+			ConsolidatedByteOffset:            nullableUint64(retirementByteOffset),
+			ConsolidatedByteLength:            nullableUint64(retirementByteLength),
+			ConsolidatedUncompressedLength:    nullableUint64(retirementUncompressedLength),
+			PayloadSHA256:                     retirementPayloadSHA256.String,
+			Outcome:                           retirementOutcome.String,
+			AttemptCount:                      int(retirementAttemptCount.Int64),
+			ClaimToken:                        retirementClaimToken.String,
+			ClaimExpiresAt:                    nullableTime(retirementClaimExpiresAt),
+			PreparedAt:                        retirementPreparedAt.Time,
+			DeleteStartedAt:                   nullableTime(retirementDeleteStartedAt),
+			LastAttemptAt:                     nullableTime(retirementLastAttemptAt),
+			DeletedAt:                         nullableTime(retirementDeletedAt),
+			VerifiedAt:                        nullableTime(retirementVerifiedAt),
 		}
 	}
 	return row, nil
@@ -1051,6 +1062,7 @@ func getManifestForUpdate(ctx context.Context, tx *sql.Tx, blockMetadataID int64
 		SELECT
 			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
 			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
+			single_block_delete_marker_version_ids,
 			single_block_object_etag, single_block_object_bytes,
 			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
 			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
@@ -1071,6 +1083,7 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	var hash sql.NullString
 	var singleBlockKey sql.NullString
 	var versionIDs pq.StringArray
+	var deleteMarkerVersionIDs pq.StringArray
 	var singleBlockBytes int64
 	var byteOffset int64
 	var byteLength int64
@@ -1092,6 +1105,7 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 		&singleBlockKey,
 		&manifest.SingleBlockObjectKeySHA256,
 		&versionIDs,
+		&deleteMarkerVersionIDs,
 		&manifest.SingleBlockObjectETag,
 		&singleBlockBytes,
 		&manifest.ConsolidatedObjectKey,
@@ -1119,6 +1133,7 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	manifest.Hash = hash.String
 	manifest.SingleBlockObjectKey = singleBlockKey.String
 	manifest.SingleBlockObjectVersionIDs = append([]string(nil), versionIDs...)
+	manifest.SingleBlockDeleteMarkerVersionIDs = append([]string(nil), deleteMarkerVersionIDs...)
 	manifest.SingleBlockObjectBytes = uint64(singleBlockBytes)
 	manifest.ConsolidatedByteOffset = uint64(byteOffset)
 	manifest.ConsolidatedByteLength = uint64(byteLength)
@@ -1157,7 +1172,11 @@ func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) erro
 func validatePreparedManifest(manifest RetirementManifest) error {
 	if manifest.BlockMetadataID <= 0 || manifest.Bucket == "" || manifest.SingleBlockObjectKey == "" ||
 		manifest.SingleBlockObjectKeySHA256 != keySHA256(manifest.SingleBlockObjectKey) ||
-		len(manifest.SingleBlockObjectVersionIDs) != 1 || !isImmutableVersionID(manifest.SingleBlockObjectVersionIDs[0]) ||
+		!validPinnedVersionIDs(
+			firstString(manifest.SingleBlockObjectVersionIDs),
+			manifest.SingleBlockObjectVersionIDs,
+			manifest.SingleBlockDeleteMarkerVersionIDs,
+		) ||
 		manifest.SingleBlockObjectETag == "" || manifest.SingleBlockObjectBytes == 0 ||
 		manifest.ConsolidatedObjectKey == "" || !isImmutableVersionID(manifest.ConsolidatedObjectVersionID) || manifest.ConsolidatedObjectETag == "" ||
 		manifest.ConsolidatedByteLength == 0 || manifest.ConsolidatedUncompressedLength == 0 ||
@@ -1179,6 +1198,7 @@ func samePreparedManifest(existing RetirementManifest, expected RetirementManife
 		existing.SingleBlockObjectKey == expected.SingleBlockObjectKey &&
 		existing.SingleBlockObjectKeySHA256 == expected.SingleBlockObjectKeySHA256 &&
 		sameStrings(existing.SingleBlockObjectVersionIDs, expected.SingleBlockObjectVersionIDs) &&
+		sameStrings(existing.SingleBlockDeleteMarkerVersionIDs, expected.SingleBlockDeleteMarkerVersionIDs) &&
 		existing.SingleBlockObjectETag == expected.SingleBlockObjectETag &&
 		existing.SingleBlockObjectBytes == expected.SingleBlockObjectBytes &&
 		existing.ConsolidatedObjectKey == expected.ConsolidatedObjectKey &&

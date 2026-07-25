@@ -194,17 +194,18 @@ type (
 	}
 
 	WorkflowsConfig struct {
-		Workers           []WorkerConfig                  `mapstructure:"workers"`
-		Backfiller        BackfillerWorkflowConfig        `mapstructure:"backfiller"`
-		Poller            PollerWorkflowConfig            `mapstructure:"poller"`
-		Benchmarker       BenchmarkerWorkflowConfig       `mapstructure:"benchmarker"`
-		Monitor           MonitorWorkflowConfig           `mapstructure:"monitor"`
-		Streamer          StreamerWorkflowConfig          `mapstructure:"streamer"`
-		CrossValidator    CrossValidatorWorkflowConfig    `mapstructure:"cross_validator"`
-		EventBackfiller   EventBackfillerWorkflowConfig   `mapstructure:"event_backfiller"`
-		Replicator        ReplicatorWorkflowConfig        `mapstructure:"replicator"`
-		Migrator          MigratorWorkflowConfig          `mapstructure:"migrator"`
-		BatchConsolidator BatchConsolidatorWorkflowConfig `mapstructure:"batch_consolidator"`
+		Workers              []WorkerConfig                     `mapstructure:"workers"`
+		Backfiller           BackfillerWorkflowConfig           `mapstructure:"backfiller"`
+		Poller               PollerWorkflowConfig               `mapstructure:"poller"`
+		Benchmarker          BenchmarkerWorkflowConfig          `mapstructure:"benchmarker"`
+		Monitor              MonitorWorkflowConfig              `mapstructure:"monitor"`
+		Streamer             StreamerWorkflowConfig             `mapstructure:"streamer"`
+		CrossValidator       CrossValidatorWorkflowConfig       `mapstructure:"cross_validator"`
+		EventBackfiller      EventBackfillerWorkflowConfig      `mapstructure:"event_backfiller"`
+		Replicator           ReplicatorWorkflowConfig           `mapstructure:"replicator"`
+		Migrator             MigratorWorkflowConfig             `mapstructure:"migrator"`
+		BatchConsolidator    BatchConsolidatorWorkflowConfig    `mapstructure:"batch_consolidator"`
+		SingleBlockRetention SingleBlockRetentionWorkflowConfig `mapstructure:"single_block_retention"`
 	}
 
 	WorkerConfig struct {
@@ -331,6 +332,11 @@ type (
 		BatchSize      uint64 `mapstructure:"batch_size" validate:"required"`
 		CheckpointSize uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
 		MaxBlocks      uint64 `mapstructure:"max_blocks"`
+	}
+
+	SingleBlockRetentionWorkflowConfig struct {
+		WorkflowConfig  `mapstructure:",squash"`
+		MaxObjectRanges int `mapstructure:"max_object_ranges" validate:"required,gt=0,lte=250"`
 	}
 
 	RosettaConfig struct {

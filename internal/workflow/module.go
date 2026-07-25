@@ -19,6 +19,7 @@ var Module = fx.Options(
 	fx.Provide(NewReplicator),
 	fx.Provide(NewMigrator),
 	fx.Provide(NewBatchConsolidator),
+	fx.Provide(NewSingleBlockRetention),
 )
 
 const (

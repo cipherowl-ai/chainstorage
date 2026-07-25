@@ -21,19 +21,19 @@ import (
 )
 
 type retirementFlags struct {
-	tag                       uint32
-	startHeight               uint64
-	endHeight                 uint64
-	limit                     uint64
-	approveChain              string
-	approveStartHeight        uint64
-	approveEndHeight          uint64
-	clientMigrationApproved   bool
-	singleBlockWritersGuarded bool
-	fallbackErrorCount        uint64
-	execute                   bool
-	confirmProductionDelete   bool
-	reportFile                string
+	tag                         uint32
+	startHeight                 uint64
+	endHeight                   uint64
+	limit                       uint64
+	approveChain                string
+	approveStartHeight          uint64
+	approveEndHeight            uint64
+	directStorageClientsGuarded bool
+	singleBlockWritersGuarded   bool
+	fallbackErrorCount          uint64
+	execute                     bool
+	confirmProductionDelete     bool
+	reportFile                  string
 }
 
 var (
@@ -67,9 +67,10 @@ version, verifies the key has no remaining versions, transactionally clears the 
 then performs a fresh CSCB range read before marking the retirement verified.
 The command also verifies the live bucket policy denies every unconditional write and every API
 delete to each CSCB key, so no newer version or delete marker can replace the pinned payload.
-Execution requires --single-block-writers-guarded to confirm every live single-block writer
-honors the retirement fence. Production execution additionally requires
---confirm-production-delete.`,
+Chainstorage API and SDK clients remain compatible with CSCB storage. Execution requires
+--direct-storage-clients-guarded only for consumers that bypass Chainstorage and read object
+storage directly, plus --single-block-writers-guarded to confirm every live single-block writer
+honors the retirement fence. Production execution additionally requires --confirm-production-delete.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSingleBlockRetirementPlan(cmd.Context(), singleBlockRetirementFlags)
 		},
@@ -106,7 +107,9 @@ func addSingleBlockRetirementFlags(cmd *cobra.Command, flags *retirementFlags) {
 	cmd.Flags().StringVar(&flags.approveChain, "approve-chain", "", "explicit chain approval, e.g. solana-mainnet")
 	cmd.Flags().Uint64Var(&flags.approveStartHeight, "approve-start-height", 0, "explicit approved start height")
 	cmd.Flags().Uint64Var(&flags.approveEndHeight, "approve-end-height", 0, "explicit approved end height")
-	cmd.Flags().BoolVar(&flags.clientMigrationApproved, "client-migration-approved", false, "confirm known file clients are migrated or out of scope")
+	cmd.Flags().BoolVar(&flags.directStorageClientsGuarded, "direct-storage-clients-guarded", false, "confirm direct object-storage consumers are migrated or out of scope; Chainstorage API and SDK clients are compatible")
+	cmd.Flags().BoolVar(&flags.directStorageClientsGuarded, "client-migration-approved", false, "deprecated alias for --direct-storage-clients-guarded")
+	_ = cmd.Flags().MarkDeprecated("client-migration-approved", "use --direct-storage-clients-guarded; API and SDK clients do not require migration")
 	cmd.Flags().BoolVar(&flags.singleBlockWritersGuarded, "single-block-writers-guarded", false, "confirm every live single-block writer honors the retirement fence")
 	cmd.Flags().Uint64Var(&flags.fallbackErrorCount, "fallback-read-errors", 0, "active fallback/read error count from the operator's observation window")
 	cmd.Flags().BoolVar(&flags.execute, "execute", false, "execute guarded retirement state transitions and exact-version deletion")
@@ -174,21 +177,21 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 		retirement.NewS3ObjectStore(deps.S3Client),
 	)
 	req := retirement.PlanRequest{
-		Environment:               string(cfg.Env()),
-		Blockchain:                commonFlags.blockchain,
-		Network:                   commonFlags.network,
-		Sidechain:                 commonFlags.sidechain,
-		Bucket:                    cfg.AWS.Bucket,
-		Tag:                       tag,
-		StartHeight:               flags.startHeight,
-		EndHeight:                 flags.endHeight,
-		Limit:                     flags.limit,
-		Now:                       time.Now().UTC(),
-		Execute:                   flags.execute,
-		ProductionDeleteEnabled:   flags.confirmProductionDelete,
-		ClientMigrationApproved:   flags.clientMigrationApproved,
-		SingleBlockWritersGuarded: flags.singleBlockWritersGuarded,
-		FallbackErrorCount:        flags.fallbackErrorCount,
+		Environment:                 string(cfg.Env()),
+		Blockchain:                  commonFlags.blockchain,
+		Network:                     commonFlags.network,
+		Sidechain:                   commonFlags.sidechain,
+		Bucket:                      cfg.AWS.Bucket,
+		Tag:                         tag,
+		StartHeight:                 flags.startHeight,
+		EndHeight:                   flags.endHeight,
+		Limit:                       flags.limit,
+		Now:                         time.Now().UTC(),
+		Execute:                     flags.execute,
+		ProductionDeleteEnabled:     flags.confirmProductionDelete,
+		DirectStorageClientsGuarded: flags.directStorageClientsGuarded,
+		SingleBlockWritersGuarded:   flags.singleBlockWritersGuarded,
+		FallbackErrorCount:          flags.fallbackErrorCount,
 		Approval: retirement.Approval{
 			Chain:       flags.approveChain,
 			StartHeight: flags.approveStartHeight,
@@ -249,21 +252,21 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 
 	planner := retirement.NewPlanner(retirement.NewPostgresRepository(db), retirement.NewS3ObjectStore(deps.S3Client))
 	req := retirement.PlanRequest{
-		Environment:               string(cfg.Env()),
-		Blockchain:                commonFlags.blockchain,
-		Network:                   commonFlags.network,
-		Sidechain:                 commonFlags.sidechain,
-		Bucket:                    cfg.AWS.Bucket,
-		Tag:                       tag,
-		StartHeight:               flags.startHeight,
-		EndHeight:                 flags.endHeight,
-		Limit:                     flags.limit,
-		Now:                       time.Now().UTC(),
-		Execute:                   flags.execute,
-		ProductionDeleteEnabled:   flags.confirmProductionDelete,
-		ClientMigrationApproved:   flags.clientMigrationApproved,
-		SingleBlockWritersGuarded: flags.singleBlockWritersGuarded,
-		FallbackErrorCount:        flags.fallbackErrorCount,
+		Environment:                 string(cfg.Env()),
+		Blockchain:                  commonFlags.blockchain,
+		Network:                     commonFlags.network,
+		Sidechain:                   commonFlags.sidechain,
+		Bucket:                      cfg.AWS.Bucket,
+		Tag:                         tag,
+		StartHeight:                 flags.startHeight,
+		EndHeight:                   flags.endHeight,
+		Limit:                       flags.limit,
+		Now:                         time.Now().UTC(),
+		Execute:                     flags.execute,
+		ProductionDeleteEnabled:     flags.confirmProductionDelete,
+		DirectStorageClientsGuarded: flags.directStorageClientsGuarded,
+		SingleBlockWritersGuarded:   flags.singleBlockWritersGuarded,
+		FallbackErrorCount:          flags.fallbackErrorCount,
 		Approval: retirement.Approval{
 			Chain:       flags.approveChain,
 			StartHeight: flags.approveStartHeight,

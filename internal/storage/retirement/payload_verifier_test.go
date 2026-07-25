@@ -104,7 +104,7 @@ func TestPayloadVerifier_ParsesSupportedSingleBlockCompression(t *testing.T) {
 	}
 }
 
-func TestPayloadVerifier_RejectsSemanticAndSerializedMismatch(t *testing.T) {
+func TestPayloadVerifier_RejectsSerializedMismatch(t *testing.T) {
 	require := require.New(t)
 	candidate, store, _ := retirementPayloadFixture(t)
 	different := &api.Block{
