@@ -56,6 +56,7 @@ func TestPendingConcurrentIndexNamesOnlyIncludesPendingMigrations(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, []string{
 		"idx_block_consolidation_shadow_object_key_reference",
+		"idx_block_consolidation_shadow_retention_due",
 		"idx_block_metadata_cscb_repair_candidate",
 		"idx_block_metadata_object_key_reference",
 	}, indexNames)
