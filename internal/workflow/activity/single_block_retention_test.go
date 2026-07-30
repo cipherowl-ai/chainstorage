@@ -245,11 +245,12 @@ func TestValidateSingleBlockRetentionProcessRequestRequiresExecutionGates(t *tes
 	require.ErrorContains(t, err, "approval names chain")
 
 	base.ApprovedChain = singleBlockRetentionExpectedChain(cfg)
-	base.ApprovedEndHeight = 102
+	base.ApprovedStartHeight = 101
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
-	require.ErrorContains(t, err, "does not exactly match cohort")
+	require.ErrorContains(t, err, "outside approval envelope")
 
-	base.ApprovedEndHeight = 101
+	base.ApprovedStartHeight = 99
+	base.ApprovedEndHeight = 102
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
 	require.ErrorContains(t, err, "production-delete")
 
@@ -276,13 +277,13 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 		Cohort:              cohort,
 		Execute:             true,
 		ApprovedChain:       "solana-mainnet",
-		ApprovedStartHeight: 100,
-		ApprovedEndHeight:   110,
+		ApprovedStartHeight: 90,
+		ApprovedEndHeight:   120,
 	})
 	require.Equal(t, retirement.Approval{
 		Chain:       "solana-mainnet",
-		StartHeight: 100,
-		EndHeight:   110,
+		StartHeight: 90,
+		EndHeight:   120,
 	}, executeReq.Approval)
 
 	// An omitted operator approval stays omitted; it is never synthesized

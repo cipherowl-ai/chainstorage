@@ -330,8 +330,8 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
 		FallbackErrorCount:          request.FallbackErrorCount,
 		// The approval is the operator's assertion passed through unchanged.
-		// The planner independently re-verifies it against the actual chain
-		// and the exact range under deletion.
+		// The planner independently re-verifies the actual chain and requires
+		// the cohort under deletion to be contained by this exact envelope.
 		Approval: retirement.Approval{
 			Chain:       request.ApprovedChain,
 			StartHeight: request.ApprovedStartHeight,
@@ -402,14 +402,14 @@ func validateSingleBlockRetentionProcessRequest(
 			)
 		}
 	}
-	if request.ApprovedStartHeight != cohort.StartHeight || request.ApprovedEndHeight != cohort.EndHeight {
+	if request.ApprovedStartHeight > cohort.StartHeight || request.ApprovedEndHeight < cohort.EndHeight {
 		return xerrors.Errorf(
-			"retention execution approval range [%d, %d) does not exactly match cohort %q [%d, %d)",
-			request.ApprovedStartHeight,
-			request.ApprovedEndHeight,
+			"retention execution cohort %q [%d, %d) is outside approval envelope [%d, %d)",
 			cohort.ConsolidatedObjectKey,
 			cohort.StartHeight,
 			cohort.EndHeight,
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
 		)
 	}
 	if cfg != nil && isProductionRetentionEnvironment(cfg.Env()) && !request.ProductionDeleteEnabled {

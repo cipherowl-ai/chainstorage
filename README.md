@@ -723,21 +723,24 @@ go run ./cmd/admin workflow start --workflow single_block_retention --input '{"T
 ```
 
 The workflow is manual-only while production retention is being verified; no
-recurring cron or Temporal Schedule starts it. Each explicit run is bounded by
-`MaxObjectRanges`, and `MoreEligibleRanges` reports whether the selected range
-still has a backlog. Omitting `Execute` keeps the run read-only. Execution
-requires Postgres metadata plus versioned S3 storage, an explicit
+recurring cron or Temporal Schedule starts it. `MaxObjectRanges` bounds each
+Temporal run. A read-only run remains bounded and reports the current backlog
+through `MoreEligibleRanges`. An execute run continues as new with the same
+selection and approval envelope until no currently due or pending cohorts
+remain; it never bypasses each cohort's retention clock. Execution requires
+Postgres metadata plus versioned S3 storage, an explicit
 `FallbackReadsValidated` assertion with zero `FallbackErrorCount`, and a
 separate operator approval (`ApprovedChain`, `ApprovedStartHeight`,
-`ApprovedEndHeight`) that must exactly match both the selection range and the
-selected cohort; the approval is passed through unchanged and is never derived
-from whatever cohort the selector discovers, so unbounded execution requests
-are rejected. API and SDK clients continue to use the same Chainstorage
-interface; the `DirectStorageClientsGuarded` execution gate applies only to
-consumers that bypass Chainstorage and access object storage directly. The
-process activity heartbeats from the row and per-version delete loops under a
-bounded heartbeat timeout, so stopping the workflow cancels destructive work
-between steps instead of letting it run to completion.
+`ApprovedEndHeight`) that must exactly match the selection range. Every selected
+cohort must be fully contained by that immutable envelope across continuations;
+the approval is passed through unchanged and is never derived from selector
+output, so unbounded execution requests are rejected. API and SDK clients
+continue to use the same Chainstorage interface; the
+`DirectStorageClientsGuarded` execution gate applies only to consumers that
+bypass Chainstorage and access object storage directly. The process activity
+heartbeats from the row and per-version delete loops under a bounded heartbeat
+timeout, so stopping the workflow cancels destructive work between steps
+instead of letting it run to completion.
 
 Stop the monitor workflow:
 ```shell

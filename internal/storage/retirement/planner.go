@@ -1499,12 +1499,13 @@ func isPrimaryConsolidated(row MetadataRow) bool {
 
 func approvalMatches(req PlanRequest) bool {
 	return normalizeApprovalChain(req.Approval.Chain) == normalizeApprovalChain(actualChain(req)) &&
-		req.Approval.StartHeight == req.StartHeight &&
-		req.Approval.EndHeight == req.EndHeight
+		req.Approval.StartHeight <= req.StartHeight &&
+		req.Approval.EndHeight >= req.EndHeight
 }
 
 // approvalGateBlocked reports whether the operator approval blocks this
-// request. Execution always requires an exact chain/range approval. A
+// request. Execution always requires an explicit chain/envelope approval that
+// fully contains the cohort under deletion. A
 // read-only run may omit the approval entirely so it can still reach the S3
 // safety inspection, but a supplied approval is validated even on dry runs so
 // the report predicts the execute-time gate.

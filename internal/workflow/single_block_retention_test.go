@@ -2,13 +2,16 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/testsuite"
+	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 
 	"github.com/coinbase/chainstorage/internal/cadence"
@@ -128,6 +131,7 @@ func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDel
 	require.True(s.T(), result.MoreEligibleRanges)
 	require.Equal(s.T(), uint64(1), result.ProcessedObjectRanges)
 	require.Equal(s.T(), uint64(10), result.PlannedRows)
+	require.False(s.T(), result.SweepCompleted)
 	require.Empty(s.T(), result.CompletedObjectRanges)
 	require.Empty(s.T(), result.FailureMessage)
 }
@@ -179,9 +183,17 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 	require.Equal(s.T(), uint64(110), result.ApprovedEndHeight)
 	require.Equal(s.T(), uint64(1), result.SelectedObjectRanges)
 	require.Equal(s.T(), uint64(1), result.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(1), result.CompletedObjectRangeCount)
 	require.Equal(s.T(), uint64(10), result.DeletedVerifiedRows)
 	require.Equal(s.T(), uint64(10), result.DeletedVersions)
 	require.Equal(s.T(), uint64(1000), result.RetiredBytes)
+	require.True(s.T(), result.SweepCompleted)
+	require.Equal(s.T(), &SingleBlockRetentionCompletedRange{
+		ConsolidatedObjectKey: cohort.ConsolidatedObjectKey,
+		StartHeight:           100,
+		EndHeight:             110,
+		EligibleRows:          10,
+	}, result.LastCompletedObjectRange)
 	require.Equal(s.T(), []SingleBlockRetentionCompletedRange{
 		{
 			ConsolidatedObjectKey: cohort.ConsolidatedObjectKey,
@@ -192,12 +204,60 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 	}, result.CompletedObjectRanges)
 }
 
-func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenCohortDoesNotMatchApprovedRange() {
+func (s *singleBlockRetentionTestSuite) TestExecuteProcessesCohortsInsideApprovedEnvelope() {
 	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
 	second := testRetentionCohort("consolidated/200-210.cscb.zstd", 200, 210)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{first, second},
+		}, nil)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			require.Equal(s.T(), uint64(100), request.ApprovedStartHeight)
+			require.Equal(s.T(), uint64(210), request.ApprovedEndHeight)
+			return &activity.SingleBlockRetentionRangeResult{
+				Cohort:                   request.Cohort,
+				ScannedRows:              request.Cohort.RowCount,
+				DeletedVerifiedRows:      request.Cohort.RowCount,
+				VerifiedThroughExclusive: request.Cohort.EndHeight,
+				Terminal:                 true,
+			}, nil
+		}).Twice()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   210,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           210,
+	})
+	require.NoError(s.T(), err)
+
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.True(s.T(), result.SweepCompleted)
+	require.Equal(s.T(), uint64(2), result.SelectedObjectRanges)
+	require.Equal(s.T(), uint64(2), result.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(2), result.CompletedObjectRangeCount)
+	require.Equal(s.T(), uint64(20), result.DeletedVerifiedRows)
+	require.Equal(s.T(), second.EndHeight, result.LastCompletedObjectRange.EndHeight)
+}
+
+func (s *singleBlockRetentionTestSuite) TestLegacyExecuteRequiresExactCohortApproval() {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnGetVersion(
+		singleBlockRetentionRangeSweepChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionRangeSweepVersion,
+	).Return(temporalworkflow.DefaultVersion)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{cohort},
 		}, nil)
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
@@ -213,6 +273,160 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenCohortDoesNotM
 		ApprovedEndHeight:           210,
 	})
 	require.ErrorContains(s.T(), err, "does not exactly match the approved range")
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeCheckpoint() {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{cohort},
+			HasMore: true,
+		}, nil)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionRangeResult{
+			Cohort:                   cohort,
+			ScannedRows:              10,
+			DeletedVerifiedRows:      10,
+			DeletedVersions:          10,
+			RetiredBytes:             1000,
+			VerifiedThroughExclusive: 110,
+			Terminal:                 true,
+		}, nil)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		MaxObjectRanges:             1,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.Error(s.T(), err)
+	require.True(s.T(), IsContinueAsNewError(err))
+
+	var continueAsNewErr *temporalworkflow.ContinueAsNewError
+	require.True(s.T(), errors.As(err, &continueAsNewErr))
+	var nextRequest SingleBlockRetentionRequest
+	require.NoError(
+		s.T(),
+		converter.GetDefaultDataConverter().FromPayloads(continueAsNewErr.Input, &nextRequest),
+	)
+	require.Equal(s.T(), uint64(100), nextRequest.StartHeight)
+	require.Equal(s.T(), uint64(120), nextRequest.EndHeight)
+	require.Equal(s.T(), uint64(100), nextRequest.ApprovedStartHeight)
+	require.Equal(s.T(), uint64(120), nextRequest.ApprovedEndHeight)
+	require.NotNil(s.T(), nextRequest.Checkpoint)
+	require.Equal(s.T(), uint32(2), nextRequest.Checkpoint.EffectiveTag)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ContinueAsNewCount)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.SelectedObjectRanges)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.CompletedObjectRangeCount)
+	require.Equal(s.T(), uint64(10), nextRequest.Checkpoint.DeletedVerifiedRows)
+	require.Equal(s.T(), uint64(10), nextRequest.Checkpoint.DeletedVersions)
+	require.Equal(s.T(), uint64(1000), nextRequest.Checkpoint.RetiredBytes)
+	require.Equal(s.T(), uint64(110), nextRequest.Checkpoint.LastCompletedObjectRange.EndHeight)
+}
+
+func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalResult() {
+	startedAt := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	firstCompleted := &SingleBlockRetentionCompletedRange{
+		ConsolidatedObjectKey: "consolidated/100-110.cscb.zstd",
+		StartHeight:           100,
+		EndHeight:             110,
+		EligibleRows:          10,
+	}
+	second := testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120)
+	s.env.SetContinuedExecutionRunID("previous-run")
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{second},
+		}, nil)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionRangeResult{
+			Cohort:                   second,
+			ScannedRows:              10,
+			DeletedVerifiedRows:      10,
+			DeletedVersions:          10,
+			RetiredBytes:             1000,
+			VerifiedThroughExclusive: 120,
+			Terminal:                 true,
+		}, nil)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		MaxObjectRanges:             1,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+		Checkpoint: &SingleBlockRetentionCheckpoint{
+			StartedAt:                 startedAt,
+			EffectiveTag:              2,
+			ContinueAsNewCount:        1,
+			SelectedObjectRanges:      1,
+			ProcessedObjectRanges:     1,
+			CompletedObjectRangeCount: 1,
+			ScannedRows:               10,
+			DeletedVerifiedRows:       10,
+			DeletedVersions:           10,
+			RetiredBytes:              1000,
+			LastCompletedObjectRange:  firstCompleted,
+		},
+	})
+	require.NoError(s.T(), err)
+
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.Equal(s.T(), startedAt, result.StartedAt)
+	require.True(s.T(), result.SweepCompleted)
+	require.False(s.T(), result.MoreEligibleRanges)
+	require.Equal(s.T(), uint64(1), result.ContinueAsNewCount)
+	require.Equal(s.T(), uint64(2), result.SelectedObjectRanges)
+	require.Equal(s.T(), uint64(2), result.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(2), result.CompletedObjectRangeCount)
+	require.Equal(s.T(), uint64(20), result.DeletedVerifiedRows)
+	require.Equal(s.T(), uint64(20), result.DeletedVersions)
+	require.Equal(s.T(), uint64(2000), result.RetiredBytes)
+	require.Equal(s.T(), second.EndHeight, result.LastCompletedObjectRange.EndHeight)
+	require.Equal(s.T(), []SingleBlockRetentionCompletedRange{
+		{
+			ConsolidatedObjectKey: second.ConsolidatedObjectKey,
+			StartHeight:           second.StartHeight,
+			EndHeight:             second.EndHeight,
+			EligibleRows:          second.RowCount,
+		},
+	}, result.CompletedObjectRanges)
+	require.Len(s.T(), result.RangeResults, 1)
+}
+
+func (s *singleBlockRetentionTestSuite) TestInitialExecutionRejectsCallerSuppliedCheckpoint() {
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+		Checkpoint: &SingleBlockRetentionCheckpoint{
+			StartedAt:          time.Now().UTC(),
+			ContinueAsNewCount: 1,
+		},
+	})
+	require.ErrorContains(s.T(), err, "checkpoint is internal")
 }
 
 func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce() {
@@ -357,17 +571,33 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 func TestValidateApprovedSingleBlockRetentionCohort(t *testing.T) {
 	request := &SingleBlockRetentionRequest{
 		ApprovedStartHeight: 100,
-		ApprovedEndHeight:   110,
+		ApprovedEndHeight:   120,
 	}
 	require.NoError(t, validateApprovedSingleBlockRetentionCohort(
-		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/105-110.cscb.zstd", 105, 110),
 		request,
+		true,
 	))
 	require.ErrorContains(
 		t,
 		validateApprovedSingleBlockRetentionCohort(
-			testRetentionCohort("consolidated/100-109.cscb.zstd", 100, 109),
+			testRetentionCohort("consolidated/99-110.cscb.zstd", 99, 110),
 			request,
+			true,
+		),
+		"outside the approved envelope",
+	)
+	require.NoError(t, validateApprovedSingleBlockRetentionCohort(
+		testRetentionCohort("consolidated/100-120.cscb.zstd", 100, 120),
+		request,
+		false,
+	))
+	require.ErrorContains(
+		t,
+		validateApprovedSingleBlockRetentionCohort(
+			testRetentionCohort("consolidated/105-110.cscb.zstd", 105, 110),
+			request,
+			false,
 		),
 		"does not exactly match the approved range",
 	)

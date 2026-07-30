@@ -599,6 +599,21 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 	})
 }
 
+func TestApprovalMatchesContainingEnvelope(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	req := testRequest(now, true)
+	req.Approval.StartHeight = req.StartHeight - 1000
+	req.Approval.EndHeight = req.EndHeight + 1000
+	require.True(t, approvalMatches(req))
+
+	req.Approval.StartHeight = req.StartHeight + 1
+	require.False(t, approvalMatches(req))
+
+	req = testRequest(now, true)
+	req.Approval.EndHeight = req.EndHeight - 1
+	require.False(t, approvalMatches(req))
+}
+
 func TestPlannerPlan_FallbackAndDirectStorageClientGates(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
