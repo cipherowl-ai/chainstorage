@@ -18,28 +18,23 @@ type fakeCohortRepository struct {
 	dueCutoff     time.Time
 }
 
-func (r *fakeCohortRepository) ListPendingRetentionCohorts(
+func (r *fakeCohortRepository) ListRetentionCohorts(
 	_ context.Context,
 	_ uint32,
 	_ uint64,
 	_ uint64,
 	eligibilityCutoff time.Time,
 	_ int,
-) ([]RetentionCohort, error) {
+) ([]RetentionCohort, []RetentionCohort, error) {
 	r.pendingCutoff = eligibilityCutoff
-	return r.pending, r.pendingErr
-}
-
-func (r *fakeCohortRepository) ListDueRetentionCohorts(
-	_ context.Context,
-	_ uint32,
-	_ uint64,
-	_ uint64,
-	eligibilityCutoff time.Time,
-	_ int,
-) ([]RetentionCohort, error) {
 	r.dueCutoff = eligibilityCutoff
-	return r.due, r.dueErr
+	if r.pendingErr != nil {
+		return nil, nil, r.pendingErr
+	}
+	if r.dueErr != nil {
+		return nil, nil, r.dueErr
+	}
+	return r.pending, r.due, nil
 }
 
 func TestSelectorPrioritizesPendingAndMergesDueRange(t *testing.T) {

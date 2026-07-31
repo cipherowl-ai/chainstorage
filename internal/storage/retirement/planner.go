@@ -174,7 +174,14 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	if req.Execute && !req.SingleBlockWritersGuarded {
 		return nil, xerrors.New("retirement reconciliation requires all single-block writers to honor the retirement fence")
 	}
-	manifests, err := p.repo.ListPendingRetirements(ctx, req.Tag, req.StartHeight, req.EndHeight, req.Limit)
+	manifests, err := p.repo.ListPendingRetirements(
+		ctx,
+		req.Tag,
+		req.StartHeight,
+		req.EndHeight,
+		req.EligibilityCutoff,
+		req.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -381,7 +388,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipMissingRetirementMarker
 		return item
 	}
-	if item.EligibleAt != nil && req.Now.Before(*item.EligibleAt) {
+	if item.EligibleAt != nil && req.EligibilityCutoff.Before(*item.EligibleAt) {
 		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
@@ -938,7 +945,7 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 	}
 	if row.Shadow == nil || row.Shadow.ValidatedAt == nil || row.Shadow.SingleBlockRetentionStartedAt == nil ||
 		row.Shadow.SingleBlockDeleteAfter == nil || row.Shadow.SingleBlockObjectDeletedAt != nil ||
-		req.Now.Before(*row.Shadow.SingleBlockDeleteAfter) {
+		req.EligibilityCutoff.Before(*row.Shadow.SingleBlockDeleteAfter) {
 		return false
 	}
 	retirementMatches := row.Retirement == nil || pendingRetirementMatchesCandidate(row, candidate)
@@ -1426,6 +1433,9 @@ func normalizeRequest(req *PlanRequest) error {
 	if req.Now.IsZero() {
 		req.Now = time.Now().UTC()
 	}
+	if req.EligibilityCutoff.IsZero() {
+		req.EligibilityCutoff = req.Now
+	}
 	return nil
 }
 
@@ -1498,14 +1508,21 @@ func isPrimaryConsolidated(row MetadataRow) bool {
 }
 
 func approvalMatches(req PlanRequest) bool {
-	return normalizeApprovalChain(req.Approval.Chain) == normalizeApprovalChain(actualChain(req)) &&
-		req.Approval.StartHeight <= req.StartHeight &&
-		req.Approval.EndHeight >= req.EndHeight
+	if normalizeApprovalChain(req.Approval.Chain) != normalizeApprovalChain(actualChain(req)) {
+		return false
+	}
+	if req.Approval.AllowContainingRange {
+		return req.Approval.StartHeight <= req.StartHeight &&
+			req.Approval.EndHeight >= req.EndHeight
+	}
+	return req.Approval.StartHeight == req.StartHeight &&
+		req.Approval.EndHeight == req.EndHeight
 }
 
 // approvalGateBlocked reports whether the operator approval blocks this
-// request. Execution always requires an explicit chain/envelope approval that
-// fully contains the cohort under deletion. A
+// request. Direct planner callers require an exact chain/range approval. The
+// retention workflow may explicitly opt into a containing envelope after it
+// independently validates the selected cohort against that operator input. A
 // read-only run may omit the approval entirely so it can still reach the S3
 // safety inspection, but a supplied approval is validated even on dry runs so
 // the report predicts the execute-time gate.

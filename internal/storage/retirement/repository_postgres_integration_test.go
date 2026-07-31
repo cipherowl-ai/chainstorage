@@ -319,7 +319,7 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change a verified single-block retirement")
 
-	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, 0)
+	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, time.Now().UTC(), 0)
 	require.NoError(err)
 	require.Empty(pending)
 }
@@ -464,12 +464,28 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	require.Len(pending, 1)
 	require.Equal(uint64(1), pending[0].RowCount)
 
+	futureAtCutoff, err := repo.ListPendingRetirements(
+		ctx,
+		tag,
+		startHeight,
+		startHeight+1,
+		now.Add(-2*time.Hour),
+		10,
+	)
+	require.NoError(err)
+	require.Empty(futureAtCutoff)
+
 	due, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(due, 1)
 	require.Equal(startHeight+1, due[0].StartHeight)
 	require.Equal(startHeight+2, due[0].EndHeight)
 	require.Equal(uint64(1), due[0].RowCount)
+
+	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.Equal(pending, snapshotPending)
+	require.Equal(due, snapshotDue)
 
 	merged, hasMore, err := NewSelector(repo).Select(ctx, tag, 0, 0, now, 10)
 	require.NoError(err)

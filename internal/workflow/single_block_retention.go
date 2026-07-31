@@ -212,6 +212,16 @@ func (w *SingleBlockRetention) execute(
 			)
 		}
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
+		// Preserve the deployed workflow's resolved numeric tag on the legacy
+		// version path so replayed activity commands remain compatible.
+		activityTag := tag
+		activityEligibilityCutoff := time.Time{}
+		if rangeSweepEnabled {
+			// Pin both values before crossing the workflow/activity boundary.
+			// Workers may observe a newer stable tag during a rolling deploy.
+			activityTag = encodeSingleBlockRetentionEffectiveTag(tag)
+			activityEligibilityCutoff = result.EligibilityCutoff
+		}
 		result.Tag = tag
 		result.SelectionStartHeight = request.StartHeight
 		result.SelectionEndHeight = request.EndHeight
@@ -235,13 +245,10 @@ func (w *SingleBlockRetention) execute(
 		logger.Info("single-block retention workflow started")
 		activityCtx := w.withActivityOptions(ctx)
 		selected, err := w.activity.Select(activityCtx, &activity.SingleBlockRetentionSelectRequest{
-			// Preserve the caller's tag encoding until the activity resolves it
-			// exactly once. In particular, MaxUint32 is the only encoding for
-			// effective tag zero.
-			Tag:               request.Tag,
+			Tag:               activityTag,
 			StartHeight:       request.StartHeight,
 			EndHeight:         request.EndHeight,
-			EligibilityCutoff: result.EligibilityCutoff,
+			EligibilityCutoff: activityEligibilityCutoff,
 			Limit:             maxObjectRanges,
 		})
 		if err != nil {
@@ -278,8 +285,9 @@ func (w *SingleBlockRetention) execute(
 				}
 			}
 			processRequest := &activity.SingleBlockRetentionProcessRequest{
-				Tag:                         request.Tag,
+				Tag:                         activityTag,
 				Cohort:                      cohort,
+				EligibilityCutoff:           activityEligibilityCutoff,
 				Execute:                     request.Execute,
 				ProductionDeleteEnabled:     request.ProductionDeleteEnabled,
 				DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
@@ -362,10 +370,10 @@ func (w *SingleBlockRetention) execute(
 			remaining, err := w.activity.Select(
 				activityCtx,
 				&activity.SingleBlockRetentionSelectRequest{
-					Tag:               request.Tag,
+					Tag:               activityTag,
 					StartHeight:       request.StartHeight,
 					EndHeight:         request.EndHeight,
-					EligibilityCutoff: result.EligibilityCutoff,
+					EligibilityCutoff: activityEligibilityCutoff,
 					Limit:             1,
 				},
 			)

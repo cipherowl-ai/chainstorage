@@ -21,25 +21,17 @@ type (
 	}
 
 	// CohortRepository must return row-disjoint pending and due aggregates.
-	// Selector merges aggregates for the same consolidated object by summing
-	// their row counts.
+	// Both slices must come from one database snapshot. Selector merges
+	// aggregates for the same consolidated object by summing their row counts.
 	CohortRepository interface {
-		ListPendingRetentionCohorts(
+		ListRetentionCohorts(
 			ctx context.Context,
 			tag uint32,
 			startHeight uint64,
 			endHeight uint64,
 			eligibilityCutoff time.Time,
 			limit int,
-		) ([]RetentionCohort, error)
-		ListDueRetentionCohorts(
-			ctx context.Context,
-			tag uint32,
-			startHeight uint64,
-			endHeight uint64,
-			eligibilityCutoff time.Time,
-			limit int,
-		) ([]RetentionCohort, error)
+		) ([]RetentionCohort, []RetentionCohort, error)
 	}
 
 	Selector struct {
@@ -80,7 +72,7 @@ func (s *Selector) Select(
 	}
 
 	queryLimit := limit + 1
-	pending, err := s.repo.ListPendingRetentionCohorts(
+	pending, due, err := s.repo.ListRetentionCohorts(
 		ctx,
 		tag,
 		startHeight,
@@ -89,18 +81,7 @@ func (s *Selector) Select(
 		queryLimit,
 	)
 	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list pending retention cohorts: %w", err)
-	}
-	due, err := s.repo.ListDueRetentionCohorts(
-		ctx,
-		tag,
-		startHeight,
-		endHeight,
-		eligibilityCutoff,
-		queryLimit,
-	)
-	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list due retention cohorts: %w", err)
+		return nil, false, xerrors.Errorf("failed to list retention cohorts: %w", err)
 	}
 
 	result := make([]RetentionCohort, 0, queryLimit)

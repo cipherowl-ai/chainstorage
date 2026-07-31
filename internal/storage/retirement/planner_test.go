@@ -250,12 +250,20 @@ func (r *fakeRepo) updateManifestRow(manifest RetirementManifest) {
 	}
 }
 
-func (r *fakeRepo) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error) {
+func (r *fakeRepo) ListPendingRetirements(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit uint64,
+) ([]RetirementManifest, error) {
 	var manifests []RetirementManifest
 	for _, manifest := range r.manifests {
 		if manifest.Tag == tag && manifest.Height >= startHeight && manifest.Height < endHeight &&
 			(manifest.State == RetirementStateEligible || manifest.State == RetirementStateDeleting ||
-				manifest.State == RetirementStateDeletedPendingVerification) {
+				manifest.State == RetirementStateDeletedPendingVerification) &&
+			r.retirementEligibleAt(manifest.BlockMetadataID, eligibilityCutoff) {
 			manifests = append(manifests, manifest)
 		}
 	}
@@ -264,6 +272,18 @@ func (r *fakeRepo) ListPendingRetirements(ctx context.Context, tag uint32, start
 		manifests = manifests[:limit]
 	}
 	return manifests, nil
+}
+
+func (r *fakeRepo) retirementEligibleAt(blockMetadataID int64, eligibilityCutoff time.Time) bool {
+	for _, row := range r.rows {
+		if row.BlockMetadataID != blockMetadataID {
+			continue
+		}
+		return row.Shadow != nil &&
+			row.Shadow.SingleBlockDeleteAfter != nil &&
+			!row.Shadow.SingleBlockDeleteAfter.After(eligibilityCutoff)
+	}
+	return false
 }
 
 type fakeStore struct {
@@ -448,6 +468,28 @@ func TestPlannerPlan_NotEligibleRetentionPeriod(t *testing.T) {
 	require.Zero(store.versionCalls[row.SingleBlockObjectKey])
 }
 
+func TestPlannerPlan_UsesFrozenEligibilityCutoff(t *testing.T) {
+	require := require.New(t)
+	cutoff := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	now := cutoff.Add(2 * time.Hour)
+	row := testRow(
+		100,
+		"hash-100",
+		"single-block/100.zstd",
+		"consolidated/canary.cscb.zstd",
+		cutoff.Add(-8*24*time.Hour),
+	)
+	deleteAfter := cutoff.Add(time.Hour)
+	row.Shadow.SingleBlockDeleteAfter = &deleteAfter
+	req := testRequest(now, false)
+	req.EligibilityCutoff = cutoff
+
+	report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, newFakeStore()).Plan(context.Background(), req)
+	require.NoError(err)
+	require.Len(report.Items, 1)
+	require.Equal(SkipRetentionPeriodActive, report.Items[0].SkipReason)
+}
+
 func TestPlannerPlan_MissingRetirementMarkerIsNeverEligible(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
@@ -599,11 +641,14 @@ func TestPlannerPlan_ValidationAndApprovalGates(t *testing.T) {
 	})
 }
 
-func TestApprovalMatchesContainingEnvelope(t *testing.T) {
+func TestApprovalMatchesExactRangeUnlessContainmentIsExplicit(t *testing.T) {
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	req := testRequest(now, true)
 	req.Approval.StartHeight = req.StartHeight - 1000
 	req.Approval.EndHeight = req.EndHeight + 1000
+	require.False(t, approvalMatches(req))
+
+	req.Approval.AllowContainingRange = true
 	require.True(t, approvalMatches(req))
 
 	req.Approval.StartHeight = req.StartHeight + 1
@@ -1261,6 +1306,21 @@ func TestPlannerReconcile_ResumesPartiallyDeletedPinnedTopology(t *testing.T) {
 	require.Empty(repo.rows[0].SingleBlockObjectKey)
 	require.Empty(repo.rows[0].Shadow.SingleBlockObjectKey)
 	require.Equal(RetirementStateDeletedVerified, repo.manifests[row.BlockMetadataID].State)
+}
+
+func TestPlannerReconcile_ExcludesManifestBeyondFrozenEligibilityCutoff(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, _ := newMultiVersionExecutableTestFixture(t)
+	cutoff := req.Now
+	deleteAfter := cutoff.Add(time.Hour)
+	repo.rows[0].Shadow.SingleBlockDeleteAfter = &deleteAfter
+	req.Now = cutoff.Add(2 * time.Hour)
+	req.EligibilityCutoff = cutoff
+
+	report, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Empty(report.Items)
+	require.Empty(store.deleted)
 }
 
 func TestPlannerReconcile_RejectsUnpinnedVersionAfterPartialDeletion(t *testing.T) {

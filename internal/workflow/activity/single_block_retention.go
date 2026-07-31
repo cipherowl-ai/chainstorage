@@ -41,11 +41,13 @@ type (
 	}
 
 	SingleBlockRetentionSelectRequest struct {
-		Tag               uint32
-		StartHeight       uint64
-		EndHeight         uint64
-		EligibilityCutoff time.Time `validate:"required"`
-		Limit             int       `validate:"required,gt=0,lte=250"`
+		Tag         uint32
+		StartHeight uint64
+		EndHeight   uint64
+		// A zero cutoff is accepted only for activity payloads scheduled by the
+		// pre-sweep workflow and is resolved to activity start time.
+		EligibilityCutoff time.Time
+		Limit             int `validate:"required,gt=0,lte=250"`
 	}
 
 	SingleBlockRetentionSelectResponse struct {
@@ -54,18 +56,20 @@ type (
 	}
 
 	SingleBlockRetentionProcessRequest struct {
-		Tag                         uint32
-		Cohort                      retirement.RetentionCohort
+		Tag    uint32
+		Cohort retirement.RetentionCohort
+		// A zero cutoff preserves compatibility with activity payloads
+		// scheduled before range sweeps froze their destructive set.
+		EligibilityCutoff           time.Time
 		Execute                     bool
 		ProductionDeleteEnabled     bool
 		DirectStorageClientsGuarded bool
 		SingleBlockWritersGuarded   bool
 		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
-		// Approved* carry the operator's explicit exact-range deletion
-		// approval verbatim. They are never derived from the selected cohort;
-		// execution fails closed unless they name this chain and exactly the
-		// cohort range being processed.
+		// Approved* carry the operator's explicit deletion envelope verbatim.
+		// They are never derived from the selected cohort; execution fails
+		// closed unless they name this chain and contain the cohort.
 		ApprovedChain       string
 		ApprovedStartHeight uint64
 		ApprovedEndHeight   uint64
@@ -140,13 +144,17 @@ func (a *SingleBlockRetention) executeSelect(
 		return nil, err
 	}
 	tag := a.config.GetEffectiveBlockTag(request.Tag)
+	eligibilityCutoff := resolveSingleBlockRetentionEligibilityCutoff(
+		request.EligibilityCutoff,
+		time.Now(),
+	)
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.started", tag, request.Limit)
 	cohorts, hasMore, err := selector.Select(
 		ctx,
 		tag,
 		request.StartHeight,
 		request.EndHeight,
-		request.EligibilityCutoff,
+		eligibilityCutoff,
 		request.Limit,
 	)
 	if err != nil {
@@ -157,7 +165,7 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", request.StartHeight),
 		zap.Uint64("end_height", request.EndHeight),
-		zap.Time("eligibility_cutoff", request.EligibilityCutoff),
+		zap.Time("eligibility_cutoff", eligibilityCutoff),
 		zap.Int("cohorts", len(cohorts)),
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),
@@ -317,6 +325,16 @@ func (a *SingleBlockRetention) getComponents(
 func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) retirement.PlanRequest {
 	blockchain, network, sidechain := singleBlockRetentionChainNames(a.config)
 	tag := a.config.GetEffectiveBlockTag(request.Tag)
+	now := time.Now().UTC()
+	eligibilityCutoff := resolveSingleBlockRetentionEligibilityCutoff(request.EligibilityCutoff, now)
+	approval := retirement.Approval{
+		Chain:       request.ApprovedChain,
+		StartHeight: request.ApprovedStartHeight,
+		EndHeight:   request.ApprovedEndHeight,
+	}
+	if request.ApprovedChain != "" {
+		approval.AllowContainingRange = true
+	}
 	return retirement.PlanRequest{
 		Environment:                 string(a.config.Env()),
 		Blockchain:                  blockchain,
@@ -326,7 +344,8 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		Tag:                         tag,
 		StartHeight:                 request.Cohort.StartHeight,
 		EndHeight:                   request.Cohort.EndHeight,
-		Now:                         time.Now().UTC(),
+		Now:                         now,
+		EligibilityCutoff:           eligibilityCutoff,
 		Execute:                     request.Execute,
 		ProductionDeleteEnabled:     request.ProductionDeleteEnabled,
 		DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
@@ -334,13 +353,16 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		FallbackErrorCount:          request.FallbackErrorCount,
 		// The approval is the operator's assertion passed through unchanged.
 		// The planner independently re-verifies the actual chain and requires
-		// the cohort under deletion to be contained by this exact envelope.
-		Approval: retirement.Approval{
-			Chain:       request.ApprovedChain,
-			StartHeight: request.ApprovedStartHeight,
-			EndHeight:   request.ApprovedEndHeight,
-		},
+		// the cohort under deletion to be contained by this immutable envelope.
+		Approval: approval,
 	}
+}
+
+func resolveSingleBlockRetentionEligibilityCutoff(cutoff time.Time, now time.Time) time.Time {
+	if cutoff.IsZero() {
+		return now.UTC()
+	}
+	return cutoff.UTC()
 }
 
 func singleBlockRetentionExpectedChain(cfg *config.Config) string {
