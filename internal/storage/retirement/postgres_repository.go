@@ -835,7 +835,14 @@ func nullableHashMatches(value sql.NullString, expected string) bool {
 	return value.String == expected
 }
 
-func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error) {
+func (r *PostgresRepository) ListPendingRetirements(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit uint64,
+) ([]RetirementManifest, error) {
 	if r.db == nil {
 		return nil, xerrors.New("postgres db is required")
 	}
@@ -847,21 +854,31 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 	}
 	const query = `
 		SELECT
-			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
-			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
-			single_block_delete_marker_version_ids,
-			single_block_object_etag, single_block_object_bytes,
-			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
-			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
-			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
-			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
-		FROM block_single_block_retention
-		WHERE tag = $1
-			AND height >= $2
-			AND height < $3
-			AND state IN ($4, $5, $6)
-		ORDER BY height ASC
-		LIMIT $7`
+			retention.block_metadata_id, retention.tag, retention.height, COALESCE(retention.hash, ''),
+			retention.state, retention.bucket,
+			retention.single_block_object_key_main, retention.single_block_object_key_sha256,
+			retention.single_block_object_version_ids, retention.single_block_delete_marker_version_ids,
+			retention.single_block_object_etag, retention.single_block_object_bytes,
+			retention.consolidated_object_key_main, retention.consolidated_object_version_id,
+			retention.consolidated_object_etag, retention.consolidated_byte_offset,
+			retention.consolidated_byte_length, retention.consolidated_uncompressed_length,
+			retention.payload_sha256, retention.outcome, retention.attempt_count,
+			retention.claim_token, retention.claim_expires_at, retention.prepared_at,
+			retention.delete_started_at, retention.last_attempt_at, retention.deleted_at,
+			retention.verified_at
+		FROM block_single_block_retention retention
+		JOIN block_consolidation_shadow shadow
+			ON shadow.block_metadata_id = retention.block_metadata_id
+			AND shadow.tag = retention.tag
+			AND shadow.height = retention.height
+		WHERE retention.tag = $1
+			AND retention.height >= $2
+			AND retention.height < $3
+			AND retention.state IN ($4, $5, $6)
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_delete_after <= $7
+		ORDER BY retention.height ASC
+		LIMIT $8`
 	rows, err := r.db.QueryContext(
 		ctx,
 		query,
@@ -871,6 +888,7 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 		RetirementStateEligible,
 		RetirementStateDeleting,
 		RetirementStateDeletedPendingVerification,
+		eligibilityCutoff,
 		limit,
 	)
 	if err != nil {

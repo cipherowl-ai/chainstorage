@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -245,11 +246,12 @@ func TestValidateSingleBlockRetentionProcessRequestRequiresExecutionGates(t *tes
 	require.ErrorContains(t, err, "approval names chain")
 
 	base.ApprovedChain = singleBlockRetentionExpectedChain(cfg)
-	base.ApprovedEndHeight = 102
+	base.ApprovedStartHeight = 101
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
-	require.ErrorContains(t, err, "does not exactly match cohort")
+	require.ErrorContains(t, err, "outside approval envelope")
 
-	base.ApprovedEndHeight = 101
+	base.ApprovedStartHeight = 99
+	base.ApprovedEndHeight = 102
 	err = validateSingleBlockRetentionProcessRequest(cfg, base)
 	require.ErrorContains(t, err, "production-delete")
 
@@ -274,21 +276,40 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 
 	executeReq := a.planRequest(&SingleBlockRetentionProcessRequest{
 		Cohort:              cohort,
+		EligibilityCutoff:   cohort.EligibleAt,
 		Execute:             true,
 		ApprovedChain:       "solana-mainnet",
-		ApprovedStartHeight: 100,
-		ApprovedEndHeight:   110,
+		ApprovedStartHeight: 90,
+		ApprovedEndHeight:   120,
 	})
 	require.Equal(t, retirement.Approval{
-		Chain:       "solana-mainnet",
-		StartHeight: 100,
-		EndHeight:   110,
+		Chain:                "solana-mainnet",
+		StartHeight:          90,
+		EndHeight:            120,
+		AllowContainingRange: true,
 	}, executeReq.Approval)
+	require.Equal(t, cohort.EligibleAt.UTC(), executeReq.EligibilityCutoff)
+
+	tagZeroReq := a.planRequest(&SingleBlockRetentionProcessRequest{
+		Tag:    math.MaxUint32,
+		Cohort: cohort,
+	})
+	require.Equal(t, uint32(0), tagZeroReq.Tag)
 
 	// An omitted operator approval stays omitted; it is never synthesized
 	// from the selected cohort.
 	dryRunReq := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
 	require.Equal(t, retirement.Approval{}, dryRunReq.Approval)
+	require.False(t, dryRunReq.EligibilityCutoff.IsZero())
+	require.Equal(t, dryRunReq.Now, dryRunReq.EligibilityCutoff)
+}
+
+func TestResolveSingleBlockRetentionEligibilityCutoffSupportsLegacyPayload(t *testing.T) {
+	now := time.Date(2026, 7, 31, 4, 0, 0, 0, time.FixedZone("test", 8*60*60))
+	require.Equal(t, now.UTC(), resolveSingleBlockRetentionEligibilityCutoff(time.Time{}, now))
+
+	cutoff := now.Add(-time.Hour)
+	require.Equal(t, cutoff.UTC(), resolveSingleBlockRetentionEligibilityCutoff(cutoff, now.Add(time.Hour)))
 }
 
 func TestSingleBlockRetentionChainNamesUseOperatorCompatibleComponents(t *testing.T) {

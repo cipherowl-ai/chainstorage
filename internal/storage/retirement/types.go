@@ -19,7 +19,14 @@ type (
 		RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, claimToken string, outcome string, attemptedAt time.Time) error
 		RecordRetirementObjectDeleted(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
 		FinalizeRetirement(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
-		ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error)
+		ListPendingRetirements(
+			ctx context.Context,
+			tag uint32,
+			startHeight uint64,
+			endHeight uint64,
+			eligibilityCutoff time.Time,
+			limit uint64,
+		) ([]RetirementManifest, error)
 	}
 
 	ObjectStore interface {
@@ -142,6 +149,7 @@ type (
 		EndHeight                   uint64
 		Limit                       uint64
 		Now                         time.Time
+		EligibilityCutoff           time.Time
 		Execute                     bool
 		ProductionDeleteEnabled     bool
 		DirectStorageClientsGuarded bool
@@ -151,9 +159,10 @@ type (
 	}
 
 	Approval struct {
-		Chain       string `json:"chain"`
-		StartHeight uint64 `json:"start_height"`
-		EndHeight   uint64 `json:"end_height"`
+		Chain                string `json:"chain"`
+		StartHeight          uint64 `json:"start_height"`
+		EndHeight            uint64 `json:"end_height"`
+		AllowContainingRange bool   `json:"allow_containing_range,omitempty"`
 	}
 
 	Report struct {

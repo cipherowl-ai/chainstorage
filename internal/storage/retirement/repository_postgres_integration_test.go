@@ -319,7 +319,7 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change a verified single-block retirement")
 
-	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, 0)
+	pending, err := repo.ListPendingRetirements(ctx, tag, height, height+1, time.Now().UTC(), 0)
 	require.NoError(err)
 	require.Empty(pending)
 }
@@ -425,7 +425,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	}
 
 	repo := NewPostgresRepository(db)
-	cohorts, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(cohorts, 1)
 	require.Equal([]RetentionCohort{{
@@ -437,11 +437,74 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	}}, cohorts)
 	require.WithinDuration(now.Add(-time.Hour), cohorts[0].EligibleAt, time.Second)
 
+	pendingManifest := RetirementManifest{
+		BlockMetadataID:                blockMetadataIDs[0],
+		Tag:                            tag,
+		Height:                         startHeight,
+		State:                          RetirementStateEligible,
+		Bucket:                         "integration-bucket",
+		SingleBlockObjectKey:           fmt.Sprintf("single-block/%d.gzip", startHeight),
+		SingleBlockObjectKeySHA256:     keySHA256(fmt.Sprintf("single-block/%d.gzip", startHeight)),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         128,
+		ConsolidatedObjectKey:          dueKey,
+		ConsolidatedObjectVersionID:    "cscb-v1",
+		ConsolidatedObjectETag:         "cscb-etag",
+		ConsolidatedByteOffset:         0,
+		ConsolidatedByteLength:         128,
+		ConsolidatedUncompressedLength: 128,
+		PayloadSHA256:                  keySHA256("payload"),
+		PreparedAt:                     now.Add(-30 * time.Minute),
+	}
+	require.NoError(repo.PrepareRetirement(ctx, pendingManifest))
+
+	pending, err := repo.ListPendingRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.Len(pending, 1)
+	require.Equal(uint64(1), pending[0].RowCount)
+
+	futureAtCutoff, err := repo.ListPendingRetirements(
+		ctx,
+		tag,
+		startHeight,
+		startHeight+1,
+		now.Add(-2*time.Hour),
+		10,
+	)
+	require.NoError(err)
+	require.Empty(futureAtCutoff)
+
+	due, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.Len(due, 1)
+	require.Equal(startHeight+1, due[0].StartHeight)
+	require.Equal(startHeight+2, due[0].EndHeight)
+	require.Equal(uint64(1), due[0].RowCount)
+
+	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.Equal(pending, snapshotPending)
+	require.Equal(due, snapshotDue)
+
+	merged, hasMore, err := NewSelector(repo).Select(ctx, tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.False(hasMore)
+	require.Equal([]RetentionCohort{{
+		ConsolidatedObjectKey: dueKey,
+		StartHeight:           startHeight,
+		EndHeight:             startHeight + 2,
+		RowCount:              2,
+		EligibleAt:            merged[0].EligibleAt,
+		Pending:               true,
+	}}, merged)
+
 	bounded, err := repo.ListDueRetentionCohorts(
 		ctx,
 		tag,
 		startHeight+1,
 		startHeight+2,
+		now,
 		10,
 	)
 	require.NoError(err)
@@ -464,7 +527,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		strings.Repeat("a", 64),
 	)
 	require.NoError(err)
-	cohorts, err = repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	cohorts, err = repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
 }
@@ -575,7 +638,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 	endHeight := startHeight + cohortCount
 
 	repo := NewPostgresRepository(db)
-	bounded, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, 10)
+	bounded, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, now, 10)
 	require.NoError(err)
 	require.Len(bounded, cohortCount)
 	boundedHeights := make([]uint64, 0, len(bounded))
@@ -588,7 +651,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a bounded selection must be ordered by height, not by due time",
 	)
 
-	truncated, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, 2)
+	truncated, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, now, 2)
 	require.NoError(err)
 	require.Len(truncated, 2)
 	require.Equal(
@@ -597,7 +660,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a truncated bounded selection must keep the lowest cohorts so repeated runs advance monotonically",
 	)
 
-	unbounded, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, 10)
+	unbounded, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(unbounded, cohortCount)
 	unboundedHeights := make([]uint64, 0, len(unbounded))

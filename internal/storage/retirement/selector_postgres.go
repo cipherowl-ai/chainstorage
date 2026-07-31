@@ -11,16 +11,97 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
+type retentionCohortQuerier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// ListRetentionCohorts reads pending and newly due work from one repeatable-read
+// snapshot. Without the shared snapshot, a manifest inserted between the two
+// reads can disappear from both result sets and falsely signal sweep completion.
+func (r *PostgresRepository) ListRetentionCohorts(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit int,
+) ([]RetentionCohort, []RetentionCohort, error) {
+	if r == nil || r.db == nil {
+		return nil, nil, xerrors.New("postgres db is required")
+	}
+	if limit <= 0 {
+		return nil, nil, nil
+	}
+	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelRepeatableRead,
+		ReadOnly:  true,
+	})
+	if err != nil {
+		return nil, nil, xerrors.Errorf("failed to begin retention cohort snapshot: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	pending, err := listPendingRetentionCohorts(
+		ctx,
+		tx,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		limit,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	due, err := listDueRetentionCohorts(
+		ctx,
+		tx,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		limit,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, nil, xerrors.Errorf("failed to commit retention cohort snapshot: %w", err)
+	}
+	return pending, due, nil
+}
+
 func (r *PostgresRepository) ListPendingRetentionCohorts(
 	ctx context.Context,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
+	eligibilityCutoff time.Time,
 	limit int,
 ) ([]RetentionCohort, error) {
 	if r == nil || r.db == nil {
 		return nil, xerrors.New("postgres db is required")
 	}
+	return listPendingRetentionCohorts(
+		ctx,
+		r.db,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		limit,
+	)
+}
+
+func listPendingRetentionCohorts(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit int,
+) ([]RetentionCohort, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -39,10 +120,11 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 		WHERE retention.tag = $1
 			AND retention.state IN ($2, $3, $4)
 			AND ($6::BIGINT = 0 OR (retention.height >= $5 AND retention.height < $6))
+			AND shadow.single_block_delete_after <= $7
 		GROUP BY retention.consolidated_object_key_main
 		ORDER BY MIN(retention.prepared_at), MIN(retention.height), retention.consolidated_object_key_main
-		LIMIT $7`
-	rows, err := r.db.QueryContext(
+		LIMIT $8`
+	rows, err := db.QueryContext(
 		ctx,
 		query,
 		tag,
@@ -51,6 +133,7 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 		RetirementStateDeletedPendingVerification,
 		startHeight,
 		endHeight,
+		eligibilityCutoff,
 		limit,
 	)
 	if err != nil {
@@ -96,11 +179,32 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
+	eligibilityCutoff time.Time,
 	limit int,
 ) ([]RetentionCohort, error) {
 	if r == nil || r.db == nil {
 		return nil, xerrors.New("postgres db is required")
 	}
+	return listDueRetentionCohorts(
+		ctx,
+		r.db,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		limit,
+	)
+}
+
+func listDueRetentionCohorts(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit int,
+) ([]RetentionCohort, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
@@ -113,13 +217,20 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 			WHERE shadow.tag = $1
 				AND shadow.validated_at IS NOT NULL
 				AND shadow.single_block_delete_after IS NOT NULL
-				AND shadow.single_block_delete_after <= CURRENT_TIMESTAMP
+				AND shadow.single_block_delete_after <= $6
 				AND shadow.single_block_object_deleted_at IS NULL
 				AND shadow.single_block_object_key_main IS NOT NULL
 				AND shadow.single_block_object_key_main <> ''
 				AND shadow.consolidated_object_key_main IS NOT NULL
 				AND shadow.consolidated_object_key_main <> ''
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
+				AND NOT EXISTS (
+					SELECT 1
+					FROM block_single_block_retention retention
+					WHERE retention.block_metadata_id = shadow.block_metadata_id
+						AND retention.tag = shadow.tag
+						AND retention.state IN ($7, $8, $9)
+				)
 			GROUP BY shadow.consolidated_object_key_main
 		)
 		SELECT
@@ -151,6 +262,13 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 			AND metadata.object_key_main = shadow.consolidated_object_key_main
 			AND NOT EXISTS (
 				SELECT 1
+				FROM block_single_block_retention retention
+				WHERE retention.block_metadata_id = shadow.block_metadata_id
+					AND retention.tag = shadow.tag
+					AND retention.state IN ($7, $8, $9)
+			)
+			AND NOT EXISTS (
+				SELECT 1
 				FROM cscb_repair_manifest repair
 				WHERE repair.tag = shadow.tag
 					AND repair.state <> 'completed'
@@ -160,11 +278,11 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 					)
 			)
 		GROUP BY due.consolidated_object_key_main, due.eligible_at
-		HAVING MAX(shadow.single_block_delete_after) <= CURRENT_TIMESTAMP
+		HAVING MAX(shadow.single_block_delete_after) <= $6
 		ORDER BY %s
 		LIMIT $5`
 	query := fmt.Sprintf(queryTemplate, dueRetentionCohortOrdering(endHeight))
-	rows, err := r.db.QueryContext(
+	rows, err := db.QueryContext(
 		ctx,
 		query,
 		tag,
@@ -172,6 +290,10 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 		endHeight,
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		limit,
+		eligibilityCutoff,
+		RetirementStateEligible,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query due retention cohorts: %w", err)
