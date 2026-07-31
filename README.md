@@ -719,12 +719,17 @@ go run ./cmd/admin workflow start --workflow replicator --input '{"Tag": 0, "Sta
 Inspect currently due single-block retention cohorts in an exact repaired range
 without deleting:
 ```shell
-go run ./cmd/admin workflow start --workflow single_block_retention --input '{"Tag": 0, "StartHeight": 100000, "EndHeight": 110000, "MaxObjectRanges": 10}' --blockchain solana --network mainnet --env local
+go run ./cmd/admin workflow start --workflow single_block_retention --input '{"Tag": 0, "StartHeight": 100000, "EndHeight": 110000, "MaxObjectRanges": 20, "Parallelism": 20}' --blockchain solana --network mainnet --env local
 ```
 
 The workflow is manual-only while production retention is being verified; no
 recurring cron or Temporal Schedule starts it. `MaxObjectRanges` bounds each
-Temporal run. A read-only run remains bounded and reports the current backlog
+Temporal run, while optional `Parallelism` bounds concurrent CSCB cohort
+lifecycles from 1 to 20 and defaults to 1. Each concurrency slot schedules one
+CSCB cohort activity, which processes all covered single-block rows; Temporal
+may dispatch a bounded retry to a different worker. Selected cohorts are
+validated as unique and non-overlapping before parallel execution. A read-only
+run remains bounded and reports the current backlog
 through `MoreEligibleRanges` and returns its frozen `EligibilityCutoff`. A new
 execute sweep must supply that exact dry-run cutoff. It continues as new with
 the same cutoff, selection, and approval envelope until a final empty selection
