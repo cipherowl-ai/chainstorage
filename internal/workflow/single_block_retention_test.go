@@ -291,6 +291,7 @@ func (s *singleBlockRetentionTestSuite) TestLegacyExecuteRequiresExactCohortAppr
 
 func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeCheckpoint() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	effectiveTag := s.cfg.Workflows.SingleBlockRetention.GetEffectiveBlockTag(0)
 	var selectRequest *activity.SingleBlockRetentionSelectRequest
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionSelectRequest) (*activity.SingleBlockRetentionSelectResponse, error) {
@@ -312,7 +313,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 		}, nil)
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
-		Tag:                         2,
+		Tag:                         0,
 		StartHeight:                 100,
 		EndHeight:                   120,
 		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
@@ -339,11 +340,12 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	require.Equal(s.T(), uint64(120), nextRequest.EndHeight)
 	require.Equal(s.T(), uint64(100), nextRequest.ApprovedStartHeight)
 	require.Equal(s.T(), uint64(120), nextRequest.ApprovedEndHeight)
+	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), nextRequest.Tag)
 	require.NotNil(s.T(), nextRequest.Checkpoint)
 	require.False(s.T(), selectRequest.EligibilityCutoff.IsZero())
 	require.Equal(s.T(), selectRequest.EligibilityCutoff, nextRequest.Checkpoint.EligibilityCutoff)
 	require.Equal(s.T(), testSingleBlockRetentionEligibilityCutoff, nextRequest.Checkpoint.EligibilityCutoff)
-	require.Equal(s.T(), uint32(2), nextRequest.Checkpoint.EffectiveTag)
+	require.Equal(s.T(), effectiveTag, nextRequest.Checkpoint.EffectiveTag)
 	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ContinueAsNewCount)
 	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.SelectedObjectRanges)
 	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ProcessedObjectRanges)
@@ -352,6 +354,11 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	require.Equal(s.T(), uint64(10), nextRequest.Checkpoint.DeletedVersions)
 	require.Equal(s.T(), uint64(1000), nextRequest.Checkpoint.RetiredBytes)
 	require.Equal(s.T(), uint64(110), nextRequest.Checkpoint.LastCompletedObjectRange.EndHeight)
+}
+
+func TestEncodeSingleBlockRetentionEffectiveTag(t *testing.T) {
+	require.Equal(t, uint32(math.MaxUint32), encodeSingleBlockRetentionEffectiveTag(0))
+	require.Equal(t, uint32(2), encodeSingleBlockRetentionEffectiveTag(2))
 }
 
 func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWhenCompletionProbeFindsBacklog() {

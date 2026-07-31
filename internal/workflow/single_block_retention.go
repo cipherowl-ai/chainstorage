@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"math"
 	"strconv"
 	"time"
 
@@ -384,6 +385,7 @@ func (w *SingleBlockRetention) execute(
 		}
 		if request.Execute && rangeSweepEnabled && result.MoreEligibleRanges {
 			nextRequest := *request
+			nextRequest.Tag = encodeSingleBlockRetentionEffectiveTag(tag)
 			nextRequest.Checkpoint = result.checkpoint()
 			nextRequest.Checkpoint.ContinueAsNewCount++
 			logger.Info(
@@ -416,6 +418,13 @@ func (w *SingleBlockRetention) execute(
 		result.FailureMessage = err.Error()
 	}
 	return result, err
+}
+
+func encodeSingleBlockRetentionEffectiveTag(tag uint32) uint32 {
+	if tag == 0 {
+		return math.MaxUint32
+	}
+	return tag
 }
 
 func newSingleBlockRetentionResult(
