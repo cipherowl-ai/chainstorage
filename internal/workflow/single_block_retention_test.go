@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,7 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
+	"go.temporal.io/sdk/worker"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 
@@ -93,6 +97,7 @@ func (s *singleBlockRetentionTestSuite) TearDownTest() {
 
 func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDeleting() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	firstIncompleteHeight := cohort.StartHeight
 	var selectRequest *activity.SingleBlockRetentionSelectRequest
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionSelectRequest) (*activity.SingleBlockRetentionSelectResponse, error) {
@@ -108,6 +113,7 @@ func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDel
 			ScannedRows:              10,
 			PlannedRows:              10,
 			VerifiedThroughExclusive: 100,
+			FirstIncompleteHeight:    &firstIncompleteHeight,
 		}, nil)
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
@@ -141,6 +147,11 @@ func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDel
 
 func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.DefaultVersion)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{cohort},
@@ -191,6 +202,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 	require.Equal(s.T(), uint64(100), result.ApprovedStartHeight)
 	require.Equal(s.T(), uint64(110), result.ApprovedEndHeight)
 	require.Equal(s.T(), uint64(1), result.SelectedObjectRanges)
+	require.Equal(s.T(), 1, result.Parallelism)
 	require.Equal(s.T(), uint64(1), result.ProcessedObjectRanges)
 	require.Equal(s.T(), uint64(1), result.CompletedObjectRangeCount)
 	require.Equal(s.T(), uint64(10), result.DeletedVerifiedRows)
@@ -260,6 +272,538 @@ func (s *singleBlockRetentionTestSuite) TestExecuteProcessesCohortsInsideApprove
 	require.Equal(s.T(), uint64(2), result.CompletedObjectRangeCount)
 	require.Equal(s.T(), uint64(20), result.DeletedVerifiedRows)
 	require.Equal(s.T(), second.EndHeight, result.LastCompletedObjectRange.EndHeight)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteProcessesCohortsInParallelBatches() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+		testRetentionCohort("consolidated/120-130.cscb.zstd", 120, 130),
+	}
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.Version(singleBlockRetentionParallelismVersion))
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
+
+	var active int32
+	var maxActive int32
+	var mu sync.Mutex
+	processedKeys := make([]string, 0, len(cohorts))
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			current := atomic.AddInt32(&active, 1)
+			for {
+				previous := atomic.LoadInt32(&maxActive)
+				if current <= previous || atomic.CompareAndSwapInt32(&maxActive, previous, current) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			atomic.AddInt32(&active, -1)
+			mu.Lock()
+			processedKeys = append(processedKeys, request.Cohort.ConsolidatedObjectKey)
+			mu.Unlock()
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Times(len(cohorts))
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   130,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           130,
+	})
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), int32(2), atomic.LoadInt32(&maxActive))
+	require.ElementsMatch(s.T(), []string{
+		cohorts[0].ConsolidatedObjectKey,
+		cohorts[1].ConsolidatedObjectKey,
+		cohorts[2].ConsolidatedObjectKey,
+	}, processedKeys)
+
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.Equal(s.T(), 2, result.Parallelism)
+	require.Equal(s.T(), uint64(3), result.CompletedObjectRangeCount)
+	require.Len(s.T(), result.CompletedObjectRanges, 3)
+	for i, completed := range result.CompletedObjectRanges {
+		require.Equal(s.T(), cohorts[i].ConsolidatedObjectKey, completed.ConsolidatedObjectKey)
+	}
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteRetriesParallelCohortsConcurrently() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
+
+	attempts := make(map[string]int, len(cohorts))
+	var mu sync.Mutex
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			mu.Lock()
+			attempts[request.Cohort.ConsolidatedObjectKey]++
+			attempt := attempts[request.Cohort.ConsolidatedObjectKey]
+			mu.Unlock()
+			if attempt == 1 {
+				firstIncompleteHeight := request.Cohort.StartHeight
+				return &activity.SingleBlockRetentionRangeResult{
+					Cohort:                   request.Cohort,
+					ScannedRows:              request.Cohort.RowCount,
+					DeferredRows:             request.Cohort.RowCount,
+					VerifiedThroughExclusive: request.Cohort.StartHeight,
+					FirstIncompleteHeight:    &firstIncompleteHeight,
+					RetryAfter:               time.Minute,
+					RetryReason:              retirement.SkipCSCBSafetyQuiescenceActive,
+				}, nil
+			}
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Times(4)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 2, attempts[cohorts[0].ConsolidatedObjectKey])
+	require.Equal(s.T(), 2, attempts[cohorts[1].ConsolidatedObjectKey])
+
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.Less(s.T(), result.CompletedAt.Sub(result.StartedAt), 2*time.Minute)
+	require.Equal(s.T(), uint64(2), result.CompletedObjectRangeCount)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteRejectsOverlappingParallelCohortsBeforeProcessing() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-115.cscb.zstd", 100, 115),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.ErrorContains(s.T(), err, "retention CSCB ranges overlap")
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteRejectsDuplicateSerialCohortsBeforeProcessing() {
+	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	second := testRetentionCohort(first.ConsolidatedObjectKey, 110, 120)
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.Version(singleBlockRetentionParallelismVersion))
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{first, second},
+		}, nil).
+		Once()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:             2,
+		StartHeight:     100,
+		EndHeight:       120,
+		MaxObjectRanges: 2,
+		Parallelism:     1,
+	})
+	require.ErrorContains(s.T(), err, "retention selection contains duplicate CSCB object")
+	s.env.AssertActivityNotCalled(
+		s.T(),
+		activity.ActivitySingleBlockRetentionProcess,
+		mock.Anything,
+		mock.Anything,
+	)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteRejectsOverlappingSerialCohortsBeforeProcessing() {
+	first := testRetentionCohort("consolidated/100-115.cscb.zstd", 100, 115)
+	second := testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120)
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.Version(singleBlockRetentionParallelismVersion))
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{first, second},
+		}, nil).
+		Once()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:             2,
+		StartHeight:     100,
+		EndHeight:       120,
+		MaxObjectRanges: 2,
+		Parallelism:     1,
+	})
+	require.ErrorContains(s.T(), err, "retention CSCB ranges overlap")
+	s.env.AssertActivityNotCalled(
+		s.T(),
+		activity.ActivitySingleBlockRetentionProcess,
+		mock.Anything,
+		mock.Anything,
+	)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteParallelFailureStopsBeforeNextBatch() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+		testRetentionCohort("consolidated/120-130.cscb.zstd", 120, 130),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+
+	var mu sync.Mutex
+	processedKeys := make([]string, 0, 2)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			mu.Lock()
+			processedKeys = append(processedKeys, request.Cohort.ConsolidatedObjectKey)
+			mu.Unlock()
+			if request.Cohort.ConsolidatedObjectKey == cohorts[0].ConsolidatedObjectKey {
+				firstIncompleteHeight := request.Cohort.StartHeight
+				return &activity.SingleBlockRetentionRangeResult{
+					Cohort:                   request.Cohort,
+					ScannedRows:              request.Cohort.RowCount,
+					AlreadyRetiredRows:       request.Cohort.RowCount - 1,
+					FailedRows:               1,
+					VerifiedThroughExclusive: request.Cohort.StartHeight,
+					FirstIncompleteHeight:    &firstIncompleteHeight,
+				}, nil
+			}
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Twice()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   130,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           130,
+	})
+	require.ErrorContains(s.T(), err, "did not finish")
+	require.ElementsMatch(s.T(), []string{
+		cohorts[0].ConsolidatedObjectKey,
+		cohorts[1].ConsolidatedObjectKey,
+	}, processedKeys)
+
+	var applicationErr *temporal.ApplicationError
+	require.ErrorAs(s.T(), s.env.GetWorkflowError(), &applicationErr)
+	require.Equal(s.T(), singleBlockRetentionPartialFailureType, applicationErr.Type())
+	require.True(s.T(), applicationErr.HasDetails())
+	var failureDetails SingleBlockRetentionFailureDetails
+	require.NoError(s.T(), applicationErr.Details(&failureDetails))
+	require.ErrorContains(s.T(), errors.New(failureDetails.FailureMessage), "did not finish")
+	require.Equal(s.T(), 2, failureDetails.Parallelism)
+	require.Equal(s.T(), uint64(3), failureDetails.CurrentRunSelectedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.CurrentRunLaunchedObjectRanges)
+	require.Equal(s.T(), uint64(3), failureDetails.SelectedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(1), failureDetails.CompletedObjectRangeCount)
+	require.Len(s.T(), failureDetails.CohortOutcomes, 2)
+	require.Equal(s.T(), cohorts[0], failureDetails.CohortOutcomes[0].Cohort)
+	require.ErrorContains(
+		s.T(),
+		errors.New(failureDetails.CohortOutcomes[0].FailureMessage),
+		"did not finish",
+	)
+	require.NotNil(s.T(), failureDetails.CohortOutcomes[0].Result)
+	require.Equal(s.T(), cohorts[1], failureDetails.CohortOutcomes[1].Cohort)
+	require.Empty(s.T(), failureDetails.CohortOutcomes[1].FailureMessage)
+	require.True(s.T(), failureDetails.CohortOutcomes[1].Result.Terminal)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteParallelFailureDetailsIncludeEarlierWaves() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+		testRetentionCohort("consolidated/120-130.cscb.zstd", 120, 130),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			if request.Cohort.ConsolidatedObjectKey == cohorts[2].ConsolidatedObjectKey {
+				firstIncompleteHeight := request.Cohort.StartHeight
+				return &activity.SingleBlockRetentionRangeResult{
+					Cohort:                   request.Cohort,
+					ScannedRows:              request.Cohort.RowCount,
+					AlreadyRetiredRows:       request.Cohort.RowCount - 1,
+					FailedRows:               1,
+					VerifiedThroughExclusive: request.Cohort.StartHeight,
+					FirstIncompleteHeight:    &firstIncompleteHeight,
+				}, nil
+			}
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Times(len(cohorts))
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   130,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           130,
+	})
+	require.ErrorContains(s.T(), err, "did not finish")
+
+	var applicationErr *temporal.ApplicationError
+	require.ErrorAs(s.T(), s.env.GetWorkflowError(), &applicationErr)
+	var failureDetails SingleBlockRetentionFailureDetails
+	require.NoError(s.T(), applicationErr.Details(&failureDetails))
+	require.Equal(s.T(), uint64(3), failureDetails.CurrentRunSelectedObjectRanges)
+	require.Equal(s.T(), uint64(3), failureDetails.CurrentRunLaunchedObjectRanges)
+	require.Equal(s.T(), uint64(3), failureDetails.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.CompletedObjectRangeCount)
+	require.Len(s.T(), failureDetails.CohortOutcomes, 3)
+	for i, cohort := range cohorts {
+		require.Equal(s.T(), cohort, failureDetails.CohortOutcomes[i].Cohort)
+	}
+	require.Empty(s.T(), failureDetails.CohortOutcomes[0].FailureMessage)
+	require.Empty(s.T(), failureDetails.CohortOutcomes[1].FailureMessage)
+	require.ErrorContains(
+		s.T(),
+		errors.New(failureDetails.CohortOutcomes[2].FailureMessage),
+		"did not finish",
+	)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteParallelRetryFailurePreservesLatestValidResult() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+
+	var mu sync.Mutex
+	attempts := make(map[string]int)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			mu.Lock()
+			attempts[request.Cohort.ConsolidatedObjectKey]++
+			attempt := attempts[request.Cohort.ConsolidatedObjectKey]
+			mu.Unlock()
+			if request.Cohort.ConsolidatedObjectKey != cohorts[0].ConsolidatedObjectKey {
+				return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+			}
+			if attempt == 1 {
+				firstIncompleteHeight := request.Cohort.StartHeight
+				return &activity.SingleBlockRetentionRangeResult{
+					Cohort:                   request.Cohort,
+					ScannedRows:              request.Cohort.RowCount,
+					DeferredRows:             request.Cohort.RowCount,
+					VerifiedThroughExclusive: request.Cohort.StartHeight,
+					FirstIncompleteHeight:    &firstIncompleteHeight,
+					RetryAfter:               time.Minute,
+					RetryReason:              retirement.SkipCSCBSafetyQuiescenceActive,
+				}, nil
+			}
+			return nil, temporal.NewNonRetryableApplicationError(
+				"retry unavailable",
+				"test_retry_failure",
+				nil,
+			)
+		}).
+		Times(3)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.ErrorContains(s.T(), err, "failed to retry retention cohort")
+
+	var applicationErr *temporal.ApplicationError
+	require.ErrorAs(s.T(), s.env.GetWorkflowError(), &applicationErr)
+	var failureDetails SingleBlockRetentionFailureDetails
+	require.NoError(s.T(), applicationErr.Details(&failureDetails))
+	require.Equal(s.T(), uint64(2), failureDetails.CurrentRunLaunchedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.ProcessedObjectRanges)
+	require.Equal(s.T(), uint64(1), failureDetails.CompletedObjectRangeCount)
+	require.Equal(s.T(), cohorts[0].RowCount, failureDetails.DeferredRows)
+	require.Len(s.T(), failureDetails.CohortOutcomes, 2)
+	require.Equal(s.T(), cohorts[0], failureDetails.CohortOutcomes[0].Cohort)
+	require.NotNil(s.T(), failureDetails.CohortOutcomes[0].Result)
+	require.Equal(s.T(), cohorts[0].RowCount, failureDetails.CohortOutcomes[0].Result.DeferredRows)
+	require.ErrorContains(
+		s.T(),
+		errors.New(failureDetails.CohortOutcomes[0].FailureMessage),
+		"failed to retry retention cohort",
+	)
+	require.Equal(s.T(), cohorts[1], failureDetails.CohortOutcomes[1].Cohort)
+	require.True(s.T(), failureDetails.CohortOutcomes[1].Result.Terminal)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteCompletionProbeFailureIncludesProcessedCohorts() {
+	cohorts := []retirement.RetentionCohort{
+		testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110),
+		testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120),
+	}
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: cohorts}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Twice()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return((*activity.SingleBlockRetentionSelectResponse)(nil), errors.New("completion probe unavailable"))
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             len(cohorts),
+		Parallelism:                 2,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.ErrorContains(s.T(), err, "failed to confirm retention sweep completion")
+
+	var applicationErr *temporal.ApplicationError
+	require.ErrorAs(s.T(), s.env.GetWorkflowError(), &applicationErr)
+	var failureDetails SingleBlockRetentionFailureDetails
+	require.NoError(s.T(), applicationErr.Details(&failureDetails))
+	require.ErrorContains(
+		s.T(),
+		errors.New(failureDetails.FailureMessage),
+		"completion probe unavailable",
+	)
+	require.Equal(s.T(), uint64(2), failureDetails.CurrentRunSelectedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.CurrentRunLaunchedObjectRanges)
+	require.Equal(s.T(), uint64(2), failureDetails.CompletedObjectRangeCount)
+	require.Len(s.T(), failureDetails.CohortOutcomes, 2)
+}
+
+func (s *singleBlockRetentionTestSuite) TestLegacyExecutionRejectsParallelism() {
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.DefaultVersion)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:             2,
+		StartHeight:     100,
+		EndHeight:       120,
+		Parallelism:     2,
+		MaxObjectRanges: 2,
+	})
+	require.ErrorContains(s.T(), err, "legacy single_block_retention execution requires parallelism=1")
+}
+
+func (s *singleBlockRetentionTestSuite) TestReplayPreParallelismHistory() {
+	replayer := worker.NewWorkflowReplayer()
+	replayer.RegisterWorkflowWithOptions(s.workflow.execute, temporalworkflow.RegisterOptions{
+		Name: s.workflow.name,
+	})
+	require.NoError(
+		s.T(),
+		replayer.ReplayWorkflowHistoryFromJSONFile(
+			nil,
+			"testdata/single_block_retention_pre_parallelism_history.json",
+		),
+	)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecutionRejectsParallelismAboveMaximum() {
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:             2,
+		StartHeight:     100,
+		EndHeight:       120,
+		Parallelism:     singleBlockRetentionMaxParallelism + 1,
+		MaxObjectRanges: 2,
+	})
+	require.ErrorContains(s.T(), err, "parallelism(21) exceeds max(20)")
 }
 
 func (s *singleBlockRetentionTestSuite) TestLegacyExecuteRequiresExactCohortApproval() {
@@ -348,6 +892,11 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	effectiveTag := s.cfg.Workflows.SingleBlockRetention.GetEffectiveBlockTag(0)
 	var selectRequest *activity.SingleBlockRetentionSelectRequest
 	var processRequest *activity.SingleBlockRetentionProcessRequest
+	s.env.OnGetVersion(
+		singleBlockRetentionParallelismChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionParallelismVersion,
+	).Return(temporalworkflow.Version(singleBlockRetentionParallelismVersion))
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionSelectRequest) (*activity.SingleBlockRetentionSelectResponse, error) {
 			selectRequest = request
@@ -376,6 +925,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 		EndHeight:                   120,
 		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		MaxObjectRanges:             1,
+		Parallelism:                 2,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -398,6 +948,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	require.Equal(s.T(), uint64(120), nextRequest.EndHeight)
 	require.Equal(s.T(), uint64(100), nextRequest.ApprovedStartHeight)
 	require.Equal(s.T(), uint64(120), nextRequest.ApprovedEndHeight)
+	require.Equal(s.T(), 2, nextRequest.Parallelism)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), nextRequest.Tag)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), selectRequest.Tag)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), processRequest.Tag)
@@ -686,11 +1237,15 @@ func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce()
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
 			attempt++
 			if attempt == 1 {
+				firstIncompleteHeight := request.Cohort.StartHeight
 				return &activity.SingleBlockRetentionRangeResult{
-					Cohort:       request.Cohort,
-					DeferredRows: request.Cohort.RowCount,
-					RetryAfter:   time.Minute,
-					RetryReason:  retirement.SkipCSCBSafetyQuiescenceActive,
+					Cohort:                   request.Cohort,
+					ScannedRows:              request.Cohort.RowCount,
+					DeferredRows:             request.Cohort.RowCount,
+					VerifiedThroughExclusive: request.Cohort.StartHeight,
+					FirstIncompleteHeight:    &firstIncompleteHeight,
+					RetryAfter:               time.Minute,
+					RetryReason:              retirement.SkipCSCBSafetyQuiescenceActive,
 				}, nil
 			}
 			return &activity.SingleBlockRetentionRangeResult{
@@ -721,6 +1276,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce()
 
 func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenRangeIsIncomplete() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	firstIncompleteHeight := uint64(105)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{cohort},
@@ -729,8 +1285,10 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenRangeIsIncompl
 		Return(&activity.SingleBlockRetentionRangeResult{
 			Cohort:                   cohort,
 			ScannedRows:              10,
+			AlreadyRetiredRows:       9,
 			FailedRows:               1,
 			VerifiedThroughExclusive: 105,
+			FirstIncompleteHeight:    &firstIncompleteHeight,
 		}, nil)
 
 	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
@@ -852,6 +1410,65 @@ func TestValidateApprovedSingleBlockRetentionCohort(t *testing.T) {
 	)
 }
 
+func TestValidateSingleBlockRetentionCohorts(t *testing.T) {
+	request := &SingleBlockRetentionRequest{
+		StartHeight: 100,
+		EndHeight:   130,
+	}
+	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	second := testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120)
+	require.NoError(t, validateSingleBlockRetentionCohorts(
+		[]retirement.RetentionCohort{second, first},
+		request,
+		true,
+	))
+
+	duplicate := second
+	duplicate.ConsolidatedObjectKey = first.ConsolidatedObjectKey
+	require.ErrorContains(t, validateSingleBlockRetentionCohorts(
+		[]retirement.RetentionCohort{first, duplicate},
+		request,
+		true,
+	), "duplicate CSCB object")
+}
+
+func TestValidateSingleBlockRetentionRangeResult(t *testing.T) {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	require.NoError(t, validateSingleBlockRetentionRangeResult(
+		cohort,
+		terminalSingleBlockRetentionRangeResult(cohort),
+	))
+	mismatch := terminalSingleBlockRetentionRangeResult(cohort)
+	mismatch.Cohort.EndHeight++
+	require.ErrorContains(t, validateSingleBlockRetentionRangeResult(cohort, mismatch), "does not match request")
+
+	incompleteTerminal := terminalSingleBlockRetentionRangeResult(cohort)
+	incompleteTerminal.VerifiedThroughExclusive--
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionRangeResult(cohort, incompleteTerminal),
+		"inconsistent terminal progress",
+	)
+
+	firstIncompleteHeight := cohort.EndHeight - 1
+	contradictoryTerminal := terminalSingleBlockRetentionRangeResult(cohort)
+	contradictoryTerminal.VerifiedThroughExclusive = firstIncompleteHeight
+	contradictoryTerminal.FirstIncompleteHeight = &firstIncompleteHeight
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionRangeResult(cohort, contradictoryTerminal),
+		"inconsistent incomplete progress",
+	)
+
+	impossibleAccounting := terminalSingleBlockRetentionRangeResult(cohort)
+	impossibleAccounting.DeletedVerifiedRows++
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionRangeResult(cohort, impossibleAccounting),
+		"row accounting exceeds scanned rows",
+	)
+}
+
 func testRetentionCohort(key string, start uint64, end uint64) retirement.RetentionCohort {
 	return retirement.RetentionCohort{
 		ConsolidatedObjectKey: key,
@@ -859,5 +1476,18 @@ func testRetentionCohort(key string, start uint64, end uint64) retirement.Retent
 		EndHeight:             end,
 		RowCount:              end - start,
 		EligibleAt:            testSingleBlockRetentionEligibilityCutoff,
+	}
+}
+
+func terminalSingleBlockRetentionRangeResult(
+	cohort retirement.RetentionCohort,
+) *activity.SingleBlockRetentionRangeResult {
+	return &activity.SingleBlockRetentionRangeResult{
+		Cohort:                   cohort,
+		ScannedRows:              cohort.RowCount,
+		DeletedVerifiedRows:      cohort.RowCount,
+		DeletedVersions:          cohort.RowCount,
+		VerifiedThroughExclusive: cohort.EndHeight,
+		Terminal:                 true,
 	}
 }
