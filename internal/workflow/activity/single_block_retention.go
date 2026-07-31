@@ -41,10 +41,11 @@ type (
 	}
 
 	SingleBlockRetentionSelectRequest struct {
-		Tag         uint32
-		StartHeight uint64
-		EndHeight   uint64
-		Limit       int `validate:"required,gt=0,lte=250"`
+		Tag               uint32
+		StartHeight       uint64
+		EndHeight         uint64
+		EligibilityCutoff time.Time `validate:"required"`
+		Limit             int       `validate:"required,gt=0,lte=250"`
 	}
 
 	SingleBlockRetentionSelectResponse struct {
@@ -145,6 +146,7 @@ func (a *SingleBlockRetention) executeSelect(
 		tag,
 		request.StartHeight,
 		request.EndHeight,
+		request.EligibilityCutoff,
 		request.Limit,
 	)
 	if err != nil {
@@ -155,6 +157,7 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", request.StartHeight),
 		zap.Uint64("end_height", request.EndHeight),
+		zap.Time("eligibility_cutoff", request.EligibilityCutoff),
 		zap.Int("cohorts", len(cohorts)),
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),

@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -31,6 +32,8 @@ type singleBlockRetentionTestSuite struct {
 	app      testapp.TestApp
 	cfg      *config.Config
 }
+
+var testSingleBlockRetentionEligibilityCutoff = time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
 
 func TestSingleBlockRetentionWorkflowTestSuite(t *testing.T) {
 	suite.Run(t, new(singleBlockRetentionTestSuite))
@@ -114,17 +117,17 @@ func (s *singleBlockRetentionTestSuite) TestDryRunReturnsPlannedRangesWithoutDel
 		MaxObjectRanges: 1,
 	})
 	require.NoError(s.T(), err)
-	require.Equal(s.T(), &activity.SingleBlockRetentionSelectRequest{
-		Tag:         2,
-		StartHeight: 100,
-		EndHeight:   110,
-		Limit:       1,
-	}, selectRequest)
+	require.Equal(s.T(), uint32(2), selectRequest.Tag)
+	require.Equal(s.T(), uint64(100), selectRequest.StartHeight)
+	require.Equal(s.T(), uint64(110), selectRequest.EndHeight)
+	require.False(s.T(), selectRequest.EligibilityCutoff.IsZero())
+	require.Equal(s.T(), 1, selectRequest.Limit)
 
 	var result SingleBlockRetentionResult
 	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
 	require.False(s.T(), result.Execute)
 	require.Equal(s.T(), uint32(2), result.Tag)
+	require.Equal(s.T(), selectRequest.EligibilityCutoff, result.EligibilityCutoff)
 	require.Equal(s.T(), uint64(100), result.SelectionStartHeight)
 	require.Equal(s.T(), uint64(110), result.SelectionEndHeight)
 	require.Equal(s.T(), uint64(1), result.SelectedObjectRanges)
@@ -141,7 +144,11 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{cohort},
-		}, nil)
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
 			require.True(s.T(), request.FallbackReadsValidated)
@@ -165,6 +172,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteReturnsExactCompletedRanges()
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   110,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -210,7 +218,11 @@ func (s *singleBlockRetentionTestSuite) TestExecuteProcessesCohortsInsideApprove
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{first, second},
-		}, nil)
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
 			require.Equal(s.T(), uint64(100), request.ApprovedStartHeight)
@@ -228,6 +240,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteProcessesCohortsInsideApprove
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   210,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -264,6 +277,7 @@ func (s *singleBlockRetentionTestSuite) TestLegacyExecuteRequiresExactCohortAppr
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   210,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -277,11 +291,15 @@ func (s *singleBlockRetentionTestSuite) TestLegacyExecuteRequiresExactCohortAppr
 
 func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeCheckpoint() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	var selectRequest *activity.SingleBlockRetentionSelectRequest
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
-		Return(&activity.SingleBlockRetentionSelectResponse{
-			Cohorts: []retirement.RetentionCohort{cohort},
-			HasMore: true,
-		}, nil)
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionSelectRequest) (*activity.SingleBlockRetentionSelectResponse, error) {
+			selectRequest = request
+			return &activity.SingleBlockRetentionSelectResponse{
+				Cohorts: []retirement.RetentionCohort{cohort},
+				HasMore: true,
+			}, nil
+		})
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionRangeResult{
 			Cohort:                   cohort,
@@ -297,6 +315,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		MaxObjectRanges:             1,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
@@ -321,6 +340,9 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	require.Equal(s.T(), uint64(100), nextRequest.ApprovedStartHeight)
 	require.Equal(s.T(), uint64(120), nextRequest.ApprovedEndHeight)
 	require.NotNil(s.T(), nextRequest.Checkpoint)
+	require.False(s.T(), selectRequest.EligibilityCutoff.IsZero())
+	require.Equal(s.T(), selectRequest.EligibilityCutoff, nextRequest.Checkpoint.EligibilityCutoff)
+	require.Equal(s.T(), testSingleBlockRetentionEligibilityCutoff, nextRequest.Checkpoint.EligibilityCutoff)
 	require.Equal(s.T(), uint32(2), nextRequest.Checkpoint.EffectiveTag)
 	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ContinueAsNewCount)
 	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.SelectedObjectRanges)
@@ -330,6 +352,108 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	require.Equal(s.T(), uint64(10), nextRequest.Checkpoint.DeletedVersions)
 	require.Equal(s.T(), uint64(1000), nextRequest.Checkpoint.RetiredBytes)
 	require.Equal(s.T(), uint64(110), nextRequest.Checkpoint.LastCompletedObjectRange.EndHeight)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWhenCompletionProbeFindsBacklog() {
+	first := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	second := testRetentionCohort("consolidated/110-120.cscb.zstd", 110, 120)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{first},
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionRangeResult{
+			Cohort:                   first,
+			ScannedRows:              first.RowCount,
+			DeletedVerifiedRows:      first.RowCount,
+			VerifiedThroughExclusive: first.EndHeight,
+			Terminal:                 true,
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{
+			Cohorts: []retirement.RetentionCohort{second},
+		}, nil).
+		Once()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             1,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.Error(s.T(), err)
+	require.True(s.T(), IsContinueAsNewError(err))
+
+	var continueAsNewErr *temporalworkflow.ContinueAsNewError
+	require.True(s.T(), errors.As(err, &continueAsNewErr))
+	var nextRequest SingleBlockRetentionRequest
+	require.NoError(
+		s.T(),
+		converter.GetDefaultDataConverter().FromPayloads(continueAsNewErr.Input, &nextRequest),
+	)
+	require.NotNil(s.T(), nextRequest.Checkpoint)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.ContinueAsNewCount)
+	require.Equal(s.T(), uint64(1), nextRequest.Checkpoint.CompletedObjectRangeCount)
+	require.Equal(s.T(), first.EndHeight, nextRequest.Checkpoint.LastCompletedObjectRange.EndHeight)
+}
+
+func (s *singleBlockRetentionTestSuite) TestExecutePreservesExplicitTagZeroEncoding() {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	selectCalls := 0
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionSelectRequest) (*activity.SingleBlockRetentionSelectResponse, error) {
+			require.Equal(s.T(), uint32(math.MaxUint32), request.Tag)
+			selectCalls++
+			if selectCalls == 1 {
+				return &activity.SingleBlockRetentionSelectResponse{
+					Cohorts: []retirement.RetentionCohort{cohort},
+				}, nil
+			}
+			return &activity.SingleBlockRetentionSelectResponse{}, nil
+		}).
+		Twice()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			require.Equal(s.T(), uint32(math.MaxUint32), request.Tag)
+			return &activity.SingleBlockRetentionRangeResult{
+				Cohort:                   request.Cohort,
+				ScannedRows:              request.Cohort.RowCount,
+				DeletedVerifiedRows:      request.Cohort.RowCount,
+				VerifiedThroughExclusive: request.Cohort.EndHeight,
+				Terminal:                 true,
+			}, nil
+		}).
+		Once()
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         math.MaxUint32,
+		StartHeight:                 100,
+		EndHeight:                   110,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           110,
+	})
+	require.NoError(s.T(), err)
+
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.Equal(s.T(), uint32(0), result.Tag)
+	require.True(s.T(), result.SweepCompleted)
 }
 
 func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalResult() {
@@ -345,7 +469,11 @@ func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalRe
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{second},
-		}, nil)
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionRangeResult{
 			Cohort:                   second,
@@ -361,6 +489,7 @@ func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalRe
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   120,
+		EligibilityCutoff:           startedAt,
 		MaxObjectRanges:             1,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
@@ -371,6 +500,7 @@ func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalRe
 		ApprovedEndHeight:           120,
 		Checkpoint: &SingleBlockRetentionCheckpoint{
 			StartedAt:                 startedAt,
+			EligibilityCutoff:         startedAt,
 			EffectiveTag:              2,
 			ContinueAsNewCount:        1,
 			SelectedObjectRanges:      1,
@@ -388,6 +518,7 @@ func (s *singleBlockRetentionTestSuite) TestContinuationReturnsCumulativeFinalRe
 	var result SingleBlockRetentionResult
 	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
 	require.Equal(s.T(), startedAt, result.StartedAt)
+	require.Equal(s.T(), startedAt, result.EligibilityCutoff)
 	require.True(s.T(), result.SweepCompleted)
 	require.False(s.T(), result.MoreEligibleRanges)
 	require.Equal(s.T(), uint64(1), result.ContinueAsNewCount)
@@ -414,6 +545,7 @@ func (s *singleBlockRetentionTestSuite) TestInitialExecutionRejectsCallerSupplie
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -429,12 +561,58 @@ func (s *singleBlockRetentionTestSuite) TestInitialExecutionRejectsCallerSupplie
 	require.ErrorContains(s.T(), err, "checkpoint is internal")
 }
 
+func (s *singleBlockRetentionTestSuite) TestRangeExecutionRequiresApprovedDryRunCutoff() {
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+	})
+	require.ErrorContains(s.T(), err, "eligibility cutoff from its approved dry run")
+}
+
+func (s *singleBlockRetentionTestSuite) TestContinuationRejectsChangedEligibilityCutoff() {
+	startedAt := testSingleBlockRetentionEligibilityCutoff.Add(time.Hour)
+	s.env.SetContinuedExecutionRunID("previous-run")
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 100,
+		EndHeight:                   120,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff.Add(-time.Minute),
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         100,
+		ApprovedEndHeight:           120,
+		Checkpoint: &SingleBlockRetentionCheckpoint{
+			StartedAt:          startedAt,
+			EligibilityCutoff:  testSingleBlockRetentionEligibilityCutoff,
+			EffectiveTag:       2,
+			ContinueAsNewCount: 1,
+		},
+	})
+	require.ErrorContains(s.T(), err, "eligibility cutoff changed across continuation")
+}
+
 func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce() {
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{
 			Cohorts: []retirement.RetentionCohort{cohort},
-		}, nil)
+		}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
 	attempt := 0
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
 		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
@@ -460,6 +638,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteRetriesSafetyQuiescenceOnce()
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   110,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -490,6 +669,7 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsClosedWhenRangeIsIncompl
 		Tag:                         2,
 		StartHeight:                 100,
 		EndHeight:                   110,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 		Execute:                     true,
 		DirectStorageClientsGuarded: true,
 		SingleBlockWritersGuarded:   true,
@@ -506,6 +686,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 		return &SingleBlockRetentionRequest{
 			StartHeight:                 100,
 			EndHeight:                   110,
+			EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
 			Execute:                     true,
 			DirectStorageClientsGuarded: true,
 			SingleBlockWritersGuarded:   true,
@@ -609,6 +790,6 @@ func testRetentionCohort(key string, start uint64, end uint64) retirement.Retent
 		StartHeight:           start,
 		EndHeight:             end,
 		RowCount:              end - start,
-		EligibleAt:            time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC),
+		EligibleAt:            testSingleBlockRetentionEligibilityCutoff,
 	}
 }

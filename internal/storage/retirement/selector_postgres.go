@@ -16,6 +16,7 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
+	eligibilityCutoff time.Time,
 	limit int,
 ) ([]RetentionCohort, error) {
 	if r == nil || r.db == nil {
@@ -39,9 +40,10 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 		WHERE retention.tag = $1
 			AND retention.state IN ($2, $3, $4)
 			AND ($6::BIGINT = 0 OR (retention.height >= $5 AND retention.height < $6))
+			AND shadow.single_block_delete_after <= $7
 		GROUP BY retention.consolidated_object_key_main
 		ORDER BY MIN(retention.prepared_at), MIN(retention.height), retention.consolidated_object_key_main
-		LIMIT $7`
+		LIMIT $8`
 	rows, err := r.db.QueryContext(
 		ctx,
 		query,
@@ -51,6 +53,7 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 		RetirementStateDeletedPendingVerification,
 		startHeight,
 		endHeight,
+		eligibilityCutoff,
 		limit,
 	)
 	if err != nil {
@@ -96,6 +99,7 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
+	eligibilityCutoff time.Time,
 	limit int,
 ) ([]RetentionCohort, error) {
 	if r == nil || r.db == nil {
@@ -113,13 +117,20 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 			WHERE shadow.tag = $1
 				AND shadow.validated_at IS NOT NULL
 				AND shadow.single_block_delete_after IS NOT NULL
-				AND shadow.single_block_delete_after <= CURRENT_TIMESTAMP
+				AND shadow.single_block_delete_after <= $6
 				AND shadow.single_block_object_deleted_at IS NULL
 				AND shadow.single_block_object_key_main IS NOT NULL
 				AND shadow.single_block_object_key_main <> ''
 				AND shadow.consolidated_object_key_main IS NOT NULL
 				AND shadow.consolidated_object_key_main <> ''
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
+				AND NOT EXISTS (
+					SELECT 1
+					FROM block_single_block_retention retention
+					WHERE retention.block_metadata_id = shadow.block_metadata_id
+						AND retention.tag = shadow.tag
+						AND retention.state IN ($7, $8, $9)
+				)
 			GROUP BY shadow.consolidated_object_key_main
 		)
 		SELECT
@@ -151,6 +162,13 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 			AND metadata.object_key_main = shadow.consolidated_object_key_main
 			AND NOT EXISTS (
 				SELECT 1
+				FROM block_single_block_retention retention
+				WHERE retention.block_metadata_id = shadow.block_metadata_id
+					AND retention.tag = shadow.tag
+					AND retention.state IN ($7, $8, $9)
+			)
+			AND NOT EXISTS (
+				SELECT 1
 				FROM cscb_repair_manifest repair
 				WHERE repair.tag = shadow.tag
 					AND repair.state <> 'completed'
@@ -160,7 +178,7 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 					)
 			)
 		GROUP BY due.consolidated_object_key_main, due.eligible_at
-		HAVING MAX(shadow.single_block_delete_after) <= CURRENT_TIMESTAMP
+		HAVING MAX(shadow.single_block_delete_after) <= $6
 		ORDER BY %s
 		LIMIT $5`
 	query := fmt.Sprintf(queryTemplate, dueRetentionCohortOrdering(endHeight))
@@ -172,6 +190,10 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 		endHeight,
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		limit,
+		eligibilityCutoff,
+		RetirementStateEligible,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query due retention cohorts: %w", err)

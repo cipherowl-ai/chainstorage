@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -285,6 +286,12 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 		StartHeight: 90,
 		EndHeight:   120,
 	}, executeReq.Approval)
+
+	tagZeroReq := a.planRequest(&SingleBlockRetentionProcessRequest{
+		Tag:    math.MaxUint32,
+		Cohort: cohort,
+	})
+	require.Equal(t, uint32(0), tagZeroReq.Tag)
 
 	// An omitted operator approval stays omitted; it is never synthesized
 	// from the selected cohort.

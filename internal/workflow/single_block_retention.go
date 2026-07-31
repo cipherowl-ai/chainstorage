@@ -35,6 +35,10 @@ type (
 		Tag         uint32
 		StartHeight uint64
 		EndHeight   uint64
+		// EligibilityCutoff freezes the destructive set. Dry runs may omit it
+		// and return the captured cutoff; new execute sweeps must reuse that
+		// exact dry-run cutoff across every continuation.
+		EligibilityCutoff time.Time
 		// MaxObjectRanges bounds each workflow run. Execute runs continue as new
 		// with the same approved envelope while more eligible cohorts remain.
 		MaxObjectRanges             int `validate:"omitempty,gt=0,lte=250"`
@@ -61,6 +65,7 @@ type (
 
 	SingleBlockRetentionCheckpoint struct {
 		StartedAt                 time.Time
+		EligibilityCutoff         time.Time
 		EffectiveTag              uint32
 		ContinueAsNewCount        uint64
 		SelectedObjectRanges      uint64
@@ -89,6 +94,7 @@ type (
 	SingleBlockRetentionResult struct {
 		StartedAt                 time.Time                           `json:"started_at"`
 		CompletedAt               time.Time                           `json:"completed_at"`
+		EligibilityCutoff         time.Time                           `json:"eligibility_cutoff"`
 		Tag                       uint32                              `json:"tag"`
 		SelectionStartHeight      uint64                              `json:"selection_start_height"`
 		SelectionEndHeight        uint64                              `json:"selection_end_height"`
@@ -183,6 +189,15 @@ func (w *SingleBlockRetention) execute(
 			singleBlockRetentionRangeSweepVersion,
 		) != workflow.DefaultVersion
 		isContinuation := workflow.GetInfo(ctx).ContinuedExecutionRunID != ""
+		if request.Execute && rangeSweepEnabled && request.EligibilityCutoff.IsZero() {
+			return xerrors.New("single-block retention range execution requires the eligibility cutoff from its approved dry run")
+		}
+		if result.EligibilityCutoff.After(workflow.Now(ctx).UTC()) {
+			return xerrors.Errorf(
+				"single-block retention eligibility cutoff %s is in the future",
+				result.EligibilityCutoff,
+			)
+		}
 
 		maxObjectRanges := cfg.MaxObjectRanges
 		if request.MaxObjectRanges > 0 {
@@ -213,15 +228,20 @@ func (w *SingleBlockRetention) execute(
 			zap.Int("max_object_ranges", maxObjectRanges),
 			zap.Uint64("selection_start_height", request.StartHeight),
 			zap.Uint64("selection_end_height", request.EndHeight),
+			zap.Time("eligibility_cutoff", result.EligibilityCutoff),
 			zap.Bool("execute", request.Execute),
 		)
 		logger.Info("single-block retention workflow started")
 		activityCtx := w.withActivityOptions(ctx)
 		selected, err := w.activity.Select(activityCtx, &activity.SingleBlockRetentionSelectRequest{
-			Tag:         tag,
-			StartHeight: request.StartHeight,
-			EndHeight:   request.EndHeight,
-			Limit:       maxObjectRanges,
+			// Preserve the caller's tag encoding until the activity resolves it
+			// exactly once. In particular, MaxUint32 is the only encoding for
+			// effective tag zero.
+			Tag:               request.Tag,
+			StartHeight:       request.StartHeight,
+			EndHeight:         request.EndHeight,
+			EligibilityCutoff: result.EligibilityCutoff,
+			Limit:             maxObjectRanges,
 		})
 		if err != nil {
 			return xerrors.Errorf("failed to select retention cohorts: %w", err)
@@ -257,7 +277,7 @@ func (w *SingleBlockRetention) execute(
 				}
 			}
 			processRequest := &activity.SingleBlockRetentionProcessRequest{
-				Tag:                         tag,
+				Tag:                         request.Tag,
 				Cohort:                      cohort,
 				Execute:                     request.Execute,
 				ProductionDeleteEnabled:     request.ProductionDeleteEnabled,
@@ -337,7 +357,32 @@ func (w *SingleBlockRetention) execute(
 				}
 			}
 		}
-		if request.Execute && rangeSweepEnabled && selected.HasMore {
+		if request.Execute && rangeSweepEnabled && !result.MoreEligibleRanges && len(selected.Cohorts) > 0 {
+			remaining, err := w.activity.Select(
+				activityCtx,
+				&activity.SingleBlockRetentionSelectRequest{
+					Tag:               request.Tag,
+					StartHeight:       request.StartHeight,
+					EndHeight:         request.EndHeight,
+					EligibilityCutoff: result.EligibilityCutoff,
+					Limit:             1,
+				},
+			)
+			if err != nil {
+				return xerrors.Errorf("failed to confirm retention sweep completion: %w", err)
+			}
+			if len(remaining.Cohorts) > 1 {
+				return xerrors.Errorf(
+					"single-block retention completion selector returned %d cohorts above limit 1",
+					len(remaining.Cohorts),
+				)
+			}
+			if remaining.HasMore && len(remaining.Cohorts) == 0 {
+				return xerrors.New("single-block retention completion selector reported a backlog without returning a cohort")
+			}
+			result.MoreEligibleRanges = remaining.HasMore || len(remaining.Cohorts) > 0
+		}
+		if request.Execute && rangeSweepEnabled && result.MoreEligibleRanges {
 			nextRequest := *request
 			nextRequest.Checkpoint = result.checkpoint()
 			nextRequest.Checkpoint.ContinueAsNewCount++
@@ -352,7 +397,7 @@ func (w *SingleBlockRetention) execute(
 			)
 			return w.continueAsNew(ctx, &nextRequest)
 		}
-		result.SweepCompleted = request.Execute && !selected.HasMore
+		result.SweepCompleted = request.Execute && !result.MoreEligibleRanges
 		logger.Info(
 			"single-block retention workflow completed",
 			zap.Bool("sweep_completed", result.SweepCompleted),
@@ -377,7 +422,10 @@ func newSingleBlockRetentionResult(
 	request *SingleBlockRetentionRequest,
 	now time.Time,
 ) *SingleBlockRetentionResult {
-	result := &SingleBlockRetentionResult{StartedAt: now}
+	result := &SingleBlockRetentionResult{
+		StartedAt:         now,
+		EligibilityCutoff: now,
+	}
 	if request == nil {
 		return result
 	}
@@ -388,12 +436,16 @@ func newSingleBlockRetentionResult(
 	result.ApprovedEndHeight = request.ApprovedEndHeight
 	result.FallbackReadsValidated = request.FallbackReadsValidated
 	result.FallbackErrorCount = request.FallbackErrorCount
+	if !request.EligibilityCutoff.IsZero() {
+		result.EligibilityCutoff = request.EligibilityCutoff.UTC()
+	}
 
 	checkpoint := request.Checkpoint
 	if checkpoint == nil {
 		return result
 	}
 	result.StartedAt = checkpoint.StartedAt
+	result.EligibilityCutoff = checkpoint.EligibilityCutoff
 	result.ContinueAsNewCount = checkpoint.ContinueAsNewCount
 	result.SelectedObjectRanges = checkpoint.SelectedObjectRanges
 	result.ProcessedObjectRanges = checkpoint.ProcessedObjectRanges
@@ -417,6 +469,7 @@ func newSingleBlockRetentionResult(
 func (r *SingleBlockRetentionResult) checkpoint() *SingleBlockRetentionCheckpoint {
 	return &SingleBlockRetentionCheckpoint{
 		StartedAt:                 r.StartedAt,
+		EligibilityCutoff:         r.EligibilityCutoff,
 		EffectiveTag:              r.Tag,
 		ContinueAsNewCount:        r.ContinueAsNewCount,
 		SelectedObjectRanges:      r.SelectedObjectRanges,
@@ -499,8 +552,18 @@ func validateSingleBlockRetentionCheckpoint(
 	if checkpoint == nil {
 		return xerrors.New("single-block retention continuation is missing its checkpoint")
 	}
-	if checkpoint.StartedAt.IsZero() || checkpoint.ContinueAsNewCount == 0 {
+	if checkpoint.StartedAt.IsZero() ||
+		checkpoint.EligibilityCutoff.IsZero() ||
+		checkpoint.EligibilityCutoff.After(checkpoint.StartedAt) ||
+		checkpoint.ContinueAsNewCount == 0 {
 		return xerrors.New("single-block retention continuation checkpoint is invalid")
+	}
+	if !checkpoint.EligibilityCutoff.Equal(request.EligibilityCutoff) {
+		return xerrors.Errorf(
+			"single-block retention eligibility cutoff changed across continuation: checkpoint=%s current=%s",
+			checkpoint.EligibilityCutoff,
+			request.EligibilityCutoff,
+		)
 	}
 	if checkpoint.EffectiveTag != effectiveTag {
 		return xerrors.Errorf(

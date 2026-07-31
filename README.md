@@ -725,10 +725,12 @@ go run ./cmd/admin workflow start --workflow single_block_retention --input '{"T
 The workflow is manual-only while production retention is being verified; no
 recurring cron or Temporal Schedule starts it. `MaxObjectRanges` bounds each
 Temporal run. A read-only run remains bounded and reports the current backlog
-through `MoreEligibleRanges`. An execute run continues as new with the same
-selection and approval envelope until no currently due or pending cohorts
-remain; it never bypasses each cohort's retention clock. Execution requires
-Postgres metadata plus versioned S3 storage, an explicit
+through `MoreEligibleRanges` and returns its frozen `EligibilityCutoff`. A new
+execute sweep must supply that exact dry-run cutoff. It continues as new with
+the same cutoff, selection, and approval envelope until a final empty selection
+confirms that no cohort from the frozen set remains; it never admits cohorts
+that become eligible later or bypasses each cohort's retention clock. Execution
+requires Postgres metadata plus versioned S3 storage, an explicit
 `FallbackReadsValidated` assertion with zero `FallbackErrorCount`, and a
 separate operator approval (`ApprovedChain`, `ApprovedStartHeight`,
 `ApprovedEndHeight`) that must exactly match the selection range. Every selected
