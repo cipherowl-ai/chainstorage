@@ -728,9 +728,12 @@ Temporal run, while optional `Parallelism` bounds concurrent CSCB cohort
 lifecycles from 1 to 20 and defaults to 1. Each concurrency slot schedules one
 CSCB cohort activity, which processes all covered single-block rows; Temporal
 may dispatch a bounded retry to a different worker. Selected cohorts are
-validated as unique and non-overlapping before parallel execution. A read-only
-run remains bounded and reports the current backlog
-through `MoreEligibleRanges` and returns its frozen `EligibilityCutoff`. A new
+validated as unique and non-overlapping before execution on new workflow
+histories. If any post-processing failure occurs after cohort activities start,
+the terminal Temporal application error includes structured outcomes for every
+cohort launched in that run; a failed wave starts no later wave. A read-only run
+remains bounded, reports the current backlog through `MoreEligibleRanges`, and
+returns its frozen `EligibilityCutoff`. A new
 execute sweep must supply that exact dry-run cutoff. It continues as new with
 the same cutoff, selection, and approval envelope until a final empty selection
 confirms that no cohort from the frozen set remains; it never admits cohorts

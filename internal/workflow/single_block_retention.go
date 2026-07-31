@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
@@ -136,7 +137,28 @@ type (
 		FailureMessage        string                                      `json:"failure_message,omitempty"`
 	}
 
+	SingleBlockRetentionFailureDetails struct {
+		FailureMessage                 string                                     `json:"failure_message"`
+		Parallelism                    int                                        `json:"parallelism"`
+		CurrentRunSelectedObjectRanges uint64                                     `json:"current_run_selected_object_ranges"`
+		CurrentRunLaunchedObjectRanges uint64                                     `json:"current_run_launched_object_ranges"`
+		SelectedObjectRanges           uint64                                     `json:"selected_object_ranges"`
+		ProcessedObjectRanges          uint64                                     `json:"processed_object_ranges"`
+		CompletedObjectRangeCount      uint64                                     `json:"completed_object_range_count"`
+		DeletedVerifiedRows            uint64                                     `json:"deleted_verified_rows"`
+		FailedRows                     uint64                                     `json:"failed_rows"`
+		DeferredRows                   uint64                                     `json:"deferred_rows"`
+		CohortOutcomes                 []SingleBlockRetentionCohortFailureOutcome `json:"cohort_outcomes"`
+	}
+
+	SingleBlockRetentionCohortFailureOutcome struct {
+		Cohort         retirement.RetentionCohort                `json:"cohort"`
+		Result         *activity.SingleBlockRetentionRangeResult `json:"result,omitempty"`
+		FailureMessage string                                    `json:"failure_message,omitempty"`
+	}
+
 	singleBlockRetentionCohortOutcome struct {
+		cohort retirement.RetentionCohort
 		result *activity.SingleBlockRetentionRangeResult
 		err    error
 	}
@@ -152,6 +174,7 @@ const (
 	singleBlockRetentionRangeSweepVersion   = 1
 	singleBlockRetentionParallelismChangeID = "single_block_retention.parallelism"
 	singleBlockRetentionParallelismVersion  = 1
+	singleBlockRetentionPartialFailureType  = "single_block_retention_partial_failure"
 )
 
 func NewSingleBlockRetention(params SingleBlockRetentionParams) *SingleBlockRetention {
@@ -189,6 +212,9 @@ func (w *SingleBlockRetention) execute(
 	request *SingleBlockRetentionRequest,
 ) (*SingleBlockRetentionResult, error) {
 	result := newSingleBlockRetentionResult(request, workflow.Now(ctx).UTC())
+	failureDetailsEnabled := false
+	currentRunSelectedObjectRanges := uint64(0)
+	cohortOutcomes := make([]SingleBlockRetentionCohortFailureOutcome, 0)
 	err := w.executeWorkflow(ctx, request, func() error {
 		var cfg config.SingleBlockRetentionWorkflowConfig
 		if err := w.readConfig(ctx, &cfg); err != nil {
@@ -242,6 +268,7 @@ func (w *SingleBlockRetention) execute(
 			workflow.DefaultVersion,
 			singleBlockRetentionParallelismVersion,
 		)
+		failureDetailsEnabled = parallelismVersion != workflow.DefaultVersion
 		if parallelismVersion == workflow.DefaultVersion && parallelism != 1 {
 			return xerrors.Errorf(
 				"legacy single_block_retention execution requires parallelism=1, got %d",
@@ -304,17 +331,20 @@ func (w *SingleBlockRetention) execute(
 			return xerrors.New("single-block retention selector reported a backlog without returning a cohort")
 		}
 		result.SelectedObjectRanges += uint64(len(selected.Cohorts))
+		currentRunSelectedObjectRanges = uint64(len(selected.Cohorts))
 		result.MoreEligibleRanges = selected.HasMore
 
-		if parallelismVersion != workflow.DefaultVersion && parallelism > 1 {
-			if err := validateParallelSingleBlockRetentionCohorts(
+		if parallelismVersion != workflow.DefaultVersion {
+			if err := validateSingleBlockRetentionCohorts(
 				selected.Cohorts,
 				request,
 				rangeSweepEnabled,
 			); err != nil {
 				return err
 			}
-			if err := w.processSingleBlockRetentionCohortsParallel(
+		}
+		if parallelismVersion != workflow.DefaultVersion && parallelism > 1 {
+			outcomes, err := w.processSingleBlockRetentionCohortsParallel(
 				ctx,
 				activityCtx,
 				logger,
@@ -324,8 +354,11 @@ func (w *SingleBlockRetention) execute(
 				selected.Cohorts,
 				parallelism,
 				rangeSweepEnabled,
+				failureDetailsEnabled,
 				result,
-			); err != nil {
+			)
+			cohortOutcomes = append(cohortOutcomes, outcomes...)
+			if err != nil {
 				return err
 			}
 		} else {
@@ -339,8 +372,15 @@ func (w *SingleBlockRetention) execute(
 					activityEligibilityCutoff,
 					cohort,
 					rangeSweepEnabled,
+					failureDetailsEnabled,
 				)
 				result.addRangeResult(rangeResult)
+				if failureDetailsEnabled {
+					cohortOutcomes = append(
+						cohortOutcomes,
+						newSingleBlockRetentionCohortFailureOutcome(cohort, rangeResult, err),
+					)
+				}
 				if err != nil {
 					return err
 				}
@@ -404,6 +444,29 @@ func (w *SingleBlockRetention) execute(
 	result.CompletedAt = workflow.Now(ctx).UTC()
 	if err != nil {
 		result.FailureMessage = err.Error()
+		if failureDetailsEnabled && len(cohortOutcomes) > 0 && !IsContinueAsNewError(err) {
+			failureDetails := SingleBlockRetentionFailureDetails{
+				FailureMessage:                 err.Error(),
+				Parallelism:                    result.Parallelism,
+				CurrentRunSelectedObjectRanges: currentRunSelectedObjectRanges,
+				CurrentRunLaunchedObjectRanges: uint64(len(cohortOutcomes)),
+				SelectedObjectRanges:           result.SelectedObjectRanges,
+				ProcessedObjectRanges:          result.ProcessedObjectRanges,
+				CompletedObjectRangeCount:      result.CompletedObjectRangeCount,
+				DeletedVerifiedRows:            result.DeletedVerifiedRows,
+				FailedRows:                     result.FailedRows,
+				DeferredRows:                   result.DeferredRows,
+				CohortOutcomes:                 cohortOutcomes,
+			}
+			return result, temporal.NewApplicationErrorWithOptions(
+				err.Error(),
+				singleBlockRetentionPartialFailureType,
+				temporal.ApplicationErrorOptions{
+					Cause:   err,
+					Details: []interface{}{failureDetails},
+				},
+			)
+		}
 	}
 	return result, err
 }
@@ -418,8 +481,10 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohortsParallel(
 	cohorts []retirement.RetentionCohort,
 	parallelism int,
 	rangeSweepEnabled bool,
+	resultValidationEnabled bool,
 	result *SingleBlockRetentionResult,
-) error {
+) ([]SingleBlockRetentionCohortFailureOutcome, error) {
+	cohortOutcomes := make([]SingleBlockRetentionCohortFailureOutcome, 0, len(cohorts))
 	for start := 0; start < len(cohorts); start += parallelism {
 		end := start + parallelism
 		if end > len(cohorts) {
@@ -440,8 +505,10 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohortsParallel(
 					activityEligibilityCutoff,
 					cohort,
 					rangeSweepEnabled,
+					resultValidationEnabled,
 				)
 				settable.Set(&singleBlockRetentionCohortOutcome{
+					cohort: cohort,
 					result: rangeResult,
 					err:    err,
 				}, nil)
@@ -450,30 +517,44 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohortsParallel(
 		}
 
 		var firstErr error
-		for _, future := range futures {
+		for i, future := range futures {
+			cohort := cohorts[start+i]
 			var outcome *singleBlockRetentionCohortOutcome
 			if err := future.Get(ctx, &outcome); err != nil {
+				cohortOutcomes = append(
+					cohortOutcomes,
+					newSingleBlockRetentionCohortFailureOutcome(cohort, nil, err),
+				)
 				if firstErr == nil {
 					firstErr = xerrors.Errorf("failed to await parallel retention cohort: %w", err)
 				}
 				continue
 			}
 			if outcome == nil {
+				outcomeErr := xerrors.New("parallel retention cohort returned no outcome")
+				cohortOutcomes = append(
+					cohortOutcomes,
+					newSingleBlockRetentionCohortFailureOutcome(cohort, nil, outcomeErr),
+				)
 				if firstErr == nil {
-					firstErr = xerrors.New("parallel retention cohort returned no outcome")
+					firstErr = outcomeErr
 				}
 				continue
 			}
 			result.addRangeResult(outcome.result)
+			cohortOutcomes = append(
+				cohortOutcomes,
+				newSingleBlockRetentionCohortFailureOutcome(outcome.cohort, outcome.result, outcome.err),
+			)
 			if outcome.err != nil && firstErr == nil {
 				firstErr = outcome.err
 			}
 		}
 		if firstErr != nil {
-			return firstErr
+			return cohortOutcomes, firstErr
 		}
 	}
-	return nil
+	return cohortOutcomes, nil
 }
 
 func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
@@ -485,6 +566,7 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 	activityEligibilityCutoff time.Time,
 	cohort retirement.RetentionCohort,
 	rangeSweepEnabled bool,
+	resultValidationEnabled bool,
 ) (*activity.SingleBlockRetentionRangeResult, error) {
 	if err := validateSelectedSingleBlockRetentionCohort(
 		cohort,
@@ -527,12 +609,15 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 			err,
 		)
 	}
-	if err := validateSingleBlockRetentionRangeResult(cohort, rangeResult); err != nil {
-		return nil, err
+	if resultValidationEnabled {
+		if err := validateSingleBlockRetentionRangeResult(cohort, rangeResult); err != nil {
+			return nil, err
+		}
 	}
+	latestValidResult := rangeResult
 	if request.Execute && rangeResult.RetryAfter > 0 {
 		if rangeResult.RetryAfter > maxSingleBlockRetentionRetryDelay {
-			return nil, xerrors.Errorf(
+			return latestValidResult, xerrors.Errorf(
 				"retention cohort %q requested retry delay %s above maximum %s",
 				cohort.ConsolidatedObjectKey,
 				rangeResult.RetryAfter,
@@ -548,11 +633,11 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 			zap.String("retry_reason", rangeResult.RetryReason),
 		)
 		if err := workflow.Sleep(ctx, rangeResult.RetryAfter); err != nil {
-			return nil, xerrors.Errorf("failed to wait before retention retry: %w", err)
+			return latestValidResult, xerrors.Errorf("failed to wait before retention retry: %w", err)
 		}
-		rangeResult, err = w.activity.Process(activityCtx, processRequest)
+		retryResult, err := w.activity.Process(activityCtx, processRequest)
 		if err != nil {
-			return nil, xerrors.Errorf(
+			return latestValidResult, xerrors.Errorf(
 				"failed to retry retention cohort %q [%d, %d): %w",
 				cohort.ConsolidatedObjectKey,
 				cohort.StartHeight,
@@ -560,9 +645,12 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 				err,
 			)
 		}
-		if err := validateSingleBlockRetentionRangeResult(cohort, rangeResult); err != nil {
-			return nil, err
+		if resultValidationEnabled {
+			if err := validateSingleBlockRetentionRangeResult(cohort, retryResult); err != nil {
+				return latestValidResult, err
+			}
 		}
+		rangeResult = retryResult
 	}
 	if !request.Execute {
 		return rangeResult, nil
@@ -593,7 +681,22 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 	return rangeResult, nil
 }
 
-func validateParallelSingleBlockRetentionCohorts(
+func newSingleBlockRetentionCohortFailureOutcome(
+	cohort retirement.RetentionCohort,
+	result *activity.SingleBlockRetentionRangeResult,
+	err error,
+) SingleBlockRetentionCohortFailureOutcome {
+	outcome := SingleBlockRetentionCohortFailureOutcome{
+		Cohort: cohort,
+		Result: result,
+	}
+	if err != nil {
+		outcome.FailureMessage = err.Error()
+	}
+	return outcome
+}
+
+func validateSingleBlockRetentionCohorts(
 	cohorts []retirement.RetentionCohort,
 	request *SingleBlockRetentionRequest,
 	rangeSweepEnabled bool,
@@ -619,7 +722,7 @@ func validateParallelSingleBlockRetentionCohorts(
 		}
 		if _, ok := seenKeys[cohort.ConsolidatedObjectKey]; ok {
 			return xerrors.Errorf(
-				"parallel retention selection contains duplicate CSCB object %q",
+				"retention selection contains duplicate CSCB object %q",
 				cohort.ConsolidatedObjectKey,
 			)
 		}
@@ -636,7 +739,7 @@ func validateParallelSingleBlockRetentionCohorts(
 		current := ordered[i]
 		if current.StartHeight < previous.EndHeight {
 			return xerrors.Errorf(
-				"parallel retention CSCB ranges overlap: %q [%d, %d) and %q [%d, %d)",
+				"retention CSCB ranges overlap: %q [%d, %d) and %q [%d, %d)",
 				previous.ConsolidatedObjectKey,
 				previous.StartHeight,
 				previous.EndHeight,
@@ -672,6 +775,95 @@ func validateSingleBlockRetentionRangeResult(
 			"retention result cohort does not match request: expected=%+v actual=%+v",
 			expected,
 			actual,
+		)
+	}
+	if result.VerifiedThroughExclusive < expected.StartHeight ||
+		result.VerifiedThroughExclusive > expected.EndHeight {
+		return xerrors.Errorf(
+			"retention result verified-through height %d is outside cohort [%d, %d)",
+			result.VerifiedThroughExclusive,
+			expected.StartHeight,
+			expected.EndHeight,
+		)
+	}
+	if result.FirstIncompleteHeight == nil {
+		if result.VerifiedThroughExclusive != expected.EndHeight ||
+			result.ScannedRows == 0 ||
+			!result.Terminal {
+			return xerrors.Errorf(
+				"retention result has inconsistent terminal progress: terminal=%t scanned_rows=%d verified_through_exclusive=%d first_incomplete_height=nil expected_end=%d",
+				result.Terminal,
+				result.ScannedRows,
+				result.VerifiedThroughExclusive,
+				expected.EndHeight,
+			)
+		}
+	} else {
+		firstIncompleteHeight := *result.FirstIncompleteHeight
+		if firstIncompleteHeight < expected.StartHeight ||
+			firstIncompleteHeight >= expected.EndHeight ||
+			firstIncompleteHeight != result.VerifiedThroughExclusive ||
+			result.Terminal {
+			return xerrors.Errorf(
+				"retention result has inconsistent incomplete progress: terminal=%t verified_through_exclusive=%d first_incomplete_height=%d cohort=[%d, %d)",
+				result.Terminal,
+				result.VerifiedThroughExclusive,
+				firstIncompleteHeight,
+				expected.StartHeight,
+				expected.EndHeight,
+			)
+		}
+	}
+	classifiedRows := []struct {
+		name  string
+		value uint64
+	}{
+		{name: "planned_rows", value: result.PlannedRows},
+		{name: "deleted_verified_rows", value: result.DeletedVerifiedRows},
+		{name: "already_retired_rows", value: result.AlreadyRetiredRows},
+		{name: "skipped_slots", value: result.SkippedSlots},
+		{name: "deferred_rows", value: result.DeferredRows},
+		{name: "failed_rows", value: result.FailedRows},
+	}
+	remainingRows := result.ScannedRows
+	for _, classified := range classifiedRows {
+		if classified.value > remainingRows {
+			return xerrors.Errorf(
+				"retention result row accounting exceeds scanned rows at %s: value=%d remaining=%d scanned_rows=%d",
+				classified.name,
+				classified.value,
+				remainingRows,
+				result.ScannedRows,
+			)
+		}
+		remainingRows -= classified.value
+	}
+	if remainingRows != 0 {
+		return xerrors.Errorf(
+			"retention result row accounting is incomplete: unclassified_rows=%d scanned_rows=%d",
+			remainingRows,
+			result.ScannedRows,
+		)
+	}
+	if result.RetryAfter < 0 || (result.RetryAfter > 0) != (result.RetryReason != "") {
+		return xerrors.Errorf(
+			"retention result has inconsistent retry state: retry_after=%s retry_reason=%q",
+			result.RetryAfter,
+			result.RetryReason,
+		)
+	}
+	if result.Terminal && (result.PlannedRows != 0 ||
+		result.DeferredRows != 0 ||
+		result.FailedRows != 0 ||
+		result.RetryAfter != 0 ||
+		result.FailureMessage != "") {
+		return xerrors.Errorf(
+			"terminal retention result contains nonterminal accounting: planned_rows=%d deferred_rows=%d failed_rows=%d retry_after=%s failure_message=%q",
+			result.PlannedRows,
+			result.DeferredRows,
+			result.FailedRows,
+			result.RetryAfter,
+			result.FailureMessage,
 		)
 	}
 	return nil
