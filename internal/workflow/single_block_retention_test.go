@@ -931,8 +931,8 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 		SingleBlockWritersGuarded:   true,
 		FallbackReadsValidated:      true,
 		ApprovedChain:               "solana-mainnet",
-		ApprovedStartHeight:         100,
-		ApprovedEndHeight:           120,
+		ApprovedStartHeight:         90,
+		ApprovedEndHeight:           130,
 	})
 	require.Error(s.T(), err)
 	require.True(s.T(), IsContinueAsNewError(err))
@@ -946,13 +946,15 @@ func (s *singleBlockRetentionTestSuite) TestExecuteContinuesAsNewWithCumulativeC
 	)
 	require.Equal(s.T(), uint64(100), nextRequest.StartHeight)
 	require.Equal(s.T(), uint64(120), nextRequest.EndHeight)
-	require.Equal(s.T(), uint64(100), nextRequest.ApprovedStartHeight)
-	require.Equal(s.T(), uint64(120), nextRequest.ApprovedEndHeight)
+	require.Equal(s.T(), uint64(90), nextRequest.ApprovedStartHeight)
+	require.Equal(s.T(), uint64(130), nextRequest.ApprovedEndHeight)
 	require.Equal(s.T(), 2, nextRequest.Parallelism)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), nextRequest.Tag)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), selectRequest.Tag)
 	require.Equal(s.T(), encodeSingleBlockRetentionEffectiveTag(effectiveTag), processRequest.Tag)
 	require.Equal(s.T(), testSingleBlockRetentionEligibilityCutoff, processRequest.EligibilityCutoff)
+	require.Equal(s.T(), uint64(90), processRequest.ApprovedStartHeight)
+	require.Equal(s.T(), uint64(130), processRequest.ApprovedEndHeight)
 	require.NotNil(s.T(), nextRequest.Checkpoint)
 	require.False(s.T(), selectRequest.EligibilityCutoff.IsZero())
 	require.Equal(s.T(), selectRequest.EligibilityCutoff, nextRequest.Checkpoint.EligibilityCutoff)
@@ -1324,6 +1326,13 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	}
 	require.NoError(t, validateSingleBlockRetentionExecutionRequest(validRequest()))
 
+	campaignRequest := validRequest()
+	campaignRequest.StartHeight = 423300000
+	campaignRequest.EndHeight = 423550000
+	campaignRequest.ApprovedStartHeight = 423300000
+	campaignRequest.ApprovedEndHeight = 437068000
+	require.NoError(t, validateSingleBlockRetentionExecutionRequest(campaignRequest))
+
 	request := validRequest()
 	request.StartHeight = 0
 	request.EndHeight = 0
@@ -1347,7 +1356,15 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	require.ErrorContains(
 		t,
 		validateSingleBlockRetentionExecutionRequest(request),
-		"valid exact approved range",
+		"valid approved range",
+	)
+
+	request = validRequest()
+	request.ApprovedStartHeight = 101
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(request),
+		"outside the approved envelope",
 	)
 
 	request = validRequest()
@@ -1355,7 +1372,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	require.ErrorContains(
 		t,
 		validateSingleBlockRetentionExecutionRequest(request),
-		"must exactly match the selection range",
+		"outside the approved envelope",
 	)
 
 	request = validRequest()

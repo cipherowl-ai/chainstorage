@@ -741,10 +741,12 @@ that become eligible later or bypasses each cohort's retention clock. Execution
 requires Postgres metadata plus versioned S3 storage, an explicit
 `FallbackReadsValidated` assertion with zero `FallbackErrorCount`, and a
 separate operator approval (`ApprovedChain`, `ApprovedStartHeight`,
-`ApprovedEndHeight`) that must exactly match the selection range. Every selected
-cohort must be fully contained by that immutable envelope across continuations;
-the approval is passed through unchanged and is never derived from selector
-output, so unbounded execution requests are rejected. API and SDK clients
+`ApprovedEndHeight`) that must fully contain the selection range. This permits
+one immutable campaign-wide approval to authorize separately bounded shards,
+while selections extending outside that envelope are rejected. Every selected
+cohort must also be fully contained by the envelope across continuations; the
+approval is passed through unchanged and is never derived from selector output,
+so unbounded execution requests are rejected. API and SDK clients
 continue to use the same Chainstorage interface; the
 `DirectStorageClientsGuarded` execution gate applies only to consumers that
 bypass Chainstorage and access object storage directly. The process activity
