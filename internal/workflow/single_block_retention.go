@@ -55,12 +55,12 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackReadsValidated      bool
 		FallbackErrorCount          uint64
-		// Approved* are the operator's separate exact-envelope deletion approval.
-		// Execution requires them, requires the selection range to equal the
-		// approved envelope, and passes them through unchanged across every
-		// continuation. Selected cohorts must be contained by this envelope;
-		// approval is never derived from selector output. Read-only runs may
-		// omit them.
+		// Approved* are the operator's separate deletion approval envelope.
+		// Execution requires them, requires the selection range to be fully
+		// contained by the approved envelope, and passes them through unchanged
+		// across every continuation. Selected cohorts must also be contained by
+		// this envelope; approval is never derived from selector output. Read-only
+		// runs may omit them.
 		ApprovedChain       string
 		ApprovedStartHeight uint64
 		ApprovedEndHeight   uint64
@@ -220,15 +220,15 @@ func (w *SingleBlockRetention) execute(
 		if err := w.readConfig(ctx, &cfg); err != nil {
 			return xerrors.Errorf("failed to read config: %w", err)
 		}
-		if err := validateSingleBlockRetentionExecutionRequest(request); err != nil {
-			return err
-		}
 		rangeSweepEnabled := workflow.GetVersion(
 			ctx,
 			singleBlockRetentionRangeSweepChangeID,
 			workflow.DefaultVersion,
 			singleBlockRetentionRangeSweepVersion,
 		) != workflow.DefaultVersion
+		if err := validateSingleBlockRetentionExecutionRequest(request, rangeSweepEnabled); err != nil {
+			return err
+		}
 		isContinuation := workflow.GetInfo(ctx).ContinuedExecutionRunID != ""
 		if request.Execute && rangeSweepEnabled && request.EligibilityCutoff.IsZero() {
 			return xerrors.New("single-block retention range execution requires the eligibility cutoff from its approved dry run")
@@ -1047,6 +1047,7 @@ func validateSingleBlockRetentionCheckpoint(
 
 func validateSingleBlockRetentionExecutionRequest(
 	request *SingleBlockRetentionRequest,
+	allowContainingApproval bool,
 ) error {
 	if request == nil {
 		return xerrors.New("single-block retention request is required")
@@ -1065,18 +1066,29 @@ func validateSingleBlockRetentionExecutionRequest(
 	}
 	if request.ApprovedEndHeight <= request.ApprovedStartHeight {
 		return xerrors.Errorf(
-			"retention execution requires a valid exact approved range, got [%d, %d)",
+			"retention execution requires a valid approved range, got [%d, %d)",
 			request.ApprovedStartHeight,
 			request.ApprovedEndHeight,
 		)
 	}
-	if request.ApprovedStartHeight != request.StartHeight || request.ApprovedEndHeight != request.EndHeight {
+	if !allowContainingApproval &&
+		(request.ApprovedStartHeight != request.StartHeight || request.ApprovedEndHeight != request.EndHeight) {
 		return xerrors.Errorf(
 			"retention execution approved range [%d, %d) must exactly match the selection range [%d, %d)",
 			request.ApprovedStartHeight,
 			request.ApprovedEndHeight,
 			request.StartHeight,
 			request.EndHeight,
+		)
+	}
+	if allowContainingApproval &&
+		(request.ApprovedStartHeight > request.StartHeight || request.ApprovedEndHeight < request.EndHeight) {
+		return xerrors.Errorf(
+			"retention execution selection range [%d, %d) is outside the approved envelope [%d, %d)",
+			request.StartHeight,
+			request.EndHeight,
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
 		)
 	}
 	if !request.DirectStorageClientsGuarded {
