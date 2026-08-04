@@ -781,6 +781,32 @@ func (s *singleBlockRetentionTestSuite) TestLegacyExecutionRejectsParallelism() 
 	require.ErrorContains(s.T(), err, "legacy single_block_retention execution requires parallelism=1")
 }
 
+func (s *singleBlockRetentionTestSuite) TestLegacyReplayRejectsContainingApprovalBeforeActivities() {
+	s.env.OnGetVersion(
+		singleBlockRetentionRangeSweepChangeID,
+		temporalworkflow.DefaultVersion,
+		singleBlockRetentionRangeSweepVersion,
+	).Return(temporalworkflow.DefaultVersion)
+
+	_, err := s.workflow.Execute(context.Background(), &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 423300000,
+		EndHeight:                   423550000,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             250,
+		Parallelism:                 10,
+		Execute:                     true,
+		ProductionDeleteEnabled:     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         423300000,
+		ApprovedEndHeight:           437068000,
+	})
+	require.ErrorContains(s.T(), err, "must exactly match the selection range")
+}
+
 func (s *singleBlockRetentionTestSuite) TestReplayPreParallelismHistory() {
 	replayer := worker.NewWorkflowReplayer()
 	replayer.RegisterWorkflowWithOptions(s.workflow.execute, temporalworkflow.RegisterOptions{
@@ -1324,21 +1350,26 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 			ApprovedEndHeight:           110,
 		}
 	}
-	require.NoError(t, validateSingleBlockRetentionExecutionRequest(validRequest()))
+	require.NoError(t, validateSingleBlockRetentionExecutionRequest(validRequest(), true))
 
 	campaignRequest := validRequest()
 	campaignRequest.StartHeight = 423300000
 	campaignRequest.EndHeight = 423550000
 	campaignRequest.ApprovedStartHeight = 423300000
 	campaignRequest.ApprovedEndHeight = 437068000
-	require.NoError(t, validateSingleBlockRetentionExecutionRequest(campaignRequest))
+	require.NoError(t, validateSingleBlockRetentionExecutionRequest(campaignRequest, true))
+	require.ErrorContains(
+		t,
+		validateSingleBlockRetentionExecutionRequest(campaignRequest, false),
+		"must exactly match the selection range",
+	)
 
 	request := validRequest()
 	request.StartHeight = 0
 	request.EndHeight = 0
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"explicit exact selection range",
 	)
 
@@ -1346,7 +1377,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.ApprovedChain = ""
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"operator approval chain",
 	)
 
@@ -1355,7 +1386,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.ApprovedEndHeight = 110
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"valid approved range",
 	)
 
@@ -1363,7 +1394,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.ApprovedStartHeight = 101
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"outside the approved envelope",
 	)
 
@@ -1371,7 +1402,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.ApprovedEndHeight = 109
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"outside the approved envelope",
 	)
 
@@ -1379,7 +1410,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.FallbackReadsValidated = false
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"explicit fallback-disabled read validation",
 	)
 
@@ -1387,7 +1418,7 @@ func TestValidateSingleBlockRetentionExecutionRequestGates(t *testing.T) {
 	request.FallbackErrorCount = 3
 	require.ErrorContains(
 		t,
-		validateSingleBlockRetentionExecutionRequest(request),
+		validateSingleBlockRetentionExecutionRequest(request, true),
 		"zero fallback read errors",
 	)
 }

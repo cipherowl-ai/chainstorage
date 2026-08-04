@@ -220,15 +220,15 @@ func (w *SingleBlockRetention) execute(
 		if err := w.readConfig(ctx, &cfg); err != nil {
 			return xerrors.Errorf("failed to read config: %w", err)
 		}
-		if err := validateSingleBlockRetentionExecutionRequest(request); err != nil {
-			return err
-		}
 		rangeSweepEnabled := workflow.GetVersion(
 			ctx,
 			singleBlockRetentionRangeSweepChangeID,
 			workflow.DefaultVersion,
 			singleBlockRetentionRangeSweepVersion,
 		) != workflow.DefaultVersion
+		if err := validateSingleBlockRetentionExecutionRequest(request, rangeSweepEnabled); err != nil {
+			return err
+		}
 		isContinuation := workflow.GetInfo(ctx).ContinuedExecutionRunID != ""
 		if request.Execute && rangeSweepEnabled && request.EligibilityCutoff.IsZero() {
 			return xerrors.New("single-block retention range execution requires the eligibility cutoff from its approved dry run")
@@ -1047,6 +1047,7 @@ func validateSingleBlockRetentionCheckpoint(
 
 func validateSingleBlockRetentionExecutionRequest(
 	request *SingleBlockRetentionRequest,
+	allowContainingApproval bool,
 ) error {
 	if request == nil {
 		return xerrors.New("single-block retention request is required")
@@ -1070,7 +1071,18 @@ func validateSingleBlockRetentionExecutionRequest(
 			request.ApprovedEndHeight,
 		)
 	}
-	if request.ApprovedStartHeight > request.StartHeight || request.ApprovedEndHeight < request.EndHeight {
+	if !allowContainingApproval &&
+		(request.ApprovedStartHeight != request.StartHeight || request.ApprovedEndHeight != request.EndHeight) {
+		return xerrors.Errorf(
+			"retention execution approved range [%d, %d) must exactly match the selection range [%d, %d)",
+			request.ApprovedStartHeight,
+			request.ApprovedEndHeight,
+			request.StartHeight,
+			request.EndHeight,
+		)
+	}
+	if allowContainingApproval &&
+		(request.ApprovedStartHeight > request.StartHeight || request.ApprovedEndHeight < request.EndHeight) {
 		return xerrors.Errorf(
 			"retention execution selection range [%d, %d) is outside the approved envelope [%d, %d)",
 			request.StartHeight,
