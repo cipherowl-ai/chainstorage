@@ -192,7 +192,10 @@ func (a *SingleBlockRetention) executeProcess(
 		return nil, err
 	}
 
-	req := a.planRequest(request)
+	req, err := a.planRequest(request)
+	if err != nil {
+		return nil, err
+	}
 	logger := a.processActivity.getLogger(ctx).With(
 		zap.Uint32("tag", req.Tag),
 		zap.String("consolidated_object_key", request.Cohort.ConsolidatedObjectKey),
@@ -322,7 +325,7 @@ func (a *SingleBlockRetention) getComponents(
 	return a.selector, a.planner, nil
 }
 
-func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) retirement.PlanRequest {
+func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) (retirement.PlanRequest, error) {
 	blockchain, network, sidechain := singleBlockRetentionChainNames(a.config)
 	tag := a.config.GetEffectiveBlockTag(request.Tag)
 	now := time.Now().UTC()
@@ -335,12 +338,21 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 	if request.ApprovedChain != "" {
 		approval.AllowContainingRange = true
 	}
+	bucket, err := a.config.ActiveBlockStorageBucket()
+	if err != nil {
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+	}
+	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	if err != nil {
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+	}
 	return retirement.PlanRequest{
 		Environment:                 string(a.config.Env()),
 		Blockchain:                  blockchain,
 		Network:                     network,
 		Sidechain:                   sidechain,
-		Bucket:                      a.config.AWS.Bucket,
+		Bucket:                      bucket,
+		StorageGeneration:           storageGeneration,
 		Tag:                         tag,
 		StartHeight:                 request.Cohort.StartHeight,
 		EndHeight:                   request.Cohort.EndHeight,
@@ -355,7 +367,7 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		// The planner independently re-verifies the actual chain and requires
 		// the cohort under deletion to be contained by this immutable envelope.
 		Approval: approval,
-	}
+	}, nil
 }
 
 func resolveSingleBlockRetentionEligibilityCutoff(cutoff time.Time, now time.Time) time.Time {

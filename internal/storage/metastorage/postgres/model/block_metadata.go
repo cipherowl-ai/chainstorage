@@ -14,11 +14,13 @@ type Scanner interface {
 
 // scanBlockMetadata scans a single row into a BlockMetadata struct.
 // Schema: id, height, tag, hash, parent_hash, parent_height, object_key_main,
-// timestamp, skipped, object_format, byte_offset, byte_length, uncompressed_length
+// timestamp, skipped, object_format, byte_offset, byte_length, uncompressed_length,
+// storage_generation
 func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
 	var objectFormat int32
+	var storageGeneration int32
 	var byteOffset, byteLength, uncompressedLength sql.NullInt64
 	var id int64 // We get this but don't need it in the result
 
@@ -36,6 +38,7 @@ func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 		&byteOffset,
 		&byteLength,
 		&uncompressedLength,
+		&storageGeneration,
 	)
 	if err != nil {
 		return nil, err
@@ -43,6 +46,7 @@ func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 
 	block.Timestamp = utils.ToTimestamp(timestamp)
 	block.ObjectFormat = api.BlockObjectFormat(objectFormat)
+	block.StorageGeneration = api.BlockStorageGeneration(storageGeneration)
 	if byteOffset.Valid {
 		block.ByteOffset = uint64(byteOffset.Int64)
 	}

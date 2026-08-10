@@ -154,10 +154,18 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
 	targetChain := approvalChainFromFlags()
+	bucket, err := cfg.ActiveBlockStorageBucket()
+	if err != nil {
+		return xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+	}
+	storageGeneration, err := cfg.ActiveBlockStorageGeneration()
+	if err != nil {
+		return xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+	}
 	logger.Info("planning single-block object retirement",
 		zap.String("environment", string(cfg.Env())),
 		zap.String("chain", targetChain),
-		zap.String("bucket", cfg.AWS.Bucket),
+		zap.String("bucket", bucket),
 		zap.Uint32("tag", tag),
 		zap.Uint64("start_height", flags.startHeight),
 		zap.Uint64("end_height", flags.endHeight),
@@ -181,7 +189,8 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 		Blockchain:                  commonFlags.blockchain,
 		Network:                     commonFlags.network,
 		Sidechain:                   commonFlags.sidechain,
-		Bucket:                      cfg.AWS.Bucket,
+		Bucket:                      bucket,
+		StorageGeneration:           storageGeneration,
 		Tag:                         tag,
 		StartHeight:                 flags.startHeight,
 		EndHeight:                   flags.endHeight,
@@ -244,6 +253,14 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 	}
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
+	bucket, err := cfg.ActiveBlockStorageBucket()
+	if err != nil {
+		return xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+	}
+	storageGeneration, err := cfg.ActiveBlockStorageGeneration()
+	if err != nil {
+		return xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+	}
 	db, err := openRetirementPostgres(ctx, cfg.AWS.Postgres, !flags.execute)
 	if err != nil {
 		return xerrors.Errorf("failed to open retirement postgres connection: %w", err)
@@ -256,7 +273,8 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 		Blockchain:                  commonFlags.blockchain,
 		Network:                     commonFlags.network,
 		Sidechain:                   commonFlags.sidechain,
-		Bucket:                      cfg.AWS.Bucket,
+		Bucket:                      bucket,
+		StorageGeneration:           storageGeneration,
 		Tag:                         tag,
 		StartHeight:                 flags.startHeight,
 		EndHeight:                   flags.endHeight,

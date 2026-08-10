@@ -47,6 +47,7 @@ type (
 		Hash                      string
 		Skipped                   bool
 		PrimaryObjectKey          string
+		PrimaryStorageGeneration  api.BlockStorageGeneration
 		SingleBlockObjectKey      string
 		PrimaryObjectFormat       api.BlockObjectFormat
 		PrimaryByteOffset         uint64
@@ -62,7 +63,9 @@ type (
 		Height                        uint64
 		Hash                          string
 		SingleBlockObjectKey          string
+		SingleBlockStorageGeneration  api.BlockStorageGeneration
 		ConsolidatedObjectKey         string
+		ConsolidatedStorageGeneration api.BlockStorageGeneration
 		ObjectFormat                  api.BlockObjectFormat
 		ByteOffset                    uint64
 		ByteLength                    uint64
@@ -144,6 +147,7 @@ type (
 		Network                     string
 		Sidechain                   string
 		Bucket                      string
+		StorageGeneration           api.BlockStorageGeneration
 		Tag                         uint32
 		StartHeight                 uint64
 		EndHeight                   uint64
@@ -253,6 +257,7 @@ const (
 	SkipActiveMetadataStillSingleBlock   = "active_metadata_still_single_block"
 	SkipMissingRetirementMarker          = "missing_retirement_marker"
 	SkipInvalidMetadataReference         = "invalid_metadata_reference"
+	SkipStorageGenerationMismatch        = "storage_generation_mismatch"
 	SkipRetentionPeriodActive            = "retention_period_active"
 	SkipChainRangeNotApproved            = "chain_range_not_approved"
 	SkipActiveFallbackOrReadErrors       = "active_fallback_or_read_errors"

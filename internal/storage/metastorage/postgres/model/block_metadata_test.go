@@ -11,6 +11,7 @@ import (
 
 type blockMetadataScanner struct {
 	objectFormat       int32
+	storageGeneration  int32
 	byteOffset         sql.NullInt64
 	byteLength         sql.NullInt64
 	uncompressedLength sql.NullInt64
@@ -30,6 +31,7 @@ func (s blockMetadataScanner) Scan(dest ...interface{}) error {
 	*dest[10].(*sql.NullInt64) = s.byteOffset
 	*dest[11].(*sql.NullInt64) = s.byteLength
 	*dest[12].(*sql.NullInt64) = s.uncompressedLength
+	*dest[13].(*int32) = s.storageGeneration
 	return nil
 }
 
@@ -46,6 +48,7 @@ func TestScanBlockMetadata_SingleBlockNullByteFields(t *testing.T) {
 func TestScanBlockMetadata_ConsolidatedFields(t *testing.T) {
 	actual, err := scanBlockMetadata(blockMetadataScanner{
 		objectFormat:       int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH),
+		storageGeneration:  int32(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2),
 		byteOffset:         sql.NullInt64{Int64: 4096, Valid: true},
 		byteLength:         sql.NullInt64{Int64: 8192, Valid: true},
 		uncompressedLength: sql.NullInt64{Int64: 8192, Valid: true},
@@ -56,4 +59,5 @@ func TestScanBlockMetadata_ConsolidatedFields(t *testing.T) {
 	require.Equal(t, uint64(4096), actual.GetByteOffset())
 	require.Equal(t, uint64(8192), actual.GetByteLength())
 	require.Equal(t, uint64(8192), actual.GetUncompressedLength())
+	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, actual.GetStorageGeneration())
 }

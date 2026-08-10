@@ -203,13 +203,14 @@ func TestDerivedConfigValues(t *testing.T) {
 		}
 
 		expectedAWS := config.AwsConfig{
-			Region:                 "us-east-1",
-			Bucket:                 fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
-			DynamoDB:               dynamoDBPtr,
-			Postgres:               postgresPtr,
-			IsLocalStack:           cfg.AWS.IsLocalStack,
-			IsResetLocal:           cfg.AWS.IsResetLocal,
-			PresignedUrlExpiration: 30 * time.Minute,
+			Region:                  "us-east-1",
+			Bucket:                  fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
+			ActiveStorageGeneration: config.StorageGenerationLegacy,
+			DynamoDB:                dynamoDBPtr,
+			Postgres:                postgresPtr,
+			IsLocalStack:            cfg.AWS.IsLocalStack,
+			IsResetLocal:            cfg.AWS.IsResetLocal,
+			PresignedUrlExpiration:  30 * time.Minute,
 			DLQ: config.SQSConfig{
 				Name:                  fmt.Sprintf("example_chainstorage_blocks_%v_dlq", configName),
 				VisibilityTimeoutSecs: 600,
@@ -962,73 +963,140 @@ func TestConsolidationHistoricalBackfillModeAcceptedAsDeprecatedAlias(t *testing
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
-func TestConsolidationHistoricalSourceBucketConfig(t *testing.T) {
+func TestStorageGenerationDefaultsToLegacy(t *testing.T) {
 	require := testutil.Require(t)
-
-	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
-	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
-	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_HISTORICAL_SOURCE_BUCKET", "legacy-solana-blocks")
 
 	cfg, err := config.New()
 	require.NoError(err)
-	require.Equal("legacy-solana-blocks", cfg.AWS.Storage.Consolidation.HistoricalSourceBucket)
+	require.Equal(config.StorageGenerationLegacy, cfg.AWS.ActiveStorageGeneration)
+	generation, err := cfg.ActiveBlockStorageGeneration()
+	require.NoError(err)
+	require.Equal(
+		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		generation,
+	)
+	bucket, err := cfg.ActiveBlockStorageBucket()
+	require.NoError(err)
+	require.Equal(cfg.AWS.Bucket, bucket)
 }
 
-func TestConsolidationHistoricalSourceBucketValidation(t *testing.T) {
+func TestStorageGenerationV2Config(t *testing.T) {
+	require := testutil.Require(t)
+	t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", "chainstorage-blocks-v2")
+	t.Setenv("CHAINSTORAGE_AWS_ACTIVE_STORAGE_GENERATION", "v2")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(config.StorageGenerationV2, cfg.AWS.ActiveStorageGeneration)
+	generation, err := cfg.ActiveBlockStorageGeneration()
+	require.NoError(err)
+	require.Equal(
+		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		generation,
+	)
+	bucket, err := cfg.ActiveBlockStorageBucket()
+	require.NoError(err)
+	require.Equal("chainstorage-blocks-v2", bucket)
+	legacyBucket, err := cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+	require.NoError(err)
+	require.Equal(cfg.AWS.Bucket, legacyBucket)
+}
+
+func TestStorageGenerationV2CanRemainDormant(t *testing.T) {
+	require := testutil.Require(t)
+	t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", "chainstorage-blocks-v2")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(config.StorageGenerationLegacy, cfg.AWS.ActiveStorageGeneration)
+	bucket, err := cfg.ActiveBlockStorageBucket()
+	require.NoError(err)
+	require.Equal(cfg.AWS.Bucket, bucket)
+}
+
+func TestStorageGenerationValidation(t *testing.T) {
 	require := testutil.Require(t)
 	baseConfig, err := config.New()
 	require.NoError(err)
 
 	tests := []struct {
-		name        string
-		source      string
-		enabled     string
-		blobStorage string
-		expectedErr string
+		name             string
+		bucketV2         string
+		activeGeneration string
+		blobStorage      string
+		expectedErr      string
 	}{
 		{
-			name:        "requires consolidation enabled",
-			source:      "legacy-solana-blocks",
-			enabled:     "false",
-			blobStorage: "S3",
-			expectedErr: "historical_source_bucket requires consolidation enabled",
+			name:             "active v2 requires bucket",
+			activeGeneration: "v2",
+			blobStorage:      "S3",
+			expectedErr:      "active_storage_generation=v2 requires aws.bucket_v2",
 		},
 		{
-			name:        "requires s3",
-			source:      "legacy-solana-blocks",
-			enabled:     "true",
-			blobStorage: "GCS",
-			expectedErr: "historical_source_bucket requires S3 blob storage",
+			name:             "active v2 requires s3",
+			bucketV2:         "chainstorage-blocks-v2",
+			activeGeneration: "v2",
+			blobStorage:      "GCS",
+			expectedErr:      "active_storage_generation=v2 requires S3 blob storage",
 		},
 		{
-			name:        "rejects active bucket",
-			source:      baseConfig.AWS.Bucket,
-			enabled:     "true",
-			blobStorage: "S3",
-			expectedErr: "historical_source_bucket must differ from aws.bucket",
+			name:             "rejects duplicate bucket",
+			bucketV2:         baseConfig.AWS.Bucket,
+			activeGeneration: "legacy",
+			blobStorage:      "S3",
+			expectedErr:      "aws.bucket_v2 must differ from aws.bucket",
 		},
 		{
-			name:        "rejects surrounding whitespace",
-			source:      " legacy-solana-blocks ",
-			enabled:     "true",
-			blobStorage: "S3",
-			expectedErr: "historical_source_bucket must not contain surrounding whitespace",
+			name:             "rejects surrounding whitespace",
+			bucketV2:         " chainstorage-blocks-v2 ",
+			activeGeneration: "legacy",
+			blobStorage:      "S3",
+			expectedErr:      "aws.bucket_v2 must not contain surrounding whitespace",
+		},
+		{
+			name:             "rejects unknown generation",
+			bucketV2:         "chainstorage-blocks-v2",
+			activeGeneration: "v3",
+			blobStorage:      "S3",
+			expectedErr:      "invalid aws.active_storage_generation",
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			require := testutil.Require(t)
-			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
 			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_BLOB", test.blobStorage)
-			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", test.enabled)
-			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_HISTORICAL_SOURCE_BUCKET", test.source)
+			t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", test.bucketV2)
+			t.Setenv("CHAINSTORAGE_AWS_ACTIVE_STORAGE_GENERATION", test.activeGeneration)
 
 			_, err := config.New()
 			require.Error(err)
 			require.Contains(err.Error(), test.expectedErr)
 		})
 	}
+}
+
+func TestResolveBlockStorageBucketRejectsUnavailableOrUnknownGeneration(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+
+	_, err = cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2)
+	require.ErrorContains(err, "aws.bucket_v2 is not configured")
+	_, err = cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration(99))
+	require.ErrorContains(err, "unsupported block storage generation 99")
+}
+
+func TestActiveBlockStorageGenerationRejectsInvalidManualConfig(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.ActiveStorageGeneration = config.StorageGeneration("v3")
+
+	_, err = cfg.ActiveBlockStorageGeneration()
+	require.ErrorContains(err, "invalid aws.active_storage_generation")
+	_, err = cfg.ActiveBlockStorageBucket()
+	require.ErrorContains(err, "invalid aws.active_storage_generation")
 }
 
 func TestConsolidationSingleBlockObjectRetentionConfig(t *testing.T) {

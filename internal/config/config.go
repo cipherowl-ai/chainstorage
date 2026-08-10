@@ -56,6 +56,7 @@ type (
 	MetaStorageType   int32
 	DLQType           int32
 	ConsolidationMode string
+	StorageGeneration string
 
 	ChainConfig struct {
 		Blockchain       common.Blockchain `mapstructure:"blockchain" validate:"required"`
@@ -124,16 +125,18 @@ type (
 	}
 
 	AwsConfig struct {
-		Region                 string          `mapstructure:"region" validate:"required"`
-		Bucket                 string          `mapstructure:"bucket" validate:"required"`
-		Postgres               *PostgresConfig `mapstructure:"postgres" validate:"required_without=DynamoDB"`
-		DynamoDB               *DynamoDBConfig `mapstructure:"dynamodb" validate:"required_without=Postgres"`
-		IsLocalStack           bool            `mapstructure:"local_stack"`
-		IsResetLocal           bool            `mapstructure:"reset_local"`
-		PresignedUrlExpiration time.Duration   `mapstructure:"presigned_url_expiration" validate:"required"`
-		DLQ                    SQSConfig       `mapstructure:"dlq"`
-		Storage                StorageConfig   `mapstructure:"storage"`
-		AWSAccount             AWSAccount      `mapstructure:"aws_account" validate:"required"`
+		Region                  string            `mapstructure:"region" validate:"required"`
+		Bucket                  string            `mapstructure:"bucket" validate:"required"`
+		BucketV2                string            `mapstructure:"bucket_v2"`
+		ActiveStorageGeneration StorageGeneration `mapstructure:"active_storage_generation"`
+		Postgres                *PostgresConfig   `mapstructure:"postgres" validate:"required_without=DynamoDB"`
+		DynamoDB                *DynamoDBConfig   `mapstructure:"dynamodb" validate:"required_without=Postgres"`
+		IsLocalStack            bool              `mapstructure:"local_stack"`
+		IsResetLocal            bool              `mapstructure:"reset_local"`
+		PresignedUrlExpiration  time.Duration     `mapstructure:"presigned_url_expiration" validate:"required"`
+		DLQ                     SQSConfig         `mapstructure:"dlq"`
+		Storage                 StorageConfig     `mapstructure:"storage"`
+		AWSAccount              AWSAccount        `mapstructure:"aws_account" validate:"required"`
 	}
 
 	PostgresConfig struct {
@@ -445,7 +448,6 @@ type (
 	ConsolidationConfig struct {
 		Enabled                                  bool              `mapstructure:"enabled"`
 		Mode                                     ConsolidationMode `mapstructure:"mode"`
-		HistoricalSourceBucket                   string            `mapstructure:"historical_source_bucket"`
 		Codec                                    api.Compression   `mapstructure:"codec"`
 		CodecLevel                               int               `mapstructure:"codec_level"`
 		ZstdLongDistanceWindowLog                *int              `mapstructure:"zstd_long_distance_window_log"`
@@ -642,6 +644,9 @@ const (
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
 	DefaultSingleBlockObjectRetention                            = 72 * time.Hour
 
+	StorageGenerationLegacy StorageGeneration = "legacy"
+	StorageGenerationV2     StorageGeneration = "v2"
+
 	AWSAccountDevelopment AWSAccount = "development"
 	AWSAccountProduction  AWSAccount = "production"
 
@@ -722,7 +727,8 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
 	v.SetDefault("aws.storage.consolidation.enabled", false)
 	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeSingleBlockOnly))
-	v.SetDefault("aws.storage.consolidation.historical_source_bucket", "")
+	v.SetDefault("aws.bucket_v2", "")
+	v.SetDefault("aws.active_storage_generation", string(StorageGenerationLegacy))
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
 	v.SetDefault("aws.storage.consolidation.codec_level", 6)
 	v.SetDefault("aws.storage.consolidation.max_compressed_bytes", 2147483648)
@@ -784,6 +790,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	if err := validate.Struct(&cfg); err != nil {
 		return nil, xerrors.Errorf("failed to validate config: %w", err)
 	}
+	if err := cfg.validateStorageGenerationConfig(); err != nil {
+		return nil, xerrors.Errorf("failed to validate storage generation config: %w", err)
+	}
 	if err := cfg.validateConsolidationConfig(); err != nil {
 		return nil, xerrors.Errorf("failed to validate consolidation config: %w", err)
 	}
@@ -844,6 +853,66 @@ func applyDeprecatedConfigAlias(v *viper.Viper, canonicalKey string, deprecatedK
 	}
 }
 
+func (c *Config) validateStorageGenerationConfig() error {
+	if strings.TrimSpace(c.AWS.BucketV2) != c.AWS.BucketV2 {
+		return xerrors.New("aws.bucket_v2 must not contain surrounding whitespace")
+	}
+	if c.AWS.BucketV2 != "" && c.AWS.BucketV2 == c.AWS.Bucket {
+		return xerrors.New("aws.bucket_v2 must differ from aws.bucket")
+	}
+
+	switch c.AWS.ActiveStorageGeneration {
+	case StorageGenerationLegacy:
+		return nil
+	case StorageGenerationV2:
+		if c.AWS.BucketV2 == "" {
+			return xerrors.New("aws.active_storage_generation=v2 requires aws.bucket_v2")
+		}
+		switch c.StorageType.BlobStorageType {
+		case BlobStorageType_UNSPECIFIED, BlobStorageType_S3:
+			return nil
+		default:
+			return xerrors.Errorf("aws.active_storage_generation=v2 requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
+		}
+	default:
+		return xerrors.Errorf("invalid aws.active_storage_generation %q", c.AWS.ActiveStorageGeneration)
+	}
+}
+
+func (c *Config) ActiveBlockStorageGeneration() (api.BlockStorageGeneration, error) {
+	switch c.AWS.ActiveStorageGeneration {
+	case StorageGenerationLegacy:
+		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, nil
+	case StorageGenerationV2:
+		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, nil
+	default:
+		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+			xerrors.Errorf("invalid aws.active_storage_generation %q", c.AWS.ActiveStorageGeneration)
+	}
+}
+
+func (c *Config) ResolveBlockStorageBucket(generation api.BlockStorageGeneration) (string, error) {
+	switch generation {
+	case api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY:
+		return c.AWS.Bucket, nil
+	case api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2:
+		if c.AWS.BucketV2 == "" {
+			return "", xerrors.New("block metadata requires storage generation v2 but aws.bucket_v2 is not configured")
+		}
+		return c.AWS.BucketV2, nil
+	default:
+		return "", xerrors.Errorf("unsupported block storage generation %d", generation)
+	}
+}
+
+func (c *Config) ActiveBlockStorageBucket() (string, error) {
+	generation, err := c.ActiveBlockStorageGeneration()
+	if err != nil {
+		return "", err
+	}
+	return c.ResolveBlockStorageBucket(generation)
+}
+
 func (c *Config) validateConsolidationConfig() error {
 	consolidation := c.AWS.Storage.Consolidation
 	switch consolidation.Mode {
@@ -855,24 +924,6 @@ func (c *Config) validateConsolidationConfig() error {
 		ConsolidationModeSyncerConsolidatedPrimary:
 	default:
 		return xerrors.Errorf("invalid consolidation mode %q", consolidation.Mode)
-	}
-
-	historicalSourceBucket := consolidation.HistoricalSourceBucket
-	if historicalSourceBucket != "" {
-		if strings.TrimSpace(historicalSourceBucket) != historicalSourceBucket {
-			return xerrors.New("consolidation historical_source_bucket must not contain surrounding whitespace")
-		}
-		if !consolidation.Enabled {
-			return xerrors.New("consolidation historical_source_bucket requires consolidation enabled")
-		}
-		switch c.StorageType.BlobStorageType {
-		case BlobStorageType_UNSPECIFIED, BlobStorageType_S3:
-		default:
-			return xerrors.Errorf("consolidation historical_source_bucket requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
-		}
-		if historicalSourceBucket == c.AWS.Bucket {
-			return xerrors.New("consolidation historical_source_bucket must differ from aws.bucket")
-		}
 	}
 
 	switch consolidation.Codec {

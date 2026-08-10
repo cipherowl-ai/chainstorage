@@ -61,9 +61,6 @@ func (s *batchConsolidatorTestSuite) SetupTest() {
 		fx.Provide(func() blobstorage.BlobStorage {
 			return nil
 		}),
-		fx.Provide(func(storage blobstorage.BlobStorage) blobstorage.HistoricalSingleBlockDownloader {
-			return storage
-		}),
 		fx.Populate(&s.batchConsolidator),
 	)
 }

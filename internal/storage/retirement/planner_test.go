@@ -562,6 +562,52 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
 }
 
+func TestPlannerPlan_StorageGenerationMismatchIsNeverRetired(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+
+	tests := []struct {
+		name   string
+		mutate func(*MetadataRow)
+	}{
+		{
+			name: "primary",
+			mutate: func(row *MetadataRow) {
+				row.PrimaryStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+			},
+		},
+		{
+			name: "source shadow",
+			mutate: func(row *MetadataRow) {
+				row.Shadow.SingleBlockStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+			},
+		},
+		{
+			name: "consolidated shadow",
+			mutate: func(row *MetadataRow) {
+				row.Shadow.ConsolidatedStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+			test.mutate(&row)
+			store := newFakeStore()
+
+			report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+			require.NoError(err)
+			require.Len(report.Items, 1)
+			require.Equal(ActionSkip, report.Items[0].Action)
+			require.Equal(SkipStorageGenerationMismatch, report.Items[0].SkipReason)
+			require.Empty(store.headCalls)
+			require.Empty(store.versionCalls)
+		})
+	}
+}
+
 func TestPlannerPlan_ActiveSingleBlockMetadataIsNeverRetired(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)

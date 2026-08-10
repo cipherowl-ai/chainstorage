@@ -31,28 +31,26 @@ import (
 type (
 	BatchConsolidator struct {
 		baseActivity
-		statsActivity        baseActivity
-		latestBlockActivity  baseActivity
-		planActivity         baseActivity
-		cursorActivity       baseActivity
-		candidateActivity    baseActivity
-		config               *config.Config
-		metaStorage          metastorage.MetaStorage
-		blobStorage          blobstorage.BlobStorage
-		historicalDownloader blobstorage.HistoricalSingleBlockDownloader
-		s3Client             chains3.Client
-		repairerMu           sync.Mutex
-		repairer             cscbrepair.Repairer
+		statsActivity       baseActivity
+		latestBlockActivity baseActivity
+		planActivity        baseActivity
+		cursorActivity      baseActivity
+		candidateActivity   baseActivity
+		config              *config.Config
+		metaStorage         metastorage.MetaStorage
+		blobStorage         blobstorage.BlobStorage
+		s3Client            chains3.Client
+		repairerMu          sync.Mutex
+		repairer            cscbrepair.Repairer
 	}
 
 	BatchConsolidatorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime              cadence.Runtime
-		MetaStorage          metastorage.MetaStorage
-		BlobStorage          blobstorage.BlobStorage
-		HistoricalDownloader blobstorage.HistoricalSingleBlockDownloader
-		S3Client             chains3.Client `optional:"true"`
+		Runtime     cadence.Runtime
+		MetaStorage metastorage.MetaStorage
+		BlobStorage blobstorage.BlobStorage
+		S3Client    chains3.Client `optional:"true"`
 	}
 
 	BatchConsolidatorRequest struct {
@@ -137,17 +135,16 @@ type (
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a := &BatchConsolidator{
-		baseActivity:         newBaseActivity(ActivityBatchConsolidator, params.Runtime),
-		statsActivity:        newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
-		latestBlockActivity:  newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
-		planActivity:         newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
-		cursorActivity:       newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
-		candidateActivity:    newBaseActivity(ActivityBatchConsolidatorRepairCandidates, params.Runtime),
-		config:               params.Config,
-		metaStorage:          params.MetaStorage,
-		blobStorage:          params.BlobStorage,
-		historicalDownloader: params.HistoricalDownloader,
-		s3Client:             params.S3Client,
+		baseActivity:        newBaseActivity(ActivityBatchConsolidator, params.Runtime),
+		statsActivity:       newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
+		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
+		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
+		cursorActivity:      newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
+		candidateActivity:   newBaseActivity(ActivityBatchConsolidatorRepairCandidates, params.Runtime),
+		config:              params.Config,
+		metaStorage:         params.MetaStorage,
+		blobStorage:         params.BlobStorage,
+		s3Client:            params.S3Client,
 	}
 	a.register(a.execute)
 	a.statsActivity.register(a.executeStats)
@@ -483,6 +480,13 @@ func (a *BatchConsolidator) getCSCBRepairer(ctx context.Context) (cscbrepair.Rep
 	if a.s3Client == nil {
 		return nil, xerrors.New("repair_existing_cscb requires an S3 client")
 	}
+	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	if err != nil {
+		return nil, xerrors.Errorf("repair_existing_cscb failed to resolve active block storage generation: %w", err)
+	}
+	if storageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY {
+		return nil, xerrors.New("repair_existing_cscb is only supported for the legacy block storage generation")
+	}
 	pool, err := metapostgres.GetConnectionPool(ctx, a.config.AWS.Postgres)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get CSCB repair Postgres pool: %w", err)
@@ -567,13 +571,8 @@ func (a *BatchConsolidator) executeShadowDualWriteWithExpected(
 		}
 	}
 
-	downloader := blobstorage.HistoricalSingleBlockDownloader(a.blobStorage)
-	if mode == config.ConsolidationModeHistoricalBackfill {
-		downloader = a.historicalDownloader
-	}
-
 	buildStart := time.Now()
-	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, downloader, records)
+	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, records)
 	if err != nil {
 		return nil, err
 	}
@@ -961,7 +960,6 @@ func (a *BatchConsolidator) buildPinnedRepairPayloads(
 
 func (a *BatchConsolidator) buildPayloads(
 	ctx context.Context,
-	downloader blobstorage.HistoricalSingleBlockDownloader,
 	records []*metastorage.BlockMetadataRecord,
 ) ([]blobstorage.ConsolidatedBlockPayload, map[int64]*api.BlockMetadata, func(), error) {
 	payloads := make([]blobstorage.ConsolidatedBlockPayload, len(records))
@@ -995,7 +993,7 @@ func (a *BatchConsolidator) buildPayloads(
 		group.Go(func() error {
 			record := records[i]
 			metadata := record.Metadata
-			block, err := downloader.Download(groupCtx, metadata)
+			block, err := a.blobStorage.Download(groupCtx, metadata)
 			if err != nil {
 				return xerrors.Errorf("failed to download single-block object (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}
@@ -1118,16 +1116,18 @@ func makeShadowPlacements(
 			)
 		}
 		shadowPlacements = append(shadowPlacements, &metastorage.ConsolidationShadowPlacement{
-			BlockMetadataID:           placement.MetadataID,
-			Tag:                       metadata.GetTag(),
-			Height:                    metadata.GetHeight(),
-			Hash:                      metadata.GetHash(),
-			SingleBlockObjectKeyMain:  metadata.GetObjectKeyMain(),
-			ConsolidatedObjectKeyMain: objectKey,
-			ObjectFormat:              placement.ObjectFormat,
-			ByteOffset:                placement.ByteOffset,
-			ByteLength:                placement.ByteLength,
-			UncompressedLength:        placement.UncompressedLength,
+			BlockMetadataID:               placement.MetadataID,
+			Tag:                           metadata.GetTag(),
+			Height:                        metadata.GetHeight(),
+			Hash:                          metadata.GetHash(),
+			SingleBlockObjectKeyMain:      metadata.GetObjectKeyMain(),
+			SingleBlockStorageGeneration:  metadata.GetStorageGeneration(),
+			ConsolidatedObjectKeyMain:     objectKey,
+			ConsolidatedStorageGeneration: placement.StorageGeneration,
+			ObjectFormat:                  placement.ObjectFormat,
+			ByteOffset:                    placement.ByteOffset,
+			ByteLength:                    placement.ByteLength,
+			UncompressedLength:            placement.UncompressedLength,
 		})
 	}
 	return shadowPlacements, nil

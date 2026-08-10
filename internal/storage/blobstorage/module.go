@@ -9,17 +9,16 @@ import (
 )
 
 type (
-	BlobStorage                     = internal.BlobStorage
-	HistoricalSingleBlockDownloader = internal.HistoricalSingleBlockDownloader
-	BlobStorageFactory              = internal.BlobStorageFactory
-	BlobStorageFactoryParams        = internal.BlobStorageFactoryParams
-	RawBlockData                    = internal.RawBlockData
-	PayloadSource                   = internal.PayloadSource
-	BytesPayloadSource              = internal.BytesPayloadSource
-	FilePayloadSource               = internal.FilePayloadSource
-	ConsolidatedBlockPayload        = internal.ConsolidatedBlockPayload
-	BlockPlacement                  = internal.BlockPlacement
-	ConsolidatedUploadProgress      = internal.ConsolidatedUploadProgress
+	BlobStorage                = internal.BlobStorage
+	BlobStorageFactory         = internal.BlobStorageFactory
+	BlobStorageFactoryParams   = internal.BlobStorageFactoryParams
+	RawBlockData               = internal.RawBlockData
+	PayloadSource              = internal.PayloadSource
+	BytesPayloadSource         = internal.BytesPayloadSource
+	FilePayloadSource          = internal.FilePayloadSource
+	ConsolidatedBlockPayload   = internal.ConsolidatedBlockPayload
+	BlockPlacement             = internal.BlockPlacement
+	ConsolidatedUploadProgress = internal.ConsolidatedUploadProgress
 )
 
 var (
@@ -29,7 +28,6 @@ var (
 
 	Module = fx.Module("blobstorage",
 		fx.Provide(withBlobStorageFactory),
-		fx.Provide(withHistoricalSingleBlockDownloader),
 		s3.Module,
 		gcs.Module,
 	)

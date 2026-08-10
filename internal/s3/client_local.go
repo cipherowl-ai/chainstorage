@@ -13,7 +13,16 @@ import (
 )
 
 func resetLocalResources(params S3Params) error {
-	return initBucket(params.Logger, params.Config.AWS.Bucket, params.AWSConfig, params.Config.AWS.IsResetLocal)
+	buckets := []string{params.Config.AWS.Bucket}
+	if params.Config.AWS.BucketV2 != "" {
+		buckets = append(buckets, params.Config.AWS.BucketV2)
+	}
+	for _, bucket := range buckets {
+		if err := initBucket(params.Logger, bucket, params.AWSConfig, params.Config.AWS.IsResetLocal); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func initBucket(log *zap.Logger, bucket string, cfg aws.Config, reset bool) error {

@@ -20,6 +20,7 @@ import (
 	"go.uber.org/mock/gomock"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
 	s3mocks "github.com/coinbase/chainstorage/internal/s3/mocks"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
@@ -133,6 +134,8 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	require.Equal(uint64(5), placements[0].ByteLength)
 	require.Equal(uint64(5), placements[1].ByteOffset)
 	require.Equal(uint64(6), placements[1].ByteLength)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, placements[0].StorageGeneration)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, placements[1].StorageGeneration)
 	require.Contains(stages, "s3_encode_config_loaded")
 	require.Contains(stages, "cscb_encode_started")
 	require.Contains(stages, "cscb_block_encoded")
@@ -144,6 +147,59 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	require.Contains(stages, "s3_put_finished")
 	require.Contains(stages, "s3_head_uploaded_started")
 	require.Contains(stages, "s3_head_uploaded_finished")
+}
+
+func TestBlobStorage_UploadConsolidated_ActiveV2RoutesAndStampsPlacements(t *testing.T) {
+	require := testutil.Require(t)
+	expected, err := cscb.Encode(context.Background(), testS3EncodeConfig(), testS3Payloads())
+	require.NoError(err)
+	defer expected.Close()
+
+	cfg, err := config.New(
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+	cfg.AWS.BucketV2 = "v2-blocks"
+	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationV2
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	client.EXPECT().HeadObject(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *awss3.HeadObjectInput, opts ...func(*awss3.Options)) (*awss3.HeadObjectOutput, error) {
+			require.Equal("v2-blocks", aws.ToString(input.Bucket))
+			return &awss3.HeadObjectOutput{
+				ContentLength: aws.Int64(int64(expected.Length)),
+				Metadata: map[string]string{
+					cscbMetadataSHA256: expected.SHA256,
+				},
+			}, nil
+		},
+	)
+
+	var storage internal.BlobStorageCore
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(newBlobStorage),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	objectKey, placements, err := storage.UploadConsolidated(context.Background(), testS3Payloads())
+	require.NoError(err)
+	require.Equal(expected.Key, objectKey)
+	require.Len(placements, 2)
+	for _, placement := range placements {
+		require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, placement.StorageGeneration)
+	}
 }
 
 func TestBlobStorage_UploadConsolidated_AcceptsExistingExactObject(t *testing.T) {
@@ -362,6 +418,82 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_GroupsByObjectAndChunk(t *te
 	require.True(proto.Equal(expectedBlocks[0], actual[1]))
 	require.True(proto.Equal(expectedBlocks[1], actual[2]))
 	assertRangeReadsConsumed(t, expectedRanges)
+}
+
+func TestBlobStorage_DownloadManyConsolidatedBlocks_SeparatesSameKeyByGeneration(t *testing.T) {
+	require := testutil.Require(t)
+	object, metadatas, _, objectData, index := testS3CSCBProtoObject(t)
+	defer object.Close()
+
+	legacy := proto.Clone(metadatas[0]).(*api.BlockMetadata)
+	legacy.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+	v2 := proto.Clone(metadatas[0]).(*api.BlockMetadata)
+	v2.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	_, chunk, err := index.LookupBlock(legacy)
+	require.NoError(err)
+
+	cfg, err := config.New(
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_SOLANA),
+		config.WithNetwork(common.Network_NETWORK_SOLANA_MAINNET),
+	)
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+	cfg.AWS.BucketV2 = "v2-blocks"
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	calls := make(chan string, 4)
+	client.EXPECT().GetObject(gomock.Any(), gomock.Any()).Times(4).DoAndReturn(
+		func(ctx context.Context, input *awss3.GetObjectInput, opts ...func(*awss3.Options)) (*awss3.GetObjectOutput, error) {
+			rangeValue := aws.ToString(input.Range)
+			calls <- aws.ToString(input.Bucket) + "|" + rangeValue
+			var start uint64
+			var end uint64
+			if _, err := fmt.Sscanf(rangeValue, "bytes=%d-%d", &start, &end); err != nil {
+				return nil, err
+			}
+			if start >= uint64(len(objectData)) {
+				return nil, fmt.Errorf("range start %d exceeds object length %d", start, len(objectData))
+			}
+			if end >= uint64(len(objectData)) {
+				end = uint64(len(objectData)) - 1
+			}
+			return &awss3.GetObjectOutput{Body: io.NopCloser(bytes.NewReader(objectData[start : end+1]))}, nil
+		},
+	)
+
+	var storage internal.BlobStorageCore
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(newBlobStorage),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	blocks, err := storage.DownloadMany(context.Background(), []*api.BlockMetadata{legacy, v2})
+	require.NoError(err)
+	require.Len(blocks, 2)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, blocks[0].GetMetadata().GetStorageGeneration())
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, blocks[1].GetMetadata().GetStorageGeneration())
+	close(calls)
+	actualCalls := make(map[string]int)
+	for call := range calls {
+		actualCalls[call]++
+	}
+	chunkRange := rangeHeader(chunk)
+	require.Equal(map[string]int{
+		"legacy-blocks|bytes=0-65535": 1,
+		"legacy-blocks|" + chunkRange: 1,
+		"v2-blocks|bytes=0-65535":     1,
+		"v2-blocks|" + chunkRange:     1,
+	}, actualCalls)
 }
 
 func TestBlobStorage_DownloadManyConsolidatedBlocks_AllowsDuplicateInputs(t *testing.T) {

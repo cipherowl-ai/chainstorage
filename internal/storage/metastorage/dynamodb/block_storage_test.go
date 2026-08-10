@@ -17,6 +17,7 @@ func TestMakeBlockMetaDataDDBEntries_ConsolidatedFields(t *testing.T) {
 	block.ByteOffset = 4096
 	block.ByteLength = 8192
 	block.UncompressedLength = 8192
+	block.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
 
 	entries := (&blockStorageImpl{}).makeBlockMetaDataDDBEntries(true, []*api.BlockMetadata{block})
 
@@ -28,6 +29,7 @@ func TestMakeBlockMetaDataDDBEntries_ConsolidatedFields(t *testing.T) {
 		require.Equal(t, uint64(4096), blockEntry.ByteOffset)
 		require.Equal(t, uint64(8192), blockEntry.ByteLength)
 		require.Equal(t, uint64(8192), blockEntry.UncompressedLength)
+		require.Equal(t, int32(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2), blockEntry.StorageGeneration)
 	}
 	require.Equal(t, getBlockRidWithBlockHash(block.Hash), entries[0].(*ddbmodel.BlockMetaDataDDBEntry).BlockRid)
 	require.Equal(t, getCanonicalBlockRid(), entries[1].(*ddbmodel.BlockMetaDataDDBEntry).BlockRid)

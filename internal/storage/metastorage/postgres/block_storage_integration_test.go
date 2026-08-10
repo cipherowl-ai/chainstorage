@@ -242,9 +242,17 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	require.Error(err)
 	require.Contains(err.Error(), "cannot change CSCB placement after single-block object retirement is fenced")
 
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET storage_generation = $2
+		WHERE id = $1`, blockMetadataID, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2)
+	require.Error(err)
+	require.Contains(err.Error(), "cannot change storage generation after single-block object retirement is fenced")
+
 	replayedSingleBlock := proto.Clone(block).(*api.BlockMetadata)
 	replayedSingleBlock.ObjectKeyMain = "single-block/replayed-block.gzip"
 	replayedSingleBlock.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
+	replayedSingleBlock.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
 	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayedSingleBlock}, nil))
 
 	for _, fetched := range []*api.BlockMetadata{
@@ -256,6 +264,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 		require.Equal(uint64(64), fetched.ByteOffset)
 		require.Equal(uint64(128), fetched.ByteLength)
 		require.Equal(uint64(256), fetched.UncompressedLength)
+		require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, fetched.GetStorageGeneration())
 	}
 
 	claimToken := "normal-read-path-claim"
@@ -1142,6 +1151,40 @@ func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStats() {
 	require.Equal(uint64(2), stats.EligibleBlocks)
 }
 
+func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsCountsSameKeyInDifferentGenerationsSeparately() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 2, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, blocks, nil)
+	require.NoError(err)
+	placements := make([]*internal.ConsolidationShadowPlacement, 0, len(blocks))
+	for i, block := range blocks {
+		placements = append(placements, &internal.ConsolidationShadowPlacement{
+			BlockMetadataID:               s.getBlockMetadataID(ctx, block),
+			Tag:                           block.GetTag(),
+			Height:                        block.GetHeight(),
+			Hash:                          block.GetHash(),
+			SingleBlockObjectKeyMain:      block.GetObjectKeyMain(),
+			SingleBlockStorageGeneration:  block.GetStorageGeneration(),
+			ConsolidatedObjectKeyMain:     "consolidated/shared-key.cscb.zstd",
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration(i),
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                    uint64(i * 100),
+			ByteLength:                    100,
+			UncompressedLength:            100,
+		})
+	}
+	require.NoError(s.accessor.PersistBlockConsolidationShadows(ctx, placements))
+
+	stats, err := s.accessor.GetBlockConsolidationShadowStats(ctx, tag, startHeight, startHeight+2)
+	require.NoError(err)
+	require.Equal(uint64(2), stats.Objects)
+	require.Equal(uint64(2), stats.Blocks)
+	require.Equal(uint64(2), stats.EligibleBlocks)
+}
+
 func (s *blockStorageTestSuite) TestGetBlockConsolidationShadowStatsExcludesSkippedBlocks() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()
@@ -1270,6 +1313,166 @@ func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimar
 	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[1])
 	require.Error(err)
 	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
+func (s *blockStorageTestSuite) TestConsolidationShadowPromotionMovesStorageGenerationAtomically() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	block := testutil.MakeBlockMetadata(s.config.Chain.BlockStartHeight, tag)
+	block.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+
+	err := s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil)
+	require.NoError(err)
+	err = s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:               s.getBlockMetadataID(ctx, block),
+			Tag:                           block.GetTag(),
+			Height:                        block.GetHeight(),
+			Hash:                          block.GetHash(),
+			SingleBlockObjectKeyMain:      block.GetObjectKeyMain(),
+			SingleBlockStorageGeneration:  api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+			ConsolidatedObjectKeyMain:     "consolidated/v2.cscb.zstd",
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                    100,
+			ByteLength:                    200,
+			UncompressedLength:            200,
+		},
+	})
+	require.NoError(err)
+
+	shadow, err := s.accessor.GetBlockConsolidationShadow(ctx, block)
+	require.NoError(err)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, shadow.GetStorageGeneration())
+	require.Equal("consolidated/v2.cscb.zstd", shadow.GetObjectKeyMain())
+
+	result, err := s.accessor.PromoteBlockConsolidationShadows(
+		ctx,
+		block.GetTag(),
+		block.GetHeight(),
+		block.GetHeight()+1,
+		1,
+		config.DefaultSingleBlockObjectRetention,
+	)
+	require.NoError(err)
+	require.Equal(uint64(1), result.Blocks)
+
+	primary, err := s.accessor.GetBlockByHeight(ctx, block.GetTag(), block.GetHeight())
+	require.NoError(err)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, primary.GetStorageGeneration())
+	require.Equal("consolidated/v2.cscb.zstd", primary.GetObjectKeyMain())
+	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, primary.GetObjectFormat())
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsRejectsStaleSourceGeneration() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	block := testutil.MakeBlockMetadata(s.config.Chain.BlockStartHeight, tag)
+
+	err := s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil)
+	require.NoError(err)
+	err = s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:               s.getBlockMetadataID(ctx, block),
+			Tag:                           block.GetTag(),
+			Height:                        block.GetHeight(),
+			Hash:                          block.GetHash(),
+			SingleBlockObjectKeyMain:      block.GetObjectKeyMain(),
+			SingleBlockStorageGeneration:  api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			ConsolidatedObjectKeyMain:     "consolidated/v2.cscb.zstd",
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                    200,
+			UncompressedLength:            200,
+		},
+	})
+	require.Error(err)
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, block)
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsReplacesStaleGenerationAndResetsRetention() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	block := testutil.MakeBlockMetadata(s.config.Chain.BlockStartHeight, tag)
+	originalSingleBlockKey := block.GetObjectKeyMain()
+
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, []*api.BlockMetadata{block}, nil))
+	require.NoError(s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:               s.getBlockMetadataID(ctx, block),
+			Tag:                           block.GetTag(),
+			Height:                        block.GetHeight(),
+			Hash:                          block.GetHash(),
+			SingleBlockObjectKeyMain:      originalSingleBlockKey,
+			SingleBlockStorageGeneration:  api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+			ConsolidatedObjectKeyMain:     "consolidated/legacy.cscb.zstd",
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                    200,
+			UncompressedLength:            200,
+		},
+	}))
+
+	promotion, err := s.accessor.PromoteBlockConsolidationShadows(
+		ctx,
+		block.GetTag(),
+		block.GetHeight(),
+		block.GetHeight()+1,
+		1,
+		config.DefaultSingleBlockObjectRetention,
+	)
+	require.NoError(err)
+	require.Equal(uint64(1), promotion.Blocks)
+
+	// A replay writes the same deterministic key to the active v2 bucket. The
+	// primary row moves first; the next consolidation must replace the now-stale
+	// legacy shadow rather than carrying its legacy retirement clock forward.
+	replayed := proto.Clone(block).(*api.BlockMetadata)
+	replayed.ObjectKeyMain = originalSingleBlockKey
+	replayed.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, []*api.BlockMetadata{replayed}, nil))
+	require.NoError(s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:               s.getBlockMetadataID(ctx, replayed),
+			Tag:                           replayed.GetTag(),
+			Height:                        replayed.GetHeight(),
+			Hash:                          replayed.GetHash(),
+			SingleBlockObjectKeyMain:      originalSingleBlockKey,
+			SingleBlockStorageGeneration:  api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			ConsolidatedObjectKeyMain:     "consolidated/v2.cscb.zstd",
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			ObjectFormat:                  api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                    200,
+			UncompressedLength:            200,
+		},
+	}))
+
+	shadow, err := s.accessor.GetBlockConsolidationShadow(ctx, replayed)
+	require.NoError(err)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, shadow.GetStorageGeneration())
+	require.Equal("consolidated/v2.cscb.zstd", shadow.GetObjectKeyMain())
+
+	var sourceGeneration int32
+	var consolidatedGeneration int32
+	var retentionStartedAt sql.NullTime
+	var deleteAfter sql.NullTime
+	err = s.db.QueryRowContext(ctx, `
+		SELECT single_block_storage_generation, consolidated_storage_generation,
+			single_block_retention_started_at, single_block_delete_after
+		FROM block_consolidation_shadow
+		WHERE block_metadata_id = $1`, s.getBlockMetadataID(ctx, replayed)).Scan(
+		&sourceGeneration,
+		&consolidatedGeneration,
+		&retentionStartedAt,
+		&deleteAfter,
+	)
+	require.NoError(err)
+	require.Equal(int32(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2), sourceGeneration)
+	require.Equal(int32(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2), consolidatedGeneration)
+	require.False(retentionStartedAt.Valid)
+	require.False(deleteAfter.Valid)
 }
 
 func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsPromotesValidatedShadows() {

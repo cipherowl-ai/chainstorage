@@ -22,6 +22,7 @@ const metadataRowColumns = `
 	bm.skipped,
 	COALESCE(bm.object_key_main, ''),
 	bm.object_format,
+	bm.storage_generation,
 	bm.byte_offset,
 	bm.byte_length,
 	bm.uncompressed_length,
@@ -31,7 +32,9 @@ const metadataRowColumns = `
 	shadow.height,
 	shadow.hash,
 	shadow.single_block_object_key_main,
+	shadow.single_block_storage_generation,
 	shadow.consolidated_object_key_main,
+	shadow.consolidated_storage_generation,
 	shadow.object_format,
 	shadow.byte_offset,
 	shadow.byte_length,
@@ -916,6 +919,7 @@ type scanner interface {
 func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var row MetadataRow
 	var primaryObjectFormat int64
+	var primaryStorageGeneration int64
 	var primaryByteOffset sql.NullInt64
 	var primaryByteLength sql.NullInt64
 	var primaryUncompressedLength sql.NullInt64
@@ -925,7 +929,9 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var shadowHeight sql.NullInt64
 	var shadowHash sql.NullString
 	var shadowSingleBlockKey sql.NullString
+	var shadowSingleBlockStorageGeneration sql.NullInt64
 	var shadowConsolidatedKey sql.NullString
+	var shadowConsolidatedStorageGeneration sql.NullInt64
 	var shadowObjectFormat sql.NullInt64
 	var shadowByteOffset sql.NullInt64
 	var shadowByteLength sql.NullInt64
@@ -969,6 +975,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&row.Skipped,
 		&row.PrimaryObjectKey,
 		&primaryObjectFormat,
+		&primaryStorageGeneration,
 		&primaryByteOffset,
 		&primaryByteLength,
 		&primaryUncompressedLength,
@@ -978,7 +985,9 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&shadowHeight,
 		&shadowHash,
 		&shadowSingleBlockKey,
+		&shadowSingleBlockStorageGeneration,
 		&shadowConsolidatedKey,
+		&shadowConsolidatedStorageGeneration,
 		&shadowObjectFormat,
 		&shadowByteOffset,
 		&shadowByteLength,
@@ -1017,6 +1026,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		return MetadataRow{}, err
 	}
 	row.PrimaryObjectFormat = api.BlockObjectFormat(primaryObjectFormat)
+	row.PrimaryStorageGeneration = api.BlockStorageGeneration(primaryStorageGeneration)
 	row.PrimaryByteOffset = nullableUint64(primaryByteOffset)
 	row.PrimaryByteLength = nullableUint64(primaryByteLength)
 	row.PrimaryUncompressedLength = nullableUint64(primaryUncompressedLength)
@@ -1024,16 +1034,18 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	if shadowBlockMetadataID.Valid {
 		row.SingleBlockObjectKey = shadowSingleBlockKey.String
 		row.Shadow = &ConsolidationShadow{
-			Tag:                   uint32(shadowTag.Int64),
-			Height:                uint64(shadowHeight.Int64),
-			Hash:                  shadowHash.String,
-			SingleBlockObjectKey:  shadowSingleBlockKey.String,
-			ConsolidatedObjectKey: shadowConsolidatedKey.String,
-			ObjectFormat:          api.BlockObjectFormat(shadowObjectFormat.Int64),
-			ByteOffset:            nullableUint64(shadowByteOffset),
-			ByteLength:            nullableUint64(shadowByteLength),
-			UncompressedLength:    nullableUint64(shadowUncompressedLength),
-			FormatVersion:         int(shadowFormatVersion.Int64),
+			Tag:                           uint32(shadowTag.Int64),
+			Height:                        uint64(shadowHeight.Int64),
+			Hash:                          shadowHash.String,
+			SingleBlockObjectKey:          shadowSingleBlockKey.String,
+			SingleBlockStorageGeneration:  api.BlockStorageGeneration(shadowSingleBlockStorageGeneration.Int64),
+			ConsolidatedObjectKey:         shadowConsolidatedKey.String,
+			ConsolidatedStorageGeneration: api.BlockStorageGeneration(shadowConsolidatedStorageGeneration.Int64),
+			ObjectFormat:                  api.BlockObjectFormat(shadowObjectFormat.Int64),
+			ByteOffset:                    nullableUint64(shadowByteOffset),
+			ByteLength:                    nullableUint64(shadowByteLength),
+			UncompressedLength:            nullableUint64(shadowUncompressedLength),
+			FormatVersion:                 int(shadowFormatVersion.Int64),
 		}
 		row.Shadow.ValidatedAt = nullableTime(shadowValidatedAt)
 		row.Shadow.SingleBlockRetentionStartedAt = nullableTime(shadowSingleBlockRetentionStartedAt)

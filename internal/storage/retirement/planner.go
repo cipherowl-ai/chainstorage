@@ -365,6 +365,12 @@ func (p *Planner) planRow(
 		return item
 	}
 	shadow := row.Shadow
+	if row.PrimaryStorageGeneration != req.StorageGeneration ||
+		shadow.SingleBlockStorageGeneration != req.StorageGeneration ||
+		shadow.ConsolidatedStorageGeneration != req.StorageGeneration {
+		item.SkipReason = SkipStorageGenerationMismatch
+		return item
+	}
 	item.ConsolidatedKey = shadow.ConsolidatedObjectKey
 	item.ValidatedAt = shadow.ValidatedAt
 	item.RetiredAt = shadow.SingleBlockRetentionStartedAt
@@ -1447,6 +1453,9 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 		return false
 	}
 	if shadow.SingleBlockObjectKey != row.SingleBlockObjectKey {
+		return false
+	}
+	if shadow.ConsolidatedStorageGeneration != row.PrimaryStorageGeneration {
 		return false
 	}
 	if !isPrimaryConsolidated(row) {

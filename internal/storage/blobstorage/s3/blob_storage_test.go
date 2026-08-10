@@ -3,15 +3,20 @@ package s3
 import (
 	"context"
 	"io"
+	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/proto"
 
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/s3"
 	s3mocks "github.com/coinbase/chainstorage/internal/s3/mocks"
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
@@ -239,6 +244,172 @@ func TestBlobStorage_DownloadErrRequestCanceled(t *testing.T) {
 	_, err := blobStorage.Download(context.Background(), metadata)
 	require.Error(err)
 	require.Equal(errors.ErrRequestCanceled, err)
+}
+
+func TestBlobStorage_RoutesMixedGenerationReads(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+	cfg.AWS.BucketV2 = "v2-blocks"
+	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationLegacy
+
+	payload, err := proto.Marshal(&api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
+		Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
+	})
+	require.NoError(err)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	buckets := make([]string, 0, 2)
+	var bucketsMu sync.Mutex
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).Times(2).
+		DoAndReturn(func(ctx context.Context, writer io.WriterAt, input *awss3.GetObjectInput, opts ...func(*manager.Downloader)) (int64, error) {
+			bucketsMu.Lock()
+			buckets = append(buckets, aws.ToString(input.Bucket))
+			bucketsMu.Unlock()
+			written, err := writer.WriteAt(payload, 0)
+			return int64(written), err
+		})
+
+	var storage internal.BlobStorageCore
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(newBlobStorage),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	metadatas := []*api.BlockMetadata{
+		{
+			Height:            100,
+			ObjectKeyMain:     "shared-key",
+			StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		},
+		{
+			Height:            101,
+			ObjectKeyMain:     "shared-key",
+			StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		},
+	}
+	blocks, err := storage.DownloadMany(context.Background(), metadatas)
+	require.NoError(err)
+	require.Len(blocks, 2)
+	require.Same(metadatas[0], blocks[0].GetMetadata())
+	require.Same(metadatas[1], blocks[1].GetMetadata())
+	require.ElementsMatch([]string{"legacy-blocks", "v2-blocks"}, buckets)
+}
+
+func TestBlobStorage_RejectsUnresolvableGenerationBeforeS3(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	downloader.EXPECT().Download(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	var storage internal.BlobStorageCore
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(newBlobStorage),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	_, err = storage.Download(context.Background(), &api.BlockMetadata{
+		Height:            100,
+		ObjectKeyMain:     "key",
+		StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+	})
+	require.ErrorContains(err, "aws.bucket_v2 is not configured")
+
+	_, err = storage.Download(context.Background(), &api.BlockMetadata{
+		Height:            101,
+		ObjectKeyMain:     "key",
+		StorageGeneration: api.BlockStorageGeneration(99),
+	})
+	require.ErrorContains(err, "unsupported block storage generation 99")
+}
+
+func TestBlobStorage_ActiveV2RoutesAndStampsNewSingleBlock(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+	cfg.AWS.BucketV2 = "v2-blocks"
+	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationV2
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	downloader := s3mocks.NewMockDownloader(ctrl)
+	uploader := s3mocks.NewMockUploader(ctrl)
+	client := s3mocks.NewMockClient(ctrl)
+	uploader.EXPECT().Upload(gomock.Any(), gomock.Any()).DoAndReturn(
+		func(ctx context.Context, input *awss3.PutObjectInput, opts ...func(*manager.Uploader)) (*manager.UploadOutput, error) {
+			require.Equal("v2-blocks", aws.ToString(input.Bucket))
+			return &manager.UploadOutput{}, nil
+		},
+	)
+
+	var storage internal.BlobStorageCore
+	app := testapp.New(
+		t,
+		testapp.WithConfig(cfg),
+		fx.Provide(newBlobStorage),
+		fx.Provide(func() s3.Downloader { return downloader }),
+		fx.Provide(func() s3.Uploader { return uploader }),
+		fx.Provide(func() s3.Client { return client }),
+		fx.Populate(&storage),
+	)
+	defer app.Close()
+
+	metadata := &api.BlockMetadata{Tag: 1, Height: 12345, Hash: "hash"}
+	_, err = storage.Upload(context.Background(), &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
+		Network:    common.Network_NETWORK_ETHEREUM_MAINNET,
+		Metadata:   metadata,
+	}, api.Compression_NONE)
+	require.NoError(err)
+	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, metadata.GetStorageGeneration())
+}
+
+func TestBlobStorage_PreSignRoutesByGeneration(t *testing.T) {
+	require := testutil.Require(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.AWS.Bucket = "legacy-blocks"
+	cfg.AWS.BucketV2 = "v2-blocks"
+	client := awss3.NewFromConfig(aws.Config{
+		Region:      "us-east-1",
+		Credentials: credentials.NewStaticCredentialsProvider("test", "test", ""),
+	})
+	storage := &blobStorageImpl{config: cfg, client: client}
+
+	fileURL, err := storage.PreSign(context.Background(), &api.BlockMetadata{
+		ObjectKeyMain:     "key",
+		StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+	})
+	require.NoError(err)
+	parsed, err := url.Parse(fileURL)
+	require.NoError(err)
+	require.Contains(parsed.Host, "v2-blocks")
 }
 
 // Silence unused import warning

@@ -89,19 +89,6 @@ func TestModuleDoesNotExposeRawBlobStorageFactory(t *testing.T) {
 	)
 	require.Error(t, app.Err())
 	require.Contains(t, app.Err().Error(), "blobstorage/s3")
-
-	type historicalFactoryParams struct {
-		fx.In
-		S3 storageinternal.HistoricalSingleBlockDownloaderFactory `name:"blobstorage/s3/historical-single-block-downloader"`
-	}
-
-	app = fx.New(
-		Module,
-		fx.NopLogger,
-		fx.Invoke(func(historicalFactoryParams) {}),
-	)
-	require.Error(t, app.Err())
-	require.Contains(t, app.Err().Error(), "blobstorage/s3/historical-single-block-downloader")
 }
 
 type singleBlockUploadTestCore struct {
@@ -120,6 +107,6 @@ func (*singleBlockUploadTestCore) DownloadMany(context.Context, []*api.BlockMeta
 	return nil, nil
 }
 
-func (*singleBlockUploadTestCore) PreSign(context.Context, string) (string, error) {
+func (*singleBlockUploadTestCore) PreSign(context.Context, *api.BlockMetadata) (string, error) {
 	return "", nil
 }

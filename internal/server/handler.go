@@ -856,15 +856,16 @@ func (s *Server) newBlockFileWithPresignCache(block *api.BlockMetadata, presigne
 
 	key := block.GetObjectKeyMain()
 	compression := storage_utils.GetCompressionType(key)
-	fileUrl, ok := presignedURLs[key]
+	presignCacheKey := fmt.Sprintf("%d\x00%s", block.GetStorageGeneration(), key)
+	fileUrl, ok := presignedURLs[presignCacheKey]
 	if !ok {
 		var err error
-		fileUrl, err = s.blobStorage.PreSign(context.Background(), key)
+		fileUrl, err = s.blobStorage.PreSign(context.Background(), block)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to generate presigned url: %w", err)
 		}
 		if presignedURLs != nil {
-			presignedURLs[key] = fileUrl
+			presignedURLs[presignCacheKey] = fileUrl
 		}
 	}
 

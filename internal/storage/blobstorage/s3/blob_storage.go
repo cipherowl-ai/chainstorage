@@ -52,6 +52,7 @@ type (
 		logger                 *zap.Logger
 		config                 *config.Config
 		bucket                 string
+		storageGeneration      api.BlockStorageGeneration
 		client                 s3.Client
 		downloader             s3.Downloader
 		uploader               s3.Uploader
@@ -69,7 +70,13 @@ type (
 
 	downloadRef struct {
 		index    int
+		bucket   string
 		metadata *api.BlockMetadata
+	}
+
+	cscbObjectLocation struct {
+		bucket string
+		key    string
 	}
 
 	cscbBlockDownload struct {
@@ -110,10 +117,19 @@ func newBlobStorage(params BlobStorageParams) (internal.BlobStorageCore, error) 
 	metrics := params.Metrics.SubScope("blob_storage").Tagged(map[string]string{
 		"storage_type": "s3",
 	})
+	bucket, err := params.Config.ActiveBlockStorageBucket()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+	}
+	storageGeneration, err := params.Config.ActiveBlockStorageGeneration()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+	}
 	return &blobStorageImpl{
 		logger:                 log.WithPackage(params.Logger),
 		config:                 params.Config,
-		bucket:                 params.Config.AWS.Bucket,
+		bucket:                 bucket,
+		storageGeneration:      storageGeneration,
 		client:                 params.Client,
 		downloader:             params.Downloader,
 		uploader:               params.Uploader,
@@ -177,6 +193,7 @@ func (s *blobStorageImpl) uploadRaw(ctx context.Context, rawBlockData *internal.
 	}); err != nil {
 		return "", xerrors.Errorf("failed to upload to s3: %w", err)
 	}
+	rawBlockData.BlockMetadata.StorageGeneration = s.storageGeneration
 
 	// a workaround to use timer
 	s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(size) * time.Millisecond)
@@ -330,6 +347,9 @@ func (s *blobStorageImpl) UploadConsolidated(ctx context.Context, blocks []inter
 		zap.Duration("head_uploaded_duration", headUploadedDuration),
 		zap.Duration("total_duration", time.Since(totalStart)),
 	)
+	for i := range object.Placements {
+		object.Placements[i].StorageGeneration = s.storageGeneration
+	}
 	return object.Key, object.Placements, nil
 }
 
@@ -503,13 +523,20 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 	return s.instrumentDownload.Instrument(ctx, func(ctx context.Context) (*api.Block, error) {
 		defer s.logDuration("download", time.Now())
 
-		if metadata.Skipped {
+		if metadata == nil {
+			return nil, xerrors.New("block metadata is required")
+		}
+		if metadata.GetSkipped() {
 			return s.skippedBlock(metadata), nil
 		}
-		if isSingleBlockObject(metadata) {
-			return s.downloadSingleBlock(ctx, metadata)
+		bucket, err := s.bucketForMetadata(metadata)
+		if err != nil {
+			return nil, err
 		}
-		return s.downloadCSCBBlock(ctx, metadata)
+		if isSingleBlockObject(metadata) {
+			return s.downloadSingleBlock(ctx, bucket, metadata)
+		}
+		return s.downloadCSCBBlock(ctx, bucket, metadata)
 	})
 }
 
@@ -519,14 +546,22 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 
 		result := make([]*api.Block, len(metadatas))
 		singleBlockRefs := make([]downloadRef, 0, len(metadatas))
-		cscbRefsByObject := make(map[string][]downloadRef)
+		cscbRefsByObject := make(map[cscbObjectLocation][]downloadRef)
 		for i, metadata := range metadatas {
+			if metadata == nil {
+				return nil, xerrors.Errorf("block metadata is required at index %d", i)
+			}
 			if metadata.GetSkipped() {
 				result[i] = s.skippedBlock(metadata)
 				continue
 			}
+			bucket, err := s.bucketForMetadata(metadata)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to resolve block storage at index %d: %w", i, err)
+			}
 			ref := downloadRef{
 				index:    i,
+				bucket:   bucket,
 				metadata: metadata,
 			}
 			if isSingleBlockObject(metadata) {
@@ -537,14 +572,15 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 			if key == "" {
 				return nil, xerrors.Errorf("missing CSCB object key for height %d", metadata.GetHeight())
 			}
-			cscbRefsByObject[key] = append(cscbRefsByObject[key], ref)
+			location := cscbObjectLocation{bucket: bucket, key: key}
+			cscbRefsByObject[location] = append(cscbRefsByObject[location], ref)
 		}
 
 		group, ctx := syncgroup.New(ctx, syncgroup.WithThrottling(s.downloadWorkerLimit()))
 		for _, ref := range singleBlockRefs {
 			ref := ref
 			group.Go(func() error {
-				block, err := s.Download(ctx, ref.metadata)
+				block, err := s.downloadSingleBlock(ctx, ref.bucket, ref.metadata)
 				if err != nil {
 					return xerrors.Errorf("failed to download single-block object (input={%+v}): %w", ref.metadata, err)
 				}
@@ -552,11 +588,11 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 				return nil
 			})
 		}
-		for key, refs := range cscbRefsByObject {
-			key, refs := key, refs
+		for location, refs := range cscbRefsByObject {
+			location, refs := location, refs
 			group.Go(func() error {
-				if err := s.downloadCSCBObject(ctx, key, refs, result); err != nil {
-					return xerrors.Errorf("failed to download CSCB object %s: %w", key, err)
+				if err := s.downloadCSCBObject(ctx, location.bucket, location.key, refs, result); err != nil {
+					return xerrors.Errorf("failed to download CSCB object (bucket=%s key=%s): %w", location.bucket, location.key, err)
 				}
 				return nil
 			})
@@ -566,6 +602,18 @@ func (s *blobStorageImpl) DownloadMany(ctx context.Context, metadatas []*api.Blo
 		}
 		return result, nil
 	})
+}
+
+func (s *blobStorageImpl) bucketForMetadata(metadata *api.BlockMetadata) (string, error) {
+	bucket, err := s.config.ResolveBlockStorageBucket(metadata.GetStorageGeneration())
+	if err != nil {
+		return "", xerrors.Errorf(
+			"failed to resolve block storage generation for height %d: %w",
+			metadata.GetHeight(),
+			err,
+		)
+	}
+	return bucket, nil
 }
 
 func (s *blobStorageImpl) skippedBlock(metadata *api.BlockMetadata) *api.Block {
@@ -590,24 +638,25 @@ func (s *blobStorageImpl) downloadWorkerLimit() int {
 	return limit
 }
 
-func (s *blobStorageImpl) downloadSingleBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-	return downloadSingleBlockFromBucket(ctx, s.bucket, s.downloader, s.blobStorageMetrics, metadata)
+func (s *blobStorageImpl) downloadSingleBlock(ctx context.Context, bucket string, metadata *api.BlockMetadata) (*api.Block, error) {
+	return downloadSingleBlockFromBucket(ctx, bucket, s.downloader, s.blobStorageMetrics, metadata)
 }
 
-func (s *blobStorageImpl) downloadCSCBBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
+func (s *blobStorageImpl) downloadCSCBBlock(ctx context.Context, bucket string, metadata *api.BlockMetadata) (*api.Block, error) {
 	result := make([]*api.Block, 1)
 	ref := downloadRef{
 		index:    0,
+		bucket:   bucket,
 		metadata: metadata,
 	}
-	if err := s.downloadCSCBObject(ctx, metadata.GetObjectKeyMain(), []downloadRef{ref}, result); err != nil {
+	if err := s.downloadCSCBObject(ctx, bucket, metadata.GetObjectKeyMain(), []downloadRef{ref}, result); err != nil {
 		return nil, err
 	}
 	return result[0], nil
 }
 
-func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, key string, refs []downloadRef, result []*api.Block) error {
-	index, err := s.readCSCBIndex(ctx, key)
+func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, bucket string, key string, refs []downloadRef, result []*api.Block) error {
+	index, err := s.readCSCBIndex(ctx, bucket, key)
 	if err != nil {
 		return err
 	}
@@ -638,13 +687,13 @@ func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, key string, re
 		for i, download := range downloads {
 			blocks[i] = download.block
 		}
-		blockPayloads, err := s.downloadCSCBChunkPayloads(ctx, key, index.Header.Codec, chunk, blocks)
+		blockPayloads, err := s.downloadCSCBChunkPayloads(ctx, bucket, key, index.Header.Codec, chunk, blocks)
 		if err != nil {
 			return err
 		}
 		for i, download := range downloads {
 			blockPayload := blockPayloads[i]
-			block, err := unmarshalBlockData(s.bucket, key, download.ref.metadata, blockPayload)
+			block, err := unmarshalBlockData(bucket, key, download.ref.metadata, blockPayload)
 			if err != nil {
 				return err
 			}
@@ -654,8 +703,8 @@ func (s *blobStorageImpl) downloadCSCBObject(ctx context.Context, key string, re
 	return nil
 }
 
-func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, key string) (*cscb.Index, error) {
-	first, err := s.readObjectRange(ctx, key, 0, cscbInitialIndexReadSize-1)
+func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, bucket string, key string) (*cscb.Index, error) {
+	first, err := s.readObjectRange(ctx, bucket, key, 0, cscbInitialIndexReadSize-1)
 	if err != nil {
 		return nil, err
 	}
@@ -666,7 +715,7 @@ func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, key string) (*cscb.
 	if required <= uint64(len(first)) {
 		return cscb.ParseIndex(first)
 	}
-	remaining, err := s.readObjectRange(ctx, key, uint64(len(first)), required-1)
+	remaining, err := s.readObjectRange(ctx, bucket, key, uint64(len(first)), required-1)
 	if err != nil {
 		return nil, err
 	}
@@ -676,11 +725,11 @@ func (s *blobStorageImpl) readCSCBIndex(ctx context.Context, key string) (*cscb.
 	return cscb.ParseIndex(indexData)
 }
 
-func (s *blobStorageImpl) downloadCSCBChunkPayloads(ctx context.Context, key string, codec api.Compression, chunk *cscb.ChunkDescriptor, blocks []*cscb.BlockDescriptor) ([][]byte, error) {
+func (s *blobStorageImpl) downloadCSCBChunkPayloads(ctx context.Context, bucket string, key string, codec api.Compression, chunk *cscb.ChunkDescriptor, blocks []*cscb.BlockDescriptor) ([][]byte, error) {
 	if len(blocks) == 0 {
 		return nil, xerrors.New("CSCB block descriptors are required")
 	}
-	body, err := s.openObjectRangeByLength(ctx, key, chunk.CompressedPayloadOffset, chunk.CompressedLength)
+	body, err := s.openObjectRangeByLength(ctx, bucket, key, chunk.CompressedPayloadOffset, chunk.CompressedLength)
 	if err != nil {
 		return nil, err
 	}
@@ -702,7 +751,7 @@ func (s *blobStorageImpl) downloadCSCBChunkPayloads(ctx context.Context, key str
 	return payloads, nil
 }
 
-func (s *blobStorageImpl) openObjectRangeByLength(ctx context.Context, key string, offset uint64, length uint64) (io.ReadCloser, error) {
+func (s *blobStorageImpl) openObjectRangeByLength(ctx context.Context, bucket string, key string, offset uint64, length uint64) (io.ReadCloser, error) {
 	if length == 0 {
 		return nil, xerrors.Errorf("empty range read for key %s at offset %d", key, offset)
 	}
@@ -710,14 +759,14 @@ func (s *blobStorageImpl) openObjectRangeByLength(ctx context.Context, key strin
 	if err != nil {
 		return nil, err
 	}
-	return s.openObjectRange(ctx, key, offset, end)
+	return s.openObjectRange(ctx, bucket, key, offset, end)
 }
 
-func (s *blobStorageImpl) readObjectRange(ctx context.Context, key string, start uint64, end uint64) ([]byte, error) {
+func (s *blobStorageImpl) readObjectRange(ctx context.Context, bucket string, key string, start uint64, end uint64) ([]byte, error) {
 	if end < start {
 		return nil, xerrors.Errorf("invalid range for key %s: start=%d end=%d", key, start, end)
 	}
-	body, err := s.openObjectRange(ctx, key, start, end)
+	body, err := s.openObjectRange(ctx, bucket, key, start, end)
 	if err != nil {
 		return nil, err
 	}
@@ -728,18 +777,18 @@ func (s *blobStorageImpl) readObjectRange(ctx context.Context, key string, start
 		if errors.Is(err, context.Canceled) {
 			return nil, storageerrors.ErrRequestCanceled
 		}
-		return nil, xerrors.Errorf("failed to read s3 range body (bucket=%s, key=%s, range=bytes=%d-%d): %w", s.bucket, key, start, end, err)
+		return nil, xerrors.Errorf("failed to read s3 range body (bucket=%s, key=%s, range=bytes=%d-%d): %w", bucket, key, start, end, err)
 	}
 	s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(len(data)) * time.Millisecond)
 	return data, nil
 }
 
-func (s *blobStorageImpl) openObjectRange(ctx context.Context, key string, start uint64, end uint64) (io.ReadCloser, error) {
+func (s *blobStorageImpl) openObjectRange(ctx context.Context, bucket string, key string, start uint64, end uint64) (io.ReadCloser, error) {
 	if end < start {
 		return nil, xerrors.Errorf("invalid range for key %s: start=%d end=%d", key, start, end)
 	}
 	output, err := s.client.GetObject(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
+		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 	})
@@ -747,10 +796,10 @@ func (s *blobStorageImpl) openObjectRange(ctx context.Context, key string, start
 		if errors.Is(err, context.Canceled) {
 			return nil, storageerrors.ErrRequestCanceled
 		}
-		return nil, xerrors.Errorf("failed to range download from s3 (bucket=%s, key=%s, range=bytes=%d-%d): %w", s.bucket, key, start, end, err)
+		return nil, xerrors.Errorf("failed to range download from s3 (bucket=%s, key=%s, range=bytes=%d-%d): %w", bucket, key, start, end, err)
 	}
 	if output.Body == nil {
-		return nil, xerrors.Errorf("empty s3 body (bucket=%s, key=%s, range=bytes=%d-%d)", s.bucket, key, start, end)
+		return nil, xerrors.Errorf("empty s3 body (bucket=%s, key=%s, range=bytes=%d-%d)", bucket, key, start, end)
 	}
 	return output.Body, nil
 }
@@ -813,11 +862,18 @@ func unmarshalBlockData(bucket string, key string, metadata *api.BlockMetadata, 
 	return &block, nil
 }
 
-func (s *blobStorageImpl) PreSign(ctx context.Context, objectKey string) (string, error) {
+func (s *blobStorageImpl) PreSign(ctx context.Context, metadata *api.BlockMetadata) (string, error) {
+	if metadata == nil {
+		return "", xerrors.New("block metadata is required")
+	}
+	bucket, err := s.bucketForMetadata(metadata)
+	if err != nil {
+		return "", err
+	}
 	presignClient := awss3.NewPresignClient(s.client.(*awss3.Client))
 	presignResult, err := presignClient.PresignGetObject(ctx, &awss3.GetObjectInput{
-		Bucket: aws.String(s.config.AWS.Bucket),
-		Key:    aws.String(objectKey),
+		Bucket: aws.String(bucket),
+		Key:    aws.String(metadata.GetObjectKeyMain()),
 	}, awss3.WithPresignExpires(s.config.AWS.PresignedUrlExpiration))
 	if err != nil {
 		return "", xerrors.Errorf("failed to generate presigned url: %w", err)

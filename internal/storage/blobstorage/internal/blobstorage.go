@@ -50,6 +50,7 @@ type (
 		Hash               string
 		ObjectKey          string
 		ObjectFormat       api.BlockObjectFormat
+		StorageGeneration  api.BlockStorageGeneration
 		ByteOffset         uint64
 		ByteLength         uint64
 		UncompressedLength uint64
@@ -59,17 +60,7 @@ type (
 		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
 		DownloadMany(ctx context.Context, metadata []*api.BlockMetadata) ([]*api.Block, error)
-		PreSign(ctx context.Context, objectKey string) (string, error)
-	}
-
-	// HistoricalSingleBlockDownloader is the read-only seam used by manual
-	// historical consolidation. It intentionally cannot upload or presign.
-	HistoricalSingleBlockDownloader interface {
-		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
-	}
-
-	HistoricalSingleBlockDownloaderFactory interface {
-		Create(bucket string) (HistoricalSingleBlockDownloader, error)
+		PreSign(ctx context.Context, metadata *api.BlockMetadata) (string, error)
 	}
 
 	// SingleBlockUploader is deliberately confined to the blobstorage package
