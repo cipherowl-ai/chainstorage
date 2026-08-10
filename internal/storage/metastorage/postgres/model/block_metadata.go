@@ -20,7 +20,7 @@ func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 	var block api.BlockMetadata
 	var timestamp int64
 	var objectFormat int32
-	var storageGeneration int32
+	var storageGeneration sql.NullString
 	var byteOffset, byteLength, uncompressedLength sql.NullInt64
 	var id int64 // We get this but don't need it in the result
 
@@ -46,7 +46,7 @@ func scanBlockMetadata(scanner Scanner) (*api.BlockMetadata, error) {
 
 	block.Timestamp = utils.ToTimestamp(timestamp)
 	block.ObjectFormat = api.BlockObjectFormat(objectFormat)
-	block.StorageGeneration = api.BlockStorageGeneration(storageGeneration)
+	block.StorageGeneration = storageGeneration.String
 	if byteOffset.Valid {
 		block.ByteOffset = uint64(byteOffset.Int64)
 	}

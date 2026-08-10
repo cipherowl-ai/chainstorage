@@ -480,11 +480,11 @@ func (a *BatchConsolidator) getCSCBRepairer(ctx context.Context) (cscbrepair.Rep
 	if a.s3Client == nil {
 		return nil, xerrors.New("repair_existing_cscb requires an S3 client")
 	}
-	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
 	if err != nil {
-		return nil, xerrors.Errorf("repair_existing_cscb failed to resolve active block storage generation: %w", err)
+		return nil, xerrors.Errorf("repair_existing_cscb failed to resolve write block storage generation: %w", err)
 	}
-	if storageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY {
+	if storageGeneration != "" {
 		return nil, xerrors.New("repair_existing_cscb is only supported for the legacy block storage generation")
 	}
 	pool, err := metapostgres.GetConnectionPool(ctx, a.config.AWS.Postgres)

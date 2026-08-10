@@ -1,22 +1,28 @@
 -- +goose Up
--- The zero value is the existing bucket. Constant defaults keep this migration
--- metadata-only on supported PostgreSQL versions while giving every row one
--- deterministic physical object location. Keep the checks NOT VALID so this
+-- NULL is the immutable legacy bucket. Adding nullable columns keeps this
+-- migration metadata-only while giving new rows a compact, extensible physical
+-- storage generation such as "v2" or "v3". Keep the checks NOT VALID so this
 -- deployment does not scan the large existing tables; PostgreSQL still
 -- enforces them for every new or updated row. Validate them separately after
 -- the application rollout.
 ALTER TABLE block_metadata
-    ADD COLUMN storage_generation SMALLINT NOT NULL DEFAULT 0,
+    ADD COLUMN storage_generation TEXT,
     ADD CONSTRAINT block_metadata_storage_generation_check
-        CHECK (storage_generation IN (0, 1)) NOT VALID;
+        CHECK (storage_generation IS NULL OR storage_generation ~ '^v[1-9][0-9]*$') NOT VALID;
 
 ALTER TABLE block_consolidation_shadow
-    ADD COLUMN single_block_storage_generation SMALLINT NOT NULL DEFAULT 0,
-    ADD COLUMN consolidated_storage_generation SMALLINT NOT NULL DEFAULT 0,
+    ADD COLUMN single_block_storage_generation TEXT,
+    ADD COLUMN consolidated_storage_generation TEXT,
     ADD CONSTRAINT block_consolidation_shadow_single_block_storage_generation_check
-        CHECK (single_block_storage_generation IN (0, 1)) NOT VALID,
+        CHECK (
+            single_block_storage_generation IS NULL
+            OR single_block_storage_generation ~ '^v[1-9][0-9]*$'
+        ) NOT VALID,
     ADD CONSTRAINT block_consolidation_shadow_consolidated_storage_generation_check
-        CHECK (consolidated_storage_generation IN (0, 1)) NOT VALID;
+        CHECK (
+            consolidated_storage_generation IS NULL
+            OR consolidated_storage_generation ~ '^v[1-9][0-9]*$'
+        ) NOT VALID;
 
 -- Storage generation is part of a block's object placement. Protect it with
 -- the same retention and repair invariants that already guard the object key

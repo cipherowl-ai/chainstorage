@@ -203,14 +203,16 @@ func TestDerivedConfigValues(t *testing.T) {
 		}
 
 		expectedAWS := config.AwsConfig{
-			Region:                  "us-east-1",
-			Bucket:                  fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
-			ActiveStorageGeneration: config.StorageGenerationLegacy,
-			DynamoDB:                dynamoDBPtr,
-			Postgres:                postgresPtr,
-			IsLocalStack:            cfg.AWS.IsLocalStack,
-			IsResetLocal:            cfg.AWS.IsResetLocal,
-			PresignedUrlExpiration:  30 * time.Minute,
+			Region: "us-east-1",
+			Bucket: fmt.Sprintf("example-chainstorage-%v-%v", normalizedConfigName, cfg.AwsEnv()),
+			BlockStorage: config.BlockStorageConfig{
+				WriteGeneration: "legacy",
+			},
+			DynamoDB:               dynamoDBPtr,
+			Postgres:               postgresPtr,
+			IsLocalStack:           cfg.AWS.IsLocalStack,
+			IsResetLocal:           cfg.AWS.IsResetLocal,
+			PresignedUrlExpiration: 30 * time.Minute,
 			DLQ: config.SQSConfig{
 				Name:                  fmt.Sprintf("example_chainstorage_blocks_%v_dlq", configName),
 				VisibilityTimeoutSecs: 600,
@@ -968,112 +970,56 @@ func TestStorageGenerationDefaultsToLegacy(t *testing.T) {
 
 	cfg, err := config.New()
 	require.NoError(err)
-	require.Equal(config.StorageGenerationLegacy, cfg.AWS.ActiveStorageGeneration)
-	generation, err := cfg.ActiveBlockStorageGeneration()
+	require.Equal(config.StorageGeneration("legacy"), cfg.AWS.BlockStorage.WriteGeneration)
+	generation, err := cfg.WriteBlockStorageGeneration()
 	require.NoError(err)
 	require.Equal(
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		"",
 		generation,
 	)
-	bucket, err := cfg.ActiveBlockStorageBucket()
+	bucket, err := cfg.WriteBlockStorageBucket()
 	require.NoError(err)
 	require.Equal(cfg.AWS.Bucket, bucket)
 }
 
 func TestStorageGenerationV2Config(t *testing.T) {
 	require := testutil.Require(t)
-	t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", "chainstorage-blocks-v2")
-	t.Setenv("CHAINSTORAGE_AWS_ACTIVE_STORAGE_GENERATION", "v2")
-
 	cfg, err := config.New()
 	require.NoError(err)
-	require.Equal(config.StorageGenerationV2, cfg.AWS.ActiveStorageGeneration)
-	generation, err := cfg.ActiveBlockStorageGeneration()
+	cfg.AWS.BlockStorage = config.BlockStorageConfig{
+		WriteGeneration: "v2",
+		Generations: map[string]config.BlockStorageGenerationConfig{
+			"v2": {Bucket: "chainstorage-blocks-v2"},
+			"v3": {Bucket: "chainstorage-blocks-v3"},
+		},
+	}
+	generation, err := cfg.WriteBlockStorageGeneration()
 	require.NoError(err)
 	require.Equal(
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
 		generation,
 	)
-	bucket, err := cfg.ActiveBlockStorageBucket()
+	bucket, err := cfg.WriteBlockStorageBucket()
 	require.NoError(err)
 	require.Equal("chainstorage-blocks-v2", bucket)
-	legacyBucket, err := cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+	legacyBucket, err := cfg.ResolveBlockStorageBucket("")
 	require.NoError(err)
 	require.Equal(cfg.AWS.Bucket, legacyBucket)
+	v3Bucket, err := cfg.ResolveBlockStorageBucket("v3")
+	require.NoError(err)
+	require.Equal("chainstorage-blocks-v3", v3Bucket)
 }
 
 func TestStorageGenerationV2CanRemainDormant(t *testing.T) {
 	require := testutil.Require(t)
-	t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", "chainstorage-blocks-v2")
-
 	cfg, err := config.New()
 	require.NoError(err)
-	require.Equal(config.StorageGenerationLegacy, cfg.AWS.ActiveStorageGeneration)
-	bucket, err := cfg.ActiveBlockStorageBucket()
+	cfg.AWS.BlockStorage.Generations = map[string]config.BlockStorageGenerationConfig{
+		"v2": {Bucket: "chainstorage-blocks-v2"},
+	}
+	bucket, err := cfg.WriteBlockStorageBucket()
 	require.NoError(err)
 	require.Equal(cfg.AWS.Bucket, bucket)
-}
-
-func TestStorageGenerationValidation(t *testing.T) {
-	require := testutil.Require(t)
-	baseConfig, err := config.New()
-	require.NoError(err)
-
-	tests := []struct {
-		name             string
-		bucketV2         string
-		activeGeneration string
-		blobStorage      string
-		expectedErr      string
-	}{
-		{
-			name:             "active v2 requires bucket",
-			activeGeneration: "v2",
-			blobStorage:      "S3",
-			expectedErr:      "active_storage_generation=v2 requires aws.bucket_v2",
-		},
-		{
-			name:             "active v2 requires s3",
-			bucketV2:         "chainstorage-blocks-v2",
-			activeGeneration: "v2",
-			blobStorage:      "GCS",
-			expectedErr:      "active_storage_generation=v2 requires S3 blob storage",
-		},
-		{
-			name:             "rejects duplicate bucket",
-			bucketV2:         baseConfig.AWS.Bucket,
-			activeGeneration: "legacy",
-			blobStorage:      "S3",
-			expectedErr:      "aws.bucket_v2 must differ from aws.bucket",
-		},
-		{
-			name:             "rejects surrounding whitespace",
-			bucketV2:         " chainstorage-blocks-v2 ",
-			activeGeneration: "legacy",
-			blobStorage:      "S3",
-			expectedErr:      "aws.bucket_v2 must not contain surrounding whitespace",
-		},
-		{
-			name:             "rejects unknown generation",
-			bucketV2:         "chainstorage-blocks-v2",
-			activeGeneration: "v3",
-			blobStorage:      "S3",
-			expectedErr:      "invalid aws.active_storage_generation",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			require := testutil.Require(t)
-			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_BLOB", test.blobStorage)
-			t.Setenv("CHAINSTORAGE_AWS_BUCKET_V2", test.bucketV2)
-			t.Setenv("CHAINSTORAGE_AWS_ACTIVE_STORAGE_GENERATION", test.activeGeneration)
-
-			_, err := config.New()
-			require.Error(err)
-			require.Contains(err.Error(), test.expectedErr)
-		})
-	}
 }
 
 func TestResolveBlockStorageBucketRejectsUnavailableOrUnknownGeneration(t *testing.T) {
@@ -1081,22 +1027,22 @@ func TestResolveBlockStorageBucketRejectsUnavailableOrUnknownGeneration(t *testi
 	cfg, err := config.New()
 	require.NoError(err)
 
-	_, err = cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2)
-	require.ErrorContains(err, "aws.bucket_v2 is not configured")
-	_, err = cfg.ResolveBlockStorageBucket(api.BlockStorageGeneration(99))
-	require.ErrorContains(err, "unsupported block storage generation 99")
+	_, err = cfg.ResolveBlockStorageBucket("v2")
+	require.ErrorContains(err, "unconfigured storage generation \"v2\"")
+	_, err = cfg.ResolveBlockStorageBucket("future")
+	require.ErrorContains(err, "unsupported block storage generation \"future\"")
 }
 
-func TestActiveBlockStorageGenerationRejectsInvalidManualConfig(t *testing.T) {
+func TestWriteBlockStorageGenerationRejectsInvalidManualConfig(t *testing.T) {
 	require := testutil.Require(t)
 	cfg, err := config.New()
 	require.NoError(err)
-	cfg.AWS.ActiveStorageGeneration = config.StorageGeneration("v3")
+	cfg.AWS.BlockStorage.WriteGeneration = config.StorageGeneration("future")
 
-	_, err = cfg.ActiveBlockStorageGeneration()
-	require.ErrorContains(err, "invalid aws.active_storage_generation")
-	_, err = cfg.ActiveBlockStorageBucket()
-	require.ErrorContains(err, "invalid aws.active_storage_generation")
+	_, err = cfg.WriteBlockStorageGeneration()
+	require.ErrorContains(err, "invalid aws.block_storage.write_generation")
+	_, err = cfg.WriteBlockStorageBucket()
+	require.ErrorContains(err, "invalid aws.block_storage.write_generation")
 }
 
 func TestConsolidationSingleBlockObjectRetentionConfig(t *testing.T) {

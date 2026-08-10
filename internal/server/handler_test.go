@@ -873,7 +873,7 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_DoesNotReusePresignedURLAcro
 				ObjectKeyMain:     objectKey,
 				ObjectFormat:      api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 				ByteLength:        100,
-				StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+				StorageGeneration: "",
 			},
 			{
 				Tag:               stableTag,
@@ -883,14 +883,18 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_DoesNotReusePresignedURLAcro
 				ObjectFormat:      api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 				ByteOffset:        100,
 				ByteLength:        100,
-				StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+				StorageGeneration: "v2",
 			},
 		}, nil,
 	)
 	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Return(&api.BlockMetadata{Height: 100000}, nil)
 	s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(2).DoAndReturn(
 		func(ctx context.Context, metadata *api.BlockMetadata) (string, error) {
-			return fmt.Sprintf("http://endpoint/generation-%d", metadata.GetStorageGeneration()), nil
+			generation := metadata.GetStorageGeneration()
+			if generation == "" {
+				generation = "legacy"
+			}
+			return fmt.Sprintf("http://endpoint/generation-%s", generation), nil
 		},
 	)
 
@@ -900,8 +904,8 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_DoesNotReusePresignedURLAcro
 	})
 	require.NoError(err)
 	require.Len(resp.GetFiles(), 2)
-	require.Equal("http://endpoint/generation-0", resp.GetFiles()[0].GetFileUrl())
-	require.Equal("http://endpoint/generation-1", resp.GetFiles()[1].GetFileUrl())
+	require.Equal("http://endpoint/generation-legacy", resp.GetFiles()[0].GetFileUrl())
+	require.Equal("http://endpoint/generation-v2", resp.GetFiles()[1].GetFileUrl())
 }
 
 func (s *handlerTestSuite) TestGetBlockFilesByRange_ReadSourceConsolidatedUsesShadowMetadata() {

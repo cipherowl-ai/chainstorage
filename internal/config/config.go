@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -57,6 +58,22 @@ type (
 	DLQType           int32
 	ConsolidationMode string
 	StorageGeneration string
+
+	BlockStorageConfig struct {
+		// WriteGeneration selects the physical generation for all new single-block
+		// and consolidated-block writes. "legacy" is the backward-compatible
+		// default and is persisted as an empty generation/SQL NULL.
+		WriteGeneration StorageGeneration `mapstructure:"write_generation"`
+		// Generations resolves non-legacy metadata values (for example, "v2")
+		// to buckets. Once referenced by a metadata row, a mapping is immutable;
+		// future bucket replacements must add a new generation instead of
+		// repointing an existing one.
+		Generations map[string]BlockStorageGenerationConfig `mapstructure:"generations"`
+	}
+
+	BlockStorageGenerationConfig struct {
+		Bucket string `mapstructure:"bucket"`
+	}
 
 	ChainConfig struct {
 		Blockchain       common.Blockchain `mapstructure:"blockchain" validate:"required"`
@@ -125,18 +142,19 @@ type (
 	}
 
 	AwsConfig struct {
-		Region                  string            `mapstructure:"region" validate:"required"`
-		Bucket                  string            `mapstructure:"bucket" validate:"required"`
-		BucketV2                string            `mapstructure:"bucket_v2"`
-		ActiveStorageGeneration StorageGeneration `mapstructure:"active_storage_generation"`
-		Postgres                *PostgresConfig   `mapstructure:"postgres" validate:"required_without=DynamoDB"`
-		DynamoDB                *DynamoDBConfig   `mapstructure:"dynamodb" validate:"required_without=Postgres"`
-		IsLocalStack            bool              `mapstructure:"local_stack"`
-		IsResetLocal            bool              `mapstructure:"reset_local"`
-		PresignedUrlExpiration  time.Duration     `mapstructure:"presigned_url_expiration" validate:"required"`
-		DLQ                     SQSConfig         `mapstructure:"dlq"`
-		Storage                 StorageConfig     `mapstructure:"storage"`
-		AWSAccount              AWSAccount        `mapstructure:"aws_account" validate:"required"`
+		Region string `mapstructure:"region" validate:"required"`
+		// Bucket is the immutable legacy block bucket used by metadata rows whose
+		// storage generation is empty/SQL NULL.
+		Bucket                 string             `mapstructure:"bucket" validate:"required"`
+		BlockStorage           BlockStorageConfig `mapstructure:"block_storage"`
+		Postgres               *PostgresConfig    `mapstructure:"postgres" validate:"required_without=DynamoDB"`
+		DynamoDB               *DynamoDBConfig    `mapstructure:"dynamodb" validate:"required_without=Postgres"`
+		IsLocalStack           bool               `mapstructure:"local_stack"`
+		IsResetLocal           bool               `mapstructure:"reset_local"`
+		PresignedUrlExpiration time.Duration      `mapstructure:"presigned_url_expiration" validate:"required"`
+		DLQ                    SQSConfig          `mapstructure:"dlq"`
+		Storage                StorageConfig      `mapstructure:"storage"`
+		AWSAccount             AWSAccount         `mapstructure:"aws_account" validate:"required"`
 	}
 
 	PostgresConfig struct {
@@ -598,6 +616,8 @@ var (
 		"SQS":         1,
 		"FIRESTORE":   2,
 	}
+
+	storageGenerationPattern = regexp.MustCompile(`^v[1-9][0-9]*$`)
 )
 
 const (
@@ -644,8 +664,8 @@ const (
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
 	DefaultSingleBlockObjectRetention                            = 72 * time.Hour
 
-	StorageGenerationLegacy StorageGeneration = "legacy"
-	StorageGenerationV2     StorageGeneration = "v2"
+	StorageGenerationLegacy            StorageGeneration = ""
+	storageGenerationLegacyConfigValue                   = "legacy"
 
 	AWSAccountDevelopment AWSAccount = "development"
 	AWSAccountProduction  AWSAccount = "production"
@@ -727,8 +747,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
 	v.SetDefault("aws.storage.consolidation.enabled", false)
 	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeSingleBlockOnly))
-	v.SetDefault("aws.bucket_v2", "")
-	v.SetDefault("aws.active_storage_generation", string(StorageGenerationLegacy))
+	v.SetDefault("aws.block_storage.write_generation", storageGenerationLegacyConfigValue)
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
 	v.SetDefault("aws.storage.consolidation.codec_level", 6)
 	v.SetDefault("aws.storage.consolidation.max_compressed_bytes", 2147483648)
@@ -854,59 +873,93 @@ func applyDeprecatedConfigAlias(v *viper.Viper, canonicalKey string, deprecatedK
 }
 
 func (c *Config) validateStorageGenerationConfig() error {
-	if strings.TrimSpace(c.AWS.BucketV2) != c.AWS.BucketV2 {
-		return xerrors.New("aws.bucket_v2 must not contain surrounding whitespace")
-	}
-	if c.AWS.BucketV2 != "" && c.AWS.BucketV2 == c.AWS.Bucket {
-		return xerrors.New("aws.bucket_v2 must differ from aws.bucket")
+	writeGeneration, err := normalizeConfiguredStorageGeneration(c.AWS.BlockStorage.WriteGeneration)
+	if err != nil {
+		return xerrors.Errorf("invalid aws.block_storage.write_generation: %w", err)
 	}
 
-	switch c.AWS.ActiveStorageGeneration {
-	case StorageGenerationLegacy:
-		return nil
-	case StorageGenerationV2:
-		if c.AWS.BucketV2 == "" {
-			return xerrors.New("aws.active_storage_generation=v2 requires aws.bucket_v2")
+	seenBuckets := map[string]string{c.AWS.Bucket: storageGenerationLegacyConfigValue}
+	for generation, location := range c.AWS.BlockStorage.Generations {
+		if !storageGenerationPattern.MatchString(generation) {
+			return xerrors.Errorf("invalid aws.block_storage.generations key %q", generation)
 		}
+		if strings.TrimSpace(location.Bucket) != location.Bucket || location.Bucket == "" {
+			return xerrors.Errorf("aws.block_storage.generations.%s.bucket must be non-empty without surrounding whitespace", generation)
+		}
+		if previousGeneration, ok := seenBuckets[location.Bucket]; ok {
+			return xerrors.Errorf(
+				"aws.block_storage generations %q and %q must use different buckets",
+				previousGeneration,
+				generation,
+			)
+		}
+		seenBuckets[location.Bucket] = generation
+	}
+
+	if len(c.AWS.BlockStorage.Generations) > 0 {
 		switch c.StorageType.BlobStorageType {
 		case BlobStorageType_UNSPECIFIED, BlobStorageType_S3:
-			return nil
 		default:
-			return xerrors.Errorf("aws.active_storage_generation=v2 requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
+			return xerrors.Errorf("non-legacy block storage generations require S3 blob storage, got %v", c.StorageType.BlobStorageType)
 		}
-	default:
-		return xerrors.Errorf("invalid aws.active_storage_generation %q", c.AWS.ActiveStorageGeneration)
+		usesPostgres := c.StorageType.MetaStorageType == MetaStorageType_POSTGRES ||
+			(c.StorageType.MetaStorageType == MetaStorageType_UNSPECIFIED && c.AWS.Postgres != nil && c.AWS.DynamoDB == nil)
+		if !usesPostgres {
+			return xerrors.Errorf("non-legacy block storage generations require Postgres meta storage, got %v", c.StorageType.MetaStorageType)
+		}
 	}
+
+	if writeGeneration == StorageGenerationLegacy {
+		return nil
+	}
+	if _, ok := c.AWS.BlockStorage.Generations[string(writeGeneration)]; !ok {
+		return xerrors.Errorf("aws.block_storage.write_generation=%s is not configured in aws.block_storage.generations", writeGeneration)
+	}
+	return nil
 }
 
-func (c *Config) ActiveBlockStorageGeneration() (api.BlockStorageGeneration, error) {
-	switch c.AWS.ActiveStorageGeneration {
-	case StorageGenerationLegacy:
-		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, nil
-	case StorageGenerationV2:
-		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, nil
-	default:
-		return api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
-			xerrors.Errorf("invalid aws.active_storage_generation %q", c.AWS.ActiveStorageGeneration)
+func normalizeConfiguredStorageGeneration(generation StorageGeneration) (StorageGeneration, error) {
+	if generation == StorageGenerationLegacy || generation == storageGenerationLegacyConfigValue {
+		return StorageGenerationLegacy, nil
 	}
+	if !storageGenerationPattern.MatchString(string(generation)) {
+		return StorageGenerationLegacy, xerrors.Errorf("unsupported storage generation %q", generation)
+	}
+	return generation, nil
 }
 
-func (c *Config) ResolveBlockStorageBucket(generation api.BlockStorageGeneration) (string, error) {
-	switch generation {
-	case api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY:
+func (c *Config) WriteBlockStorageGeneration() (string, error) {
+	generation, err := normalizeConfiguredStorageGeneration(c.AWS.BlockStorage.WriteGeneration)
+	if err != nil {
+		return "", xerrors.Errorf("invalid aws.block_storage.write_generation: %w", err)
+	}
+	if generation != StorageGenerationLegacy {
+		if _, ok := c.AWS.BlockStorage.Generations[string(generation)]; !ok {
+			return "", xerrors.Errorf("aws.block_storage.write_generation=%s is not configured", generation)
+		}
+	}
+	return string(generation), nil
+}
+
+func (c *Config) ResolveBlockStorageBucket(generation string) (string, error) {
+	if generation == string(StorageGenerationLegacy) {
 		return c.AWS.Bucket, nil
-	case api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2:
-		if c.AWS.BucketV2 == "" {
-			return "", xerrors.New("block metadata requires storage generation v2 but aws.bucket_v2 is not configured")
-		}
-		return c.AWS.BucketV2, nil
-	default:
-		return "", xerrors.Errorf("unsupported block storage generation %d", generation)
 	}
+	if !storageGenerationPattern.MatchString(generation) {
+		return "", xerrors.Errorf("unsupported block storage generation %q", generation)
+	}
+	location, ok := c.AWS.BlockStorage.Generations[generation]
+	if !ok {
+		return "", xerrors.Errorf("block metadata requires unconfigured storage generation %q", generation)
+	}
+	if strings.TrimSpace(location.Bucket) != location.Bucket || location.Bucket == "" {
+		return "", xerrors.Errorf("block metadata storage generation %q has an invalid bucket", generation)
+	}
+	return location.Bucket, nil
 }
 
-func (c *Config) ActiveBlockStorageBucket() (string, error) {
-	generation, err := c.ActiveBlockStorageGeneration()
+func (c *Config) WriteBlockStorageBucket() (string, error) {
+	generation, err := c.WriteBlockStorageGeneration()
 	if err != nil {
 		return "", err
 	}

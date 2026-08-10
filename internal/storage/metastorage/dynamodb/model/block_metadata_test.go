@@ -21,7 +21,6 @@ func TestBlockMetadataToProto_ConsolidatedFields(t *testing.T) {
 		ByteOffset:         4096,
 		ByteLength:         8192,
 		UncompressedLength: 8192,
-		StorageGeneration:  int32(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2),
 	}
 
 	actual := BlockMetadataToProto(entry)
@@ -30,7 +29,6 @@ func TestBlockMetadataToProto_ConsolidatedFields(t *testing.T) {
 	require.Equal(t, uint64(4096), actual.GetByteOffset())
 	require.Equal(t, uint64(8192), actual.GetByteLength())
 	require.Equal(t, uint64(8192), actual.GetUncompressedLength())
-	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, actual.GetStorageGeneration())
 	require.Equal(t, entry.ObjectKeyMain, actual.GetObjectKeyMain())
 }
 

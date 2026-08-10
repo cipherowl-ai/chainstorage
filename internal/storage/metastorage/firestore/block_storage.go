@@ -320,28 +320,26 @@ func (b *blockStorageImpl) getBlock(ctx context.Context, docRef *firestore.Docum
 
 // firestore does not support storing uin64, hence we use int64 to store block height
 type firestoreBlockMetadata struct {
-	Hash              string
-	ParentHash        string
-	Height            int64
-	ParentHeight      int64
-	ObjectKeyMain     string
-	Skipped           bool
-	Timestamp         *timestamppb.Timestamp
-	Tag               uint32
-	StorageGeneration int32
+	Hash          string
+	ParentHash    string
+	Height        int64
+	ParentHeight  int64
+	ObjectKeyMain string
+	Skipped       bool
+	Timestamp     *timestamppb.Timestamp
+	Tag           uint32
 }
 
 func (*blockStorageImpl) fromBlockMetadata(block *chainstorage.BlockMetadata) *firestoreBlockMetadata {
 	return &firestoreBlockMetadata{
-		Hash:              block.Hash,
-		ParentHash:        block.ParentHash,
-		Height:            int64(block.Height),
-		ParentHeight:      int64(block.ParentHeight),
-		ObjectKeyMain:     block.ObjectKeyMain,
-		Skipped:           block.Skipped,
-		Tag:               block.Tag,
-		Timestamp:         block.Timestamp,
-		StorageGeneration: int32(block.GetStorageGeneration()),
+		Hash:          block.Hash,
+		ParentHash:    block.ParentHash,
+		Height:        int64(block.Height),
+		ParentHeight:  int64(block.ParentHeight),
+		ObjectKeyMain: block.ObjectKeyMain,
+		Skipped:       block.Skipped,
+		Tag:           block.Tag,
+		Timestamp:     block.Timestamp,
 	}
 }
 
@@ -358,14 +356,13 @@ func (*blockStorageImpl) intoBlockMetadata(doc *firestore.DocumentSnapshot) (*ch
 		return nil, xerrors.Errorf("expecting block ParentHeight to be uint64, but got %d", s.ParentHeight)
 	}
 	return &chainstorage.BlockMetadata{
-		Hash:              s.Hash,
-		ParentHash:        s.ParentHash,
-		Height:            uint64(s.Height),
-		ParentHeight:      uint64(s.ParentHeight),
-		ObjectKeyMain:     s.ObjectKeyMain,
-		Skipped:           s.Skipped,
-		Timestamp:         s.Timestamp,
-		StorageGeneration: chainstorage.BlockStorageGeneration(s.StorageGeneration),
-		Tag:               s.Tag,
+		Hash:          s.Hash,
+		ParentHash:    s.ParentHash,
+		Height:        uint64(s.Height),
+		ParentHeight:  uint64(s.ParentHeight),
+		ObjectKeyMain: s.ObjectKeyMain,
+		Skipped:       s.Skipped,
+		Timestamp:     s.Timestamp,
+		Tag:           s.Tag,
 	}, nil
 }

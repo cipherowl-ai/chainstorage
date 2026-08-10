@@ -20,7 +20,6 @@ type BlockMetaDataDDBEntry struct {
 	ByteOffset         uint64 `dynamodbav:"byte_offset,omitempty"`
 	ByteLength         uint64 `dynamodbav:"byte_length,omitempty"`
 	UncompressedLength uint64 `dynamodbav:"uncompressed_length,omitempty"`
-	StorageGeneration  int32  `dynamodbav:"storage_generation,omitempty"`
 }
 
 func BlockMetadataToProto(bm *BlockMetaDataDDBEntry) *api.BlockMetadata {
@@ -37,7 +36,6 @@ func BlockMetadataToProto(bm *BlockMetaDataDDBEntry) *api.BlockMetadata {
 		ByteOffset:         bm.ByteOffset,
 		ByteLength:         bm.ByteLength,
 		UncompressedLength: bm.UncompressedLength,
-		StorageGeneration:  api.BlockStorageGeneration(bm.StorageGeneration),
 	}
 
 	return v

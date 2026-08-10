@@ -99,9 +99,9 @@ type (
 		Height                        uint64
 		Hash                          string
 		SingleBlockObjectKeyMain      string
-		SingleBlockStorageGeneration  api.BlockStorageGeneration
+		SingleBlockStorageGeneration  string
 		ConsolidatedObjectKeyMain     string
-		ConsolidatedStorageGeneration api.BlockStorageGeneration
+		ConsolidatedStorageGeneration string
 		ObjectFormat                  api.BlockObjectFormat
 		ByteOffset                    uint64
 		ByteLength                    uint64

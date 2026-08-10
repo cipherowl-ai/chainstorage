@@ -134,8 +134,8 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	require.Equal(uint64(5), placements[0].ByteLength)
 	require.Equal(uint64(5), placements[1].ByteOffset)
 	require.Equal(uint64(6), placements[1].ByteLength)
-	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, placements[0].StorageGeneration)
-	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, placements[1].StorageGeneration)
+	require.Equal("", placements[0].StorageGeneration)
+	require.Equal("", placements[1].StorageGeneration)
 	require.Contains(stages, "s3_encode_config_loaded")
 	require.Contains(stages, "cscb_encode_started")
 	require.Contains(stages, "cscb_block_encoded")
@@ -149,7 +149,7 @@ func TestBlobStorage_UploadConsolidated_NewObject(t *testing.T) {
 	require.Contains(stages, "s3_head_uploaded_finished")
 }
 
-func TestBlobStorage_UploadConsolidated_ActiveV2RoutesAndStampsPlacements(t *testing.T) {
+func TestBlobStorage_UploadConsolidated_WriteGenerationV2RoutesAndStampsPlacements(t *testing.T) {
 	require := testutil.Require(t)
 	expected, err := cscb.Encode(context.Background(), testS3EncodeConfig(), testS3Payloads())
 	require.NoError(err)
@@ -161,8 +161,12 @@ func TestBlobStorage_UploadConsolidated_ActiveV2RoutesAndStampsPlacements(t *tes
 	)
 	require.NoError(err)
 	cfg.AWS.Bucket = "legacy-blocks"
-	cfg.AWS.BucketV2 = "v2-blocks"
-	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationV2
+	cfg.AWS.BlockStorage = config.BlockStorageConfig{
+		WriteGeneration: "v2",
+		Generations: map[string]config.BlockStorageGenerationConfig{
+			"v2": {Bucket: "v2-blocks"},
+		},
+	}
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -198,7 +202,7 @@ func TestBlobStorage_UploadConsolidated_ActiveV2RoutesAndStampsPlacements(t *tes
 	require.Equal(expected.Key, objectKey)
 	require.Len(placements, 2)
 	for _, placement := range placements {
-		require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, placement.StorageGeneration)
+		require.Equal("v2", placement.StorageGeneration)
 	}
 }
 
@@ -426,9 +430,9 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_SeparatesSameKeyByGeneration
 	defer object.Close()
 
 	legacy := proto.Clone(metadatas[0]).(*api.BlockMetadata)
-	legacy.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+	legacy.StorageGeneration = ""
 	v2 := proto.Clone(metadatas[0]).(*api.BlockMetadata)
-	v2.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	v2.StorageGeneration = "v2"
 	_, chunk, err := index.LookupBlock(legacy)
 	require.NoError(err)
 
@@ -438,7 +442,9 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_SeparatesSameKeyByGeneration
 	)
 	require.NoError(err)
 	cfg.AWS.Bucket = "legacy-blocks"
-	cfg.AWS.BucketV2 = "v2-blocks"
+	cfg.AWS.BlockStorage.Generations = map[string]config.BlockStorageGenerationConfig{
+		"v2": {Bucket: "v2-blocks"},
+	}
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -480,8 +486,8 @@ func TestBlobStorage_DownloadManyConsolidatedBlocks_SeparatesSameKeyByGeneration
 	blocks, err := storage.DownloadMany(context.Background(), []*api.BlockMetadata{legacy, v2})
 	require.NoError(err)
 	require.Len(blocks, 2)
-	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, blocks[0].GetMetadata().GetStorageGeneration())
-	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, blocks[1].GetMetadata().GetStorageGeneration())
+	require.Equal("", blocks[0].GetMetadata().GetStorageGeneration())
+	require.Equal("v2", blocks[1].GetMetadata().GetStorageGeneration())
 	close(calls)
 	actualCalls := make(map[string]int)
 	for call := range calls {

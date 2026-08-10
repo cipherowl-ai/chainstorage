@@ -163,7 +163,7 @@ func (s *blobStorageImpl) uploadRaw(ctx context.Context, rawBlockData *internal.
 	if !bytes.Equal(checksum, attrs.MD5) {
 		return "", xerrors.Errorf("uploaded block md5 checksum %x is different from expected %x", attrs.MD5, checksum)
 	}
-	rawBlockData.BlockMetadata.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+	rawBlockData.BlockMetadata.StorageGeneration = ""
 
 	// a workaround to use timer
 	s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(size) * time.Millisecond)
@@ -234,9 +234,9 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 				Blobdata:   nil,
 			}, nil
 		}
-		if metadata.GetStorageGeneration() != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY {
+		if metadata.GetStorageGeneration() != "" {
 			return nil, xerrors.Errorf(
-				"GCS blob storage does not support block storage generation %d",
+				"GCS blob storage does not support block storage generation %q",
 				metadata.GetStorageGeneration(),
 			)
 		}
@@ -312,9 +312,9 @@ func (s *blobStorageImpl) PreSign(ctx context.Context, metadata *api.BlockMetada
 	if metadata == nil {
 		return "", xerrors.New("block metadata is required")
 	}
-	if metadata.GetStorageGeneration() != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY {
+	if metadata.GetStorageGeneration() != "" {
 		return "", xerrors.Errorf(
-			"GCS blob storage does not support block storage generation %d",
+			"GCS blob storage does not support block storage generation %q",
 			metadata.GetStorageGeneration(),
 		)
 	}

@@ -3,16 +3,23 @@ package retirement
 import (
 	"context"
 	"errors"
+	"regexp"
 	"time"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
+var storageGenerationPattern = regexp.MustCompile(`^v[1-9][0-9]*$`)
+
+func isValidStorageGeneration(generation string) bool {
+	return generation == "" || storageGenerationPattern.MatchString(generation)
+}
+
 type (
 	Repository interface {
 		ListMetadataRows(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]MetadataRow, error)
 		GetMetadataRow(ctx context.Context, blockMetadataID int64) (MetadataRow, error)
-		PrepareRetirement(ctx context.Context, manifest RetirementManifest, expectedStorageGeneration api.BlockStorageGeneration) error
+		PrepareRetirement(ctx context.Context, manifest RetirementManifest, expectedStorageGeneration string) error
 		ObserveRetentionSafety(ctx context.Context, bucket string, consolidatedObjectKey string, configurationSHA256 string) (time.Time, time.Time, error)
 		ClaimRetirement(ctx context.Context, blockMetadataID int64, claimToken string, claimedAt time.Time, claimExpiresAt time.Time) error
 		RenewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string, renewedAt time.Time, claimExpiresAt time.Time) error
@@ -47,7 +54,7 @@ type (
 		Hash                      string
 		Skipped                   bool
 		PrimaryObjectKey          string
-		PrimaryStorageGeneration  api.BlockStorageGeneration
+		PrimaryStorageGeneration  string
 		SingleBlockObjectKey      string
 		PrimaryObjectFormat       api.BlockObjectFormat
 		PrimaryByteOffset         uint64
@@ -63,9 +70,9 @@ type (
 		Height                        uint64
 		Hash                          string
 		SingleBlockObjectKey          string
-		SingleBlockStorageGeneration  api.BlockStorageGeneration
+		SingleBlockStorageGeneration  string
 		ConsolidatedObjectKey         string
-		ConsolidatedStorageGeneration api.BlockStorageGeneration
+		ConsolidatedStorageGeneration string
 		ObjectFormat                  api.BlockObjectFormat
 		ByteOffset                    uint64
 		ByteLength                    uint64
@@ -147,7 +154,7 @@ type (
 		Network                     string
 		Sidechain                   string
 		Bucket                      string
-		StorageGeneration           api.BlockStorageGeneration
+		StorageGeneration           string
 		Tag                         uint32
 		StartHeight                 uint64
 		EndHeight                   uint64

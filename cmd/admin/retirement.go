@@ -154,13 +154,13 @@ func runSingleBlockRetirementPlan(ctx context.Context, flags retirementFlags) er
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
 	targetChain := approvalChainFromFlags()
-	bucket, err := cfg.ActiveBlockStorageBucket()
+	bucket, err := cfg.WriteBlockStorageBucket()
 	if err != nil {
-		return xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+		return xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
 	}
-	storageGeneration, err := cfg.ActiveBlockStorageGeneration()
+	storageGeneration, err := cfg.WriteBlockStorageGeneration()
 	if err != nil {
-		return xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+		return xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	logger.Info("planning single-block object retirement",
 		zap.String("environment", string(cfg.Env())),
@@ -253,13 +253,13 @@ func runSingleBlockRetirementReconcile(ctx context.Context, flags retirementFlag
 	}
 
 	tag := cfg.GetEffectiveBlockTag(flags.tag)
-	bucket, err := cfg.ActiveBlockStorageBucket()
+	bucket, err := cfg.WriteBlockStorageBucket()
 	if err != nil {
-		return xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+		return xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
 	}
-	storageGeneration, err := cfg.ActiveBlockStorageGeneration()
+	storageGeneration, err := cfg.WriteBlockStorageGeneration()
 	if err != nil {
-		return xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+		return xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	db, err := openRetirementPostgres(ctx, cfg.AWS.Postgres, !flags.execute)
 	if err != nil {

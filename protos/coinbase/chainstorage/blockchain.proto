@@ -49,14 +49,6 @@ enum BlockObjectFormat {
   BLOCK_OBJECT_FORMAT_CSCB_BATCH = 1;
 }
 
-// BlockStorageGeneration identifies the configured physical object-storage
-// generation that owns object_key_main. The zero value preserves all metadata
-// written before generation-aware routing was introduced.
-enum BlockStorageGeneration {
-  BLOCK_STORAGE_GENERATION_LEGACY = 0;
-  BLOCK_STORAGE_GENERATION_V2 = 1;
-}
-
 message BlockMetadata {
   // Tag is a way to version the blockchain dataset. See http://go/cs-design for more details.
   uint32 tag = 1;
@@ -82,8 +74,10 @@ message BlockMetadata {
   uint64 uncompressed_length = 11;
   // Object format for object_key_main. Zero value is the single-block whole-object format.
   BlockObjectFormat object_format = 12;
-  // Physical object-storage generation that owns object_key_main.
-  BlockStorageGeneration storage_generation = 13;
+  // Physical object-storage generation that owns object_key_main. Empty means
+  // the immutable legacy generation; non-empty values such as "v2" resolve
+  // through the configured generation registry.
+  string storage_generation = 13;
 }
 
 message TransactionMetadata {

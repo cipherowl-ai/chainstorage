@@ -50,7 +50,7 @@ type (
 		Hash               string
 		ObjectKey          string
 		ObjectFormat       api.BlockObjectFormat
-		StorageGeneration  api.BlockStorageGeneration
+		StorageGeneration  string
 		ByteOffset         uint64
 		ByteLength         uint64
 		UncompressedLength uint64

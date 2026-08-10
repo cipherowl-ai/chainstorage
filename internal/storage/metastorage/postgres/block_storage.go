@@ -378,7 +378,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				byteOffset,
 				byteLength,
 				uncompressedLength,
-				int32(block.GetStorageGeneration()),
+				nullableStorageGeneration(block.GetStorageGeneration()),
 			).Scan(&blockId)
 			if err != nil {
 				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
@@ -679,7 +679,7 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 		var blockTimestamp int64
 		var skipped bool
 		var objectFormat int32
-		var storageGeneration int32
+		var storageGeneration sql.NullString
 		var byteOffset, byteLength, uncompressedLength sql.NullInt64
 
 		err := b.db.QueryRowContext(ctx, query, tag, timestamp).Scan(
@@ -712,7 +712,7 @@ func (b *blockStorageImpl) GetBlockByTimestamp(ctx context.Context, tag uint32, 
 			ByteOffset:         uint64Value(byteOffset),
 			ByteLength:         uint64Value(byteLength),
 			UncompressedLength: uint64Value(uncompressedLength),
-			StorageGeneration:  api.BlockStorageGeneration(storageGeneration),
+			StorageGeneration:  storageGeneration.String,
 		}, nil
 	})
 }
@@ -738,7 +738,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 			continue
 		}
 		placeholders = append(placeholders, fmt.Sprintf(
-			"($%d::int, $%d::int, $%d::bigint, $%d::varchar, $%d::text, $%d::smallint)",
+			"($%d::int, $%d::int, $%d::bigint, $%d::varchar, $%d::text, $%d::text)",
 			nextArg,
 			nextArg+1,
 			nextArg+2,
@@ -746,7 +746,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 			nextArg+4,
 			nextArg+5,
 		))
-		args = append(args, i, block.GetTag(), block.GetHeight(), block.GetHash(), block.GetObjectKeyMain(), int32(block.GetStorageGeneration()))
+		args = append(args, i, block.GetTag(), block.GetHeight(), block.GetHash(), block.GetObjectKeyMain(), nullableStorageGeneration(block.GetStorageGeneration()))
 		nextArg += 6
 	}
 	if len(placeholders) == 0 {
@@ -773,7 +773,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 				AND height = input.height
 				AND hash = input.hash
 				AND single_block_object_key_main = input.single_block_object_key_main
-				AND single_block_storage_generation = input.single_block_storage_generation
+				AND single_block_storage_generation IS NOT DISTINCT FROM input.single_block_storage_generation
 				AND validated_at IS NOT NULL
 			ORDER BY created_at DESC
 			LIMIT 1
@@ -790,7 +790,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 	for rows.Next() {
 		var ord int
 		var objectKey sql.NullString
-		var storageGeneration sql.NullInt64
+		var storageGeneration sql.NullString
 		var objectFormat sql.NullInt64
 		var byteOffset, byteLength sql.NullInt64
 		var uncompressedLength sql.NullInt64
@@ -814,7 +814,7 @@ func (b *blockStorageImpl) GetBlocksConsolidationShadow(ctx context.Context, blo
 		shadows[ord] = makeConsolidationShadowBlockMetadata(
 			blocks[ord],
 			objectKey.String,
-			api.BlockStorageGeneration(storageGeneration.Int64),
+			storageGeneration.String,
 			api.BlockObjectFormat(objectFormat.Int64),
 			uint64Value(byteOffset),
 			uint64Value(byteLength),
@@ -852,7 +852,7 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 				FROM block_consolidation_shadow shadow
 				WHERE shadow.block_metadata_id = bm.id
 					AND shadow.single_block_object_key_main = bm.object_key_main
-					AND shadow.single_block_storage_generation = bm.storage_generation
+					AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
 					AND shadow.validated_at IS NOT NULL
 			)
 		ORDER BY bm.height ASC
@@ -876,7 +876,7 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 		var blockTimestamp int64
 		var skipped bool
 		var objectFormat int32
-		var storageGeneration int32
+		var storageGeneration sql.NullString
 		var byteOffset, byteLength, uncompressedLength sql.NullInt64
 		if err := rows.Scan(
 			&id,
@@ -911,7 +911,7 @@ func (b *blockStorageImpl) GetBlocksMissingConsolidationShadow(ctx context.Conte
 				ByteOffset:         uint64Value(byteOffset),
 				ByteLength:         uint64Value(byteLength),
 				UncompressedLength: uint64Value(uncompressedLength),
-				StorageGeneration:  api.BlockStorageGeneration(storageGeneration),
+				StorageGeneration:  storageGeneration.String,
 			},
 		})
 	}
@@ -943,7 +943,7 @@ func (b *blockStorageImpl) GetFirstBlockMissingConsolidationShadow(ctx context.C
 				FROM block_consolidation_shadow shadow
 				WHERE shadow.block_metadata_id = bm.id
 					AND shadow.single_block_object_key_main = bm.object_key_main
-					AND shadow.single_block_storage_generation = bm.storage_generation
+					AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
 					AND shadow.validated_at IS NOT NULL
 			)
 		ORDER BY bm.height ASC
@@ -1000,7 +1000,7 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 			AND (
 				(
 					shadow.single_block_object_key_main = eligible.object_key_main
-					AND shadow.single_block_storage_generation = eligible.storage_generation
+					AND shadow.single_block_storage_generation IS NOT DISTINCT FROM eligible.storage_generation
 					AND eligible.byte_length IS NULL
 					AND shadow.object_format = $4
 					AND shadow.byte_offset >= 0
@@ -1010,7 +1010,7 @@ func (b *blockStorageImpl) GetBlockConsolidationShadowStats(ctx context.Context,
 				)
 				OR (
 					eligible.object_key_main = shadow.consolidated_object_key_main
-					AND eligible.storage_generation = shadow.consolidated_storage_generation
+					AND eligible.storage_generation IS NOT DISTINCT FROM shadow.consolidated_storage_generation
 					AND eligible.object_format = $4
 					AND eligible.object_format = shadow.object_format
 					AND eligible.byte_offset = shadow.byte_offset
@@ -1048,7 +1048,7 @@ func (b *blockStorageImpl) GetFirstPromotableBlockConsolidationShadow(ctx contex
 			AND shadow.height = bm.height
 			AND shadow.hash = bm.hash
 			AND shadow.single_block_object_key_main = bm.object_key_main
-			AND shadow.single_block_storage_generation = bm.storage_generation
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
 		JOIN canonical_blocks cb ON cb.block_metadata_id = bm.id
 			AND cb.tag = bm.tag
 			AND cb.height = bm.height
@@ -1159,7 +1159,7 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			AND bm.height = $3
 			AND bm.hash = $4
 			AND bm.object_key_main = $5
-			AND bm.storage_generation = $7
+			AND bm.storage_generation IS NOT DISTINCT FROM $7
 			AND bm.skipped = false
 		FOR UPDATE OF bm
 		ON CONFLICT (block_metadata_id) DO UPDATE SET
@@ -1176,13 +1176,13 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			uncompressed_length = EXCLUDED.uncompressed_length,
 			single_block_retention_started_at = CASE
 				WHEN block_consolidation_shadow.single_block_object_key_main = EXCLUDED.single_block_object_key_main
-					AND block_consolidation_shadow.single_block_storage_generation = EXCLUDED.single_block_storage_generation
+					AND block_consolidation_shadow.single_block_storage_generation IS NOT DISTINCT FROM EXCLUDED.single_block_storage_generation
 					THEN block_consolidation_shadow.single_block_retention_started_at
 				ELSE NULL
 			END,
 			single_block_delete_after = CASE
 				WHEN block_consolidation_shadow.single_block_object_key_main = EXCLUDED.single_block_object_key_main
-					AND block_consolidation_shadow.single_block_storage_generation = EXCLUDED.single_block_storage_generation
+					AND block_consolidation_shadow.single_block_storage_generation IS NOT DISTINCT FROM EXCLUDED.single_block_storage_generation
 					THEN block_consolidation_shadow.single_block_delete_after
 				ELSE NULL
 			END,
@@ -1204,8 +1204,8 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			placement.Hash,
 			placement.SingleBlockObjectKeyMain,
 			placement.ConsolidatedObjectKeyMain,
-			int32(placement.SingleBlockStorageGeneration),
-			int32(placement.ConsolidatedStorageGeneration),
+			nullableStorageGeneration(placement.SingleBlockStorageGeneration),
+			nullableStorageGeneration(placement.ConsolidatedStorageGeneration),
 			int32(placement.ObjectFormat),
 			placement.ByteOffset,
 			placement.ByteLength,
@@ -1268,7 +1268,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 			AND shadow.height = bm.height
 			AND shadow.hash = bm.hash
 			AND shadow.single_block_object_key_main = bm.object_key_main
-			AND shadow.single_block_storage_generation = bm.storage_generation
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
 		WHERE cb.tag = $1
 			AND cb.height >= $2
 			AND cb.height < $3
@@ -1329,7 +1329,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				AND shadow.height = bm.height
 				AND shadow.hash = bm.hash
 				AND shadow.single_block_object_key_main = bm.object_key_main
-				AND shadow.single_block_storage_generation = bm.storage_generation
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
 			WHERE cb.tag = $1
 				AND cb.height >= $2
 				AND cb.height < $3
@@ -1364,7 +1364,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				AND bm.height = candidates.height
 				AND bm.hash = candidates.hash
 				AND bm.object_key_main = candidates.single_block_object_key_main
-				AND bm.storage_generation = candidates.single_block_storage_generation
+				AND bm.storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
 				AND bm.skipped = false
 				AND bm.byte_length IS NULL
 			RETURNING bm.id
@@ -1380,7 +1380,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 				AND shadow.height = candidates.height
 				AND shadow.hash = candidates.hash
 				AND shadow.single_block_object_key_main = candidates.single_block_object_key_main
-				AND shadow.single_block_storage_generation = candidates.single_block_storage_generation
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
 			RETURNING shadow.block_metadata_id
 		)
 		SELECT
@@ -1419,7 +1419,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 func makeConsolidationShadowBlockMetadata(
 	block *api.BlockMetadata,
 	objectKey string,
-	storageGeneration api.BlockStorageGeneration,
+	storageGeneration string,
 	objectFormat api.BlockObjectFormat,
 	byteOffset uint64,
 	byteLength uint64,
@@ -1440,6 +1440,13 @@ func uint64Value(value sql.NullInt64) uint64 {
 		return 0
 	}
 	return uint64(value.Int64)
+}
+
+func nullableStorageGeneration(generation string) interface{} {
+	if generation == "" {
+		return nil
+	}
+	return generation
 }
 
 func blockObjectByteFields(block *api.BlockMetadata) (sql.NullInt64, sql.NullInt64, sql.NullInt64) {

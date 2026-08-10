@@ -15,7 +15,7 @@ func TestCloneBlockWithoutStoragePlacement(t *testing.T) {
 		ByteOffset:         10,
 		ByteLength:         20,
 		UncompressedLength: 30,
-		StorageGeneration:  api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		StorageGeneration:  "v2",
 		Hash:               "hash",
 	}}
 
@@ -23,7 +23,7 @@ func TestCloneBlockWithoutStoragePlacement(t *testing.T) {
 	clone := CloneBlockWithoutStoragePlacement(block)
 	require.False(t, HasBlockStoragePlacement(clone))
 	require.Equal(t, "hash", clone.Metadata.Hash)
-	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, clone.Metadata.StorageGeneration)
+	require.Equal(t, "", clone.Metadata.StorageGeneration)
 	require.Equal(t, "single-block/block.gzip", block.Metadata.ObjectKeyMain)
-	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, block.Metadata.StorageGeneration)
+	require.Equal(t, "v2", block.Metadata.StorageGeneration)
 }

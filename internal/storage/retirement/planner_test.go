@@ -51,7 +51,7 @@ func (r *fakeRepo) GetMetadataRow(ctx context.Context, blockMetadataID int64) (M
 func (r *fakeRepo) PrepareRetirement(
 	ctx context.Context,
 	manifest RetirementManifest,
-	expectedStorageGeneration api.BlockStorageGeneration,
+	expectedStorageGeneration string,
 ) error {
 	row, err := r.GetMetadataRow(ctx, manifest.BlockMetadataID)
 	if err != nil {
@@ -586,19 +586,19 @@ func TestPlannerPlan_StorageGenerationMismatchIsNeverRetired(t *testing.T) {
 		{
 			name: "primary",
 			mutate: func(row *MetadataRow) {
-				row.PrimaryStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+				row.PrimaryStorageGeneration = "v2"
 			},
 		},
 		{
 			name: "source shadow",
 			mutate: func(row *MetadataRow) {
-				row.Shadow.SingleBlockStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+				row.Shadow.SingleBlockStorageGeneration = "v2"
 			},
 		},
 		{
 			name: "consolidated shadow",
 			mutate: func(row *MetadataRow) {
-				row.Shadow.ConsolidatedStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+				row.Shadow.ConsolidatedStorageGeneration = "v2"
 			},
 		},
 	}
@@ -1312,7 +1312,7 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 
 	v2Req := dryRunReq
 	v2Req.Bucket = "generation-v2"
-	v2Req.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	v2Req.StorageGeneration = "v2"
 	v2Report, err := planner.Plan(context.Background(), v2Req)
 	require.NoError(err)
 	require.Len(v2Report.Items, 1)
@@ -1569,7 +1569,7 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterSingleBlockDelete(t *te
 	v2Req.Execute = false
 	v2Req.ProductionDeleteEnabled = false
 	v2Req.Bucket = "generation-v2"
-	v2Req.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	v2Req.StorageGeneration = "v2"
 	v2Report, err := planner.Plan(context.Background(), v2Req)
 	require.NoError(err)
 	require.Len(v2Report.Items, 1)
@@ -1618,9 +1618,9 @@ func TestPlannerApply_RejectsBlockThatIsNoLongerCanonical(t *testing.T) {
 func TestPlannerApply_RejectsStorageGenerationChangeAfterPlan(t *testing.T) {
 	require := require.New(t)
 	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
-	repo.rows[0].PrimaryStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
-	repo.rows[0].Shadow.SingleBlockStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
-	repo.rows[0].Shadow.ConsolidatedStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	repo.rows[0].PrimaryStorageGeneration = "v2"
+	repo.rows[0].Shadow.SingleBlockStorageGeneration = "v2"
+	repo.rows[0].Shadow.ConsolidatedStorageGeneration = "v2"
 
 	err := planner.Apply(context.Background(), req, report)
 	require.Error(err)
@@ -1732,9 +1732,9 @@ func TestPlannerReconcile_RejectsStorageGenerationChangeBeforePendingVerificatio
 	manifest.ClaimExpiresAt = &expiredAt
 	repo.manifests[repo.rows[0].BlockMetadataID] = manifest
 	repo.updateManifestRow(manifest)
-	repo.rows[0].PrimaryStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
-	repo.rows[0].Shadow.SingleBlockStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
-	repo.rows[0].Shadow.ConsolidatedStorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2
+	repo.rows[0].PrimaryStorageGeneration = "v2"
+	repo.rows[0].Shadow.SingleBlockStorageGeneration = "v2"
+	repo.rows[0].Shadow.ConsolidatedStorageGeneration = "v2"
 	policyCalls := store.policyCalls[report.Items[0].ConsolidatedKey]
 	headCalls := store.headCalls[report.Items[0].ConsolidatedKey]
 	versionCalls := store.versionCalls[versionObjectKey(report.Items[0].ConsolidatedKey, report.Items[0].CSCBVersionID)]

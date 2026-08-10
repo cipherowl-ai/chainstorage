@@ -52,7 +52,7 @@ type (
 		logger                 *zap.Logger
 		config                 *config.Config
 		bucket                 string
-		storageGeneration      api.BlockStorageGeneration
+		storageGeneration      string
 		client                 s3.Client
 		downloader             s3.Downloader
 		uploader               s3.Uploader
@@ -117,13 +117,13 @@ func newBlobStorage(params BlobStorageParams) (internal.BlobStorageCore, error) 
 	metrics := params.Metrics.SubScope("blob_storage").Tagged(map[string]string{
 		"storage_type": "s3",
 	})
-	bucket, err := params.Config.ActiveBlockStorageBucket()
+	bucket, err := params.Config.WriteBlockStorageBucket()
 	if err != nil {
-		return nil, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+		return nil, xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
 	}
-	storageGeneration, err := params.Config.ActiveBlockStorageGeneration()
+	storageGeneration, err := params.Config.WriteBlockStorageGeneration()
 	if err != nil {
-		return nil, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+		return nil, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	return &blobStorageImpl{
 		logger:                 log.WithPackage(params.Logger),

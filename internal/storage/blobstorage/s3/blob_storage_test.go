@@ -251,8 +251,9 @@ func TestBlobStorage_RoutesMixedGenerationReads(t *testing.T) {
 	cfg, err := config.New()
 	require.NoError(err)
 	cfg.AWS.Bucket = "legacy-blocks"
-	cfg.AWS.BucketV2 = "v2-blocks"
-	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationLegacy
+	cfg.AWS.BlockStorage.Generations = map[string]config.BlockStorageGenerationConfig{
+		"v2": {Bucket: "v2-blocks"},
+	}
 
 	payload, err := proto.Marshal(&api.Block{
 		Blockchain: common.Blockchain_BLOCKCHAIN_ETHEREUM,
@@ -292,12 +293,12 @@ func TestBlobStorage_RoutesMixedGenerationReads(t *testing.T) {
 		{
 			Height:            100,
 			ObjectKeyMain:     "shared-key",
-			StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+			StorageGeneration: "",
 		},
 		{
 			Height:            101,
 			ObjectKeyMain:     "shared-key",
-			StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+			StorageGeneration: "v2",
 		},
 	}
 	blocks, err := storage.DownloadMany(context.Background(), metadatas)
@@ -336,25 +337,29 @@ func TestBlobStorage_RejectsUnresolvableGenerationBeforeS3(t *testing.T) {
 	_, err = storage.Download(context.Background(), &api.BlockMetadata{
 		Height:            100,
 		ObjectKeyMain:     "key",
-		StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		StorageGeneration: "v2",
 	})
-	require.ErrorContains(err, "aws.bucket_v2 is not configured")
+	require.ErrorContains(err, "unconfigured storage generation \"v2\"")
 
 	_, err = storage.Download(context.Background(), &api.BlockMetadata{
 		Height:            101,
 		ObjectKeyMain:     "key",
-		StorageGeneration: api.BlockStorageGeneration(99),
+		StorageGeneration: "future",
 	})
-	require.ErrorContains(err, "unsupported block storage generation 99")
+	require.ErrorContains(err, "unsupported block storage generation \"future\"")
 }
 
-func TestBlobStorage_ActiveV2RoutesAndStampsNewSingleBlock(t *testing.T) {
+func TestBlobStorage_WriteGenerationV2RoutesAndStampsNewSingleBlock(t *testing.T) {
 	require := testutil.Require(t)
 	cfg, err := config.New()
 	require.NoError(err)
 	cfg.AWS.Bucket = "legacy-blocks"
-	cfg.AWS.BucketV2 = "v2-blocks"
-	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationV2
+	cfg.AWS.BlockStorage = config.BlockStorageConfig{
+		WriteGeneration: "v2",
+		Generations: map[string]config.BlockStorageGenerationConfig{
+			"v2": {Bucket: "v2-blocks"},
+		},
+	}
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -387,7 +392,7 @@ func TestBlobStorage_ActiveV2RoutesAndStampsNewSingleBlock(t *testing.T) {
 		Metadata:   metadata,
 	}, api.Compression_NONE)
 	require.NoError(err)
-	require.Equal(api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, metadata.GetStorageGeneration())
+	require.Equal("v2", metadata.GetStorageGeneration())
 }
 
 func TestBlobStorage_PreSignRoutesByGeneration(t *testing.T) {
@@ -395,7 +400,9 @@ func TestBlobStorage_PreSignRoutesByGeneration(t *testing.T) {
 	cfg, err := config.New()
 	require.NoError(err)
 	cfg.AWS.Bucket = "legacy-blocks"
-	cfg.AWS.BucketV2 = "v2-blocks"
+	cfg.AWS.BlockStorage.Generations = map[string]config.BlockStorageGenerationConfig{
+		"v2": {Bucket: "v2-blocks"},
+	}
 	client := awss3.NewFromConfig(aws.Config{
 		Region:      "us-east-1",
 		Credentials: credentials.NewStaticCredentialsProvider("test", "test", ""),
@@ -404,7 +411,7 @@ func TestBlobStorage_PreSignRoutesByGeneration(t *testing.T) {
 
 	fileURL, err := storage.PreSign(context.Background(), &api.BlockMetadata{
 		ObjectKeyMain:     "key",
-		StorageGeneration: api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		StorageGeneration: "v2",
 	})
 	require.NoError(err)
 	parsed, err := url.Parse(fileURL)

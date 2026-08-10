@@ -10,7 +10,6 @@ import (
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
-	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 func TestSummarizeSingleBlockRetentionReportReturnsExactCompletedRange(t *testing.T) {
@@ -292,7 +291,7 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 	}, executeReq.Approval)
 	require.Equal(t, cohort.EligibleAt.UTC(), executeReq.EligibilityCutoff)
 	require.Equal(t, cfg.AWS.Bucket, executeReq.Bucket)
-	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, executeReq.StorageGeneration)
+	require.Equal(t, "", executeReq.StorageGeneration)
 
 	tagZeroReq, err := a.planRequest(&SingleBlockRetentionProcessRequest{
 		Tag:    math.MaxUint32,
@@ -309,12 +308,16 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 	require.False(t, dryRunReq.EligibilityCutoff.IsZero())
 	require.Equal(t, dryRunReq.Now, dryRunReq.EligibilityCutoff)
 
-	cfg.AWS.BucketV2 = "v2-blocks"
-	cfg.AWS.ActiveStorageGeneration = config.StorageGenerationV2
+	cfg.AWS.BlockStorage = config.BlockStorageConfig{
+		WriteGeneration: "v2",
+		Generations: map[string]config.BlockStorageGenerationConfig{
+			"v2": {Bucket: "v2-blocks"},
+		},
+	}
 	v2Req, err := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
 	require.NoError(t, err)
 	require.Equal(t, "v2-blocks", v2Req.Bucket)
-	require.Equal(t, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2, v2Req.StorageGeneration)
+	require.Equal(t, "v2", v2Req.StorageGeneration)
 }
 
 func TestResolveSingleBlockRetentionEligibilityCutoffSupportsLegacyPayload(t *testing.T) {

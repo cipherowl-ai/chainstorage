@@ -22,7 +22,7 @@ func CloneBlockWithoutStoragePlacement(block *api.Block) *api.Block {
 	clone.Metadata.ByteLength = 0
 	clone.Metadata.UncompressedLength = 0
 	clone.Metadata.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
-	clone.Metadata.StorageGeneration = api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+	clone.Metadata.StorageGeneration = ""
 	return clone
 }
 
@@ -38,5 +38,5 @@ func HasBlockStoragePlacement(block *api.Block) bool {
 		metadata.ByteLength != 0 ||
 		metadata.UncompressedLength != 0 ||
 		metadata.ObjectFormat != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK ||
-		metadata.StorageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY
+		metadata.StorageGeneration != ""
 }

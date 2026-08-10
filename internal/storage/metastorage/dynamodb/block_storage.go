@@ -334,7 +334,6 @@ func makeBlockMetaDataDDBEntry(block *api.BlockMetadata) *model.BlockMetaDataDDB
 		ByteOffset:         block.GetByteOffset(),
 		ByteLength:         block.GetByteLength(),
 		UncompressedLength: block.GetUncompressedLength(),
-		StorageGeneration:  int32(block.GetStorageGeneration()),
 	}
 	return &blockMetaDataDDBEntry
 }

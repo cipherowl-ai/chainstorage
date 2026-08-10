@@ -148,12 +148,12 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Contains(err.Error(), "must be inserted in eligible state")
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
-	err = repo.PrepareRetirement(ctx, manifest, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+	err = repo.PrepareRetirement(ctx, manifest, "")
 	require.Error(err)
 	require.Contains(err.Error(), "failed to lock canonical retirement metadata")
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = $2 WHERE block_metadata_id = $1`, blockMetadataID, retireAfter)
 	require.NoError(err)
-	require.NoError(repo.PrepareRetirement(ctx, manifest, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY))
+	require.NoError(repo.PrepareRetirement(ctx, manifest, ""))
 	_, err = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "audit manifests cannot be deleted")
@@ -427,7 +427,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	}
 
 	repo := NewPostgresRepository(db)
-	cohorts, err := repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(cohorts, 1)
 	require.Equal([]RetentionCohort{{
@@ -459,9 +459,9 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		PayloadSHA256:                  keySHA256("payload"),
 		PreparedAt:                     now.Add(-30 * time.Minute),
 	}
-	require.NoError(repo.PrepareRetirement(ctx, pendingManifest, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY))
+	require.NoError(repo.PrepareRetirement(ctx, pendingManifest, ""))
 
-	pending, err := repo.ListPendingRetentionCohorts(ctx, integrationRetentionBucket, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	pending, err := repo.ListPendingRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(pending, 1)
 	require.Equal(uint64(1), pending[0].RowCount)
@@ -477,19 +477,19 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	require.NoError(err)
 	require.Empty(futureAtCutoff)
 
-	due, err := repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	due, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(due, 1)
 	require.Equal(startHeight+1, due[0].StartHeight)
 	require.Equal(startHeight+2, due[0].EndHeight)
 	require.Equal(uint64(1), due[0].RowCount)
 
-	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, integrationRetentionBucket, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Equal(pending, snapshotPending)
 	require.Equal(due, snapshotDue)
 
-	merged, hasMore, err := NewSelector(repo).Select(ctx, integrationRetentionBucket, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	merged, hasMore, err := NewSelector(repo).Select(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.False(hasMore)
 	require.Equal([]RetentionCohort{{
@@ -503,7 +503,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 
 	bounded, err := repo.ListDueRetentionCohorts(
 		ctx,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		"",
 		tag,
 		startHeight+1,
 		startHeight+2,
@@ -530,12 +530,12 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		strings.Repeat("a", 64),
 	)
 	require.NoError(err)
-	cohorts, err = repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	cohorts, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
 }
 
-func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(t *testing.T) {
+func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t *testing.T) {
 	require := require.New(t)
 	cfg, err := config.New()
 	require.NoError(err)
@@ -577,9 +577,9 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 	seed := func(
 		height uint64,
 		consolidatedKey string,
-		primaryGeneration api.BlockStorageGeneration,
-		sourceGeneration api.BlockStorageGeneration,
-		destinationGeneration api.BlockStorageGeneration,
+		primaryGeneration string,
+		sourceGeneration string,
+		destinationGeneration string,
 	) int64 {
 		singleBlockKey := fmt.Sprintf("single-block/generation-%d.gzip", height)
 		var blockMetadataID int64
@@ -587,7 +587,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 			INSERT INTO block_metadata (
 				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
 				object_format, byte_offset, byte_length, uncompressed_length, storage_generation
-			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, $7, $8, $9, $10)
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, $7, $8, $9, NULLIF($10, ''))
 			RETURNING id`,
 			height,
 			tag,
@@ -598,7 +598,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 			0,
 			128,
 			128,
-			int32(primaryGeneration),
+			primaryGeneration,
 		).Scan(&blockMetadataID)
 		require.NoError(err)
 		blockMetadataIDs = append(blockMetadataIDs, blockMetadataID)
@@ -619,14 +619,14 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 				consolidated_storage_generation, object_format, byte_offset, byte_length,
 				uncompressed_length, validated_at, single_block_retention_started_at,
 				single_block_delete_after
-			) VALUES ($1, $2, $3, NULL, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+			) VALUES ($1, $2, $3, NULL, $4, NULLIF($5, ''), $6, NULLIF($7, ''), $8, $9, $10, $11, $12, $13, $14)`,
 			blockMetadataID,
 			tag,
 			height,
 			singleBlockKey,
-			int32(sourceGeneration),
+			sourceGeneration,
 			consolidatedKey,
-			int32(destinationGeneration),
+			destinationGeneration,
 			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 			0,
 			128,
@@ -642,30 +642,30 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 	seed(
 		startHeight,
 		sharedKey,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
+		"",
+		"v2",
 	)
 	nativeV2ID := seed(
 		startHeight+1,
 		sharedKey,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
+		"v2",
+		"v2",
 	)
 	nativeLegacyID := seed(
 		startHeight+2,
 		sharedKey,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		"",
+		"",
+		"",
 	)
 	pendingV2ID := seed(
 		startHeight+3,
 		pendingKey,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
+		"v2",
+		"v2",
 	)
 
 	repo := NewPostgresRepository(db)
@@ -688,13 +688,13 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 		ConsolidatedUncompressedLength: 128,
 		PayloadSHA256:                  keySHA256("payload"),
 		PreparedAt:                     now.Add(-30 * time.Minute),
-	}, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2))
+	}, "v2"))
 
 	v2Bucket := "integration-v2-bucket"
 	pendingV2, dueV2, err := repo.ListRetentionCohorts(
 		ctx,
 		v2Bucket,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
 		tag,
 		0,
 		0,
@@ -715,7 +715,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 	pendingLegacy, dueLegacy, err := repo.ListRetentionCohorts(
 		ctx,
 		integrationRetentionBucket,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY,
+		"",
 		tag,
 		0,
 		0,
@@ -756,15 +756,15 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 	_, err = db.ExecContext(ctx, `
 		UPDATE block_metadata
 		SET storage_generation = $2
-		WHERE id = $1`, nativeLegacyID, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2)
+		WHERE id = $1`, nativeLegacyID, "v2")
 	require.NoError(err)
 	_, err = db.ExecContext(ctx, `
 		UPDATE block_consolidation_shadow
 		SET single_block_storage_generation = $2,
 			consolidated_storage_generation = $2
-		WHERE block_metadata_id = $1`, nativeLegacyID, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2)
+		WHERE block_metadata_id = $1`, nativeLegacyID, "v2")
 	require.NoError(err)
-	err = repo.PrepareRetirement(ctx, legacyManifest, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+	err = repo.PrepareRetirement(ctx, legacyManifest, "")
 	require.ErrorContains(err, "storage generation changed before retirement")
 	var retirementFencedAt sql.NullTime
 	require.NoError(db.QueryRowContext(ctx, `
@@ -781,14 +781,14 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 
 	_, err = db.ExecContext(ctx, `
 		UPDATE block_metadata
-		SET storage_generation = $2
-		WHERE id = $1`, nativeLegacyID, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+		SET storage_generation = NULL
+		WHERE id = $1`, nativeLegacyID)
 	require.NoError(err)
 	_, err = db.ExecContext(ctx, `
 		UPDATE block_consolidation_shadow
-		SET single_block_storage_generation = $2,
-			consolidated_storage_generation = $2
-		WHERE block_metadata_id = $1`, nativeLegacyID, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
+		SET single_block_storage_generation = NULL,
+			consolidated_storage_generation = NULL
+		WHERE block_metadata_id = $1`, nativeLegacyID)
 	require.NoError(err)
 
 	_, err = db.ExecContext(ctx, `
@@ -800,7 +800,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyActiveStorageGenerationCohorts(
 	completed, hasMore, err := NewSelector(repo).Select(
 		ctx,
 		v2Bucket,
-		api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2,
+		"v2",
 		tag,
 		0,
 		0,
@@ -918,7 +918,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 	endHeight := startHeight + cohortCount
 
 	repo := NewPostgresRepository(db)
-	bounded, err := repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, startHeight, endHeight, now, 10)
+	bounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 10)
 	require.NoError(err)
 	require.Len(bounded, cohortCount)
 	boundedHeights := make([]uint64, 0, len(bounded))
@@ -931,7 +931,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a bounded selection must be ordered by height, not by due time",
 	)
 
-	truncated, err := repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, startHeight, endHeight, now, 2)
+	truncated, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 2)
 	require.NoError(err)
 	require.Len(truncated, 2)
 	require.Equal(
@@ -940,7 +940,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a truncated bounded selection must keep the lowest cohorts so repeated runs advance monotonically",
 	)
 
-	unbounded, err := repo.ListDueRetentionCohorts(ctx, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY, tag, 0, 0, now, 10)
+	unbounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(unbounded, cohortCount)
 	unboundedHeights := make([]uint64, 0, len(unbounded))

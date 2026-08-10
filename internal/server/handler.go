@@ -856,7 +856,7 @@ func (s *Server) newBlockFileWithPresignCache(block *api.BlockMetadata, presigne
 
 	key := block.GetObjectKeyMain()
 	compression := storage_utils.GetCompressionType(key)
-	presignCacheKey := fmt.Sprintf("%d\x00%s", block.GetStorageGeneration(), key)
+	presignCacheKey := fmt.Sprintf("%s\x00%s", block.GetStorageGeneration(), key)
 	fileUrl, ok := presignedURLs[presignCacheKey]
 	if !ok {
 		var err error

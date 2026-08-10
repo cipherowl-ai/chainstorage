@@ -148,13 +148,13 @@ func (a *SingleBlockRetention) executeSelect(
 		request.EligibilityCutoff,
 		time.Now(),
 	)
-	bucket, err := a.config.ActiveBlockStorageBucket()
+	bucket, err := a.config.WriteBlockStorageBucket()
 	if err != nil {
-		return nil, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+		return nil, xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
 	}
-	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
 	if err != nil {
-		return nil, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+		return nil, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.started", tag, request.Limit)
 	cohorts, hasMore, err := selector.Select(
@@ -177,7 +177,7 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Uint64("end_height", request.EndHeight),
 		zap.Time("eligibility_cutoff", eligibilityCutoff),
 		zap.String("bucket", bucket),
-		zap.Int32("storage_generation", int32(storageGeneration)),
+		zap.String("storage_generation", storageGeneration),
 		zap.Int("cohorts", len(cohorts)),
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),
@@ -350,13 +350,13 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 	if request.ApprovedChain != "" {
 		approval.AllowContainingRange = true
 	}
-	bucket, err := a.config.ActiveBlockStorageBucket()
+	bucket, err := a.config.WriteBlockStorageBucket()
 	if err != nil {
-		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
 	}
-	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
 	if err != nil {
-		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	return retirement.PlanRequest{
 		Environment:                 string(a.config.Env()),
