@@ -34,6 +34,7 @@ type BatchConsolidatorTestSuite struct {
 	ctrl              *gomock.Controller
 	metaStorage       *metastoragemocks.MockMetaStorage
 	blobStorage       *blobstoragemocks.MockBlobStorage
+	historicalStorage *blobstoragemocks.MockBlobStorage
 	app               testapp.TestApp
 	batchConsolidator *BatchConsolidator
 }
@@ -53,6 +54,7 @@ func (s *BatchConsolidatorTestSuite) SetupTest() {
 	s.ctrl = gomock.NewController(s.T())
 	s.metaStorage = metastoragemocks.NewMockMetaStorage(s.ctrl)
 	s.blobStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
+	s.historicalStorage = blobstoragemocks.NewMockBlobStorage(s.ctrl)
 	s.app = testapp.New(
 		s.T(),
 		Module,
@@ -63,6 +65,9 @@ func (s *BatchConsolidatorTestSuite) SetupTest() {
 		}),
 		fx.Provide(func() blobstorage.BlobStorage {
 			return s.blobStorage
+		}),
+		fx.Provide(func() blobstorage.HistoricalSingleBlockDownloader {
+			return s.historicalStorage
 		}),
 		fx.Provide(dlq.NewNop),
 		fx.Populate(&s.batchConsolidator),
@@ -266,7 +271,7 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
 		Return(records, nil)
 	for i, record := range records {
-		s.blobStorage.EXPECT().Download(gomock.Any(), record.Metadata).Return(blocks[i], nil)
+		s.historicalStorage.EXPECT().Download(gomock.Any(), record.Metadata).Return(blocks[i], nil)
 	}
 	s.blobStorage.EXPECT().
 		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatchAndCapturePaths(blocks, []int64{records[0].ID, records[1].ID}, &capturedPayloadPaths)).
@@ -293,6 +298,44 @@ func (s *BatchConsolidatorTestSuite) TestConsolidatesAndPersistsShadowPlacements
 		_, statErr := os.Stat(path)
 		require.ErrorIs(statErr, os.ErrNotExist)
 	}
+}
+
+func (s *BatchConsolidatorTestSuite) TestConfiguredHistoricalBackfillUsesHistoricalDownloadsAndActiveUpload() {
+	require := testutil.Require(s.T())
+	records, blocks := makeConsolidatorFixture(1, 1000)
+	request := &BatchConsolidatorRequest{
+		Tag:         records[0].Metadata.GetTag(),
+		StartHeight: 1000,
+		EndHeight:   1001,
+		MaxBlocks:   100,
+	}
+	s.batchConsolidator.config.AWS.Storage.Consolidation.Mode = config.ConsolidationModeHistoricalBackfill
+	s.batchConsolidator.config.AWS.Storage.Consolidation.LocalSpillDir = s.T().TempDir()
+
+	s.metaStorage.EXPECT().
+		PromoteBlockConsolidationShadows(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks, config.DefaultSingleBlockObjectRetention).
+		Times(2).
+		Return(&metastorage.ConsolidationPromotionResult{}, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksMissingConsolidationShadow(gomock.Any(), request.Tag, request.StartHeight, request.EndHeight, request.MaxBlocks).
+		Return(records, nil)
+	s.historicalStorage.EXPECT().Download(gomock.Any(), records[0].Metadata).Return(blocks[0], nil)
+	s.blobStorage.EXPECT().
+		UploadConsolidated(gomock.Any(), consolidatedPayloadsMatch(blocks, []int64{records[0].ID})).
+		Return("active-bucket-object", makeConsolidatorPlacements(records), nil)
+	s.metaStorage.EXPECT().
+		PersistBlockConsolidationShadows(gomock.Any(), gomock.Any()).
+		Return(nil)
+
+	response, err := s.batchConsolidator.Execute(s.env.BackgroundContext(), request)
+	require.NoError(err)
+	require.Equal(&BatchConsolidatorResponse{
+		StartHeight:        request.StartHeight,
+		EndHeight:          request.EndHeight,
+		ScannedBlocks:      1,
+		ConsolidatedBlocks: 1,
+		ObjectKey:          "active-bucket-object",
+	}, response)
 }
 
 func (s *BatchConsolidatorTestSuite) TestAutoConsolidateAllowsPartialRetryWindow() {

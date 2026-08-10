@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	awss3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -592,30 +591,7 @@ func (s *blobStorageImpl) downloadWorkerLimit() int {
 }
 
 func (s *blobStorageImpl) downloadSingleBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {
-	key := metadata.ObjectKeyMain
-	buf := manager.NewWriteAtBuffer([]byte{})
-
-	size, err := s.downloader.Download(ctx, buf, &awss3.GetObjectInput{
-		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return nil, storageerrors.ErrRequestCanceled
-		}
-		return nil, xerrors.Errorf("failed to download from s3 (bucket=%s, key=%s): %w", s.bucket, key, err)
-	}
-
-	// a workaround to use timer
-	s.blobStorageMetrics.blobDownloadedSize.Record(time.Duration(size) * time.Millisecond)
-
-	compression := storage_utils.GetCompressionType(key)
-	blockData, err := storage_utils.Decompress(buf.Bytes(), compression)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to decompress block data with type %v: %w", compression.String(), err)
-	}
-
-	return unmarshalBlockData(s.bucket, key, metadata, blockData)
+	return downloadSingleBlockFromBucket(ctx, s.bucket, s.downloader, s.blobStorageMetrics, metadata)
 }
 
 func (s *blobStorageImpl) downloadCSCBBlock(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error) {

@@ -62,6 +62,16 @@ type (
 		PreSign(ctx context.Context, objectKey string) (string, error)
 	}
 
+	// HistoricalSingleBlockDownloader is the read-only seam used by manual
+	// historical consolidation. It intentionally cannot upload or presign.
+	HistoricalSingleBlockDownloader interface {
+		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
+	}
+
+	HistoricalSingleBlockDownloaderFactory interface {
+		Create(bucket string) (HistoricalSingleBlockDownloader, error)
+	}
+
 	// SingleBlockUploader is deliberately confined to the blobstorage package
 	// tree. Production consumers receive only the guarded public uploader.
 	SingleBlockUploader interface {

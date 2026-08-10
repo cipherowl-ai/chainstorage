@@ -962,6 +962,75 @@ func TestConsolidationHistoricalBackfillModeAcceptedAsDeprecatedAlias(t *testing
 	require.Equal(config.ConsolidationModeHistoricalBackfill, cfg.AWS.Storage.Consolidation.Mode)
 }
 
+func TestConsolidationHistoricalSourceBucketConfig(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_HISTORICAL_SOURCE_BUCKET", "legacy-solana-blocks")
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal("legacy-solana-blocks", cfg.AWS.Storage.Consolidation.HistoricalSourceBucket)
+}
+
+func TestConsolidationHistoricalSourceBucketValidation(t *testing.T) {
+	require := testutil.Require(t)
+	baseConfig, err := config.New()
+	require.NoError(err)
+
+	tests := []struct {
+		name        string
+		source      string
+		enabled     string
+		blobStorage string
+		expectedErr string
+	}{
+		{
+			name:        "requires consolidation enabled",
+			source:      "legacy-solana-blocks",
+			enabled:     "false",
+			blobStorage: "S3",
+			expectedErr: "historical_source_bucket requires consolidation enabled",
+		},
+		{
+			name:        "requires s3",
+			source:      "legacy-solana-blocks",
+			enabled:     "true",
+			blobStorage: "GCS",
+			expectedErr: "historical_source_bucket requires S3 blob storage",
+		},
+		{
+			name:        "rejects active bucket",
+			source:      baseConfig.AWS.Bucket,
+			enabled:     "true",
+			blobStorage: "S3",
+			expectedErr: "historical_source_bucket must differ from aws.bucket",
+		},
+		{
+			name:        "rejects surrounding whitespace",
+			source:      " legacy-solana-blocks ",
+			enabled:     "true",
+			blobStorage: "S3",
+			expectedErr: "historical_source_bucket must not contain surrounding whitespace",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := testutil.Require(t)
+			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+			t.Setenv("CHAINSTORAGE_STORAGE_TYPE_BLOB", test.blobStorage)
+			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", test.enabled)
+			t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_HISTORICAL_SOURCE_BUCKET", test.source)
+
+			_, err := config.New()
+			require.Error(err)
+			require.Contains(err.Error(), test.expectedErr)
+		})
+	}
+}
+
 func TestConsolidationSingleBlockObjectRetentionConfig(t *testing.T) {
 	require := testutil.Require(t)
 

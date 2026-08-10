@@ -445,6 +445,7 @@ type (
 	ConsolidationConfig struct {
 		Enabled                                  bool              `mapstructure:"enabled"`
 		Mode                                     ConsolidationMode `mapstructure:"mode"`
+		HistoricalSourceBucket                   string            `mapstructure:"historical_source_bucket"`
 		Codec                                    api.Compression   `mapstructure:"codec"`
 		CodecLevel                               int               `mapstructure:"codec_level"`
 		ZstdLongDistanceWindowLog                *int              `mapstructure:"zstd_long_distance_window_log"`
@@ -721,6 +722,7 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("cron.batch_consolidator.delay_start_duration", "1m")
 	v.SetDefault("aws.storage.consolidation.enabled", false)
 	v.SetDefault("aws.storage.consolidation.mode", string(ConsolidationModeSingleBlockOnly))
+	v.SetDefault("aws.storage.consolidation.historical_source_bucket", "")
 	v.SetDefault("aws.storage.consolidation.codec", "ZSTD")
 	v.SetDefault("aws.storage.consolidation.codec_level", 6)
 	v.SetDefault("aws.storage.consolidation.max_compressed_bytes", 2147483648)
@@ -853,6 +855,24 @@ func (c *Config) validateConsolidationConfig() error {
 		ConsolidationModeSyncerConsolidatedPrimary:
 	default:
 		return xerrors.Errorf("invalid consolidation mode %q", consolidation.Mode)
+	}
+
+	historicalSourceBucket := consolidation.HistoricalSourceBucket
+	if historicalSourceBucket != "" {
+		if strings.TrimSpace(historicalSourceBucket) != historicalSourceBucket {
+			return xerrors.New("consolidation historical_source_bucket must not contain surrounding whitespace")
+		}
+		if !consolidation.Enabled {
+			return xerrors.New("consolidation historical_source_bucket requires consolidation enabled")
+		}
+		switch c.StorageType.BlobStorageType {
+		case BlobStorageType_UNSPECIFIED, BlobStorageType_S3:
+		default:
+			return xerrors.Errorf("consolidation historical_source_bucket requires S3 blob storage, got %v", c.StorageType.BlobStorageType)
+		}
+		if historicalSourceBucket == c.AWS.Bucket {
+			return xerrors.New("consolidation historical_source_bucket must differ from aws.bucket")
+		}
 	}
 
 	switch consolidation.Codec {

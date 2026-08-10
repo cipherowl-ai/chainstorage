@@ -31,26 +31,28 @@ import (
 type (
 	BatchConsolidator struct {
 		baseActivity
-		statsActivity       baseActivity
-		latestBlockActivity baseActivity
-		planActivity        baseActivity
-		cursorActivity      baseActivity
-		candidateActivity   baseActivity
-		config              *config.Config
-		metaStorage         metastorage.MetaStorage
-		blobStorage         blobstorage.BlobStorage
-		s3Client            chains3.Client
-		repairerMu          sync.Mutex
-		repairer            cscbrepair.Repairer
+		statsActivity        baseActivity
+		latestBlockActivity  baseActivity
+		planActivity         baseActivity
+		cursorActivity       baseActivity
+		candidateActivity    baseActivity
+		config               *config.Config
+		metaStorage          metastorage.MetaStorage
+		blobStorage          blobstorage.BlobStorage
+		historicalDownloader blobstorage.HistoricalSingleBlockDownloader
+		s3Client             chains3.Client
+		repairerMu           sync.Mutex
+		repairer             cscbrepair.Repairer
 	}
 
 	BatchConsolidatorParams struct {
 		fx.In
 		fxparams.Params
-		Runtime     cadence.Runtime
-		MetaStorage metastorage.MetaStorage
-		BlobStorage blobstorage.BlobStorage
-		S3Client    chains3.Client `optional:"true"`
+		Runtime              cadence.Runtime
+		MetaStorage          metastorage.MetaStorage
+		BlobStorage          blobstorage.BlobStorage
+		HistoricalDownloader blobstorage.HistoricalSingleBlockDownloader
+		S3Client             chains3.Client `optional:"true"`
 	}
 
 	BatchConsolidatorRequest struct {
@@ -135,16 +137,17 @@ type (
 
 func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	a := &BatchConsolidator{
-		baseActivity:        newBaseActivity(ActivityBatchConsolidator, params.Runtime),
-		statsActivity:       newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
-		latestBlockActivity: newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
-		planActivity:        newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
-		cursorActivity:      newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
-		candidateActivity:   newBaseActivity(ActivityBatchConsolidatorRepairCandidates, params.Runtime),
-		config:              params.Config,
-		metaStorage:         params.MetaStorage,
-		blobStorage:         params.BlobStorage,
-		s3Client:            params.S3Client,
+		baseActivity:         newBaseActivity(ActivityBatchConsolidator, params.Runtime),
+		statsActivity:        newBaseActivity(ActivityBatchConsolidatorStats, params.Runtime),
+		latestBlockActivity:  newBaseActivity(ActivityBatchConsolidatorLatestBlock, params.Runtime),
+		planActivity:         newBaseActivity(ActivityBatchConsolidatorPlan, params.Runtime),
+		cursorActivity:       newBaseActivity(ActivityBatchConsolidatorCursor, params.Runtime),
+		candidateActivity:    newBaseActivity(ActivityBatchConsolidatorRepairCandidates, params.Runtime),
+		config:               params.Config,
+		metaStorage:          params.MetaStorage,
+		blobStorage:          params.BlobStorage,
+		historicalDownloader: params.HistoricalDownloader,
+		s3Client:             params.S3Client,
 	}
 	a.register(a.execute)
 	a.statsActivity.register(a.executeStats)
@@ -564,8 +567,13 @@ func (a *BatchConsolidator) executeShadowDualWriteWithExpected(
 		}
 	}
 
+	downloader := blobstorage.HistoricalSingleBlockDownloader(a.blobStorage)
+	if mode == config.ConsolidationModeHistoricalBackfill {
+		downloader = a.historicalDownloader
+	}
+
 	buildStart := time.Now()
-	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, records)
+	payloads, recordsByID, cleanup, err := a.buildPayloads(ctx, downloader, records)
 	if err != nil {
 		return nil, err
 	}
@@ -953,6 +961,7 @@ func (a *BatchConsolidator) buildPinnedRepairPayloads(
 
 func (a *BatchConsolidator) buildPayloads(
 	ctx context.Context,
+	downloader blobstorage.HistoricalSingleBlockDownloader,
 	records []*metastorage.BlockMetadataRecord,
 ) ([]blobstorage.ConsolidatedBlockPayload, map[int64]*api.BlockMetadata, func(), error) {
 	payloads := make([]blobstorage.ConsolidatedBlockPayload, len(records))
@@ -986,7 +995,7 @@ func (a *BatchConsolidator) buildPayloads(
 		group.Go(func() error {
 			record := records[i]
 			metadata := record.Metadata
-			block, err := a.blobStorage.Download(groupCtx, metadata)
+			block, err := downloader.Download(groupCtx, metadata)
 			if err != nil {
 				return xerrors.Errorf("failed to download single-block object (height=%d, hash=%s): %w", metadata.GetHeight(), metadata.GetHash(), err)
 			}

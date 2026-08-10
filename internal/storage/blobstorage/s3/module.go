@@ -9,4 +9,8 @@ var Module = fx.Options(
 		Name:   "blobstorage/s3",
 		Target: newFactory,
 	}, fx.Private),
+	fx.Provide(fx.Annotated{
+		Name:   "blobstorage/s3/historical-single-block-downloader",
+		Target: newHistoricalSingleBlockDownloaderFactory,
+	}, fx.Private),
 )
