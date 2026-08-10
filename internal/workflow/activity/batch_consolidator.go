@@ -407,6 +407,7 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 				Height:             placement.Height,
 				Hash:               placement.Hash,
 				ObjectFormat:       placement.ObjectFormat,
+				StorageGeneration:  placement.StorageGeneration,
 				ByteOffset:         placement.ByteOffset,
 				ByteLength:         placement.ByteLength,
 				UncompressedLength: placement.UncompressedLength,

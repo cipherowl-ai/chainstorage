@@ -50,6 +50,69 @@ func TestValidateCandidateRejectsUnsafeSingleBlockState(t *testing.T) {
 	}
 }
 
+func TestPrepareObjectRejectsNonLegacyCandidateBeforeS3AfterWriteRollback(t *testing.T) {
+	tests := map[string]func(*Block){
+		"primary":             func(block *Block) { block.StorageGeneration = "v2" },
+		"single block shadow": func(block *Block) { block.SingleBlockStorageGeneration = "v2" },
+		"consolidated shadow": func(block *Block) { block.ConsolidatedStorageGeneration = "v2" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := validRepairCandidate()
+			mutate(&candidate.Blocks[0])
+			repository := &preparationRepository{candidate: candidate}
+			store := &preparationObjectStore{repository: repository}
+			repairer := NewRepairer(repository, store, "legacy-repair-bucket")
+
+			_, err := repairer.PrepareObject(
+				context.Background(),
+				executionKey("write-generation-rollback"),
+				candidate.Tag,
+				candidate.StartHeight,
+				candidate.EndHeight,
+				1,
+				candidate.OldConsolidatedObjectKey,
+				nil,
+			)
+			require.ErrorContains(t, err, "legacy storage generation")
+			require.False(t, repository.fenced)
+			require.Zero(t, store.listCalls, "non-legacy repair must fail before S3")
+		})
+	}
+}
+
+func TestValidateRebuiltPlacementsRejectsNonLegacyUpload(t *testing.T) {
+	candidate := validRepairCandidate()
+	_, err := validateRebuiltPlacements(candidate, "consolidated/rebuilt.cscb.zstd", []RebuiltPlacement{{
+		BlockMetadataID:    candidate.Blocks[0].BlockMetadataID,
+		Height:             candidate.Blocks[0].Height,
+		Hash:               candidate.Blocks[0].Hash,
+		ObjectFormat:       api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		StorageGeneration:  "v2",
+		ByteLength:         100,
+		UncompressedLength: 200,
+	}})
+	require.ErrorContains(t, err, "legacy storage generation")
+}
+
+func TestCompareCandidateRowsRejectsStorageGenerationChange(t *testing.T) {
+	tests := map[string]func(*Block){
+		"primary":             func(block *Block) { block.StorageGeneration = "v2" },
+		"single block shadow": func(block *Block) { block.SingleBlockStorageGeneration = "v2" },
+		"consolidated shadow": func(block *Block) { block.ConsolidatedStorageGeneration = "v2" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			pinned := validRepairCandidate()
+			current := *pinned
+			current.Blocks = append([]Block(nil), pinned.Blocks...)
+			mutate(&current.Blocks[0])
+
+			require.ErrorContains(t, compareCandidateRows(&current, pinned), "row changed")
+		})
+	}
+}
+
 func TestPrepareNextRejectsPendingRepairOutsideApprovedRange(t *testing.T) {
 	pending := validRepairCandidate()
 	pending.State = StatePrepared
@@ -765,6 +828,9 @@ func TestValidateRebuiltMetadataRequiresFreshRetentionAndCleanNonCanonicalRows(t
 		},
 	}
 	require.NoError(t, validateRebuiltMetadata(manifest, "consolidated/clean.cscb.zstd"))
+	manifest.Blocks[0].StorageGeneration = "v2"
+	require.ErrorContains(t, validateRebuiltMetadata(manifest, "consolidated/clean.cscb.zstd"), "legacy storage generation")
+	manifest.Blocks[0].StorageGeneration = ""
 
 	staleStartedAt := restoredAt.Add(-time.Second)
 	manifest.Blocks[0].NewRetentionStartedAt = &staleStartedAt
