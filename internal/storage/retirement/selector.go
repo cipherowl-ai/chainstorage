@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"golang.org/x/xerrors"
+
+	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
 const MaxRetentionCohortsPerWorkflow = 250
@@ -26,6 +28,8 @@ type (
 	CohortRepository interface {
 		ListRetentionCohorts(
 			ctx context.Context,
+			bucket string,
+			storageGeneration api.BlockStorageGeneration,
 			tag uint32,
 			startHeight uint64,
 			endHeight uint64,
@@ -45,6 +49,8 @@ func NewSelector(repo CohortRepository) *Selector {
 
 func (s *Selector) Select(
 	ctx context.Context,
+	bucket string,
+	storageGeneration api.BlockStorageGeneration,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -53,6 +59,13 @@ func (s *Selector) Select(
 ) ([]RetentionCohort, bool, error) {
 	if s == nil || s.repo == nil {
 		return nil, false, xerrors.New("retention cohort repository is required")
+	}
+	if bucket == "" {
+		return nil, false, xerrors.New("retention cohort bucket is required")
+	}
+	if storageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY &&
+		storageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2 {
+		return nil, false, xerrors.Errorf("unsupported retention cohort storage generation %d", storageGeneration)
 	}
 	if limit <= 0 || limit > MaxRetentionCohortsPerWorkflow {
 		return nil, false, xerrors.Errorf(
@@ -74,6 +87,8 @@ func (s *Selector) Select(
 	queryLimit := limit + 1
 	pending, due, err := s.repo.ListRetentionCohorts(
 		ctx,
+		bucket,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,

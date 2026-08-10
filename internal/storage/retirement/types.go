@@ -12,7 +12,7 @@ type (
 	Repository interface {
 		ListMetadataRows(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]MetadataRow, error)
 		GetMetadataRow(ctx context.Context, blockMetadataID int64) (MetadataRow, error)
-		PrepareRetirement(ctx context.Context, manifest RetirementManifest) error
+		PrepareRetirement(ctx context.Context, manifest RetirementManifest, expectedStorageGeneration api.BlockStorageGeneration) error
 		ObserveRetentionSafety(ctx context.Context, bucket string, consolidatedObjectKey string, configurationSHA256 string) (time.Time, time.Time, error)
 		ClaimRetirement(ctx context.Context, blockMetadataID int64, claimToken string, claimedAt time.Time, claimExpiresAt time.Time) error
 		RenewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string, renewedAt time.Time, claimExpiresAt time.Time) error

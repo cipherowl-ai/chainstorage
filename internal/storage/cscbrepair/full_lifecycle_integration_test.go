@@ -444,7 +444,7 @@ func TestIntegrationCSCBRepairFullLifecycle(t *testing.T) {
 		ConsolidatedUncompressedLength: manifest.Blocks[0].OldUncompressedLength,
 		PayloadSHA256:                  manifest.Blocks[0].PayloadSHA256,
 		PreparedAt:                     time.Now().UTC(),
-	})
+	}, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
 	require.ErrorContains(err, "failed to lock canonical retirement metadata")
 
 	activeBeforeRebuild, err := meta.GetBlockByHeight(ctx, tag, height)

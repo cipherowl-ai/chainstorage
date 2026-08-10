@@ -147,9 +147,17 @@ func (r *PostgresRepository) GetMetadataRow(ctx context.Context, blockMetadataID
 	return row, nil
 }
 
-func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest RetirementManifest) error {
+func (r *PostgresRepository) PrepareRetirement(
+	ctx context.Context,
+	manifest RetirementManifest,
+	expectedStorageGeneration api.BlockStorageGeneration,
+) error {
 	if r.db == nil {
 		return xerrors.New("postgres db is required")
+	}
+	if expectedStorageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY &&
+		expectedStorageGeneration != api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_V2 {
+		return xerrors.Errorf("unsupported expected storage generation %d", expectedStorageGeneration)
 	}
 	if manifest.State != RetirementStateEligible {
 		return xerrors.Errorf("prepared retirement must be eligible, got %q", manifest.State)
@@ -198,7 +206,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	if err != nil {
 		return xerrors.Errorf("failed to lock retirement metadata row: %w", err)
 	}
-	if err := validateManifestMetadata(row, manifest); err != nil {
+	if err := validateManifestMetadata(row, manifest, expectedStorageGeneration); err != nil {
 		return err
 	}
 	const fenceMetadata = `
@@ -209,7 +217,8 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 			AND object_format = $4
 			AND byte_offset = $5
 			AND byte_length = $6
-			AND uncompressed_length = $7`
+			AND uncompressed_length = $7
+			AND storage_generation = $8`
 	result, err := tx.ExecContext(
 		ctx,
 		fenceMetadata,
@@ -220,6 +229,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		manifest.ConsolidatedByteOffset,
 		manifest.ConsolidatedByteLength,
 		manifest.ConsolidatedUncompressedLength,
+		int32(expectedStorageGeneration),
 	)
 	if err != nil {
 		return xerrors.Errorf("failed to fence retired block metadata: %w", err)
@@ -1178,12 +1188,21 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	return manifest, nil
 }
 
-func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) error {
+func validateManifestMetadata(
+	row MetadataRow,
+	manifest RetirementManifest,
+	expectedStorageGeneration api.BlockStorageGeneration,
+) error {
 	if !row.Canonical || row.BlockMetadataID != manifest.BlockMetadataID || row.Tag != manifest.Tag || row.Height != manifest.Height || row.Hash != manifest.Hash {
 		return xerrors.Errorf("canonical metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.Skipped || row.Shadow == nil || !validShadowReference(row, row.Shadow) || row.SingleBlockObjectKey != manifest.SingleBlockObjectKey {
 		return xerrors.Errorf("single-block shadow metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
+	}
+	if row.PrimaryStorageGeneration != expectedStorageGeneration ||
+		row.Shadow.SingleBlockStorageGeneration != expectedStorageGeneration ||
+		row.Shadow.ConsolidatedStorageGeneration != expectedStorageGeneration {
+		return xerrors.Errorf("storage generation changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.Shadow.ValidatedAt == nil || row.Shadow.SingleBlockRetentionStartedAt == nil || row.Shadow.SingleBlockDeleteAfter == nil ||
 		row.Shadow.SingleBlockObjectDeletedAt != nil {

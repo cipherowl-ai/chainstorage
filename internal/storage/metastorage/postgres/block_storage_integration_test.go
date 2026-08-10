@@ -212,7 +212,7 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCS
 	}
 	prepareDone := make(chan error, 1)
 	go func() {
-		prepareDone <- repo.PrepareRetirement(ctx, manifest)
+		prepareDone <- repo.PrepareRetirement(ctx, manifest, api.BlockStorageGeneration_BLOCK_STORAGE_GENERATION_LEGACY)
 	}()
 	select {
 	case err := <-prepareDone:

@@ -148,9 +148,19 @@ func (a *SingleBlockRetention) executeSelect(
 		request.EligibilityCutoff,
 		time.Now(),
 	)
+	bucket, err := a.config.ActiveBlockStorageBucket()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve active block storage bucket: %w", err)
+	}
+	storageGeneration, err := a.config.ActiveBlockStorageGeneration()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve active block storage generation: %w", err)
+	}
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.started", tag, request.Limit)
 	cohorts, hasMore, err := selector.Select(
 		ctx,
+		bucket,
+		storageGeneration,
 		tag,
 		request.StartHeight,
 		request.EndHeight,
@@ -166,6 +176,8 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Uint64("start_height", request.StartHeight),
 		zap.Uint64("end_height", request.EndHeight),
 		zap.Time("eligibility_cutoff", eligibilityCutoff),
+		zap.String("bucket", bucket),
+		zap.Int32("storage_generation", int32(storageGeneration)),
 		zap.Int("cohorts", len(cohorts)),
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),
