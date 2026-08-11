@@ -148,9 +148,19 @@ func (a *SingleBlockRetention) executeSelect(
 		request.EligibilityCutoff,
 		time.Now(),
 	)
+	bucket, err := a.config.WriteBlockStorageBucket()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
+	}
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
+	if err != nil {
+		return nil, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
+	}
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.started", tag, request.Limit)
 	cohorts, hasMore, err := selector.Select(
 		ctx,
+		bucket,
+		storageGeneration,
 		tag,
 		request.StartHeight,
 		request.EndHeight,
@@ -166,6 +176,8 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Uint64("start_height", request.StartHeight),
 		zap.Uint64("end_height", request.EndHeight),
 		zap.Time("eligibility_cutoff", eligibilityCutoff),
+		zap.String("bucket", bucket),
+		zap.String("storage_generation", storageGeneration),
 		zap.Int("cohorts", len(cohorts)),
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),
@@ -192,7 +204,10 @@ func (a *SingleBlockRetention) executeProcess(
 		return nil, err
 	}
 
-	req := a.planRequest(request)
+	req, err := a.planRequest(request)
+	if err != nil {
+		return nil, err
+	}
 	logger := a.processActivity.getLogger(ctx).With(
 		zap.Uint32("tag", req.Tag),
 		zap.String("consolidated_object_key", request.Cohort.ConsolidatedObjectKey),
@@ -322,7 +337,7 @@ func (a *SingleBlockRetention) getComponents(
 	return a.selector, a.planner, nil
 }
 
-func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) retirement.PlanRequest {
+func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessRequest) (retirement.PlanRequest, error) {
 	blockchain, network, sidechain := singleBlockRetentionChainNames(a.config)
 	tag := a.config.GetEffectiveBlockTag(request.Tag)
 	now := time.Now().UTC()
@@ -335,12 +350,21 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 	if request.ApprovedChain != "" {
 		approval.AllowContainingRange = true
 	}
+	bucket, err := a.config.WriteBlockStorageBucket()
+	if err != nil {
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve write block storage bucket: %w", err)
+	}
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
+	if err != nil {
+		return retirement.PlanRequest{}, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
+	}
 	return retirement.PlanRequest{
 		Environment:                 string(a.config.Env()),
 		Blockchain:                  blockchain,
 		Network:                     network,
 		Sidechain:                   sidechain,
-		Bucket:                      a.config.AWS.Bucket,
+		Bucket:                      bucket,
+		StorageGeneration:           storageGeneration,
 		Tag:                         tag,
 		StartHeight:                 request.Cohort.StartHeight,
 		EndHeight:                   request.Cohort.EndHeight,
@@ -355,7 +379,7 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		// The planner independently re-verifies the actual chain and requires
 		// the cohort under deletion to be contained by this immutable envelope.
 		Approval: approval,
-	}
+	}, nil
 }
 
 func resolveSingleBlockRetentionEligibilityCutoff(cutoff time.Time, now time.Time) time.Time {

@@ -50,6 +50,7 @@ type (
 		Hash               string
 		ObjectKey          string
 		ObjectFormat       api.BlockObjectFormat
+		StorageGeneration  string
 		ByteOffset         uint64
 		ByteLength         uint64
 		UncompressedLength uint64
@@ -59,7 +60,7 @@ type (
 		UploadConsolidated(ctx context.Context, blocks []ConsolidatedBlockPayload) (string, []BlockPlacement, error)
 		Download(ctx context.Context, metadata *api.BlockMetadata) (*api.Block, error)
 		DownloadMany(ctx context.Context, metadata []*api.BlockMetadata) ([]*api.Block, error)
-		PreSign(ctx context.Context, objectKey string) (string, error)
+		PreSign(ctx context.Context, metadata *api.BlockMetadata) (string, error)
 	}
 
 	// SingleBlockUploader is deliberately confined to the blobstorage package

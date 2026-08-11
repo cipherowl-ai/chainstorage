@@ -74,8 +74,8 @@ func (s *safeBlobStorage) DownloadMany(ctx context.Context, metadata []*api.Bloc
 	return s.storage.DownloadMany(ctx, metadata)
 }
 
-func (s *safeBlobStorage) PreSign(ctx context.Context, objectKey string) (string, error) {
-	return s.storage.PreSign(ctx, objectKey)
+func (s *safeBlobStorage) PreSign(ctx context.Context, metadata *api.BlockMetadata) (string, error) {
+	return s.storage.PreSign(ctx, metadata)
 }
 
 func (u *guardedSingleBlockUploader) Upload(

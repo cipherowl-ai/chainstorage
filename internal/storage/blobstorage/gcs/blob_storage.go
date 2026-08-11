@@ -163,6 +163,7 @@ func (s *blobStorageImpl) uploadRaw(ctx context.Context, rawBlockData *internal.
 	if !bytes.Equal(checksum, attrs.MD5) {
 		return "", xerrors.Errorf("uploaded block md5 checksum %x is different from expected %x", attrs.MD5, checksum)
 	}
+	rawBlockData.BlockMetadata.StorageGeneration = ""
 
 	// a workaround to use timer
 	s.blobStorageMetrics.blobUploadedSize.Record(time.Duration(size) * time.Millisecond)
@@ -220,6 +221,9 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 	return s.instrumentDownload.Instrument(ctx, func(ctx context.Context) (*api.Block, error) {
 		defer s.logDuration("download", time.Now())
 
+		if metadata == nil {
+			return nil, xerrors.New("block metadata is required")
+		}
 		if metadata.Skipped {
 			// No blob data is available when the block is skipped.
 			return &api.Block{
@@ -229,6 +233,12 @@ func (s *blobStorageImpl) Download(ctx context.Context, metadata *api.BlockMetad
 				Metadata:   metadata,
 				Blobdata:   nil,
 			}, nil
+		}
+		if metadata.GetStorageGeneration() != "" {
+			return nil, xerrors.Errorf(
+				"GCS blob storage does not support block storage generation %q",
+				metadata.GetStorageGeneration(),
+			)
 		}
 
 		key := metadata.ObjectKeyMain
@@ -298,8 +308,17 @@ func (s *blobStorageImpl) downloadWorkerLimit() int {
 }
 
 // PreSign implements internal.BlobStorage.
-func (s *blobStorageImpl) PreSign(ctx context.Context, objectKey string) (string, error) {
-	fileUrl, err := s.client.Bucket(s.bucket).SignedURL(objectKey, &storage.SignedURLOptions{
+func (s *blobStorageImpl) PreSign(ctx context.Context, metadata *api.BlockMetadata) (string, error) {
+	if metadata == nil {
+		return "", xerrors.New("block metadata is required")
+	}
+	if metadata.GetStorageGeneration() != "" {
+		return "", xerrors.Errorf(
+			"GCS blob storage does not support block storage generation %q",
+			metadata.GetStorageGeneration(),
+		)
+	}
+	fileUrl, err := s.client.Bucket(s.bucket).SignedURL(metadata.GetObjectKeyMain(), &storage.SignedURLOptions{
 		Expires: time.Now().Add(s.presignedUrlExpiration),
 		Method:  "GET",
 	})

@@ -274,7 +274,7 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 		EligibleAt:            time.Now().Add(-time.Hour),
 	}
 
-	executeReq := a.planRequest(&SingleBlockRetentionProcessRequest{
+	executeReq, err := a.planRequest(&SingleBlockRetentionProcessRequest{
 		Cohort:              cohort,
 		EligibilityCutoff:   cohort.EligibleAt,
 		Execute:             true,
@@ -282,6 +282,7 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 		ApprovedStartHeight: 90,
 		ApprovedEndHeight:   120,
 	})
+	require.NoError(t, err)
 	require.Equal(t, retirement.Approval{
 		Chain:                "solana-mainnet",
 		StartHeight:          90,
@@ -289,19 +290,34 @@ func TestSingleBlockRetentionPlanRequestUsesOperatorApprovalVerbatim(t *testing.
 		AllowContainingRange: true,
 	}, executeReq.Approval)
 	require.Equal(t, cohort.EligibleAt.UTC(), executeReq.EligibilityCutoff)
+	require.Equal(t, cfg.AWS.Bucket, executeReq.Bucket)
+	require.Equal(t, "", executeReq.StorageGeneration)
 
-	tagZeroReq := a.planRequest(&SingleBlockRetentionProcessRequest{
+	tagZeroReq, err := a.planRequest(&SingleBlockRetentionProcessRequest{
 		Tag:    math.MaxUint32,
 		Cohort: cohort,
 	})
+	require.NoError(t, err)
 	require.Equal(t, uint32(0), tagZeroReq.Tag)
 
 	// An omitted operator approval stays omitted; it is never synthesized
 	// from the selected cohort.
-	dryRunReq := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
+	dryRunReq, err := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
+	require.NoError(t, err)
 	require.Equal(t, retirement.Approval{}, dryRunReq.Approval)
 	require.False(t, dryRunReq.EligibilityCutoff.IsZero())
 	require.Equal(t, dryRunReq.Now, dryRunReq.EligibilityCutoff)
+
+	cfg.AWS.BlockStorage = config.BlockStorageConfig{
+		WriteGeneration: "v2",
+		Generations: map[string]config.BlockStorageGenerationConfig{
+			"v2": {Bucket: "v2-blocks"},
+		},
+	}
+	v2Req, err := a.planRequest(&SingleBlockRetentionProcessRequest{Cohort: cohort})
+	require.NoError(t, err)
+	require.Equal(t, "v2-blocks", v2Req.Bucket)
+	require.Equal(t, "v2", v2Req.StorageGeneration)
 }
 
 func TestResolveSingleBlockRetentionEligibilityCutoffSupportsLegacyPayload(t *testing.T) {

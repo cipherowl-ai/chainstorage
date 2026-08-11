@@ -72,7 +72,7 @@ func (mr *MockBlobStorageMockRecorder) DownloadMany(arg0, arg1 any) *gomock.Call
 }
 
 // PreSign mocks base method.
-func (m *MockBlobStorage) PreSign(arg0 context.Context, arg1 string) (string, error) {
+func (m *MockBlobStorage) PreSign(arg0 context.Context, arg1 *chainstorage.BlockMetadata) (string, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "PreSign", arg0, arg1)
 	ret0, _ := ret[0].(string)

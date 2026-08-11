@@ -249,6 +249,9 @@ func (r *repairerImpl) Restore(ctx context.Context, repairID int64, progress Pro
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return nil, err
+	}
 	if manifest.State != StatePrepared {
 		return manifest, nil
 	}
@@ -274,7 +277,14 @@ func (r *repairerImpl) Get(ctx context.Context, repairID int64) (*Manifest, erro
 	if err := r.validate(); err != nil {
 		return nil, err
 	}
-	return r.repository.Get(ctx, repairID)
+	manifest, err := r.repository.Get(ctx, repairID)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return nil, err
+	}
+	return manifest, nil
 }
 
 func (r *repairerImpl) VisitPinnedPayloads(
@@ -291,6 +301,9 @@ func (r *repairerImpl) VisitPinnedPayloads(
 	}
 	manifest, err := r.repository.Get(ctx, repairID)
 	if err != nil {
+		return err
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
 		return err
 	}
 	if manifest.State != StatePrepared && manifest.State != StateRestored {
@@ -371,6 +384,9 @@ func (r *repairerImpl) VerifyAndPromote(
 	}
 	manifest, err := r.repository.Get(ctx, repairID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
 		return nil, err
 	}
 	if manifest.State == StateVerified || manifest.State == StateCompleted {
@@ -471,6 +487,9 @@ func (r *repairerImpl) VerifyRebuilt(ctx context.Context, repairID int64, progre
 	if err != nil {
 		return nil, err
 	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return nil, err
+	}
 	if manifest.State == StateVerified || manifest.State == StateCompleted {
 		return manifest, nil
 	}
@@ -536,6 +555,9 @@ func (r *repairerImpl) Complete(ctx context.Context, repairID int64, progress Pr
 	}
 	manifest, err := r.repository.GetRebuilt(ctx, repairID)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
 		return nil, err
 	}
 	if manifest.State == StateCompleted {
@@ -639,6 +661,26 @@ func validateApprovedManifest(manifest *Manifest, startHeight uint64, endHeight 
 			startHeight,
 			endHeight,
 		)
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateLegacyStorageGenerations(blocks []Block) error {
+	for _, block := range blocks {
+		if block.StorageGeneration != "" ||
+			block.SingleBlockStorageGeneration != "" ||
+			block.ConsolidatedStorageGeneration != "" {
+			return xerrors.Errorf(
+				"CSCB repair requires legacy storage generation for metadata_id=%d: primary=%q single_block_shadow=%q consolidated_shadow=%q",
+				block.BlockMetadataID,
+				block.StorageGeneration,
+				block.SingleBlockStorageGeneration,
+				block.ConsolidatedStorageGeneration,
+			)
+		}
 	}
 	return nil
 }
@@ -831,6 +873,13 @@ func validateRebuiltPlacements(
 		}
 		if _, ok := placementsByID[placement.BlockMetadataID]; ok {
 			return nil, xerrors.Errorf("rebuilt CSCB returned duplicate metadata_id=%d", placement.BlockMetadataID)
+		}
+		if placement.StorageGeneration != "" {
+			return nil, xerrors.Errorf(
+				"CSCB repair rebuilt placement requires legacy storage generation for metadata_id=%d: generation=%q",
+				placement.BlockMetadataID,
+				placement.StorageGeneration,
+			)
 		}
 		if placement.Height != block.Height || placement.Hash != block.Hash ||
 			placement.ObjectFormat != api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH ||

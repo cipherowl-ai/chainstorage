@@ -94,16 +94,18 @@ type (
 	}
 
 	ConsolidationShadowPlacement struct {
-		BlockMetadataID           int64
-		Tag                       uint32
-		Height                    uint64
-		Hash                      string
-		SingleBlockObjectKeyMain  string
-		ConsolidatedObjectKeyMain string
-		ObjectFormat              api.BlockObjectFormat
-		ByteOffset                uint64
-		ByteLength                uint64
-		UncompressedLength        uint64
+		BlockMetadataID               int64
+		Tag                           uint32
+		Height                        uint64
+		Hash                          string
+		SingleBlockObjectKeyMain      string
+		SingleBlockStorageGeneration  string
+		ConsolidatedObjectKeyMain     string
+		ConsolidatedStorageGeneration string
+		ObjectFormat                  api.BlockObjectFormat
+		ByteOffset                    uint64
+		ByteLength                    uint64
+		UncompressedLength            uint64
 	}
 
 	ConsolidationShadowStats struct {

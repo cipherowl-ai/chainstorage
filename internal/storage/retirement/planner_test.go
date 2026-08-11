@@ -48,7 +48,20 @@ func (r *fakeRepo) GetMetadataRow(ctx context.Context, blockMetadataID int64) (M
 	return MetadataRow{}, fmt.Errorf("metadata row not found: %d", blockMetadataID)
 }
 
-func (r *fakeRepo) PrepareRetirement(ctx context.Context, manifest RetirementManifest) error {
+func (r *fakeRepo) PrepareRetirement(
+	ctx context.Context,
+	manifest RetirementManifest,
+	expectedStorageGeneration string,
+) error {
+	row, err := r.GetMetadataRow(ctx, manifest.BlockMetadataID)
+	if err != nil {
+		return err
+	}
+	if row.PrimaryStorageGeneration != expectedStorageGeneration || row.Shadow == nil ||
+		row.Shadow.SingleBlockStorageGeneration != expectedStorageGeneration ||
+		row.Shadow.ConsolidatedStorageGeneration != expectedStorageGeneration {
+		return errors.New("storage generation changed")
+	}
 	if r.manifests == nil {
 		r.manifests = make(map[int64]RetirementManifest)
 	}
@@ -560,6 +573,52 @@ func TestPlannerPlan_InvalidMetadataReference(t *testing.T) {
 	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipInvalidMetadataReference, report.Items[0].SkipReason)
 	require.Zero(store.headCalls[row.Shadow.ConsolidatedObjectKey])
+}
+
+func TestPlannerPlan_StorageGenerationMismatchIsNeverRetired(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	validatedAt := now.Add(-8 * 24 * time.Hour)
+
+	tests := []struct {
+		name   string
+		mutate func(*MetadataRow)
+	}{
+		{
+			name: "primary",
+			mutate: func(row *MetadataRow) {
+				row.PrimaryStorageGeneration = "v2"
+			},
+		},
+		{
+			name: "source shadow",
+			mutate: func(row *MetadataRow) {
+				row.Shadow.SingleBlockStorageGeneration = "v2"
+			},
+		},
+		{
+			name: "consolidated shadow",
+			mutate: func(row *MetadataRow) {
+				row.Shadow.ConsolidatedStorageGeneration = "v2"
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			row := testRow(100, "hash-100", "single-block/100.zstd", "consolidated/canary.cscb.zstd", validatedAt)
+			test.mutate(&row)
+			store := newFakeStore()
+
+			report, err := testPlanner(&fakeRepo{rows: []MetadataRow{row}}, store).Plan(context.Background(), testRequest(now, false))
+			require.NoError(err)
+			require.Len(report.Items, 1)
+			require.Equal(ActionSkip, report.Items[0].Action)
+			require.Equal(SkipStorageGenerationMismatch, report.Items[0].SkipReason)
+			require.Empty(store.headCalls)
+			require.Empty(store.versionCalls)
+		})
+	}
 }
 
 func TestPlannerPlan_ActiveSingleBlockMetadataIsNeverRetired(t *testing.T) {
@@ -1250,6 +1309,15 @@ func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
 	require.NotNil(finalReport.Items[0].RetirementVerifiedAt)
 	require.Empty(finalReport.Items[0].Key)
 	require.Equal(keySHA256(row.SingleBlockObjectKey), manifest.SingleBlockObjectKeySHA256)
+
+	v2Req := dryRunReq
+	v2Req.Bucket = "generation-v2"
+	v2Req.StorageGeneration = "v2"
+	v2Report, err := planner.Plan(context.Background(), v2Req)
+	require.NoError(err)
+	require.Len(v2Report.Items, 1)
+	require.Equal(ActionSkip, v2Report.Items[0].Action)
+	require.Equal(SkipStorageGenerationMismatch, v2Report.Items[0].SkipReason)
 }
 
 func TestPlannerApply_DeletesEveryPinnedVersionAndDeleteMarker(t *testing.T) {
@@ -1496,6 +1564,17 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterSingleBlockDelete(t *te
 	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 	require.Equal(1, repo.recordDeletedCalls)
 	require.Zero(repo.finalizeCalls)
+
+	v2Req := req
+	v2Req.Execute = false
+	v2Req.ProductionDeleteEnabled = false
+	v2Req.Bucket = "generation-v2"
+	v2Req.StorageGeneration = "v2"
+	v2Report, err := planner.Plan(context.Background(), v2Req)
+	require.NoError(err)
+	require.Len(v2Report.Items, 1)
+	require.Equal(ActionSkip, v2Report.Items[0].Action)
+	require.Equal(SkipStorageGenerationMismatch, v2Report.Items[0].SkipReason)
 }
 
 func TestPlannerApply_UsesFreshVerifierAfterRecordingDeletion(t *testing.T) {
@@ -1531,6 +1610,21 @@ func TestPlannerApply_RejectsBlockThatIsNoLongerCanonical(t *testing.T) {
 
 	err := planner.Apply(context.Background(), req, report)
 	require.Error(err)
+	require.Equal(SkipMetadataChanged, report.Items[0].SkipReason)
+	require.Empty(repo.manifests)
+	require.Empty(store.deleted)
+}
+
+func TestPlannerApply_RejectsStorageGenerationChangeAfterPlan(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	repo.rows[0].PrimaryStorageGeneration = "v2"
+	repo.rows[0].Shadow.SingleBlockStorageGeneration = "v2"
+	repo.rows[0].Shadow.ConsolidatedStorageGeneration = "v2"
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Equal(ActionSkip, report.Items[0].Action)
 	require.Equal(SkipMetadataChanged, report.Items[0].SkipReason)
 	require.Empty(repo.manifests)
 	require.Empty(store.deleted)
@@ -1622,11 +1716,47 @@ func TestPlannerReconcile_CompletesCrashAfterDeletionRecord(t *testing.T) {
 	require.NotNil(repo.rows[0].Shadow.SingleBlockObjectDeletedAt)
 }
 
+func TestPlannerReconcile_RejectsStorageGenerationChangeBeforePendingVerification(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	repo.finalizeErr = errors.New("database unavailable")
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[repo.rows[0].BlockMetadataID].State)
+	finalizeCalls := repo.finalizeCalls
+
+	repo.finalizeErr = nil
+	manifest := repo.manifests[repo.rows[0].BlockMetadataID]
+	expiredAt := time.Now().UTC().Add(-time.Second)
+	manifest.ClaimExpiresAt = &expiredAt
+	repo.manifests[repo.rows[0].BlockMetadataID] = manifest
+	repo.updateManifestRow(manifest)
+	repo.rows[0].PrimaryStorageGeneration = "v2"
+	repo.rows[0].Shadow.SingleBlockStorageGeneration = "v2"
+	repo.rows[0].Shadow.ConsolidatedStorageGeneration = "v2"
+	policyCalls := store.policyCalls[report.Items[0].ConsolidatedKey]
+	headCalls := store.headCalls[report.Items[0].ConsolidatedKey]
+	versionCalls := store.versionCalls[versionObjectKey(report.Items[0].ConsolidatedKey, report.Items[0].CSCBVersionID)]
+
+	reconcileReport, err := planner.Reconcile(context.Background(), req)
+	require.NoError(err)
+	require.Len(reconcileReport.Items, 1)
+	require.Equal(ActionDeletedObjectVersion, reconcileReport.Items[0].Action)
+	require.Equal(SkipMetadataChanged, reconcileReport.Items[0].SkipReason)
+	require.Equal(finalizeCalls, repo.finalizeCalls)
+	require.Len(store.deleted, 1)
+	require.Equal(policyCalls, store.policyCalls[report.Items[0].ConsolidatedKey])
+	require.Equal(headCalls, store.headCalls[report.Items[0].ConsolidatedKey])
+	require.Equal(versionCalls, store.versionCalls[versionObjectKey(report.Items[0].ConsolidatedKey, report.Items[0].CSCBVersionID)])
+	require.Equal(RetirementStateDeletedPendingVerification, repo.manifests[repo.rows[0].BlockMetadataID].State)
+}
+
 func TestPlannerReconcile_DoesNotFinalizeExternallyMissingEligibleObject(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	manifest := manifestFromCandidate(report.Items[0], req.Now)
-	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest, req.StorageGeneration))
 	delete(store.topologies, row.SingleBlockObjectKey)
 
 	reconcileReport, err := planner.Reconcile(context.Background(), req)
@@ -1643,7 +1773,7 @@ func TestPlannerReconcile_SkipsActiveRetirementClaim(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	manifest := manifestFromCandidate(report.Items[0], req.Now)
-	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest, req.StorageGeneration))
 	claimedAt := time.Now().UTC()
 	require.NoError(repo.ClaimRetirement(
 		context.Background(),
@@ -1666,7 +1796,7 @@ func TestPlannerReconcile_TakesOverExpiredRetirementClaim(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	manifest := manifestFromCandidate(report.Items[0], req.Now)
-	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest, req.StorageGeneration))
 	claimedAt := time.Now().UTC().Add(-2 * time.Hour)
 	require.NoError(repo.ClaimRetirement(
 		context.Background(),
@@ -1689,7 +1819,7 @@ func TestPlannerReconcile_ReturnsLiveCSCBWriteOncePolicyFailure(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	manifest := manifestFromCandidate(report.Items[0], req.Now)
-	require.NoError(repo.PrepareRetirement(context.Background(), manifest))
+	require.NoError(repo.PrepareRetirement(context.Background(), manifest, req.StorageGeneration))
 	store.policyErrors[manifest.ConsolidatedObjectKey] = errors.New("GetBucketPolicy temporarily unavailable")
 
 	reconcileReport, err := planner.Reconcile(context.Background(), req)

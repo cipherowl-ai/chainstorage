@@ -74,6 +74,10 @@ message BlockMetadata {
   uint64 uncompressed_length = 11;
   // Object format for object_key_main. Zero value is the single-block whole-object format.
   BlockObjectFormat object_format = 12;
+  // Physical object-storage generation that owns object_key_main. Empty means
+  // the immutable legacy generation; non-empty values such as "v2" resolve
+  // through the configured generation registry.
+  string storage_generation = 13;
 }
 
 message TransactionMetadata {

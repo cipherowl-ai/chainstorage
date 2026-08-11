@@ -219,6 +219,18 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			report.Items = append(report.Items, item)
 			continue
 		}
+		row, err := p.repo.GetMetadataRow(ctx, manifest.BlockMetadataID)
+		if err != nil || !storageGenerationsMatchRequest(req, row) {
+			markCandidateBlocked(&item, SkipMetadataChanged)
+			report.Items = append(report.Items, item)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				halted = true
+			}
+			continue
+		}
 		if approvalGateBlocked(req) {
 			markCandidateBlocked(&item, SkipChainRangeNotApproved)
 			report.Items = append(report.Items, item)
@@ -307,6 +319,10 @@ func (p *Planner) planRow(
 		item.RetirementState = row.Retirement.State
 		item.RetirementAttempts = row.Retirement.AttemptCount
 		item.RetirementOutcome = row.Retirement.Outcome
+		if row.Retirement.Bucket != req.Bucket || !storageGenerationsMatchRequest(req, row) {
+			item.SkipReason = SkipStorageGenerationMismatch
+			return item
+		}
 		if row.Retirement.State == RetirementStateDeletedVerified {
 			if !finalizedRetirementMatchesRow(row) {
 				item.SkipReason = SkipMetadataChanged
@@ -365,6 +381,10 @@ func (p *Planner) planRow(
 		return item
 	}
 	shadow := row.Shadow
+	if !storageGenerationsMatchRequest(req, row) {
+		item.SkipReason = SkipStorageGenerationMismatch
+		return item
+	}
 	item.ConsolidatedKey = shadow.ConsolidatedObjectKey
 	item.ValidatedAt = shadow.ValidatedAt
 	item.RetiredAt = shadow.SingleBlockRetentionStartedAt
@@ -502,7 +522,7 @@ func (p *Planner) applyCandidate(ctx context.Context, req PlanRequest, item *Can
 	item.PayloadSHA256 = payloadSHA256
 	item.SingleBlockKeySHA256 = keySHA256(item.Key)
 	manifest := manifestFromCandidate(*item, req.Now)
-	if err := p.repo.PrepareRetirement(ctx, manifest); err != nil {
+	if err := p.repo.PrepareRetirement(ctx, manifest, req.StorageGeneration); err != nil {
 		return SkipMetadataChanged, err
 	}
 	return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
@@ -940,6 +960,9 @@ func (p *Planner) verifySingleBlockDeleted(ctx context.Context, bucket string, k
 }
 
 func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
+	if !storageGenerationsMatchRequest(req, row) {
+		return false
+	}
 	if candidate.RetirementState == RetirementStateDeletedPendingVerification {
 		return pendingVerificationCandidateMatchesRow(req, candidate, row, requireCanonical)
 	}
@@ -968,6 +991,13 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		row.PrimaryUncompressedLength == candidate.UncompressedLength &&
 		retirementMatches &&
 		validShadowReference(row, row.Shadow)
+}
+
+func storageGenerationsMatchRequest(req PlanRequest, row MetadataRow) bool {
+	return row.Shadow != nil &&
+		row.PrimaryStorageGeneration == req.StorageGeneration &&
+		row.Shadow.SingleBlockStorageGeneration == req.StorageGeneration &&
+		row.Shadow.ConsolidatedStorageGeneration == req.StorageGeneration
 }
 
 func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
@@ -1447,6 +1477,9 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 		return false
 	}
 	if shadow.SingleBlockObjectKey != row.SingleBlockObjectKey {
+		return false
+	}
+	if shadow.ConsolidatedStorageGeneration != row.PrimaryStorageGeneration {
 		return false
 	}
 	if !isPrimaryConsolidated(row) {

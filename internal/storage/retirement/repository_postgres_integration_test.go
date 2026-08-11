@@ -17,6 +17,8 @@ import (
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
+const integrationRetentionBucket = "integration-bucket"
+
 func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require := require.New(t)
 	cfg, err := config.New()
@@ -146,12 +148,12 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	require.Contains(err.Error(), "must be inserted in eligible state")
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = CURRENT_TIMESTAMP + INTERVAL '1 hour' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
-	err = repo.PrepareRetirement(ctx, manifest)
+	err = repo.PrepareRetirement(ctx, manifest, "")
 	require.Error(err)
 	require.Contains(err.Error(), "failed to lock canonical retirement metadata")
 	_, err = db.ExecContext(ctx, `UPDATE block_consolidation_shadow SET single_block_delete_after = $2 WHERE block_metadata_id = $1`, blockMetadataID, retireAfter)
 	require.NoError(err)
-	require.NoError(repo.PrepareRetirement(ctx, manifest))
+	require.NoError(repo.PrepareRetirement(ctx, manifest, ""))
 	_, err = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE block_metadata_id = $1`, blockMetadataID)
 	require.Error(err)
 	require.Contains(err.Error(), "audit manifests cannot be deleted")
@@ -425,7 +427,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	}
 
 	repo := NewPostgresRepository(db)
-	cohorts, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(cohorts, 1)
 	require.Equal([]RetentionCohort{{
@@ -442,7 +444,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		Tag:                            tag,
 		Height:                         startHeight,
 		State:                          RetirementStateEligible,
-		Bucket:                         "integration-bucket",
+		Bucket:                         integrationRetentionBucket,
 		SingleBlockObjectKey:           fmt.Sprintf("single-block/%d.gzip", startHeight),
 		SingleBlockObjectKeySHA256:     keySHA256(fmt.Sprintf("single-block/%d.gzip", startHeight)),
 		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
@@ -457,9 +459,9 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		PayloadSHA256:                  keySHA256("payload"),
 		PreparedAt:                     now.Add(-30 * time.Minute),
 	}
-	require.NoError(repo.PrepareRetirement(ctx, pendingManifest))
+	require.NoError(repo.PrepareRetirement(ctx, pendingManifest, ""))
 
-	pending, err := repo.ListPendingRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	pending, err := repo.ListPendingRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(pending, 1)
 	require.Equal(uint64(1), pending[0].RowCount)
@@ -475,19 +477,19 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	require.NoError(err)
 	require.Empty(futureAtCutoff)
 
-	due, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	due, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(due, 1)
 	require.Equal(startHeight+1, due[0].StartHeight)
 	require.Equal(startHeight+2, due[0].EndHeight)
 	require.Equal(uint64(1), due[0].RowCount)
 
-	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Equal(pending, snapshotPending)
 	require.Equal(due, snapshotDue)
 
-	merged, hasMore, err := NewSelector(repo).Select(ctx, tag, 0, 0, now, 10)
+	merged, hasMore, err := NewSelector(repo).Select(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.False(hasMore)
 	require.Equal([]RetentionCohort{{
@@ -501,6 +503,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 
 	bounded, err := repo.ListDueRetentionCohorts(
 		ctx,
+		"",
 		tag,
 		startHeight+1,
 		startHeight+2,
@@ -520,16 +523,293 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 			row_set_sha256
 		) VALUES ($1, 'preparing', $2, $3, $4, $5, 2, 2, $6)`,
 		tag,
-		"integration-bucket",
+		integrationRetentionBucket,
 		dueKey,
 		startHeight,
 		startHeight+2,
 		strings.Repeat("a", 64),
 	)
 	require.NoError(err)
-	cohorts, err = repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	cohorts, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
+}
+
+func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_200_000_000 + unique%100_000_000)
+	startHeight := uint64(8_200_000_000 + unique%100_000_000)
+	sharedKey := fmt.Sprintf("consolidated/generation-shared-%d.cscb.gzip", unique)
+	pendingKey := fmt.Sprintf("consolidated/generation-pending-%d.cscb.gzip", unique)
+	blockMetadataIDs := make([]int64, 0, 4)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention DISABLE TRIGGER block_single_block_retention_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_single_block_retention WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE block_single_block_retention ENABLE TRIGGER block_single_block_retention_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, blockMetadataID := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, blockMetadataID)
+		}
+	}()
+
+	now := time.Now().UTC()
+	seed := func(
+		height uint64,
+		consolidatedKey string,
+		primaryGeneration string,
+		sourceGeneration string,
+		destinationGeneration string,
+	) int64 {
+		singleBlockKey := fmt.Sprintf("single-block/generation-%d.gzip", height)
+		var blockMetadataID int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length, storage_generation
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, $7, $8, $9, NULLIF($10, ''))
+			RETURNING id`,
+			height,
+			tag,
+			height-1,
+			consolidatedKey,
+			now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			0,
+			128,
+			128,
+			primaryGeneration,
+		).Scan(&blockMetadataID)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, blockMetadataID)
+
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)`,
+			height,
+			blockMetadataID,
+			tag,
+		)
+		require.NoError(err)
+
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				single_block_storage_generation, consolidated_object_key_main,
+				consolidated_storage_generation, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, NULLIF($5, ''), $6, NULLIF($7, ''), $8, $9, $10, $11, $12, $13, $14)`,
+			blockMetadataID,
+			tag,
+			height,
+			singleBlockKey,
+			sourceGeneration,
+			consolidatedKey,
+			destinationGeneration,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			0,
+			128,
+			128,
+			now.Add(-96*time.Hour),
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+		return blockMetadataID
+	}
+
+	seed(
+		startHeight,
+		sharedKey,
+		"v2",
+		"",
+		"v2",
+	)
+	nativeV2ID := seed(
+		startHeight+1,
+		sharedKey,
+		"v2",
+		"v2",
+		"v2",
+	)
+	nativeLegacyID := seed(
+		startHeight+2,
+		sharedKey,
+		"",
+		"",
+		"",
+	)
+	pendingV2ID := seed(
+		startHeight+3,
+		pendingKey,
+		"v2",
+		"v2",
+		"v2",
+	)
+
+	repo := NewPostgresRepository(db)
+	pendingSingleKey := fmt.Sprintf("single-block/generation-%d.gzip", startHeight+3)
+	require.NoError(repo.PrepareRetirement(ctx, RetirementManifest{
+		BlockMetadataID:                pendingV2ID,
+		Tag:                            tag,
+		Height:                         startHeight + 3,
+		State:                          RetirementStateEligible,
+		Bucket:                         integrationRetentionBucket,
+		SingleBlockObjectKey:           pendingSingleKey,
+		SingleBlockObjectKeySHA256:     keySHA256(pendingSingleKey),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         128,
+		ConsolidatedObjectKey:          pendingKey,
+		ConsolidatedObjectVersionID:    "cscb-v1",
+		ConsolidatedObjectETag:         "cscb-etag",
+		ConsolidatedByteLength:         128,
+		ConsolidatedUncompressedLength: 128,
+		PayloadSHA256:                  keySHA256("payload"),
+		PreparedAt:                     now.Add(-30 * time.Minute),
+	}, "v2"))
+
+	v2Bucket := "integration-v2-bucket"
+	pendingV2, dueV2, err := repo.ListRetentionCohorts(
+		ctx,
+		v2Bucket,
+		"v2",
+		tag,
+		0,
+		0,
+		now,
+		10,
+	)
+	require.NoError(err)
+	require.Empty(pendingV2, "an old-bucket manifest must not be selected under the v2 target")
+	require.Len(dueV2, 1)
+	require.Equal([]RetentionCohort{{
+		ConsolidatedObjectKey: sharedKey,
+		StartHeight:           startHeight + 1,
+		EndHeight:             startHeight + 2,
+		RowCount:              1,
+		EligibleAt:            dueV2[0].EligibleAt,
+	}}, dueV2, "mixed and legacy rows sharing the same object key must not merge into the v2 cohort")
+
+	pendingLegacy, dueLegacy, err := repo.ListRetentionCohorts(
+		ctx,
+		integrationRetentionBucket,
+		"",
+		tag,
+		0,
+		0,
+		now,
+		10,
+	)
+	require.NoError(err)
+	require.Empty(pendingLegacy, "a v2 metadata row must not be selected merely because its manifest names the old bucket")
+	require.Len(dueLegacy, 1)
+	require.Equal([]RetentionCohort{{
+		ConsolidatedObjectKey: sharedKey,
+		StartHeight:           startHeight + 2,
+		EndHeight:             startHeight + 3,
+		RowCount:              1,
+		EligibleAt:            dueLegacy[0].EligibleAt,
+	}}, dueLegacy)
+
+	legacySingleKey := fmt.Sprintf("single-block/generation-%d.gzip", startHeight+2)
+	legacyManifest := RetirementManifest{
+		BlockMetadataID:                nativeLegacyID,
+		Tag:                            tag,
+		Height:                         startHeight + 2,
+		State:                          RetirementStateEligible,
+		Bucket:                         integrationRetentionBucket,
+		SingleBlockObjectKey:           legacySingleKey,
+		SingleBlockObjectKeySHA256:     keySHA256(legacySingleKey),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         128,
+		ConsolidatedObjectKey:          sharedKey,
+		ConsolidatedObjectVersionID:    "cscb-v1",
+		ConsolidatedObjectETag:         "cscb-etag",
+		ConsolidatedByteLength:         128,
+		ConsolidatedUncompressedLength: 128,
+		PayloadSHA256:                  keySHA256("payload"),
+		PreparedAt:                     now,
+	}
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET storage_generation = $2
+		WHERE id = $1`, nativeLegacyID, "v2")
+	require.NoError(err)
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_storage_generation = $2,
+			consolidated_storage_generation = $2
+		WHERE block_metadata_id = $1`, nativeLegacyID, "v2")
+	require.NoError(err)
+	err = repo.PrepareRetirement(ctx, legacyManifest, "")
+	require.ErrorContains(err, "storage generation changed before retirement")
+	var retirementFencedAt sql.NullTime
+	require.NoError(db.QueryRowContext(ctx, `
+		SELECT single_block_retention_fenced_at
+		FROM block_metadata
+		WHERE id = $1`, nativeLegacyID).Scan(&retirementFencedAt))
+	require.False(retirementFencedAt.Valid, "a stale-generation prepare must not fence metadata")
+	var manifestCount int
+	require.NoError(db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM block_single_block_retention
+		WHERE block_metadata_id = $1`, nativeLegacyID).Scan(&manifestCount))
+	require.Zero(manifestCount, "a stale-generation prepare must not persist a manifest")
+
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_metadata
+		SET storage_generation = NULL
+		WHERE id = $1`, nativeLegacyID)
+	require.NoError(err)
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_storage_generation = NULL,
+			consolidated_storage_generation = NULL
+		WHERE block_metadata_id = $1`, nativeLegacyID)
+	require.NoError(err)
+
+	_, err = db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_object_key_main = NULL,
+			single_block_object_deleted_at = NOW()
+		WHERE block_metadata_id = $1`, nativeV2ID)
+	require.NoError(err)
+	completed, hasMore, err := NewSelector(repo).Select(
+		ctx,
+		v2Bucket,
+		"v2",
+		tag,
+		0,
+		0,
+		now,
+		10,
+	)
+	require.NoError(err)
+	require.False(hasMore)
+	require.Empty(completed, "mixed rows must not be reselected after native-v2 retention finishes")
 }
 
 // TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight seeds three
@@ -638,7 +918,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 	endHeight := startHeight + cohortCount
 
 	repo := NewPostgresRepository(db)
-	bounded, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, now, 10)
+	bounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 10)
 	require.NoError(err)
 	require.Len(bounded, cohortCount)
 	boundedHeights := make([]uint64, 0, len(bounded))
@@ -651,7 +931,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a bounded selection must be ordered by height, not by due time",
 	)
 
-	truncated, err := repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, now, 2)
+	truncated, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 2)
 	require.NoError(err)
 	require.Len(truncated, 2)
 	require.Equal(
@@ -660,7 +940,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a truncated bounded selection must keep the lowest cohorts so repeated runs advance monotonically",
 	)
 
-	unbounded, err := repo.ListDueRetentionCohorts(ctx, tag, 0, 0, now, 10)
+	unbounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
 	require.NoError(err)
 	require.Len(unbounded, cohortCount)
 	unboundedHeights := make([]uint64, 0, len(unbounded))

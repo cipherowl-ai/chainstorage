@@ -26,6 +26,8 @@ type (
 	CohortRepository interface {
 		ListRetentionCohorts(
 			ctx context.Context,
+			bucket string,
+			storageGeneration string,
 			tag uint32,
 			startHeight uint64,
 			endHeight uint64,
@@ -45,6 +47,8 @@ func NewSelector(repo CohortRepository) *Selector {
 
 func (s *Selector) Select(
 	ctx context.Context,
+	bucket string,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -53,6 +57,12 @@ func (s *Selector) Select(
 ) ([]RetentionCohort, bool, error) {
 	if s == nil || s.repo == nil {
 		return nil, false, xerrors.New("retention cohort repository is required")
+	}
+	if bucket == "" {
+		return nil, false, xerrors.New("retention cohort bucket is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return nil, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
 	}
 	if limit <= 0 || limit > MaxRetentionCohortsPerWorkflow {
 		return nil, false, xerrors.Errorf(
@@ -74,6 +84,8 @@ func (s *Selector) Select(
 	queryLimit := limit + 1
 	pending, due, err := s.repo.ListRetentionCohorts(
 		ctx,
+		bucket,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,

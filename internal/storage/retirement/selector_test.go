@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+const selectorTestBucket = "selector-test-bucket"
+
 type fakeCohortRepository struct {
 	pending       []RetentionCohort
 	due           []RetentionCohort
@@ -20,12 +22,17 @@ type fakeCohortRepository struct {
 
 func (r *fakeCohortRepository) ListRetentionCohorts(
 	_ context.Context,
+	bucket string,
+	storageGeneration string,
 	_ uint32,
 	_ uint64,
 	_ uint64,
 	eligibilityCutoff time.Time,
 	_ int,
 ) ([]RetentionCohort, []RetentionCohort, error) {
+	if bucket != selectorTestBucket || storageGeneration != "" {
+		return nil, nil, errors.New("unexpected storage target")
+	}
 	r.pendingCutoff = eligibilityCutoff
 	r.dueCutoff = eligibilityCutoff
 	if r.pendingErr != nil {
@@ -65,7 +72,7 @@ func TestSelectorPrioritizesPendingAndMergesDueRange(t *testing.T) {
 		},
 	}
 
-	cohorts, hasMore, err := NewSelector(repo).Select(context.Background(), 2, 0, 0, now, 2)
+	cohorts, hasMore, err := NewSelector(repo).Select(context.Background(), selectorTestBucket, "", 2, 0, 0, now, 2)
 	require.NoError(t, err)
 	require.False(t, hasMore)
 	require.Equal(t, now, repo.pendingCutoff)
@@ -91,7 +98,11 @@ func TestSelectorPrioritizesPendingAndMergesDueRange(t *testing.T) {
 
 func TestSelectorRejectsInvalidLimitAndCohort(t *testing.T) {
 	now := time.Now().UTC()
-	_, _, err := NewSelector(&fakeCohortRepository{}).Select(context.Background(), 2, 0, 0, now, 0)
+	_, _, err := NewSelector(&fakeCohortRepository{}).Select(context.Background(), "", "", 2, 0, 0, now, 1)
+	require.ErrorContains(t, err, "bucket is required")
+	_, _, err = NewSelector(&fakeCohortRepository{}).Select(context.Background(), selectorTestBucket, "future", 2, 0, 0, now, 1)
+	require.ErrorContains(t, err, "unsupported")
+	_, _, err = NewSelector(&fakeCohortRepository{}).Select(context.Background(), selectorTestBucket, "", 2, 0, 0, now, 0)
 	require.ErrorContains(t, err, "between 1 and")
 
 	repo := &fakeCohortRepository{
@@ -103,13 +114,13 @@ func TestSelectorRejectsInvalidLimitAndCohort(t *testing.T) {
 			EligibleAt:            time.Now(),
 		}},
 	}
-	_, _, err = NewSelector(repo).Select(context.Background(), 2, 0, 0, now, 1)
+	_, _, err = NewSelector(repo).Select(context.Background(), selectorTestBucket, "", 2, 0, 0, now, 1)
 	require.ErrorContains(t, err, "invalid retention cohort")
 }
 
 func TestSelectorPropagatesRepositoryErrors(t *testing.T) {
 	repo := &fakeCohortRepository{pendingErr: errors.New("database unavailable")}
-	_, _, err := NewSelector(repo).Select(context.Background(), 2, 0, 0, time.Now().UTC(), 1)
+	_, _, err := NewSelector(repo).Select(context.Background(), selectorTestBucket, "", 2, 0, 0, time.Now().UTC(), 1)
 	require.ErrorContains(t, err, "database unavailable")
 }
 
@@ -117,16 +128,16 @@ func TestSelectorValidatesOptionalHeightRange(t *testing.T) {
 	selector := NewSelector(&fakeCohortRepository{})
 	now := time.Now().UTC()
 
-	_, _, err := selector.Select(context.Background(), 2, 100, 0, now, 1)
+	_, _, err := selector.Select(context.Background(), selectorTestBucket, "", 2, 100, 0, now, 1)
 	require.ErrorContains(t, err, "end height is required")
 
-	_, _, err = selector.Select(context.Background(), 2, 100, 100, now, 1)
+	_, _, err = selector.Select(context.Background(), selectorTestBucket, "", 2, 100, 100, now, 1)
 	require.ErrorContains(t, err, "invalid retention selection range")
 
-	_, _, err = selector.Select(context.Background(), 2, 100, 200, now, 1)
+	_, _, err = selector.Select(context.Background(), selectorTestBucket, "", 2, 100, 200, now, 1)
 	require.NoError(t, err)
 
-	_, _, err = selector.Select(context.Background(), 2, 100, 200, time.Time{}, 1)
+	_, _, err = selector.Select(context.Background(), selectorTestBucket, "", 2, 100, 200, time.Time{}, 1)
 	require.ErrorContains(t, err, "eligibility cutoff is required")
 }
 
@@ -151,7 +162,7 @@ func TestSelectorReportsRemainingBacklog(t *testing.T) {
 		},
 	}
 
-	cohorts, hasMore, err := NewSelector(repo).Select(context.Background(), 2, 0, 0, now, 1)
+	cohorts, hasMore, err := NewSelector(repo).Select(context.Background(), selectorTestBucket, "", 2, 0, 0, now, 1)
 	require.NoError(t, err)
 	require.True(t, hasMore)
 	require.Len(t, cohorts, 1)

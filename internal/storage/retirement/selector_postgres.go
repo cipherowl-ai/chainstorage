@@ -20,6 +20,8 @@ type retentionCohortQuerier interface {
 // reads can disappear from both result sets and falsely signal sweep completion.
 func (r *PostgresRepository) ListRetentionCohorts(
 	ctx context.Context,
+	bucket string,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -44,6 +46,8 @@ func (r *PostgresRepository) ListRetentionCohorts(
 	pending, err := listPendingRetentionCohorts(
 		ctx,
 		tx,
+		bucket,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,
@@ -56,6 +60,7 @@ func (r *PostgresRepository) ListRetentionCohorts(
 	due, err := listDueRetentionCohorts(
 		ctx,
 		tx,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,
@@ -73,6 +78,8 @@ func (r *PostgresRepository) ListRetentionCohorts(
 
 func (r *PostgresRepository) ListPendingRetentionCohorts(
 	ctx context.Context,
+	bucket string,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -85,6 +92,8 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 	return listPendingRetentionCohorts(
 		ctx,
 		r.db,
+		bucket,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,
@@ -96,6 +105,8 @@ func (r *PostgresRepository) ListPendingRetentionCohorts(
 func listPendingRetentionCohorts(
 	ctx context.Context,
 	db retentionCohortQuerier,
+	bucket string,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -117,10 +128,18 @@ func listPendingRetentionCohorts(
 			ON shadow.block_metadata_id = retention.block_metadata_id
 			AND shadow.tag = retention.tag
 			AND shadow.height = retention.height
+		JOIN block_metadata metadata
+			ON metadata.id = retention.block_metadata_id
+			AND metadata.tag = retention.tag
+			AND metadata.height = retention.height
 		WHERE retention.tag = $1
 			AND retention.state IN ($2, $3, $4)
 			AND ($6::BIGINT = 0 OR (retention.height >= $5 AND retention.height < $6))
 			AND shadow.single_block_delete_after <= $7
+			AND retention.bucket = $9
+			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
 		GROUP BY retention.consolidated_object_key_main
 		ORDER BY MIN(retention.prepared_at), MIN(retention.height), retention.consolidated_object_key_main
 		LIMIT $8`
@@ -135,6 +154,8 @@ func listPendingRetentionCohorts(
 		endHeight,
 		eligibilityCutoff,
 		limit,
+		bucket,
+		storageGeneration,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query pending retention cohorts: %w", err)
@@ -176,6 +197,7 @@ func dueRetentionCohortOrdering(endHeight uint64) string {
 
 func (r *PostgresRepository) ListDueRetentionCohorts(
 	ctx context.Context,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -188,6 +210,7 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	return listDueRetentionCohorts(
 		ctx,
 		r.db,
+		storageGeneration,
 		tag,
 		startHeight,
 		endHeight,
@@ -199,6 +222,7 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 func listDueRetentionCohorts(
 	ctx context.Context,
 	db retentionCohortQuerier,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
@@ -214,6 +238,14 @@ func listDueRetentionCohorts(
 				shadow.consolidated_object_key_main,
 				MIN(shadow.single_block_delete_after) AS eligible_at
 			FROM block_consolidation_shadow shadow
+			JOIN canonical_blocks due_canonical
+				ON due_canonical.tag = shadow.tag
+				AND due_canonical.height = shadow.height
+				AND due_canonical.block_metadata_id = shadow.block_metadata_id
+			JOIN block_metadata due_metadata
+				ON due_metadata.id = due_canonical.block_metadata_id
+				AND due_metadata.tag = due_canonical.tag
+				AND due_metadata.height = due_canonical.height
 			WHERE shadow.tag = $1
 				AND shadow.validated_at IS NOT NULL
 				AND shadow.single_block_delete_after IS NOT NULL
@@ -223,6 +255,12 @@ func listDueRetentionCohorts(
 				AND shadow.single_block_object_key_main <> ''
 				AND shadow.consolidated_object_key_main IS NOT NULL
 				AND shadow.consolidated_object_key_main <> ''
+				AND due_metadata.skipped = FALSE
+				AND due_metadata.object_format = $4
+				AND due_metadata.object_key_main = shadow.consolidated_object_key_main
+				AND due_metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+				AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 				AND NOT EXISTS (
 					SELECT 1
@@ -258,6 +296,9 @@ func listDueRetentionCohorts(
 			AND shadow.single_block_object_key_main <> ''
 			AND metadata.skipped = FALSE
 			AND metadata.object_format = $4
+			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
 			AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 			AND metadata.object_key_main = shadow.consolidated_object_key_main
 			AND NOT EXISTS (
@@ -294,6 +335,7 @@ func listDueRetentionCohorts(
 		RetirementStateEligible,
 		RetirementStateDeleting,
 		RetirementStateDeletedPendingVerification,
+		storageGeneration,
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query due retention cohorts: %w", err)
