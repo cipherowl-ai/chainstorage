@@ -174,7 +174,14 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	if req.Execute && !req.SingleBlockWritersGuarded {
 		return nil, xerrors.New("retirement reconciliation requires all single-block writers to honor the retirement fence")
 	}
-	manifests, err := p.repo.ListPendingRetirements(ctx, req.Tag, req.StartHeight, req.EndHeight, req.Limit)
+	manifests, err := p.repo.ListPendingRetirements(
+		ctx,
+		req.Tag,
+		req.StartHeight,
+		req.EndHeight,
+		req.EligibilityCutoff,
+		req.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -210,6 +217,18 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 			) {
 			markCandidateBlocked(&item, SkipMetadataChanged)
 			report.Items = append(report.Items, item)
+			continue
+		}
+		row, err := p.repo.GetMetadataRow(ctx, manifest.BlockMetadataID)
+		if err != nil || !storageGenerationsMatchRequest(req, row) {
+			markCandidateBlocked(&item, SkipMetadataChanged)
+			report.Items = append(report.Items, item)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				halted = true
+			}
 			continue
 		}
 		if approvalGateBlocked(req) {
@@ -300,6 +319,10 @@ func (p *Planner) planRow(
 		item.RetirementState = row.Retirement.State
 		item.RetirementAttempts = row.Retirement.AttemptCount
 		item.RetirementOutcome = row.Retirement.Outcome
+		if row.Retirement.Bucket != req.Bucket || !storageGenerationsMatchRequest(req, row) {
+			item.SkipReason = SkipStorageGenerationMismatch
+			return item
+		}
 		if row.Retirement.State == RetirementStateDeletedVerified {
 			if !finalizedRetirementMatchesRow(row) {
 				item.SkipReason = SkipMetadataChanged
@@ -358,6 +381,10 @@ func (p *Planner) planRow(
 		return item
 	}
 	shadow := row.Shadow
+	if !storageGenerationsMatchRequest(req, row) {
+		item.SkipReason = SkipStorageGenerationMismatch
+		return item
+	}
 	item.ConsolidatedKey = shadow.ConsolidatedObjectKey
 	item.ValidatedAt = shadow.ValidatedAt
 	item.RetiredAt = shadow.SingleBlockRetentionStartedAt
@@ -381,7 +408,7 @@ func (p *Planner) planRow(
 		item.SkipReason = SkipMissingRetirementMarker
 		return item
 	}
-	if item.EligibleAt != nil && req.Now.Before(*item.EligibleAt) {
+	if item.EligibleAt != nil && req.EligibilityCutoff.Before(*item.EligibleAt) {
 		item.SkipReason = SkipRetentionPeriodActive
 		return item
 	}
@@ -495,7 +522,7 @@ func (p *Planner) applyCandidate(ctx context.Context, req PlanRequest, item *Can
 	item.PayloadSHA256 = payloadSHA256
 	item.SingleBlockKeySHA256 = keySHA256(item.Key)
 	manifest := manifestFromCandidate(*item, req.Now)
-	if err := p.repo.PrepareRetirement(ctx, manifest); err != nil {
+	if err := p.repo.PrepareRetirement(ctx, manifest, req.StorageGeneration); err != nil {
 		return SkipMetadataChanged, err
 	}
 	return p.withRetirementClaim(ctx, item, func(claimToken string) (string, error) {
@@ -933,12 +960,15 @@ func (p *Planner) verifySingleBlockDeleted(ctx context.Context, bucket string, k
 }
 
 func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
+	if !storageGenerationsMatchRequest(req, row) {
+		return false
+	}
 	if candidate.RetirementState == RetirementStateDeletedPendingVerification {
 		return pendingVerificationCandidateMatchesRow(req, candidate, row, requireCanonical)
 	}
 	if row.Shadow == nil || row.Shadow.ValidatedAt == nil || row.Shadow.SingleBlockRetentionStartedAt == nil ||
 		row.Shadow.SingleBlockDeleteAfter == nil || row.Shadow.SingleBlockObjectDeletedAt != nil ||
-		req.Now.Before(*row.Shadow.SingleBlockDeleteAfter) {
+		req.EligibilityCutoff.Before(*row.Shadow.SingleBlockDeleteAfter) {
 		return false
 	}
 	retirementMatches := row.Retirement == nil || pendingRetirementMatchesCandidate(row, candidate)
@@ -961,6 +991,13 @@ func candidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, 
 		row.PrimaryUncompressedLength == candidate.UncompressedLength &&
 		retirementMatches &&
 		validShadowReference(row, row.Shadow)
+}
+
+func storageGenerationsMatchRequest(req PlanRequest, row MetadataRow) bool {
+	return row.Shadow != nil &&
+		row.PrimaryStorageGeneration == req.StorageGeneration &&
+		row.Shadow.SingleBlockStorageGeneration == req.StorageGeneration &&
+		row.Shadow.ConsolidatedStorageGeneration == req.StorageGeneration
 }
 
 func pendingVerificationCandidateMatchesRow(req PlanRequest, candidate Candidate, row MetadataRow, requireCanonical bool) bool {
@@ -1426,6 +1463,9 @@ func normalizeRequest(req *PlanRequest) error {
 	if req.Now.IsZero() {
 		req.Now = time.Now().UTC()
 	}
+	if req.EligibilityCutoff.IsZero() {
+		req.EligibilityCutoff = req.Now
+	}
 	return nil
 }
 
@@ -1437,6 +1477,9 @@ func validShadowReference(row MetadataRow, shadow *ConsolidationShadow) bool {
 		return false
 	}
 	if shadow.SingleBlockObjectKey != row.SingleBlockObjectKey {
+		return false
+	}
+	if shadow.ConsolidatedStorageGeneration != row.PrimaryStorageGeneration {
 		return false
 	}
 	if !isPrimaryConsolidated(row) {
@@ -1498,13 +1541,21 @@ func isPrimaryConsolidated(row MetadataRow) bool {
 }
 
 func approvalMatches(req PlanRequest) bool {
-	return normalizeApprovalChain(req.Approval.Chain) == normalizeApprovalChain(actualChain(req)) &&
-		req.Approval.StartHeight == req.StartHeight &&
+	if normalizeApprovalChain(req.Approval.Chain) != normalizeApprovalChain(actualChain(req)) {
+		return false
+	}
+	if req.Approval.AllowContainingRange {
+		return req.Approval.StartHeight <= req.StartHeight &&
+			req.Approval.EndHeight >= req.EndHeight
+	}
+	return req.Approval.StartHeight == req.StartHeight &&
 		req.Approval.EndHeight == req.EndHeight
 }
 
 // approvalGateBlocked reports whether the operator approval blocks this
-// request. Execution always requires an exact chain/range approval. A
+// request. Direct planner callers require an exact chain/range approval. The
+// retention workflow may explicitly opt into a containing envelope after it
+// independently validates the selected cohort against that operator input. A
 // read-only run may omit the approval entirely so it can still reach the S3
 // safety inspection, but a supplied approval is validated even on dry runs so
 // the report predicts the execute-time gate.

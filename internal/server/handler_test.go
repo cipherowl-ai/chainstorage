@@ -322,7 +322,8 @@ func (s *handlerTestSuite) TestGetBlockFile() {
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal(objectKeyMain, key)
 				return "http://endpoint/foo/bar", nil
 			},
@@ -373,7 +374,7 @@ func (s *handlerTestSuite) TestGetBlockFile_DefaultUsesReadShadowFirst() {
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, height, hash).Times(1).Return(blockMetadata, nil),
 		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata.GetObjectKeyMain()).Times(1).Return("http://endpoint/consolidated", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata).Times(1).Return("http://endpoint/consolidated", nil),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -412,7 +413,7 @@ func (s *handlerTestSuite) TestGetBlockFile_ReadSourceSingleBlockIgnoresReadShad
 			Height:        height,
 			ObjectKeyMain: objectKeyMain,
 		}, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKeyMain).Times(1).Return("http://endpoint/foo/bar", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).Return("http://endpoint/foo/bar", nil),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -459,7 +460,7 @@ func (s *handlerTestSuite) TestGetBlockFile_ReadSourceConsolidatedUsesShadowMeta
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, height, hash).Times(1).Return(blockMetadata, nil),
 		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata.GetObjectKeyMain()).Times(1).Return("http://endpoint/consolidated", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata).Times(1).Return("http://endpoint/consolidated", nil),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -501,8 +502,8 @@ func (s *handlerTestSuite) TestGetBlockFile_ReadSourceConsolidatedFallsBackOnPre
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, height, hash).Times(1).Return(blockMetadata, nil),
 		s.metaStorage.EXPECT().GetBlockConsolidationShadow(gomock.Any(), blockMetadata).Times(1).Return(shadowMetadata, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata.GetObjectKeyMain()).Times(1).Return("", xerrors.New("presign failed")),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKeyMain).Times(1).Return("http://endpoint/single-block", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), shadowMetadata).Times(1).Return("", xerrors.New("presign failed")),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), blockMetadata).Times(1).Return("http://endpoint/single-block", nil),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -527,7 +528,7 @@ func (s *handlerTestSuite) TestGetBlockFile_PromotedConsolidatedPresignErrorDoes
 
 	gomock.InOrder(
 		s.metaStorage.EXPECT().GetBlockByHash(gomock.Any(), tag, promotedMetadata.GetHeight(), promotedMetadata.GetHash()).Times(1).Return(promotedMetadata, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), promotedMetadata.GetObjectKeyMain()).Times(1).Return("", xerrors.New("presign failed")),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), promotedMetadata).Times(1).Return("", xerrors.New("presign failed")),
 	)
 
 	resp, err := s.server.GetBlockFile(context.Background(), &api.GetBlockFileRequest{
@@ -574,7 +575,8 @@ func (s *handlerTestSuite) TestGetBlockFile_Gzip() {
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal(objectKeyMain, key)
 				return "http://endpoint/foo/bar.gzip", nil
 			},
@@ -714,13 +716,15 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_PresignErr() {
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal("foo", key)
 				return "http://endpoint/foo", nil
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal("bar", key)
 				return "", fmt.Errorf("failed")
 			},
@@ -763,13 +767,15 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange() {
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal("foo", key)
 				return "http://endpoint/foo", nil
 			},
 		),
 		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
-			func(_ context.Context, key string) (string, error) {
+			func(_ context.Context, metadata *api.BlockMetadata) (string, error) {
+				key := metadata.GetObjectKeyMain()
 				require.Equal("bar", key)
 				return "http://endpoint/bar", nil
 			},
@@ -836,7 +842,7 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_ReusesPresignedURLForSameObj
 				}, nil
 			},
 		),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("http://endpoint/consolidated", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).Return("http://endpoint/consolidated", nil),
 	)
 
 	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
@@ -851,6 +857,55 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_ReusesPresignedURLForSameObj
 	require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, resp.GetFiles()[0].GetObjectFormat())
 	require.Equal(uint64(100), resp.GetFiles()[1].GetByteOffset())
 	require.Equal(uint64(120), resp.GetFiles()[1].GetByteLength())
+}
+
+func (s *handlerTestSuite) TestGetBlockFilesByRange_DoesNotReusePresignedURLAcrossGenerations() {
+	require := testutil.Require(s.T())
+	stableTag := s.app.Config().Chain.BlockTag.Stable
+	const objectKey = "shared-consolidated-key"
+
+	s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), stableTag, uint64(9000), uint64(9002)).Return(
+		[]*api.BlockMetadata{
+			{
+				Tag:               stableTag,
+				Hash:              "hash1",
+				Height:            9000,
+				ObjectKeyMain:     objectKey,
+				ObjectFormat:      api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+				ByteLength:        100,
+				StorageGeneration: "",
+			},
+			{
+				Tag:               stableTag,
+				Hash:              "hash2",
+				Height:            9001,
+				ObjectKeyMain:     objectKey,
+				ObjectFormat:      api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+				ByteOffset:        100,
+				ByteLength:        100,
+				StorageGeneration: "v2",
+			},
+		}, nil,
+	)
+	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Return(&api.BlockMetadata{Height: 100000}, nil)
+	s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(2).DoAndReturn(
+		func(ctx context.Context, metadata *api.BlockMetadata) (string, error) {
+			generation := metadata.GetStorageGeneration()
+			if generation == "" {
+				generation = "legacy"
+			}
+			return fmt.Sprintf("http://endpoint/generation-%s", generation), nil
+		},
+	)
+
+	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
+		StartHeight: 9000,
+		EndHeight:   9002,
+	})
+	require.NoError(err)
+	require.Len(resp.GetFiles(), 2)
+	require.Equal("http://endpoint/generation-legacy", resp.GetFiles()[0].GetFileUrl())
+	require.Equal("http://endpoint/generation-v2", resp.GetFiles()[1].GetFileUrl())
 }
 
 func (s *handlerTestSuite) TestGetBlockFilesByRange_ReadSourceConsolidatedUsesShadowMetadata() {
@@ -876,7 +931,7 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_ReadSourceConsolidatedUsesSh
 		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), stableTag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
 		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Times(1).Return(testutil.MakeBlockMetadata(10000, stableTag), nil),
 		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("http://endpoint/consolidated", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).Return("http://endpoint/consolidated", nil),
 	)
 
 	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
@@ -919,7 +974,7 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_DefaultUsesReadShadowFirst()
 		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), stableTag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
 		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Times(1).Return(testutil.MakeBlockMetadata(10000, stableTag), nil),
 		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("http://endpoint/consolidated", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).Return("http://endpoint/consolidated", nil),
 	)
 
 	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{
@@ -957,9 +1012,9 @@ func (s *handlerTestSuite) TestGetBlockFilesByRange_ReadSourceConsolidatedFallsB
 		s.metaStorage.EXPECT().GetBlocksByHeightRange(gomock.Any(), stableTag, startHeight, endHeight).Times(1).Return(blockMetadatas, nil),
 		s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), stableTag).Times(1).Return(testutil.MakeBlockMetadata(10000, stableTag), nil),
 		s.metaStorage.EXPECT().GetBlocksConsolidationShadow(gomock.Any(), blockMetadatas).Times(1).Return(shadowMetadatas, nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), objectKey).Times(1).Return("", xerrors.New("presign failed")),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), blockMetadatas[0].GetObjectKeyMain()).Times(1).Return("http://endpoint/single-block/0", nil),
-		s.blobStorage.EXPECT().PreSign(gomock.Any(), blockMetadatas[1].GetObjectKeyMain()).Times(1).Return("http://endpoint/single-block/1", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), gomock.Any()).Times(1).Return("", xerrors.New("presign failed")),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), blockMetadatas[0]).Times(1).Return("http://endpoint/single-block/0", nil),
+		s.blobStorage.EXPECT().PreSign(gomock.Any(), blockMetadatas[1]).Times(1).Return("http://endpoint/single-block/1", nil),
 	)
 
 	resp, err := s.server.GetBlockFilesByRange(context.Background(), &api.GetBlockFilesByRangeRequest{

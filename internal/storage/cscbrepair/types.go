@@ -29,38 +29,42 @@ type (
 		Height             uint64
 		Hash               string
 		ObjectFormat       api.BlockObjectFormat
+		StorageGeneration  string
 		ByteOffset         uint64
 		ByteLength         uint64
 		UncompressedLength uint64
 	}
 
 	Block struct {
-		BlockMetadataID            int64
-		Canonical                  bool
-		Tag                        uint32
-		Height                     uint64
-		Hash                       string
-		Skipped                    bool
-		RetirementFenced           bool
-		RetirementManifestExists   bool
-		SingleBlockObjectKey       string
-		SingleBlockObjectKeySHA256 string
-		SingleBlockObjectDeleted   bool
-		SingleBlockObjectVersion   ObjectVersion
-		PayloadSHA256              string
-		OldConsolidatedObjectKey   string
-		OldByteOffset              uint64
-		OldByteLength              uint64
-		OldUncompressedLength      uint64
-		ActiveObjectKey            string
-		ActiveObjectFormat         int32
-		NewConsolidatedObjectKey   string
-		NewByteOffset              uint64
-		NewByteLength              uint64
-		NewUncompressedLength      uint64
-		NewValidatedAt             *time.Time
-		NewRetentionStartedAt      *time.Time
-		NewSingleBlockDeleteAfter  *time.Time
+		BlockMetadataID               int64
+		Canonical                     bool
+		Tag                           uint32
+		Height                        uint64
+		Hash                          string
+		Skipped                       bool
+		RetirementFenced              bool
+		RetirementManifestExists      bool
+		StorageGeneration             string
+		SingleBlockStorageGeneration  string
+		ConsolidatedStorageGeneration string
+		SingleBlockObjectKey          string
+		SingleBlockObjectKeySHA256    string
+		SingleBlockObjectDeleted      bool
+		SingleBlockObjectVersion      ObjectVersion
+		PayloadSHA256                 string
+		OldConsolidatedObjectKey      string
+		OldByteOffset                 uint64
+		OldByteLength                 uint64
+		OldUncompressedLength         uint64
+		ActiveObjectKey               string
+		ActiveObjectFormat            int32
+		NewConsolidatedObjectKey      string
+		NewByteOffset                 uint64
+		NewByteLength                 uint64
+		NewUncompressedLength         uint64
+		NewValidatedAt                *time.Time
+		NewRetentionStartedAt         *time.Time
+		NewSingleBlockDeleteAfter     *time.Time
 	}
 
 	Manifest struct {

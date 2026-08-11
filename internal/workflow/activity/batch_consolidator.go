@@ -407,6 +407,7 @@ func (a *BatchConsolidator) executeRepairExistingCSCB(
 				Height:             placement.Height,
 				Hash:               placement.Hash,
 				ObjectFormat:       placement.ObjectFormat,
+				StorageGeneration:  placement.StorageGeneration,
 				ByteOffset:         placement.ByteOffset,
 				ByteLength:         placement.ByteLength,
 				UncompressedLength: placement.UncompressedLength,
@@ -479,6 +480,13 @@ func (a *BatchConsolidator) getCSCBRepairer(ctx context.Context) (cscbrepair.Rep
 	}
 	if a.s3Client == nil {
 		return nil, xerrors.New("repair_existing_cscb requires an S3 client")
+	}
+	storageGeneration, err := a.config.WriteBlockStorageGeneration()
+	if err != nil {
+		return nil, xerrors.Errorf("repair_existing_cscb failed to resolve write block storage generation: %w", err)
+	}
+	if storageGeneration != "" {
+		return nil, xerrors.New("repair_existing_cscb is only supported for the legacy block storage generation")
 	}
 	pool, err := metapostgres.GetConnectionPool(ctx, a.config.AWS.Postgres)
 	if err != nil {
@@ -1109,16 +1117,18 @@ func makeShadowPlacements(
 			)
 		}
 		shadowPlacements = append(shadowPlacements, &metastorage.ConsolidationShadowPlacement{
-			BlockMetadataID:           placement.MetadataID,
-			Tag:                       metadata.GetTag(),
-			Height:                    metadata.GetHeight(),
-			Hash:                      metadata.GetHash(),
-			SingleBlockObjectKeyMain:  metadata.GetObjectKeyMain(),
-			ConsolidatedObjectKeyMain: objectKey,
-			ObjectFormat:              placement.ObjectFormat,
-			ByteOffset:                placement.ByteOffset,
-			ByteLength:                placement.ByteLength,
-			UncompressedLength:        placement.UncompressedLength,
+			BlockMetadataID:               placement.MetadataID,
+			Tag:                           metadata.GetTag(),
+			Height:                        metadata.GetHeight(),
+			Hash:                          metadata.GetHash(),
+			SingleBlockObjectKeyMain:      metadata.GetObjectKeyMain(),
+			SingleBlockStorageGeneration:  metadata.GetStorageGeneration(),
+			ConsolidatedObjectKeyMain:     objectKey,
+			ConsolidatedStorageGeneration: placement.StorageGeneration,
+			ObjectFormat:                  placement.ObjectFormat,
+			ByteOffset:                    placement.ByteOffset,
+			ByteLength:                    placement.ByteLength,
+			UncompressedLength:            placement.UncompressedLength,
 		})
 	}
 	return shadowPlacements, nil

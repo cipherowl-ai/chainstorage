@@ -2,6 +2,7 @@ package retirement
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -19,21 +20,20 @@ type (
 		Pending               bool      `json:"pending"`
 	}
 
+	// CohortRepository must return row-disjoint pending and due aggregates.
+	// Both slices must come from one database snapshot. Selector merges
+	// aggregates for the same consolidated object by summing their row counts.
 	CohortRepository interface {
-		ListPendingRetentionCohorts(
+		ListRetentionCohorts(
 			ctx context.Context,
+			bucket string,
+			storageGeneration string,
 			tag uint32,
 			startHeight uint64,
 			endHeight uint64,
+			eligibilityCutoff time.Time,
 			limit int,
-		) ([]RetentionCohort, error)
-		ListDueRetentionCohorts(
-			ctx context.Context,
-			tag uint32,
-			startHeight uint64,
-			endHeight uint64,
-			limit int,
-		) ([]RetentionCohort, error)
+		) ([]RetentionCohort, []RetentionCohort, error)
 	}
 
 	Selector struct {
@@ -47,13 +47,22 @@ func NewSelector(repo CohortRepository) *Selector {
 
 func (s *Selector) Select(
 	ctx context.Context,
+	bucket string,
+	storageGeneration string,
 	tag uint32,
 	startHeight uint64,
 	endHeight uint64,
+	eligibilityCutoff time.Time,
 	limit int,
 ) ([]RetentionCohort, bool, error) {
 	if s == nil || s.repo == nil {
 		return nil, false, xerrors.New("retention cohort repository is required")
+	}
+	if bucket == "" {
+		return nil, false, xerrors.New("retention cohort bucket is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return nil, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
 	}
 	if limit <= 0 || limit > MaxRetentionCohortsPerWorkflow {
 		return nil, false, xerrors.Errorf(
@@ -68,15 +77,23 @@ func (s *Selector) Select(
 	if endHeight != 0 && endHeight <= startHeight {
 		return nil, false, xerrors.Errorf("invalid retention selection range [%d, %d)", startHeight, endHeight)
 	}
+	if eligibilityCutoff.IsZero() {
+		return nil, false, xerrors.New("retention selection eligibility cutoff is required")
+	}
 
 	queryLimit := limit + 1
-	pending, err := s.repo.ListPendingRetentionCohorts(ctx, tag, startHeight, endHeight, queryLimit)
+	pending, due, err := s.repo.ListRetentionCohorts(
+		ctx,
+		bucket,
+		storageGeneration,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		queryLimit,
+	)
 	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list pending retention cohorts: %w", err)
-	}
-	due, err := s.repo.ListDueRetentionCohorts(ctx, tag, startHeight, endHeight, queryLimit)
-	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list due retention cohorts: %w", err)
+		return nil, false, xerrors.Errorf("failed to list retention cohorts: %w", err)
 	}
 
 	result := make([]RetentionCohort, 0, queryLimit)
@@ -93,9 +110,13 @@ func (s *Selector) Select(
 			if cohort.EndHeight > existing.EndHeight {
 				existing.EndHeight = cohort.EndHeight
 			}
-			if cohort.RowCount > existing.RowCount {
-				existing.RowCount = cohort.RowCount
+			if cohort.RowCount > math.MaxUint64-existing.RowCount {
+				return xerrors.Errorf(
+					"retention cohort row count overflow for object %q",
+					cohort.ConsolidatedObjectKey,
+				)
 			}
+			existing.RowCount += cohort.RowCount
 			if cohort.EligibleAt.After(existing.EligibleAt) {
 				existing.EligibleAt = cohort.EligibleAt
 			}

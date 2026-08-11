@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -13,7 +14,17 @@ import (
 )
 
 func resetLocalResources(params S3Params) error {
-	return initBucket(params.Logger, params.Config.AWS.Bucket, params.AWSConfig, params.Config.AWS.IsResetLocal)
+	buckets := []string{params.Config.AWS.Bucket}
+	for _, location := range params.Config.AWS.BlockStorage.Generations {
+		buckets = append(buckets, location.Bucket)
+	}
+	sort.Strings(buckets)
+	for _, bucket := range buckets {
+		if err := initBucket(params.Logger, bucket, params.AWSConfig, params.Config.AWS.IsResetLocal); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func initBucket(log *zap.Logger, bucket string, cfg aws.Config, reset bool) error {

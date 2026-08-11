@@ -721,25 +721,40 @@ go run ./cmd/admin workflow start --workflow replicator --input '{"Tag": 0, "Sta
 Inspect currently due single-block retention cohorts in an exact repaired range
 without deleting:
 ```shell
-go run ./cmd/admin workflow start --workflow single_block_retention --input '{"Tag": 0, "StartHeight": 100000, "EndHeight": 110000, "MaxObjectRanges": 10}' --blockchain solana --network mainnet --env local
+go run ./cmd/admin workflow start --workflow single_block_retention --input '{"Tag": 0, "StartHeight": 100000, "EndHeight": 110000, "MaxObjectRanges": 20, "Parallelism": 20}' --blockchain solana --network mainnet --env local
 ```
 
 The workflow is manual-only while production retention is being verified; no
-recurring cron or Temporal Schedule starts it. Each explicit run is bounded by
-`MaxObjectRanges`, and `MoreEligibleRanges` reports whether the selected range
-still has a backlog. Omitting `Execute` keeps the run read-only. Execution
+recurring cron or Temporal Schedule starts it. `MaxObjectRanges` bounds each
+Temporal run, while optional `Parallelism` bounds concurrent CSCB cohort
+lifecycles from 1 to 20 and defaults to 1. Each concurrency slot schedules one
+CSCB cohort activity, which processes all covered single-block rows; Temporal
+may dispatch a bounded retry to a different worker. Selected cohorts are
+validated as unique and non-overlapping before execution on new workflow
+histories. If any post-processing failure occurs after cohort activities start,
+the terminal Temporal application error includes structured outcomes for every
+cohort launched in that run; a failed wave starts no later wave. A read-only run
+remains bounded, reports the current backlog through `MoreEligibleRanges`, and
+returns its frozen `EligibilityCutoff`. A new
+execute sweep must supply that exact dry-run cutoff. It continues as new with
+the same cutoff, selection, and approval envelope until a final empty selection
+confirms that no cohort from the frozen set remains; it never admits cohorts
+that become eligible later or bypasses each cohort's retention clock. Execution
 requires Postgres metadata plus versioned S3 storage, an explicit
 `FallbackReadsValidated` assertion with zero `FallbackErrorCount`, and a
 separate operator approval (`ApprovedChain`, `ApprovedStartHeight`,
-`ApprovedEndHeight`) that must exactly match both the selection range and the
-selected cohort; the approval is passed through unchanged and is never derived
-from whatever cohort the selector discovers, so unbounded execution requests
-are rejected. API and SDK clients continue to use the same Chainstorage
-interface; the `DirectStorageClientsGuarded` execution gate applies only to
-consumers that bypass Chainstorage and access object storage directly. The
-process activity heartbeats from the row and per-version delete loops under a
-bounded heartbeat timeout, so stopping the workflow cancels destructive work
-between steps instead of letting it run to completion.
+`ApprovedEndHeight`) that must fully contain the selection range. This permits
+one immutable campaign-wide approval to authorize separately bounded shards,
+while selections extending outside that envelope are rejected. Every selected
+cohort must also be fully contained by the envelope across continuations; the
+approval is passed through unchanged and is never derived from selector output,
+so unbounded execution requests are rejected. API and SDK clients
+continue to use the same Chainstorage interface; the
+`DirectStorageClientsGuarded` execution gate applies only to consumers that
+bypass Chainstorage and access object storage directly. The process activity
+heartbeats from the row and per-version delete loops under a bounded heartbeat
+timeout, so stopping the workflow cancels destructive work between steps
+instead of letting it run to completion.
 
 Stop the monitor workflow:
 ```shell

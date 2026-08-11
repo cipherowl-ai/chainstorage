@@ -22,6 +22,7 @@ const metadataRowColumns = `
 	bm.skipped,
 	COALESCE(bm.object_key_main, ''),
 	bm.object_format,
+	bm.storage_generation,
 	bm.byte_offset,
 	bm.byte_length,
 	bm.uncompressed_length,
@@ -31,7 +32,9 @@ const metadataRowColumns = `
 	shadow.height,
 	shadow.hash,
 	shadow.single_block_object_key_main,
+	shadow.single_block_storage_generation,
 	shadow.consolidated_object_key_main,
+	shadow.consolidated_storage_generation,
 	shadow.object_format,
 	shadow.byte_offset,
 	shadow.byte_length,
@@ -144,9 +147,16 @@ func (r *PostgresRepository) GetMetadataRow(ctx context.Context, blockMetadataID
 	return row, nil
 }
 
-func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest RetirementManifest) error {
+func (r *PostgresRepository) PrepareRetirement(
+	ctx context.Context,
+	manifest RetirementManifest,
+	expectedStorageGeneration string,
+) error {
 	if r.db == nil {
 		return xerrors.New("postgres db is required")
+	}
+	if !isValidStorageGeneration(expectedStorageGeneration) {
+		return xerrors.Errorf("unsupported expected storage generation %q", expectedStorageGeneration)
 	}
 	if manifest.State != RetirementStateEligible {
 		return xerrors.Errorf("prepared retirement must be eligible, got %q", manifest.State)
@@ -195,7 +205,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 	if err != nil {
 		return xerrors.Errorf("failed to lock retirement metadata row: %w", err)
 	}
-	if err := validateManifestMetadata(row, manifest); err != nil {
+	if err := validateManifestMetadata(row, manifest, expectedStorageGeneration); err != nil {
 		return err
 	}
 	const fenceMetadata = `
@@ -206,7 +216,8 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 			AND object_format = $4
 			AND byte_offset = $5
 			AND byte_length = $6
-			AND uncompressed_length = $7`
+			AND uncompressed_length = $7
+			AND storage_generation IS NOT DISTINCT FROM NULLIF($8, '')`
 	result, err := tx.ExecContext(
 		ctx,
 		fenceMetadata,
@@ -217,6 +228,7 @@ func (r *PostgresRepository) PrepareRetirement(ctx context.Context, manifest Ret
 		manifest.ConsolidatedByteOffset,
 		manifest.ConsolidatedByteLength,
 		manifest.ConsolidatedUncompressedLength,
+		expectedStorageGeneration,
 	)
 	if err != nil {
 		return xerrors.Errorf("failed to fence retired block metadata: %w", err)
@@ -835,7 +847,14 @@ func nullableHashMatches(value sql.NullString, expected string) bool {
 	return value.String == expected
 }
 
-func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error) {
+func (r *PostgresRepository) ListPendingRetirements(
+	ctx context.Context,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit uint64,
+) ([]RetirementManifest, error) {
 	if r.db == nil {
 		return nil, xerrors.New("postgres db is required")
 	}
@@ -847,21 +866,31 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 	}
 	const query = `
 		SELECT
-			block_metadata_id, tag, height, COALESCE(hash, ''), state, bucket,
-			single_block_object_key_main, single_block_object_key_sha256, single_block_object_version_ids,
-			single_block_delete_marker_version_ids,
-			single_block_object_etag, single_block_object_bytes,
-			consolidated_object_key_main, consolidated_object_version_id, consolidated_object_etag,
-			consolidated_byte_offset, consolidated_byte_length, consolidated_uncompressed_length,
-			payload_sha256, outcome, attempt_count, claim_token, claim_expires_at,
-			prepared_at, delete_started_at, last_attempt_at, deleted_at, verified_at
-		FROM block_single_block_retention
-		WHERE tag = $1
-			AND height >= $2
-			AND height < $3
-			AND state IN ($4, $5, $6)
-		ORDER BY height ASC
-		LIMIT $7`
+			retention.block_metadata_id, retention.tag, retention.height, COALESCE(retention.hash, ''),
+			retention.state, retention.bucket,
+			retention.single_block_object_key_main, retention.single_block_object_key_sha256,
+			retention.single_block_object_version_ids, retention.single_block_delete_marker_version_ids,
+			retention.single_block_object_etag, retention.single_block_object_bytes,
+			retention.consolidated_object_key_main, retention.consolidated_object_version_id,
+			retention.consolidated_object_etag, retention.consolidated_byte_offset,
+			retention.consolidated_byte_length, retention.consolidated_uncompressed_length,
+			retention.payload_sha256, retention.outcome, retention.attempt_count,
+			retention.claim_token, retention.claim_expires_at, retention.prepared_at,
+			retention.delete_started_at, retention.last_attempt_at, retention.deleted_at,
+			retention.verified_at
+		FROM block_single_block_retention retention
+		JOIN block_consolidation_shadow shadow
+			ON shadow.block_metadata_id = retention.block_metadata_id
+			AND shadow.tag = retention.tag
+			AND shadow.height = retention.height
+		WHERE retention.tag = $1
+			AND retention.height >= $2
+			AND retention.height < $3
+			AND retention.state IN ($4, $5, $6)
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_delete_after <= $7
+		ORDER BY retention.height ASC
+		LIMIT $8`
 	rows, err := r.db.QueryContext(
 		ctx,
 		query,
@@ -871,6 +900,7 @@ func (r *PostgresRepository) ListPendingRetirements(ctx context.Context, tag uin
 		RetirementStateEligible,
 		RetirementStateDeleting,
 		RetirementStateDeletedPendingVerification,
+		eligibilityCutoff,
 		limit,
 	)
 	if err != nil {
@@ -898,6 +928,7 @@ type scanner interface {
 func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var row MetadataRow
 	var primaryObjectFormat int64
+	var primaryStorageGeneration sql.NullString
 	var primaryByteOffset sql.NullInt64
 	var primaryByteLength sql.NullInt64
 	var primaryUncompressedLength sql.NullInt64
@@ -907,7 +938,9 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	var shadowHeight sql.NullInt64
 	var shadowHash sql.NullString
 	var shadowSingleBlockKey sql.NullString
+	var shadowSingleBlockStorageGeneration sql.NullString
 	var shadowConsolidatedKey sql.NullString
+	var shadowConsolidatedStorageGeneration sql.NullString
 	var shadowObjectFormat sql.NullInt64
 	var shadowByteOffset sql.NullInt64
 	var shadowByteLength sql.NullInt64
@@ -951,6 +984,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&row.Skipped,
 		&row.PrimaryObjectKey,
 		&primaryObjectFormat,
+		&primaryStorageGeneration,
 		&primaryByteOffset,
 		&primaryByteLength,
 		&primaryUncompressedLength,
@@ -960,7 +994,9 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		&shadowHeight,
 		&shadowHash,
 		&shadowSingleBlockKey,
+		&shadowSingleBlockStorageGeneration,
 		&shadowConsolidatedKey,
+		&shadowConsolidatedStorageGeneration,
 		&shadowObjectFormat,
 		&shadowByteOffset,
 		&shadowByteLength,
@@ -999,6 +1035,7 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 		return MetadataRow{}, err
 	}
 	row.PrimaryObjectFormat = api.BlockObjectFormat(primaryObjectFormat)
+	row.PrimaryStorageGeneration = primaryStorageGeneration.String
 	row.PrimaryByteOffset = nullableUint64(primaryByteOffset)
 	row.PrimaryByteLength = nullableUint64(primaryByteLength)
 	row.PrimaryUncompressedLength = nullableUint64(primaryUncompressedLength)
@@ -1006,16 +1043,18 @@ func scanMetadataRow(source scanner) (MetadataRow, error) {
 	if shadowBlockMetadataID.Valid {
 		row.SingleBlockObjectKey = shadowSingleBlockKey.String
 		row.Shadow = &ConsolidationShadow{
-			Tag:                   uint32(shadowTag.Int64),
-			Height:                uint64(shadowHeight.Int64),
-			Hash:                  shadowHash.String,
-			SingleBlockObjectKey:  shadowSingleBlockKey.String,
-			ConsolidatedObjectKey: shadowConsolidatedKey.String,
-			ObjectFormat:          api.BlockObjectFormat(shadowObjectFormat.Int64),
-			ByteOffset:            nullableUint64(shadowByteOffset),
-			ByteLength:            nullableUint64(shadowByteLength),
-			UncompressedLength:    nullableUint64(shadowUncompressedLength),
-			FormatVersion:         int(shadowFormatVersion.Int64),
+			Tag:                           uint32(shadowTag.Int64),
+			Height:                        uint64(shadowHeight.Int64),
+			Hash:                          shadowHash.String,
+			SingleBlockObjectKey:          shadowSingleBlockKey.String,
+			SingleBlockStorageGeneration:  shadowSingleBlockStorageGeneration.String,
+			ConsolidatedObjectKey:         shadowConsolidatedKey.String,
+			ConsolidatedStorageGeneration: shadowConsolidatedStorageGeneration.String,
+			ObjectFormat:                  api.BlockObjectFormat(shadowObjectFormat.Int64),
+			ByteOffset:                    nullableUint64(shadowByteOffset),
+			ByteLength:                    nullableUint64(shadowByteLength),
+			UncompressedLength:            nullableUint64(shadowUncompressedLength),
+			FormatVersion:                 int(shadowFormatVersion.Int64),
 		}
 		row.Shadow.ValidatedAt = nullableTime(shadowValidatedAt)
 		row.Shadow.SingleBlockRetentionStartedAt = nullableTime(shadowSingleBlockRetentionStartedAt)
@@ -1148,12 +1187,21 @@ func scanManifest(source scanner) (RetirementManifest, error) {
 	return manifest, nil
 }
 
-func validateManifestMetadata(row MetadataRow, manifest RetirementManifest) error {
+func validateManifestMetadata(
+	row MetadataRow,
+	manifest RetirementManifest,
+	expectedStorageGeneration string,
+) error {
 	if !row.Canonical || row.BlockMetadataID != manifest.BlockMetadataID || row.Tag != manifest.Tag || row.Height != manifest.Height || row.Hash != manifest.Hash {
 		return xerrors.Errorf("canonical metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.Skipped || row.Shadow == nil || !validShadowReference(row, row.Shadow) || row.SingleBlockObjectKey != manifest.SingleBlockObjectKey {
 		return xerrors.Errorf("single-block shadow metadata changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
+	}
+	if row.PrimaryStorageGeneration != expectedStorageGeneration ||
+		row.Shadow.SingleBlockStorageGeneration != expectedStorageGeneration ||
+		row.Shadow.ConsolidatedStorageGeneration != expectedStorageGeneration {
+		return xerrors.Errorf("storage generation changed before retirement: block_metadata_id=%d", manifest.BlockMetadataID)
 	}
 	if row.Shadow.ValidatedAt == nil || row.Shadow.SingleBlockRetentionStartedAt == nil || row.Shadow.SingleBlockDeleteAfter == nil ||
 		row.Shadow.SingleBlockObjectDeletedAt != nil {

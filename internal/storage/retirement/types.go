@@ -3,23 +3,37 @@ package retirement
 import (
 	"context"
 	"errors"
+	"regexp"
 	"time"
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
+var storageGenerationPattern = regexp.MustCompile(`^v[1-9][0-9]*$`)
+
+func isValidStorageGeneration(generation string) bool {
+	return generation == "" || storageGenerationPattern.MatchString(generation)
+}
+
 type (
 	Repository interface {
 		ListMetadataRows(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]MetadataRow, error)
 		GetMetadataRow(ctx context.Context, blockMetadataID int64) (MetadataRow, error)
-		PrepareRetirement(ctx context.Context, manifest RetirementManifest) error
+		PrepareRetirement(ctx context.Context, manifest RetirementManifest, expectedStorageGeneration string) error
 		ObserveRetentionSafety(ctx context.Context, bucket string, consolidatedObjectKey string, configurationSHA256 string) (time.Time, time.Time, error)
 		ClaimRetirement(ctx context.Context, blockMetadataID int64, claimToken string, claimedAt time.Time, claimExpiresAt time.Time) error
 		RenewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string, renewedAt time.Time, claimExpiresAt time.Time) error
 		RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, claimToken string, outcome string, attemptedAt time.Time) error
 		RecordRetirementObjectDeleted(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
 		FinalizeRetirement(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
-		ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]RetirementManifest, error)
+		ListPendingRetirements(
+			ctx context.Context,
+			tag uint32,
+			startHeight uint64,
+			endHeight uint64,
+			eligibilityCutoff time.Time,
+			limit uint64,
+		) ([]RetirementManifest, error)
 	}
 
 	ObjectStore interface {
@@ -40,6 +54,7 @@ type (
 		Hash                      string
 		Skipped                   bool
 		PrimaryObjectKey          string
+		PrimaryStorageGeneration  string
 		SingleBlockObjectKey      string
 		PrimaryObjectFormat       api.BlockObjectFormat
 		PrimaryByteOffset         uint64
@@ -55,7 +70,9 @@ type (
 		Height                        uint64
 		Hash                          string
 		SingleBlockObjectKey          string
+		SingleBlockStorageGeneration  string
 		ConsolidatedObjectKey         string
+		ConsolidatedStorageGeneration string
 		ObjectFormat                  api.BlockObjectFormat
 		ByteOffset                    uint64
 		ByteLength                    uint64
@@ -137,11 +154,13 @@ type (
 		Network                     string
 		Sidechain                   string
 		Bucket                      string
+		StorageGeneration           string
 		Tag                         uint32
 		StartHeight                 uint64
 		EndHeight                   uint64
 		Limit                       uint64
 		Now                         time.Time
+		EligibilityCutoff           time.Time
 		Execute                     bool
 		ProductionDeleteEnabled     bool
 		DirectStorageClientsGuarded bool
@@ -151,9 +170,10 @@ type (
 	}
 
 	Approval struct {
-		Chain       string `json:"chain"`
-		StartHeight uint64 `json:"start_height"`
-		EndHeight   uint64 `json:"end_height"`
+		Chain                string `json:"chain"`
+		StartHeight          uint64 `json:"start_height"`
+		EndHeight            uint64 `json:"end_height"`
+		AllowContainingRange bool   `json:"allow_containing_range,omitempty"`
 	}
 
 	Report struct {
@@ -244,6 +264,7 @@ const (
 	SkipActiveMetadataStillSingleBlock   = "active_metadata_still_single_block"
 	SkipMissingRetirementMarker          = "missing_retirement_marker"
 	SkipInvalidMetadataReference         = "invalid_metadata_reference"
+	SkipStorageGenerationMismatch        = "storage_generation_mismatch"
 	SkipRetentionPeriodActive            = "retention_period_active"
 	SkipChainRangeNotApproved            = "chain_range_not_approved"
 	SkipActiveFallbackOrReadErrors       = "active_fallback_or_read_errors"

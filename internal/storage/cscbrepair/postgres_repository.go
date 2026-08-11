@@ -906,6 +906,7 @@ func (r *PostgresRepository) RestoreToSingleBlock(
 			AND bm.hash IS NOT DISTINCT FROM block.hash
 			AND bm.skipped = FALSE
 			AND bm.single_block_retention_fenced_at IS NULL
+			AND bm.storage_generation IS NULL
 			AND bm.object_key_main = $3
 			AND bm.object_format = $4
 			AND bm.byte_offset = block.old_byte_offset
@@ -936,6 +937,8 @@ func (r *PostgresRepository) RestoreToSingleBlock(
 			AND shadow.hash IS NOT DISTINCT FROM block.hash
 			AND shadow.single_block_object_key_main = block.single_block_object_key_main
 			AND shadow.single_block_object_deleted_at IS NULL
+			AND shadow.single_block_storage_generation IS NULL
+			AND shadow.consolidated_storage_generation IS NULL
 			AND shadow.consolidated_object_key_main = $2
 			AND shadow.object_format = $3
 			AND shadow.byte_offset = block.old_byte_offset
@@ -1195,6 +1198,8 @@ func (r *PostgresRepository) PromoteCompleted(
 				AND block_consolidation_shadow.height = EXCLUDED.height
 				AND block_consolidation_shadow.hash IS NOT DISTINCT FROM EXCLUDED.hash
 				AND block_consolidation_shadow.single_block_object_key_main = EXCLUDED.single_block_object_key_main
+				AND block_consolidation_shadow.single_block_storage_generation IS NULL
+				AND block_consolidation_shadow.consolidated_storage_generation IS NULL
 				AND block_consolidation_shadow.single_block_object_deleted_at IS NULL
 			RETURNING block_metadata_id`
 		var shadowID int64
@@ -1229,6 +1234,7 @@ func (r *PostgresRepository) PromoteCompleted(
 				AND height = $3
 				AND hash IS NOT DISTINCT FROM NULLIF($4, '')
 				AND skipped = FALSE
+				AND storage_generation IS NULL
 				AND single_block_retention_fenced_at IS NULL`
 		result, err := tx.ExecContext(
 			ctx,
@@ -1433,6 +1439,9 @@ func loadCandidateByKey(ctx context.Context, q queryer, tag uint32, objectKey st
 			bm.skipped,
 			(bm.single_block_retention_fenced_at IS NOT NULL),
 			(retirement.block_metadata_id IS NOT NULL),
+			COALESCE(bm.storage_generation, ''),
+			COALESCE(shadow.single_block_storage_generation, ''),
+			COALESCE(shadow.consolidated_storage_generation, ''),
 			COALESCE(shadow.single_block_object_key_main, ''),
 			(shadow.single_block_object_deleted_at IS NOT NULL),
 			COALESCE(shadow.consolidated_object_key_main, ''),
@@ -1469,6 +1478,9 @@ func loadCandidateByKey(ctx context.Context, q queryer, tag uint32, objectKey st
 			&block.Skipped,
 			&block.RetirementFenced,
 			&block.RetirementManifestExists,
+			&block.StorageGeneration,
+			&block.SingleBlockStorageGeneration,
+			&block.ConsolidatedStorageGeneration,
 			&block.SingleBlockObjectKey,
 			&block.SingleBlockObjectDeleted,
 			&block.OldConsolidatedObjectKey,
@@ -1584,15 +1596,20 @@ func scanManifest(row rowScanner) (*Manifest, error) {
 
 func loadManifestBlocks(ctx context.Context, q queryer, manifest *Manifest) error {
 	const query = `
-		SELECT block_metadata_id, canonical, tag, height, COALESCE(hash, ''),
-			COALESCE(single_block_object_key_main, ''), single_block_object_key_sha256,
-			COALESCE(single_block_object_version_id, ''),
-			COALESCE(single_block_object_etag, ''), COALESCE(single_block_object_bytes, 0),
-			COALESCE(payload_sha256, ''),
-			old_byte_offset, old_byte_length, old_uncompressed_length
-		FROM cscb_repair_block
-		WHERE repair_id = $1
-		ORDER BY height ASC, block_metadata_id ASC`
+		SELECT block.block_metadata_id, block.canonical, block.tag, block.height, COALESCE(block.hash, ''),
+			COALESCE(bm.storage_generation, ''),
+			COALESCE(shadow.single_block_storage_generation, ''),
+			COALESCE(shadow.consolidated_storage_generation, ''),
+			COALESCE(block.single_block_object_key_main, ''), block.single_block_object_key_sha256,
+			COALESCE(block.single_block_object_version_id, ''),
+			COALESCE(block.single_block_object_etag, ''), COALESCE(block.single_block_object_bytes, 0),
+			COALESCE(block.payload_sha256, ''),
+			block.old_byte_offset, block.old_byte_length, block.old_uncompressed_length
+		FROM cscb_repair_block block
+		JOIN block_metadata bm ON bm.id = block.block_metadata_id
+		LEFT JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+		WHERE block.repair_id = $1
+		ORDER BY block.height ASC, block.block_metadata_id ASC`
 	rows, err := q.QueryContext(ctx, query, manifest.ID)
 	if err != nil {
 		return xerrors.Errorf("failed to query CSCB repair blocks: %w", err)
@@ -1608,6 +1625,9 @@ func loadManifestBlocks(ctx context.Context, q queryer, manifest *Manifest) erro
 			&block.Tag,
 			&block.Height,
 			&block.Hash,
+			&block.StorageGeneration,
+			&block.SingleBlockStorageGeneration,
+			&block.ConsolidatedStorageGeneration,
 			&block.SingleBlockObjectKey,
 			&block.SingleBlockObjectKeySHA256,
 			&block.SingleBlockObjectVersion.VersionID,
@@ -1646,10 +1666,13 @@ func loadRebuiltBlocks(ctx context.Context, q queryer, manifest *Manifest) error
 			) AS canonical,
 			COALESCE(bm.object_key_main, ''),
 			bm.object_format,
+			COALESCE(bm.storage_generation, ''),
 			bm.byte_offset,
 			bm.byte_length,
 			bm.uncompressed_length,
 			COALESCE(shadow.consolidated_object_key_main, ''),
+			COALESCE(shadow.single_block_storage_generation, ''),
+			COALESCE(shadow.consolidated_storage_generation, ''),
 			shadow.validated_at,
 			shadow.single_block_retention_started_at,
 			shadow.single_block_delete_after
@@ -1674,16 +1697,20 @@ func loadRebuiltBlocks(ctx context.Context, q queryer, manifest *Manifest) error
 		var activeOffset, activeLength, activeUncompressed sql.NullInt64
 		var validatedAt, retentionStartedAt, deleteAfter sql.NullTime
 		var activeKey, newKey string
+		var storageGeneration, singleBlockStorageGeneration, consolidatedStorageGeneration string
 		var objectFormat int32
 		if err := rows.Scan(
 			&id,
 			&canonical,
 			&activeKey,
 			&objectFormat,
+			&storageGeneration,
 			&activeOffset,
 			&activeLength,
 			&activeUncompressed,
 			&newKey,
+			&singleBlockStorageGeneration,
+			&consolidatedStorageGeneration,
 			&validatedAt,
 			&retentionStartedAt,
 			&deleteAfter,
@@ -1699,6 +1726,9 @@ func loadRebuiltBlocks(ctx context.Context, q queryer, manifest *Manifest) error
 		}
 		block.ActiveObjectKey = activeKey
 		block.ActiveObjectFormat = objectFormat
+		block.StorageGeneration = storageGeneration
+		block.SingleBlockStorageGeneration = singleBlockStorageGeneration
+		block.ConsolidatedStorageGeneration = consolidatedStorageGeneration
 		block.NewConsolidatedObjectKey = newKey
 		block.NewByteOffset = nullableUint64(activeOffset)
 		block.NewByteLength = nullableUint64(activeLength)
@@ -1892,6 +1922,7 @@ func validateRepairPromotionRow(
 			),
 			COALESCE(bm.object_key_main, ''),
 			bm.object_format,
+			COALESCE(bm.storage_generation, ''),
 			bm.byte_offset,
 			bm.byte_length,
 			bm.uncompressed_length,
@@ -1905,6 +1936,8 @@ func validateRepairPromotionRow(
 			COALESCE(shadow.single_block_object_key_main, ''),
 			COALESCE(shadow.consolidated_object_key_main, ''),
 			shadow.object_format,
+			COALESCE(shadow.single_block_storage_generation, ''),
+			COALESCE(shadow.consolidated_storage_generation, ''),
 			shadow.byte_offset,
 			shadow.byte_length,
 			shadow.uncompressed_length,
@@ -1917,6 +1950,7 @@ func validateRepairPromotionRow(
 			AND bm.hash IS NOT DISTINCT FROM NULLIF($4, '')`
 	var canonical, skipped, fenced, retirementManifest, shadowExists, singleBlockDeleted bool
 	var activeKey, shadowSingleKey, shadowConsolidatedKey string
+	var storageGeneration, singleBlockStorageGeneration, consolidatedStorageGeneration string
 	var activeFormat int32
 	var activeOffset, activeLength, activeUncompressed sql.NullInt64
 	var shadowFormat, shadowOffset, shadowLength, shadowUncompressed sql.NullInt64
@@ -1931,6 +1965,7 @@ func validateRepairPromotionRow(
 		&canonical,
 		&activeKey,
 		&activeFormat,
+		&storageGeneration,
 		&activeOffset,
 		&activeLength,
 		&activeUncompressed,
@@ -1941,6 +1976,8 @@ func validateRepairPromotionRow(
 		&shadowSingleKey,
 		&shadowConsolidatedKey,
 		&shadowFormat,
+		&singleBlockStorageGeneration,
+		&consolidatedStorageGeneration,
 		&shadowOffset,
 		&shadowLength,
 		&shadowUncompressed,
@@ -1953,6 +1990,15 @@ func validateRepairPromotionRow(
 	}
 	if canonical != block.Canonical || skipped || fenced || retirementManifest || singleBlockDeleted {
 		return xerrors.Errorf("CSCB repair promotion row is blocked or changed for metadata_id=%d", block.BlockMetadataID)
+	}
+	if storageGeneration != "" || singleBlockStorageGeneration != "" || consolidatedStorageGeneration != "" {
+		return xerrors.Errorf(
+			"CSCB repair requires legacy storage generation for metadata_id=%d: primary=%q single_block_shadow=%q consolidated_shadow=%q",
+			block.BlockMetadataID,
+			storageGeneration,
+			singleBlockStorageGeneration,
+			consolidatedStorageGeneration,
+		)
 	}
 	oldLayout := activeKey == manifest.OldConsolidatedObjectKey &&
 		activeFormat == int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH) &&
@@ -2018,6 +2064,9 @@ func compareCandidateRows(current *Manifest, pinned *Manifest) error {
 			a.Skipped ||
 			a.RetirementFenced ||
 			a.RetirementManifestExists ||
+			a.StorageGeneration != b.StorageGeneration ||
+			a.SingleBlockStorageGeneration != b.SingleBlockStorageGeneration ||
+			a.ConsolidatedStorageGeneration != b.ConsolidatedStorageGeneration ||
 			a.SingleBlockObjectKey != b.SingleBlockObjectKey ||
 			a.SingleBlockObjectDeleted ||
 			a.OldConsolidatedObjectKey != b.OldConsolidatedObjectKey ||
@@ -2031,6 +2080,9 @@ func compareCandidateRows(current *Manifest, pinned *Manifest) error {
 }
 
 func validateRebuiltMetadata(manifest *Manifest, objectKey string) error {
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return err
+	}
 	if manifest.RestoredAt == nil {
 		return xerrors.Errorf("CSCB repair restore timestamp is missing: id=%d", manifest.ID)
 	}
@@ -2175,12 +2227,15 @@ func requireExactRepairedReferences(ctx context.Context, q queryer, manifest *Ma
 			 FROM block_metadata
 			 WHERE object_key_main = $1
 				AND object_key_main <> ''
+				AND storage_generation IS NULL
 				AND id = ANY($2))
 			+
 			(SELECT COUNT(*)
 			 FROM block_consolidation_shadow
 			 WHERE consolidated_object_key_main = $1
 				AND consolidated_object_key_main <> ''
+				AND single_block_storage_generation IS NULL
+				AND consolidated_storage_generation IS NULL
 				AND block_metadata_id = ANY($2)),
 			(SELECT COUNT(*)
 			 FROM block_metadata
@@ -2250,6 +2305,9 @@ func validateFencedInput(manifest *Manifest) error {
 		manifest.TotalBlockCount != uint64(len(manifest.Blocks)) ||
 		len(manifest.RowSetSHA256) != 64 || manifest.RowSetSHA256 != rowSetSHA256(manifest) {
 		return xerrors.New("complete CSCB repair fence is required")
+	}
+	if err := validateLegacyStorageGenerations(manifest.Blocks); err != nil {
+		return err
 	}
 	canonicalCount := uint64(0)
 	for _, block := range manifest.Blocks {
