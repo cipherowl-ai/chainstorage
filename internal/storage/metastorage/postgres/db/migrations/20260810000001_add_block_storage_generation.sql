@@ -102,6 +102,30 @@ FOR EACH ROW
 EXECUTE FUNCTION enforce_block_consolidation_shadow_storage_generation_mutation();
 
 -- +goose Down
+-- Dropping these columns is safe only while the generation registry is still
+-- dormant. Serialize with all placement writers before checking so a v2/v3
+-- row cannot appear between the check and the column drop.
+-- +goose StatementBegin
+LOCK TABLE block_metadata, block_consolidation_shadow IN ACCESS EXCLUSIVE MODE;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM block_metadata
+        WHERE storage_generation IS NOT NULL
+    ) OR EXISTS (
+        SELECT 1
+        FROM block_consolidation_shadow
+        WHERE single_block_storage_generation IS NOT NULL
+            OR consolidated_storage_generation IS NOT NULL
+    ) THEN
+        RAISE EXCEPTION 'cannot roll back block storage generation migration while non-legacy rows exist';
+    END IF;
+END;
+$$;
+-- +goose StatementEnd
+
 DROP TRIGGER IF EXISTS block_consolidation_shadow_storage_generation_mutation_trigger ON block_consolidation_shadow;
 DROP FUNCTION IF EXISTS enforce_block_consolidation_shadow_storage_generation_mutation();
 

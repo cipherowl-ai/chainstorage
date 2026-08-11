@@ -902,9 +902,7 @@ func (c *Config) validateStorageGenerationConfig() error {
 		default:
 			return xerrors.Errorf("non-legacy block storage generations require S3 blob storage, got %v", c.StorageType.BlobStorageType)
 		}
-		usesPostgres := c.StorageType.MetaStorageType == MetaStorageType_POSTGRES ||
-			(c.StorageType.MetaStorageType == MetaStorageType_UNSPECIFIED && c.AWS.Postgres != nil && c.AWS.DynamoDB == nil)
-		if !usesPostgres {
+		if c.StorageType.MetaStorageType != MetaStorageType_POSTGRES {
 			return xerrors.Errorf("non-legacy block storage generations require Postgres meta storage, got %v", c.StorageType.MetaStorageType)
 		}
 	}

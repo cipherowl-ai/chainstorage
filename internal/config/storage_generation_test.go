@@ -101,6 +101,18 @@ func TestValidateStorageGenerationConfig(t *testing.T) {
 			},
 			expectedErr: "require Postgres meta storage",
 		},
+		{
+			name: "unspecified metadata backend remains DynamoDB",
+			configure: func(cfg *Config) {
+				cfg.StorageType.MetaStorageType = MetaStorageType_UNSPECIFIED
+				cfg.AWS.Postgres = &PostgresConfig{}
+				cfg.AWS.DynamoDB = nil
+				cfg.AWS.BlockStorage.Generations = map[string]BlockStorageGenerationConfig{
+					"v2": {Bucket: "blocks-v2"},
+				}
+			},
+			expectedErr: "require Postgres meta storage",
+		},
 	}
 
 	for _, test := range tests {
