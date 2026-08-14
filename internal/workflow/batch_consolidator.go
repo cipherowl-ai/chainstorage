@@ -23,6 +23,7 @@ type (
 	BatchConsolidator struct {
 		baseWorkflow
 		batchConsolidator *activity.BatchConsolidator
+		workflowConfig    *config.BatchConsolidatorWorkflowConfig
 	}
 
 	BatchConsolidatorParams struct {
@@ -79,6 +80,7 @@ func NewBatchConsolidator(params BatchConsolidatorParams) *BatchConsolidator {
 	w := &BatchConsolidator{
 		baseWorkflow:      newBaseWorkflow(&params.Config.Workflows.BatchConsolidator, params.Runtime),
 		batchConsolidator: params.BatchConsolidator,
+		workflowConfig:    &params.Config.Workflows.BatchConsolidator,
 	}
 	w.registerWorkflow(w.execute)
 	return w
@@ -89,7 +91,15 @@ func (w *BatchConsolidator) Execute(ctx context.Context, request *BatchConsolida
 	if override, ok := workflowIDFromContext(ctx); ok {
 		workflowID = override
 	}
-	return w.startWorkflow(ctx, workflowID, request)
+	taskList := w.workflowConfig.TaskList
+	mode := w.workflowConfig.Storage.Consolidation.Mode
+	if request != nil && request.Mode != "" {
+		mode = request.Mode
+	}
+	if mode == config.ConsolidationModeHistoricalBackfill && w.workflowConfig.HistoricalTaskList != "" {
+		taskList = w.workflowConfig.HistoricalTaskList
+	}
+	return w.startWorkflowOnTaskList(ctx, workflowID, taskList, request)
 }
 
 func (r *BatchConsolidatorRequest) GetTags() map[string]string {
@@ -165,9 +175,13 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			zap.String("mode", string(mode)),
 		)
 		logger.Info("workflow started")
-		ctx = w.withActivityOptions(ctx)
-		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg)
-		cursorCtx := w.withCursorActivityOptions(ctx, cfg)
+		activityTaskList := cfg.TaskList
+		if mode == config.ConsolidationModeHistoricalBackfill && cfg.HistoricalTaskList != "" {
+			activityTaskList = cfg.HistoricalTaskList
+		}
+		ctx = w.withActivityOptionsOnTaskList(ctx, activityTaskList)
+		statsCtx := w.withShadowStatsActivityOptions(ctx, cfg, activityTaskList)
+		cursorCtx := w.withCursorActivityOptions(ctx, cfg, activityTaskList)
 		if mode.IsRepairExistingCSCB() {
 			repairParallelismVersion := workflow.GetVersion(
 				ctx,
@@ -1186,11 +1200,12 @@ func batchConsolidatorSafeEndHeight(latestHeight uint64, irreversibleDistance ui
 func (w *BatchConsolidator) withShadowStatsActivityOptions(
 	ctx workflow.Context,
 	cfg config.BatchConsolidatorWorkflowConfig,
+	taskList string,
 ) workflow.Context {
 	base := cfg.Base()
 	retryPolicy := w.getShadowStatsActivityRetryPolicy(base.ActivityRetry)
 	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		TaskQueue:              base.TaskList,
+		TaskQueue:              taskList,
 		StartToCloseTimeout:    base.ActivityStartToCloseTimeout,
 		ScheduleToCloseTimeout: base.ActivityScheduleToCloseTimeout,
 		HeartbeatTimeout:       base.ActivityHeartbeatTimeout,
@@ -1214,11 +1229,12 @@ func (w *BatchConsolidator) getShadowStatsActivityRetryPolicy(cfg *config.RetryP
 func (w *BatchConsolidator) withCursorActivityOptions(
 	ctx workflow.Context,
 	cfg config.BatchConsolidatorWorkflowConfig,
+	taskList string,
 ) workflow.Context {
 	base := cfg.Base()
 	retryPolicy := w.getCursorActivityRetryPolicy(base.ActivityRetry)
 	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		TaskQueue:              base.TaskList,
+		TaskQueue:              taskList,
 		StartToCloseTimeout:    base.ActivityStartToCloseTimeout,
 		ScheduleToCloseTimeout: base.ActivityScheduleToCloseTimeout,
 		HeartbeatTimeout:       base.ActivityHeartbeatTimeout,

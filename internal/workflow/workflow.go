@@ -167,6 +167,10 @@ func (w *baseWorkflow) validateRequestCtx(ctx context.Context, request any) erro
 }
 
 func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, request any) (client.WorkflowRun, error) {
+	return w.startWorkflowOnTaskList(ctx, workflowID, w.config.Base().TaskList, request)
+}
+
+func (w *baseWorkflow) startWorkflowOnTaskList(ctx context.Context, workflowID string, taskList string, request any) (client.WorkflowRun, error) {
 	if err := w.validateRequestCtx(ctx, request); err != nil {
 		return nil, err
 	}
@@ -174,7 +178,7 @@ func (w *baseWorkflow) startWorkflow(ctx context.Context, workflowID string, req
 	cfg := w.config.Base()
 	workflowOptions := client.StartWorkflowOptions{
 		ID:                                       workflowID,
-		TaskQueue:                                cfg.TaskList,
+		TaskQueue:                                taskList,
 		WorkflowRunTimeout:                       cfg.WorkflowRunTimeout,
 		WorkflowIDReusePolicy:                    enums.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE,
 		WorkflowExecutionErrorWhenAlreadyStarted: true,
@@ -257,9 +261,13 @@ func (w *baseWorkflow) getMetricsHandler(ctx workflow.Context) client.MetricsHan
 }
 
 func (w *baseWorkflow) withActivityOptions(ctx workflow.Context) workflow.Context {
+	return w.withActivityOptionsOnTaskList(ctx, w.config.Base().TaskList)
+}
+
+func (w *baseWorkflow) withActivityOptionsOnTaskList(ctx workflow.Context, taskList string) workflow.Context {
 	cfg := w.config.Base()
 	return workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		TaskQueue:              cfg.TaskList,
+		TaskQueue:              taskList,
 		StartToCloseTimeout:    cfg.ActivityStartToCloseTimeout,
 		ScheduleToCloseTimeout: cfg.ActivityScheduleToCloseTimeout,
 		HeartbeatTimeout:       cfg.ActivityHeartbeatTimeout,
