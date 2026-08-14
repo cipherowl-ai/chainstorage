@@ -349,10 +349,11 @@ type (
 	}
 
 	BatchConsolidatorWorkflowConfig struct {
-		WorkflowConfig `mapstructure:",squash"`
-		BatchSize      uint64 `mapstructure:"batch_size" validate:"required"`
-		CheckpointSize uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
-		MaxBlocks      uint64 `mapstructure:"max_blocks"`
+		WorkflowConfig     `mapstructure:",squash"`
+		BatchSize          uint64 `mapstructure:"batch_size" validate:"required"`
+		CheckpointSize     uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
+		MaxBlocks          uint64 `mapstructure:"max_blocks"`
+		HistoricalTaskList string `mapstructure:"historical_task_list"`
 	}
 
 	SingleBlockRetentionWorkflowConfig struct {

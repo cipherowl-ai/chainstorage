@@ -379,6 +379,9 @@ func (t *batchConsolidatorTask) verifyAutoConsolidateCoverage(ctx context.Contex
 
 func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Context) (string, bool, error) {
 	workflowIdentity := t.config.Workflows.BatchConsolidator.WorkflowIdentity
+	defaultTaskList := t.config.Workflows.BatchConsolidator.TaskList
+	historicalTaskList := t.config.Workflows.BatchConsolidator.HistoricalTaskList
+	hasIsolatedHistoricalTaskList := historicalTaskList != "" && historicalTaskList != defaultTaskList
 	openWorkflows, err := t.runtime.ListOpenWorkflows(ctx, t.config.Cadence.Domain, batchConsolidatorOpenPageSize, workflowIdentity)
 	if err != nil {
 		return "", false, xerrors.Errorf("failed to list open workflows for batch_consolidator cron: %w", err)
@@ -388,6 +391,11 @@ func (t *batchConsolidatorTask) openBatchConsolidatorWorkflow(ctx context.Contex
 	}
 	for _, wf := range openWorkflows.Executions {
 		if wf.GetType().GetName() == workflowIdentity {
+			// Only the dedicated historical queue is resource-isolated. Missing or
+			// shared task-queue metadata remains blocking so the guard fails closed.
+			if hasIsolatedHistoricalTaskList && wf.GetTaskQueue() == historicalTaskList {
+				continue
+			}
 			workflowID := wf.GetExecution().GetWorkflowId()
 			return workflowID, true, nil
 		}
