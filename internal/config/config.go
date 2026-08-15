@@ -446,13 +446,14 @@ type (
 	}
 
 	CronConfig struct {
-		BlockRangeSize         uint64                      `mapstructure:"block_range_size" validate:"required"`
-		BatchConsolidator      BatchConsolidatorCronConfig `mapstructure:"batch_consolidator"`
-		DisableDLQProcessor    bool                        `mapstructure:"disable_dlq_processor"`
-		DisablePollingCanary   bool                        `mapstructure:"disable_polling_canary"`
-		DisableStreamingCanary bool                        `mapstructure:"disable_streaming_canary"`
-		DisableNodeCanary      bool                        `mapstructure:"disable_node_canary"`
-		DisableWorkflowStatus  bool                        `mapstructure:"disable_workflow_status"`
+		BlockRangeSize         uint64                         `mapstructure:"block_range_size" validate:"required"`
+		BatchConsolidator      BatchConsolidatorCronConfig    `mapstructure:"batch_consolidator"`
+		SingleBlockRetention   SingleBlockRetentionCronConfig `mapstructure:"single_block_retention"`
+		DisableDLQProcessor    bool                           `mapstructure:"disable_dlq_processor"`
+		DisablePollingCanary   bool                           `mapstructure:"disable_polling_canary"`
+		DisableStreamingCanary bool                           `mapstructure:"disable_streaming_canary"`
+		DisableNodeCanary      bool                           `mapstructure:"disable_node_canary"`
+		DisableWorkflowStatus  bool                           `mapstructure:"disable_workflow_status"`
 	}
 
 	BatchConsolidatorCronConfig struct {
@@ -462,6 +463,33 @@ type (
 		WorkflowParallelism int           `mapstructure:"workflow_parallelism"`
 		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
 		StartHeight         uint64        `mapstructure:"start_height"`
+	}
+
+	// SingleBlockRetentionCronConfig drives unattended single-block retention.
+	// Enabling it moves the operator's per-run deletion approval into reviewed
+	// configuration: the Approved* fields and the guard assertions are the
+	// standing operator input the cron passes through verbatim, and every
+	// in-workflow fail-closed gate still applies.
+	SingleBlockRetentionCronConfig struct {
+		Enabled             bool          `mapstructure:"enabled"`
+		Spec                string        `mapstructure:"spec"`
+		Parallelism         int64         `mapstructure:"parallelism"`
+		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
+		MaxObjectRanges     int           `mapstructure:"max_object_ranges" validate:"omitempty,gt=0,lte=250"`
+		WorkflowParallelism int           `mapstructure:"workflow_parallelism" validate:"omitempty,gt=0,lte=20"`
+		// WindowBlocks bounds each launched sweep so selection queries stay on
+		// the height index; the window is anchored at the oldest due work.
+		WindowBlocks uint64 `mapstructure:"window_blocks" validate:"omitempty,lte=2000000"`
+		// ApprovedEndHeight zero follows the consolidation frontier and
+		// requires AllowOpenEndedApproval as an explicit opt-in.
+		ApprovedChain               string `mapstructure:"approved_chain"`
+		ApprovedStartHeight         uint64 `mapstructure:"approved_start_height"`
+		ApprovedEndHeight           uint64 `mapstructure:"approved_end_height"`
+		AllowOpenEndedApproval      bool   `mapstructure:"allow_open_ended_approval"`
+		DirectStorageClientsGuarded bool   `mapstructure:"direct_storage_clients_guarded"`
+		SingleBlockWritersGuarded   bool   `mapstructure:"single_block_writers_guarded"`
+		FallbackReadsValidated      bool   `mapstructure:"fallback_reads_validated"`
+		ProductionDeleteEnabled     bool   `mapstructure:"production_delete_enabled"`
 	}
 
 	StorageConfig struct {
