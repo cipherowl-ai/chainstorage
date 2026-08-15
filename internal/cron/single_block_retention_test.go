@@ -50,7 +50,7 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	return r.pending, r.due, nil
 }
 
-func newSingleBlockRetentionCronTask(t *testing.T) (
+func newSingleBlockRetentionCronTask(t *testing.T, configOpts ...config.ConfigOption) (
 	*singleBlockRetentionTask,
 	*batchConsolidatorCronRuntime,
 	*retentionCronCohortRepository,
@@ -59,7 +59,7 @@ func newSingleBlockRetentionCronTask(t *testing.T) (
 	*gomock.Controller,
 ) {
 	t.Helper()
-	cfg, err := config.New()
+	cfg, err := config.New(configOpts...)
 	require.NoError(t, err)
 	cfg.Chain.BlockTag.Stable = 2
 	cfg.Chain.BlockTag.Latest = 2
@@ -335,6 +335,17 @@ func TestSingleBlockRetentionCronFailsClosedOnIncompleteStandingApproval(t *test
 			require.Empty(t, runtime.executions)
 		})
 	}
+}
+
+func TestSingleBlockRetentionCronRequiresProductionDeleteEnablementInProduction(t *testing.T) {
+	task, runtime, _, _, cfg, ctrl := newSingleBlockRetentionCronTask(t, config.WithEnvironment(config.EnvProduction))
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.ProductionDeleteEnabled = false
+
+	err := task.Run(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "production_delete_enabled")
+	require.Empty(t, runtime.executions)
 }
 
 func TestSingleBlockRetentionCronPropagatesProbeErrors(t *testing.T) {
