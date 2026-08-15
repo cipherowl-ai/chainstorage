@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ type fakeRepo struct {
 	recordDeletedCalls int
 	finalizeErr        error
 	finalizeCalls      int
+	renewCalls         int
 }
 
 type fakeSafetyObservation struct {
@@ -154,6 +156,7 @@ func (r *fakeRepo) RenewRetirementClaim(
 	renewedAt time.Time,
 	claimExpiresAt time.Time,
 ) error {
+	r.renewCalls++
 	manifest, ok := r.manifests[blockMetadataID]
 	if !ok || manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification ||
 		manifest.ClaimToken != claimToken ||
@@ -1054,6 +1057,13 @@ func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyImmediatelyBeforeDelete(t 
 	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	key := report.Items[0].ConsolidatedKey
 	require.Equal(1, store.policyCalls[key])
+	// Step the safety-cache clock past the revalidation interval on every
+	// lookup so the row after preflight must re-verify against live S3.
+	cacheClock := req.Now
+	planner.retentionSafetyClock = func() time.Time {
+		cacheClock = cacheClock.Add(retentionSafetyRevalidationInterval + time.Second)
+		return cacheClock
+	}
 	store.policyHook = func(hookKey string, call int) (RetentionSafetySnapshot, error) {
 		snapshot := RetentionSafetySnapshot{ConfigurationSHA256: keySHA256("safe:" + hookKey)}
 		if call >= 3 {
@@ -1119,7 +1129,7 @@ func TestVerifyRetentionSafetyDoesNotCreditFailedInspectionTime(t *testing.T) {
 	store.policyErrors[key] = errors.New("GetBucketLifecycleConfiguration temporarily unavailable")
 	planner := testPlanner(repo, store)
 
-	reason, err := planner.verifyCSCBRetentionSafety(context.Background(), &item)
+	reason, _, err := planner.verifyCSCBRetentionSafety(context.Background(), &item)
 	require.Error(err)
 	require.Equal(SkipCSCBWriteOncePolicyUnverified, reason)
 	observation := repo.safetyObservations[observationKey]
@@ -1128,15 +1138,16 @@ func TestVerifyRetentionSafetyDoesNotCreditFailedInspectionTime(t *testing.T) {
 
 	repo.safetyNow = observedAt.Add(20 * time.Minute)
 	delete(store.policyErrors, key)
-	reason, err = planner.verifyCSCBRetentionSafety(context.Background(), &item)
+	reason, retryAfter, err := planner.verifyCSCBRetentionSafety(context.Background(), &item)
 	require.Error(err)
 	require.Equal(SkipCSCBSafetyQuiescenceActive, reason)
+	require.Equal(RetentionSafetyQuiescencePeriod, retryAfter)
 	observation = repo.safetyObservations[observationKey]
 	require.Equal(keySHA256("safe:"+key), observation.configurationSHA256)
 	require.Equal(repo.safetyNow, observation.firstObservedAt)
 }
 
-func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.T) {
+func TestPlannerApply_VerifiesCSCBWriteOncePolicyOncePerPassWithinInterval(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
 	cscbKey := "consolidated/shared.cscb.zstd"
@@ -1158,9 +1169,11 @@ func TestPlannerApply_RefetchesLiveCSCBWriteOncePolicyForEveryDelete(t *testing.
 	require.NoError(err)
 	require.Equal(1, store.policyCalls[cscbKey])
 
+	// Rows within the revalidation interval reuse the preflight verification
+	// instead of re-issuing bucket control-plane calls per delete.
 	require.NoError(planner.Apply(context.Background(), req, report))
 	require.Len(store.deleted, 2)
-	require.Equal(4, store.policyCalls[cscbKey])
+	require.Equal(2, store.policyCalls[cscbKey])
 }
 
 func TestPlannerHeartbeatsFromRowAndVersionLoops(t *testing.T) {
@@ -1544,7 +1557,9 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterSingleBlockDelete(t *te
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	store.headHook = func(key string, call int) ObjectHead {
 		head := store.heads[key]
-		if key == row.PrimaryObjectKey && call >= 4 {
+		// Call 1 is Plan, call 2 the post-claim revalidation; call 3 is the
+		// post-delete verification that must observe the replaced CSCB.
+		if key == row.PrimaryObjectKey && call >= 3 {
 			head.VersionID = "replacement-version"
 			head.ETag = "replacement-etag"
 		}
@@ -1925,7 +1940,9 @@ func TestPlannerApply_DoesNotDeleteWhenCSCBLifecycleExpirationAppears(t *testing
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	store.headHook = func(key string, call int) ObjectHead {
 		head := store.heads[key]
-		if key == row.PrimaryObjectKey && call >= 3 {
+		// Call 1 is Plan; call 2 is the post-claim revalidation that must
+		// observe the expiration before any version is deleted.
+		if key == row.PrimaryObjectKey && call >= 2 {
 			head.Expiration = `expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`
 		}
 		return head
@@ -2090,6 +2107,297 @@ func cscbObjectMetadata(uncompressedLength string, format string, compressionSco
 		cscbCompressionScopeMetadataKey:   compressionScope,
 		cscbUncompressedLengthMetadataKey: uncompressedLength,
 	}
+}
+
+// lockedRepository and lockedObjectStore make the single-threaded fakes safe
+// for row-parallel planner tests without touching the serial fixtures.
+type lockedRepository struct {
+	mu    sync.Mutex
+	inner Repository
+}
+
+func (l *lockedRepository) ListMetadataRows(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, limit uint64) ([]MetadataRow, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ListMetadataRows(ctx, tag, startHeight, endHeight, limit)
+}
+
+func (l *lockedRepository) GetMetadataRow(ctx context.Context, blockMetadataID int64) (MetadataRow, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.GetMetadataRow(ctx, blockMetadataID)
+}
+
+func (l *lockedRepository) PrepareRetirement(ctx context.Context, manifest RetirementManifest, expectedStorageGeneration string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.PrepareRetirement(ctx, manifest, expectedStorageGeneration)
+}
+
+func (l *lockedRepository) ObserveRetentionSafety(ctx context.Context, bucket string, consolidatedObjectKey string, configurationSHA256 string) (time.Time, time.Time, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ObserveRetentionSafety(ctx, bucket, consolidatedObjectKey, configurationSHA256)
+}
+
+func (l *lockedRepository) ClaimRetirement(ctx context.Context, blockMetadataID int64, claimToken string, claimedAt time.Time, claimExpiresAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ClaimRetirement(ctx, blockMetadataID, claimToken, claimedAt, claimExpiresAt)
+}
+
+func (l *lockedRepository) RenewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string, renewedAt time.Time, claimExpiresAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, claimExpiresAt)
+}
+
+func (l *lockedRepository) RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, claimToken string, outcome string, attemptedAt time.Time) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.RecordRetirementOutcome(ctx, blockMetadataID, claimToken, outcome, attemptedAt)
+}
+
+func (l *lockedRepository) RecordRetirementObjectDeleted(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, outcome)
+}
+
+func (l *lockedRepository) FinalizeRetirement(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.FinalizeRetirement(ctx, blockMetadataID, claimToken, outcome)
+}
+
+func (l *lockedRepository) ListPendingRetirements(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, eligibilityCutoff time.Time, limit uint64) ([]RetirementManifest, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ListPendingRetirements(ctx, tag, startHeight, endHeight, eligibilityCutoff, limit)
+}
+
+type lockedObjectStore struct {
+	mu    sync.Mutex
+	inner ObjectStore
+}
+
+func (l *lockedObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket string, key string) (RetentionSafetySnapshot, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.InspectObjectRetentionSafety(ctx, bucket, key)
+}
+
+func (l *lockedObjectStore) HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.HeadObject(ctx, bucket, key)
+}
+
+func (l *lockedObjectStore) HeadObjectVersion(ctx context.Context, bucket string, key string, versionID string) (ObjectHead, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.HeadObjectVersion(ctx, bucket, key, versionID)
+}
+
+func (l *lockedObjectStore) ListObjectVersions(ctx context.Context, bucket string, key string) (ObjectVersionTopology, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ListObjectVersions(ctx, bucket, key)
+}
+
+func (l *lockedObjectStore) ReadObjectVersion(ctx context.Context, bucket string, key string, versionID string) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ReadObjectVersion(ctx, bucket, key, versionID)
+}
+
+func (l *lockedObjectStore) ReadObjectVersionRange(ctx context.Context, bucket string, key string, versionID string, offset uint64, length uint64) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ReadObjectVersionRange(ctx, bucket, key, versionID, offset, length)
+}
+
+func (l *lockedObjectStore) DeleteObjectVersion(ctx context.Context, bucket string, key string, versionID string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.DeleteObjectVersion(ctx, bucket, key, versionID)
+}
+
+type lockedPayloadVerifier struct {
+	mu    sync.Mutex
+	inner blockPayloadVerifier
+}
+
+func (l *lockedPayloadVerifier) Verify(ctx context.Context, candidate Candidate) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.Verify(ctx, candidate)
+}
+
+func (l *lockedPayloadVerifier) VerifyConsolidated(ctx context.Context, candidate Candidate) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.VerifyConsolidated(ctx, candidate)
+}
+
+func newRowParallelismFixture(t *testing.T, parallelism int) (*fakeRepo, *fakeStore, *Planner, PlanRequest) {
+	t.Helper()
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	rows := make([]MetadataRow, 0, 6)
+	repo := &fakeRepo{}
+	store := newFakeStore()
+	store.deleteMutates = true
+	for i := range 6 {
+		height := uint64(428058000 + i)
+		cscbKey := "consolidated/first.cscb.zstd"
+		if i >= 3 {
+			cscbKey = "consolidated/second.cscb.zstd"
+		}
+		row := testRow(height, fmt.Sprintf("hash-%d", height), fmt.Sprintf("single-block/%d.zstd", height), cscbKey, now.Add(-8*24*time.Hour))
+		rows = append(rows, row)
+		store.topologies[row.SingleBlockObjectKey] = safeTopology(fmt.Sprintf("v-%d", height), "single-block-etag", 42)
+	}
+	repo.rows = rows
+	cscbHead := cscbObjectHead(1024, 1024)
+	for _, cscbKey := range []string{"consolidated/first.cscb.zstd", "consolidated/second.cscb.zstd"} {
+		store.heads[cscbKey] = cscbHead
+		store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	}
+	digest := strings.Repeat("a", sha256HexLength)
+	planner := NewPlanner(
+		&lockedRepository{inner: repo},
+		&lockedObjectStore{inner: store},
+		WithRowParallelism(parallelism),
+	)
+	sharedVerifier := &lockedPayloadVerifier{inner: &fakePayloadVerifier{digest: digest, consolidatedDigest: digest}}
+	planner.verifierFactory = func() blockPayloadVerifier { return sharedVerifier }
+	req := testRequest(now, true)
+	req.EndHeight = 428059000
+	req.ProductionDeleteEnabled = true
+	return repo, store, planner, req
+}
+
+func TestPlannerPlanAndApply_RowParallelismMatchesSerial(t *testing.T) {
+	require := require.New(t)
+	serialRepo, serialStore, serialPlanner, serialReq := newRowParallelismFixture(t, 1)
+	parallelRepo, parallelStore, parallelPlanner, parallelReq := newRowParallelismFixture(t, 4)
+
+	serialReport, err := serialPlanner.Plan(context.Background(), serialReq)
+	require.NoError(err)
+	parallelReport, err := parallelPlanner.Plan(context.Background(), parallelReq)
+	require.NoError(err)
+	require.Len(parallelReport.Items, len(serialReport.Items))
+	for i := range serialReport.Items {
+		require.Equal(serialReport.Items[i].Height, parallelReport.Items[i].Height)
+		require.Equal(serialReport.Items[i].Action, parallelReport.Items[i].Action)
+		require.Equal(serialReport.Items[i].SkipReason, parallelReport.Items[i].SkipReason)
+	}
+	require.Equal(serialReport.Summary, parallelReport.Summary)
+
+	require.NoError(serialPlanner.Apply(context.Background(), serialReq, serialReport))
+	require.NoError(parallelPlanner.Apply(context.Background(), parallelReq, parallelReport))
+	require.Len(parallelStore.deleted, len(serialStore.deleted))
+	require.Equal(serialReport.Summary, parallelReport.Summary)
+	require.Len(parallelRepo.manifests, len(serialRepo.manifests))
+	for blockMetadataID, serialManifest := range serialRepo.manifests {
+		parallelManifest, ok := parallelRepo.manifests[blockMetadataID]
+		require.True(ok)
+		require.Equal(serialManifest.State, parallelManifest.State)
+		require.Equal(RetirementStateDeletedVerified, parallelManifest.State)
+	}
+	for i := range serialReport.Items {
+		require.Equal(serialReport.Items[i].Action, parallelReport.Items[i].Action)
+		require.Equal(ActionDeletedVerified, parallelReport.Items[i].Action)
+	}
+}
+
+func TestPlannerApply_ThrottlesClaimRenewalsWithinLease(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+
+	require.NoError(planner.Apply(context.Background(), req, report))
+	require.Len(store.deleted, 1)
+	require.Equal(ActionDeletedVerified, report.Items[0].Action)
+	// A freshly claimed row finishes well inside the lease half-life, so no
+	// renewal write is issued at all.
+	require.Zero(repo.renewCalls)
+}
+
+func TestMaybeRenewRetirementClaimRenewsAfterHalfLife(t *testing.T) {
+	require := require.New(t)
+	now := time.Now().UTC()
+	expiresAt := now.Add(RetirementClaimLease)
+	repo := &fakeRepo{
+		manifests: map[int64]RetirementManifest{
+			428058000: {
+				BlockMetadataID: 428058000,
+				State:           RetirementStateDeleting,
+				ClaimToken:      "claim-token",
+				ClaimExpiresAt:  &expiresAt,
+			},
+		},
+	}
+	planner := testPlanner(repo, newFakeStore())
+
+	fresh := &retirementClaim{token: "claim-token", lastRenewedAt: now}
+	require.NoError(planner.maybeRenewRetirementClaim(context.Background(), 428058000, fresh))
+	require.Zero(repo.renewCalls)
+	require.Equal(now, fresh.lastRenewedAt)
+
+	aged := &retirementClaim{token: "claim-token", lastRenewedAt: now.Add(-RetirementClaimLease/retirementClaimRenewalFraction - time.Second)}
+	require.NoError(planner.maybeRenewRetirementClaim(context.Background(), 428058000, aged))
+	require.Equal(1, repo.renewCalls)
+	require.True(aged.lastRenewedAt.After(now.Add(-time.Minute)))
+}
+
+func TestPlannerPrimeRetentionSafetyStartsQuiescenceClocks(t *testing.T) {
+	require := require.New(t)
+	repo := &fakeRepo{}
+	store := newFakeStore()
+	planner := testPlanner(repo, store)
+	keys := []string{
+		"BLOCKCHAIN_SOLANA/consolidated/a.cscb.zstd",
+		"BLOCKCHAIN_SOLANA/consolidated/b.cscb.zstd",
+		"BLOCKCHAIN_SOLANA/consolidated/a.cscb.zstd",
+	}
+
+	primed, err := planner.PrimeRetentionSafety(context.Background(), "priming-bucket", keys)
+	require.NoError(err)
+	require.Equal(2, primed)
+	// One bucket-level inspection covers every primed key.
+	require.Equal(1, store.policyCalls[keys[0]])
+	require.Zero(store.policyCalls[keys[1]])
+	expectedSHA256 := keySHA256("safe:" + keys[0])
+	for _, key := range keys[:2] {
+		observation, ok := repo.safetyObservations["priming-bucket\x00"+key]
+		require.True(ok)
+		require.Equal(expectedSHA256, observation.configurationSHA256)
+	}
+
+	store.policyErrors[keys[0]] = errors.New("bucket policy unreadable")
+	primed, err = planner.PrimeRetentionSafety(context.Background(), "priming-bucket", keys[:1])
+	require.Error(err)
+	require.Zero(primed)
+}
+
+func TestPlannerApply_SurfacesRemainingQuiescenceRetryAfter(t *testing.T) {
+	require := require.New(t)
+	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	key := report.Items[0].ConsolidatedKey
+	elapsed := 5 * time.Minute
+	repo.safetyNow = req.Now
+	repo.safetyObservations = map[string]fakeSafetyObservation{
+		req.Bucket + "\x00" + key: {
+			configurationSHA256: keySHA256("safe:" + key),
+			firstObservedAt:     req.Now.Add(-elapsed),
+		},
+	}
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Empty(store.deleted)
+	require.Equal(SkipCSCBSafetyQuiescenceActive, report.Items[0].SkipReason)
+	require.Equal(RetentionSafetyQuiescencePeriod-elapsed, report.QuiescenceRetryAfter)
 }
 
 func activeSingleBlockTestRow(height uint64, hash string, singleBlockKey string, cscbKey string, validatedAt time.Time) MetadataRow {

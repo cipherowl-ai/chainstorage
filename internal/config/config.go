@@ -359,6 +359,9 @@ type (
 	SingleBlockRetentionWorkflowConfig struct {
 		WorkflowConfig  `mapstructure:",squash"`
 		MaxObjectRanges int `mapstructure:"max_object_ranges" validate:"required,gt=0,lte=250"`
+		// RowParallelism bounds how many rows the retention planner processes
+		// concurrently inside one cohort activity. Zero or one is serial.
+		RowParallelism int `mapstructure:"row_parallelism" validate:"omitempty,gte=0,lte=64"`
 	}
 
 	RosettaConfig struct {
