@@ -39,9 +39,12 @@ const (
 	// expires, so renewing at half-life preserves the fencing guarantee while
 	// removing a database write per destructive step.
 	retirementClaimRenewalFraction = 2
-	maxRetirementRowParallelism    = 64
-	s3MutableNullVersionID         = "null"
-	versionedDeleteMode            = "exact_pinned_versions_and_delete_markers"
+	// maxRetirementRowParallelism also bounds memory: each Apply worker holds
+	// two payload verifiers, and each verifier pins one decompressed CSCB
+	// chunk (tens of MB for Solana), so the cap must fit worker pod limits.
+	maxRetirementRowParallelism = 16
+	s3MutableNullVersionID      = "null"
+	versionedDeleteMode         = "exact_pinned_versions_and_delete_markers"
 )
 
 var unverifiedRetentionSafetySHA256 = keySHA256("unverified-retention-safety-configuration")
@@ -89,6 +92,10 @@ type retentionSafetyCache struct {
 	mu       sync.Mutex
 	now      func() time.Time
 	outcomes map[string]retentionSafetyOutcome
+	// maxQuiescenceRetry keeps the longest quiescence wait ever observed by
+	// this pass, so a later successful re-verification of the same key cannot
+	// erase the retry hint the deferred rows still need.
+	maxQuiescenceRetry time.Duration
 }
 
 func (p *Planner) newRetentionSafetyCache() *retentionSafetyCache {
@@ -254,43 +261,33 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 			deleteIndexes = append(deleteIndexes, i)
 		}
 	}
-	var (
-		firstErrMu sync.Mutex
-		firstErr   error
-	)
-	applyCtx, cancelApply := context.WithCancel(ctx)
-	defer cancelApply()
-	recordApplyError := func(err error) {
-		firstErrMu.Lock()
-		if firstErr == nil {
-			firstErr = err
-		}
-		firstErrMu.Unlock()
-		cancelApply()
-	}
-	var workers sync.WaitGroup
+	group, groupCtx := errgroup.WithContext(ctx)
 	// Contiguous segments keep each worker's verifiers local to height-adjacent
 	// rows. Rows are independent single-block objects; the first error cancels
 	// the pass and every not-yet-started row is marked not-attempted, matching
 	// the serial halt-on-failure contract.
 	for _, segment := range rowSegments(len(deleteIndexes), p.effectiveRowParallelism()) {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
+		group.Go(func() error {
 			preVerifier := p.verifierFactory()
 			postVerifier := p.verifierFactory()
-			for _, itemIndex := range deleteIndexes[segment.start:segment.end] {
-				item := &report.Items[itemIndex]
-				if applyCtx.Err() != nil {
-					if ctxErr := ctx.Err(); ctxErr != nil {
-						recordApplyError(xerrors.Errorf("single-block retirement apply canceled: %w", ctxErr))
-					}
-					item.Action = ActionSkip
-					item.SkipReason = SkipNotAttemptedAfterFailure
-					continue
+			markNotAttempted := func(itemIndexes []int) {
+				for _, itemIndex := range itemIndexes {
+					report.Items[itemIndex].Action = ActionSkip
+					report.Items[itemIndex].SkipReason = SkipNotAttemptedAfterFailure
 				}
-				p.recordHeartbeat(applyCtx, "retirement.apply.row", item.Height)
-				reason, err := p.applyCandidate(applyCtx, req, item, preVerifier, postVerifier, safetyCache)
+			}
+			indexes := deleteIndexes[segment.start:segment.end]
+			for position, itemIndex := range indexes {
+				item := &report.Items[itemIndex]
+				if groupCtx.Err() != nil {
+					markNotAttempted(indexes[position:])
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return xerrors.Errorf("single-block retirement apply canceled: %w", ctxErr)
+					}
+					return nil
+				}
+				p.recordHeartbeat(groupCtx, "retirement.apply.row", item.Height)
+				reason, err := p.applyCandidate(groupCtx, req, item, preVerifier, postVerifier, safetyCache)
 				if reason != "" {
 					if item.RetirementState != RetirementStateDeletedPendingVerification {
 						item.Action = ActionSkip
@@ -299,12 +296,14 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 					item.RetirementOutcome = reason
 				}
 				if err != nil {
-					recordApplyError(err)
+					markNotAttempted(indexes[position+1:])
+					return err
 				}
 			}
-		}()
+			return nil
+		})
 	}
-	workers.Wait()
+	firstErr := group.Wait()
 	report.QuiescenceRetryAfter = safetyCache.maxQuiescenceRetryAfter()
 	report.SafetyGates.CSCBWriteOncePolicyVerified = writeOncePolicyGateVerified(report.Items)
 	report.Summary = summarize(report.Items)
@@ -445,17 +444,41 @@ func (p *Planner) Reconcile(ctx context.Context, req PlanRequest) (*Report, erro
 	return report, firstErr
 }
 
-func (s *planShared) cachedHead(key string) (ObjectHead, bool) {
+// headFor and policyFor hold the shared mutex across the fetch: every row of a
+// cohort shares one CSCB key, so a check-then-fetch cache would stampede up to
+// row-parallelism duplicate bucket calls at pass start. Serializing the
+// singleton loads is the point; per-row topology lookups stay un-serialized.
+func (s *planShared) headFor(
+	ctx context.Context,
+	load func(ctx context.Context) (ObjectHead, error),
+	key string,
+) (ObjectHead, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	head, ok := s.heads[key]
-	return head, ok
+	if head, ok := s.heads[key]; ok {
+		return head, nil
+	}
+	head, err := load(ctx)
+	if err != nil {
+		return ObjectHead{}, err
+	}
+	s.heads[key] = head
+	return head, nil
 }
 
-func (s *planShared) storeHead(key string, head ObjectHead) {
+func (s *planShared) policyFor(
+	ctx context.Context,
+	load func(ctx context.Context) bool,
+	key string,
+) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.heads[key] = head
+	if verified, ok := s.policies[key]; ok {
+		return verified
+	}
+	verified := load(ctx)
+	s.policies[key] = verified
+	return verified
 }
 
 func (s *planShared) cachedTopology(key string) (ObjectVersionTopology, bool) {
@@ -469,19 +492,6 @@ func (s *planShared) storeTopology(key string, topology ObjectVersionTopology) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.topologies[key] = topology
-}
-
-func (s *planShared) cachedPolicy(key string) (bool, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	verified, ok := s.policies[key]
-	return verified, ok
-}
-
-func (s *planShared) storePolicy(key string, verified bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.policies[key] = verified
 }
 
 func (p *Planner) planRow(
@@ -644,15 +654,12 @@ func (p *Planner) planRow(
 	item.SingleBlockETag = version.ETag
 	item.SingleBlockBytes = version.Bytes
 
-	head, ok := shared.cachedHead(shadow.ConsolidatedObjectKey)
-	if !ok {
-		var err error
-		head, err = p.store.HeadObject(ctx, req.Bucket, shadow.ConsolidatedObjectKey)
-		if err != nil {
-			item.SkipReason = SkipObjectInspectionFailed
-			return item
-		}
-		shared.storeHead(shadow.ConsolidatedObjectKey, head)
+	head, err := shared.headFor(ctx, func(ctx context.Context) (ObjectHead, error) {
+		return p.store.HeadObject(ctx, req.Bucket, shadow.ConsolidatedObjectKey)
+	}, shadow.ConsolidatedObjectKey)
+	if err != nil {
+		item.SkipReason = SkipObjectInspectionFailed
+		return item
 	}
 	if !head.Exists || head.DeleteMark || !isImmutableVersionID(head.VersionID) || head.ETag == "" {
 		item.SkipReason = SkipMissingCSCBObject
@@ -676,12 +683,10 @@ func (p *Planner) planRow(
 		return item
 	}
 	item.PayloadSHA256 = payloadSHA256
-	writeOncePolicyVerified, checked := shared.cachedPolicy(shadow.ConsolidatedObjectKey)
-	if !checked {
+	writeOncePolicyVerified := shared.policyFor(ctx, func(ctx context.Context) bool {
 		_, policyErr := p.store.InspectObjectRetentionSafety(ctx, req.Bucket, shadow.ConsolidatedObjectKey)
-		writeOncePolicyVerified = policyErr == nil
-		shared.storePolicy(shadow.ConsolidatedObjectKey, writeOncePolicyVerified)
-	}
+		return policyErr == nil
+	}, shadow.ConsolidatedObjectKey)
 	item.CSCBWriteOncePolicy = writeOncePolicyVerified
 	if !writeOncePolicyVerified {
 		item.SkipReason = SkipCSCBWriteOncePolicyUnverified
@@ -711,15 +716,13 @@ func (p *Planner) applyCandidate(
 	safetyCache *retentionSafetyCache,
 ) (string, error) {
 	item.SingleBlockKeySHA256 = keySHA256(item.Key)
-	// A database-only precheck keeps rows whose canonical, shadow, or
-	// retirement metadata drifted since Plan from ever persisting a manifest or
-	// fencing their single-block path.
-	row, err := p.repo.GetMetadataRow(ctx, item.BlockMetadataID)
-	if err != nil {
-		return SkipMetadataChanged, err
-	}
-	if !candidateMatchesRow(req, *item, row, true) {
-		return SkipMetadataChanged, xerrors.Errorf("canonical, shadow, or retirement metadata changed before retirement: block_metadata_id=%d", item.BlockMetadataID)
+	// PrepareRetirement stamps the irreversible single-block upload fence, so
+	// the row must re-prove its canonical metadata and its live pinned CSCB
+	// object (fresh current + versioned HEADs) before fencing. Only the
+	// payload re-read moves after the claim: the pinned version is immutable,
+	// so the digest check there re-proves the same bytes Plan verified.
+	if _, reason, err := p.revalidateMetadataAndCSCB(ctx, req, *item, true); err != nil {
+		return reason, err
 	}
 	// The manifest pins Plan's verified digest; the post-claim revalidation
 	// below must reproduce it from live S3 before anything is deleted.
@@ -902,16 +905,23 @@ func (p *Planner) verifyCSCBRetentionSafetyCached(
 		err:        err,
 		verifiedAt: cache.now(),
 	}
+	if reason == SkipCSCBSafetyQuiescenceActive && retryAfter > cache.maxQuiescenceRetry {
+		cache.maxQuiescenceRetry = retryAfter
+	}
 	cache.mu.Unlock()
 	return reason, err
 }
 
 // PrimeRetentionSafety records safety observations for upcoming CSCB keys so
 // their quiescence clocks start before any execute attempt reaches them. The
-// verified configuration (bucket policy + lifecycle) is bucket-level, so one
-// inspection covers every key; recording the observation earlier only lengthens
-// the stability window the quiescence gate later requires. Destructive paths
-// still re-inspect live configuration through verifyCSCBRetentionSafety.
+// inspected configuration (bucket policy + lifecycle) is bucket-level, but the
+// pass/fail evaluation matches Resource ARNs and lifecycle prefixes against
+// the specific key, so the keys[0] result is fanned out on the assumption that
+// consolidated keys share one pattern. That assumption is only an
+// optimization: the destructive path re-inspects every key through
+// verifyCSCBRetentionSafety, and a key whose own inspection disagrees records
+// a different configuration digest there, which resets its quiescence clock
+// and fails closed.
 func (p *Planner) PrimeRetentionSafety(ctx context.Context, bucket string, keys []string) (int, error) {
 	if len(keys) == 0 {
 		return 0, nil
@@ -948,13 +958,7 @@ func (p *Planner) PrimeRetentionSafety(ctx context.Context, bucket string, keys 
 func (c *retentionSafetyCache) maxQuiescenceRetryAfter() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	var max time.Duration
-	for _, outcome := range c.outcomes {
-		if outcome.reason == SkipCSCBSafetyQuiescenceActive && outcome.retryAfter > max {
-			max = outcome.retryAfter
-		}
-	}
-	return max
+	return c.maxQuiescenceRetry
 }
 
 func (p *Planner) inspectCSCBRetentionSafety(ctx context.Context, item *Candidate) (string, error) {
@@ -1042,13 +1046,22 @@ func (p *Planner) withRetirementClaim(
 
 // maybeRenewRetirementClaim renews once the claim has consumed half of its
 // lease. The claim cannot be taken over before the full lease expires, so a
-// half-life cadence keeps exclusive ownership provable while dropping the
-// per-operation renewal write.
+// half-life cadence keeps exclusive ownership provable on non-destructive
+// steps; renewRetirementClaim below remains the unconditional fence
+// immediately before a row's destructive sequence.
 func (p *Planner) maybeRenewRetirementClaim(ctx context.Context, blockMetadataID int64, claim *retirementClaim) error {
-	renewedAt := time.Now().UTC()
-	if renewedAt.Sub(claim.lastRenewedAt) < RetirementClaimLease/retirementClaimRenewalFraction {
+	if time.Now().UTC().Sub(claim.lastRenewedAt) < RetirementClaimLease/retirementClaimRenewalFraction {
 		return nil
 	}
+	return p.renewRetirementClaim(ctx, blockMetadataID, claim)
+}
+
+// renewRetirementClaim unconditionally renews and thereby re-asserts exclusive
+// claim ownership against the database. It is the fence before destructive S3
+// work: a claim that was taken over after a long stall fails here instead of
+// deleting unfenced.
+func (p *Planner) renewRetirementClaim(ctx context.Context, blockMetadataID int64, claim *retirementClaim) error {
+	renewedAt := time.Now().UTC()
 	if err := p.repo.RenewRetirementClaim(ctx, blockMetadataID, claim.token, renewedAt, renewedAt.Add(RetirementClaimLease)); err != nil {
 		return err
 	}
@@ -1070,6 +1083,13 @@ func (p *Planner) deletePinnedSingleBlockTopology(
 			"single-block object version topology changed before exact deletion: block_metadata_id=%d",
 			item.BlockMetadataID,
 		)
+	}
+
+	// Unconditional fence: prove exclusive claim ownership against the
+	// database immediately before this row's destructive sequence, regardless
+	// of how recently the claim was renewed.
+	if err := p.renewRetirementClaim(ctx, item.BlockMetadataID, claim); err != nil {
+		return SkipRetirementClaimActive, err
 	}
 
 	remainingVersions := make(map[string]struct{}, len(topology.Versions))
@@ -1169,7 +1189,12 @@ func (p *Planner) finalizeRecordedDeletion(
 	// first read of each CSCB chunk happens post-delete and is then shared by
 	// height-adjacent rows in the same chunk. Every row still re-heads the
 	// pinned CSCB object freshly inside revalidateConsolidatedCandidate, so a
-	// vanished or changed CSCB fails this row even on a cached chunk.
+	// vanished or changed CSCB fails this row even on a cached chunk. Residual
+	// window accepted by this reuse: an S3 data-loss event that keeps the
+	// pinned version's HEAD metadata intact while its bytes become unreadable
+	// would pass later rows in the same chunk against the cached read; content
+	// verification at the exact instant of finalize was never atomic with the
+	// delete either, this widens that instant to at most one chunk of rows.
 	payloadSHA256, reason, err := p.revalidateConsolidatedCandidate(ctx, req, *item, postVerifier)
 	if err != nil {
 		return reason, err

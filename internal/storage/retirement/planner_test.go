@@ -1557,9 +1557,10 @@ func TestPlannerApply_DoesNotFinalizeWhenCSCBChangesAfterSingleBlockDelete(t *te
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	store.headHook = func(key string, call int) ObjectHead {
 		head := store.heads[key]
-		// Call 1 is Plan, call 2 the post-claim revalidation; call 3 is the
-		// post-delete verification that must observe the replaced CSCB.
-		if key == row.PrimaryObjectKey && call >= 3 {
+		// Call 1 is Plan, call 2 the pre-fence revalidation, call 3 the
+		// post-claim revalidation; call 4 is the post-delete verification that
+		// must observe the replaced CSCB.
+		if key == row.PrimaryObjectKey && call >= 4 {
 			head.VersionID = "replacement-version"
 			head.ETag = "replacement-etag"
 		}
@@ -1940,9 +1941,10 @@ func TestPlannerApply_DoesNotDeleteWhenCSCBLifecycleExpirationAppears(t *testing
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
 	store.headHook = func(key string, call int) ObjectHead {
 		head := store.heads[key]
-		// Call 1 is Plan; call 2 is the post-claim revalidation that must
-		// observe the expiration before any version is deleted.
-		if key == row.PrimaryObjectKey && call >= 2 {
+		// Call 1 is Plan, call 2 the pre-fence revalidation; call 3 is the
+		// post-claim revalidation that must observe the expiration before any
+		// version is deleted.
+		if key == row.PrimaryObjectKey && call >= 3 {
 			head.Expiration = `expiry-date="Mon, 20 Jul 2026 00:00:00 GMT", rule-id="expire-current"`
 		}
 		return head
@@ -2311,6 +2313,21 @@ func TestPlannerPlanAndApply_RowParallelismMatchesSerial(t *testing.T) {
 	}
 }
 
+func TestPlannerApply_DoesNotFenceWhenCSCBVanishesAfterPlan(t *testing.T) {
+	require := require.New(t)
+	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)
+	// The pinned CSCB disappears between Plan and Apply. The pre-fence
+	// revalidation must fail the row before PrepareRetirement stamps the
+	// irreversible single-block upload fence.
+	delete(store.heads, row.PrimaryObjectKey)
+
+	err := planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.Empty(store.deleted)
+	require.Empty(repo.manifests)
+	require.Equal(SkipCSCBObjectChanged, report.Items[0].SkipReason)
+}
+
 func TestPlannerApply_ThrottlesClaimRenewalsWithinLease(t *testing.T) {
 	require := require.New(t)
 	_, repo, store, planner, _, req, report := newExecutableTestFixture(t)
@@ -2318,9 +2335,10 @@ func TestPlannerApply_ThrottlesClaimRenewalsWithinLease(t *testing.T) {
 	require.NoError(planner.Apply(context.Background(), req, report))
 	require.Len(store.deleted, 1)
 	require.Equal(ActionDeletedVerified, report.Items[0].Action)
-	// A freshly claimed row finishes well inside the lease half-life, so no
-	// renewal write is issued at all.
-	require.Zero(repo.renewCalls)
+	// A freshly claimed row skips every half-life renewal but still pays
+	// exactly one unconditional ownership fence before its destructive
+	// sequence.
+	require.Equal(1, repo.renewCalls)
 }
 
 func TestMaybeRenewRetirementClaimRenewsAfterHalfLife(t *testing.T) {

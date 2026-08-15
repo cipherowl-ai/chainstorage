@@ -360,8 +360,10 @@ type (
 		WorkflowConfig  `mapstructure:",squash"`
 		MaxObjectRanges int `mapstructure:"max_object_ranges" validate:"required,gt=0,lte=250"`
 		// RowParallelism bounds how many rows the retention planner processes
-		// concurrently inside one cohort activity. Zero or one is serial.
-		RowParallelism int `mapstructure:"row_parallelism" validate:"omitempty,gte=0,lte=64"`
+		// concurrently inside one cohort activity. Zero or one is serial. The
+		// cap also bounds worker memory: each Apply worker pins up to two
+		// decompressed CSCB chunks.
+		RowParallelism int `mapstructure:"row_parallelism" validate:"omitempty,gte=0,lte=16"`
 	}
 
 	RosettaConfig struct {
