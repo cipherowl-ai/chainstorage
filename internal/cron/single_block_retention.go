@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/uber-go/tally/v4"
@@ -40,8 +39,6 @@ type (
 		metaStorage          metastorage.MetaStorage
 		singleBlockRetention *workflow.SingleBlockRetention
 
-		selectorMu      sync.Mutex
-		selector        *retirement.Selector
 		selectorFactory func(ctx context.Context) (*retirement.Selector, error)
 	}
 )
@@ -106,6 +103,12 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 	}
 
 	workflowID := t.autoRetainWorkflowID()
+	// The open-workflow guard is best-effort dedup: workflow visibility is
+	// eventually consistent, so a manual run started moments before this tick
+	// can slip past it. Correctness never depends on exclusivity — per-row
+	// retirement claims and manifest conflict checks serialize destructive
+	// work — the guard only avoids wasted contention, and the fixed auto
+	// workflow ID makes duplicate auto launches impossible.
 	openWorkflowID, open, err := t.openSingleBlockRetentionWorkflow(ctx)
 	if err != nil {
 		return err
@@ -147,9 +150,12 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 		return err
 	}
 	eligibilityCutoff := time.Now().UTC()
-	// One height-ordered cohort probes the due set; its cost is bounded by the
-	// undeleted backlog through the partial retention-due index, never by the
-	// width of the approved range.
+	// The probe's cost is bounded by the undeleted backlog through the partial
+	// retention-due index, never by the width of the approved range. It asks
+	// for a full workflow batch because the selector sorts pending (in-flight)
+	// cohorts by prepared_at ahead of height-ordered due cohorts: anchoring on
+	// the first cohort alone could hide older due work behind a stuck pending
+	// cohort indefinitely.
 	cohorts, hasMore, err := selector.Select(
 		ctx,
 		bucket,
@@ -158,13 +164,14 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 		cronConfig.ApprovedStartHeight,
 		approvedEnd,
 		eligibilityCutoff,
-		1,
+		retirement.MaxRetentionCohortsPerWorkflow,
 	)
 	if err != nil {
 		return xerrors.Errorf("failed to probe due retention cohorts: %w", err)
 	}
 	if len(cohorts) == 0 {
 		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
+		t.metrics.Gauge("probe_backlog_truncated").Update(0)
 		t.logger.Info(
 			"single_block_retention cron found no due cohorts",
 			zap.Uint32("tag", tag),
@@ -176,9 +183,27 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 		)
 		return nil
 	}
+	// Anchor at the minimum start height and age the gauge from the oldest
+	// eligibility across the whole probe set, so neither is masked by
+	// pending-cohort ordering. Stuck pending cohorts are themselves overdue,
+	// so they keep the age alarm honest rather than silencing it.
 	anchor := cohorts[0]
-	oldestDueAge := eligibilityCutoff.Sub(anchor.EligibleAt)
+	oldestEligibleAt := cohorts[0].EligibleAt
+	for _, cohort := range cohorts[1:] {
+		if cohort.StartHeight < anchor.StartHeight {
+			anchor = cohort
+		}
+		if cohort.EligibleAt.Before(oldestEligibleAt) {
+			oldestEligibleAt = cohort.EligibleAt
+		}
+	}
+	oldestDueAge := eligibilityCutoff.Sub(oldestEligibleAt)
 	t.metrics.Gauge("oldest_due_age_seconds").Update(oldestDueAge.Seconds())
+	backlogTruncated := float64(0)
+	if hasMore {
+		backlogTruncated = 1
+	}
+	t.metrics.Gauge("probe_backlog_truncated").Update(backlogTruncated)
 
 	windowBlocks := cronConfig.WindowBlocks
 	if windowBlocks == 0 {
@@ -200,7 +225,10 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 	}
 
 	request := &workflow.SingleBlockRetentionRequest{
-		Tag:                         0,
+		// Pass the resolved tag so the sweep executes under the same tag the
+		// probe and window derivation used, even if a rolling deploy bumps the
+		// stable tag between launch and activity execution.
+		Tag:                         tag,
 		StartHeight:                 windowStart,
 		EndHeight:                   windowEnd,
 		EligibilityCutoff:           eligibilityCutoff,
@@ -338,18 +366,11 @@ func (t *singleBlockRetentionTask) openSingleBlockRetentionWorkflow(ctx context.
 	return "", false, nil
 }
 
+// getSelector resolves per tick instead of caching: the postgres factory rides
+// the process-global connection-pool cache, and re-resolving keeps the cron
+// healthy if the pool is ever closed or recycled underneath it.
 func (t *singleBlockRetentionTask) getSelector(ctx context.Context) (*retirement.Selector, error) {
-	t.selectorMu.Lock()
-	defer t.selectorMu.Unlock()
-	if t.selector != nil {
-		return t.selector, nil
-	}
-	selector, err := t.selectorFactory(ctx)
-	if err != nil {
-		return nil, err
-	}
-	t.selector = selector
-	return t.selector, nil
+	return t.selectorFactory(ctx)
 }
 
 func (t *singleBlockRetentionTask) newPostgresSelector(ctx context.Context) (*retirement.Selector, error) {

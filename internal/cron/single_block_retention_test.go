@@ -154,9 +154,41 @@ func TestSingleBlockRetentionCronLaunchesWindowAnchoredAtOldestDueCohort(t *test
 	require.False(t, request.EligibilityCutoff.IsZero())
 	require.WithinDuration(t, time.Now().UTC(), request.EligibilityCutoff, time.Minute)
 	require.Nil(t, request.Checkpoint)
-	// The probe walks the approved envelope, not an unbounded range.
+	require.Equal(t, cfg.GetEffectiveBlockTag(0), request.Tag)
+	// The probe walks the approved envelope, not an unbounded range, and asks
+	// for a full workflow batch so pending-cohort ordering cannot mask the
+	// oldest due work.
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, cohortRepository.requestedEndHeight)
+	require.Equal(t, retirement.MaxRetentionCohortsPerWorkflow+1, cohortRepository.requestedLimit)
+}
+
+func TestSingleBlockRetentionCronAnchorsBelowPendingCohorts(t *testing.T) {
+	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	// A stuck in-flight cohort near the envelope tail sorts ahead of due
+	// cohorts in the selector merge; the window must still anchor at the
+	// lowest height in the probe set.
+	cohortRepository.pending = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/stuck.cscb.zstd",
+		StartHeight:           436_900_000,
+		EndHeight:             436_901_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-30 * time.Minute),
+	}}
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/oldest.cscb.zstd",
+		StartHeight:           424_000_000,
+		EndHeight:             424_001_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-48 * time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	request := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.Equal(t, uint64(424_000_000), request.StartHeight)
+	require.Equal(t, uint64(425_000_000), request.EndHeight)
 }
 
 func TestSingleBlockRetentionCronClipsWindowToApprovedEnd(t *testing.T) {
