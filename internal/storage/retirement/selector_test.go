@@ -173,3 +173,42 @@ func TestDueRetentionCohortOrdering(t *testing.T) {
 	require.Equal(t, dueRetentionCohortOrderingByHeight, dueRetentionCohortOrdering(100))
 	require.Equal(t, dueRetentionCohortOrderingByDueTime, dueRetentionCohortOrdering(0))
 }
+
+func TestSelectorLookaheadKeysReturnsDistinctKeysBeyondWorkflowCap(t *testing.T) {
+	now := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	repo := &fakeCohortRepository{
+		pending: []RetentionCohort{{
+			ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+			StartHeight:           100,
+			EndHeight:             110,
+			RowCount:              10,
+			EligibleAt:            now,
+		}},
+		due: []RetentionCohort{
+			{
+				ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+				StartHeight:           110,
+				EndHeight:             120,
+				RowCount:              10,
+				EligibleAt:            now,
+			},
+			{
+				ConsolidatedObjectKey: "consolidated/b.cscb.zstd",
+				StartHeight:           200,
+				EndHeight:             210,
+				RowCount:              10,
+				EligibleAt:            now,
+			},
+		},
+	}
+	selector := NewSelector(repo)
+
+	keys, err := selector.LookaheadKeys(context.Background(), selectorTestBucket, "", 2, 0, 0, now, MaxRetentionPrimingLookahead)
+	require.NoError(t, err)
+	require.Equal(t, []string{"consolidated/a.cscb.zstd", "consolidated/b.cscb.zstd"}, keys)
+
+	_, err = selector.LookaheadKeys(context.Background(), selectorTestBucket, "", 2, 0, 0, now, MaxRetentionPrimingLookahead+1)
+	require.Error(t, err)
+	_, err = selector.LookaheadKeys(context.Background(), selectorTestBucket, "", 2, 0, 0, time.Time{}, 10)
+	require.Error(t, err)
+}

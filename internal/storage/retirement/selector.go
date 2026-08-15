@@ -148,3 +148,69 @@ func (s *Selector) Select(
 	}
 	return result, hasMore, nil
 }
+
+// MaxRetentionPrimingLookahead bounds how many upcoming cohorts one Select pass
+// primes safety observations for. Two workflow batches of lookahead lets the
+// next continue-as-new run pass its quiescence gate on the first attempt.
+const MaxRetentionPrimingLookahead = 2 * MaxRetentionCohortsPerWorkflow
+
+// LookaheadKeys returns the distinct consolidated object keys of upcoming
+// retention cohorts, beyond the per-workflow selection cap, so their safety
+// quiescence clocks can be primed ahead of processing. It is advisory only:
+// selection and execution never trust its output.
+func (s *Selector) LookaheadKeys(
+	ctx context.Context,
+	bucket string,
+	storageGeneration string,
+	tag uint32,
+	startHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+	limit int,
+) ([]string, error) {
+	if s == nil || s.repo == nil {
+		return nil, xerrors.New("retention cohort repository is required")
+	}
+	if bucket == "" || eligibilityCutoff.IsZero() {
+		return nil, xerrors.New("retention priming lookahead requires a bucket and eligibility cutoff")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return nil, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+	}
+	if limit <= 0 || limit > MaxRetentionPrimingLookahead {
+		return nil, xerrors.Errorf(
+			"retention priming lookahead limit must be between 1 and %d: %d",
+			MaxRetentionPrimingLookahead,
+			limit,
+		)
+	}
+	pending, due, err := s.repo.ListRetentionCohorts(
+		ctx,
+		bucket,
+		storageGeneration,
+		tag,
+		startHeight,
+		endHeight,
+		eligibilityCutoff,
+		limit,
+	)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to list retention cohorts for priming: %w", err)
+	}
+	keys := make([]string, 0, len(pending)+len(due))
+	seen := make(map[string]struct{}, len(pending)+len(due))
+	for _, cohort := range append(pending, due...) {
+		if cohort.ConsolidatedObjectKey == "" {
+			continue
+		}
+		if _, duplicate := seen[cohort.ConsolidatedObjectKey]; duplicate {
+			continue
+		}
+		seen[cohort.ConsolidatedObjectKey] = struct{}{}
+		keys = append(keys, cohort.ConsolidatedObjectKey)
+		if len(keys) >= limit {
+			break
+		}
+	}
+	return keys, nil
+}

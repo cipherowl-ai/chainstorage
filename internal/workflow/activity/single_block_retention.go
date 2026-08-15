@@ -81,7 +81,11 @@ type (
 	}
 
 	SingleBlockRetentionRangeResult struct {
-		Cohort                   retirement.RetentionCohort        `json:"cohort"`
+		Cohort retirement.RetentionCohort `json:"cohort"`
+		// QuiescenceRetryAfter carries the longest remaining safety-quiescence
+		// wait the planner observed, so a deferred cohort retries when the
+		// window actually elapses instead of a full period later.
+		QuiescenceRetryAfter     time.Duration                     `json:"quiescence_retry_after,omitempty"`
 		ScannedRows              uint64                            `json:"scanned_rows"`
 		PlannedRows              uint64                            `json:"planned_rows"`
 		DeletedVerifiedRows      uint64                            `json:"deleted_verified_rows"`
@@ -139,7 +143,7 @@ func (a *SingleBlockRetention) executeSelect(
 	if err := a.selectActivity.validateRequest(request); err != nil {
 		return nil, err
 	}
-	selector, _, err := a.getComponents(ctx)
+	selector, planner, err := a.getComponents(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -182,11 +186,84 @@ func (a *SingleBlockRetention) executeSelect(
 		zap.Bool("has_more", hasMore),
 		zap.Int("limit", request.Limit),
 	)
+	a.primeRetentionSafety(ctx, selector, planner, primeRetentionSafetyRequest{
+		bucket:            bucket,
+		storageGeneration: storageGeneration,
+		tag:               tag,
+		startHeight:       request.StartHeight,
+		endHeight:         request.EndHeight,
+		eligibilityCutoff: eligibilityCutoff,
+		limit:             request.Limit,
+	})
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.completed", tag, len(cohorts))
 	return &SingleBlockRetentionSelectResponse{
 		Cohorts: cohorts,
 		HasMore: hasMore,
 	}, nil
+}
+
+type primeRetentionSafetyRequest struct {
+	bucket            string
+	storageGeneration string
+	tag               uint32
+	startHeight       uint64
+	endHeight         uint64
+	eligibilityCutoff time.Time
+	limit             int
+}
+
+// retentionPrimingLookaheadWindow extends the priming cutoff beyond the frozen
+// selection cutoff so cohorts becoming due shortly after this run also have
+// their quiescence clocks running before they are first selected.
+const retentionPrimingLookaheadWindow = 2 * time.Hour
+
+// primeRetentionSafety starts the safety-quiescence clocks for the cohorts this
+// run and its successors will process. Priming is advisory: failures are logged
+// and never fail the selection, and execution still re-verifies live safety
+// configuration before deleting.
+func (a *SingleBlockRetention) primeRetentionSafety(
+	ctx context.Context,
+	selector *retirement.Selector,
+	planner *retirement.Planner,
+	request primeRetentionSafetyRequest,
+) {
+	logger := a.selectActivity.getLogger(ctx)
+	lookahead := request.limit * 2
+	if lookahead > retirement.MaxRetentionPrimingLookahead {
+		lookahead = retirement.MaxRetentionPrimingLookahead
+	}
+	if lookahead <= 0 {
+		return
+	}
+	keys, err := selector.LookaheadKeys(
+		ctx,
+		request.bucket,
+		request.storageGeneration,
+		request.tag,
+		request.startHeight,
+		request.endHeight,
+		request.eligibilityCutoff.Add(retentionPrimingLookaheadWindow),
+		lookahead,
+	)
+	if err != nil {
+		logger.Warn("failed to look ahead for retention safety priming", zap.Error(err))
+		return
+	}
+	primed, err := planner.PrimeRetentionSafety(ctx, request.bucket, keys)
+	if err != nil {
+		logger.Warn(
+			"failed to prime retention safety observations",
+			zap.Int("primed", primed),
+			zap.Int("keys", len(keys)),
+			zap.Error(err),
+		)
+		return
+	}
+	logger.Info(
+		"primed retention safety observations",
+		zap.Int("primed", primed),
+		zap.Int("keys", len(keys)),
+	)
 }
 
 func (a *SingleBlockRetention) executeProcess(
@@ -333,6 +410,7 @@ func (a *SingleBlockRetention) getComponents(
 		retirement.WithHeartbeat(func(ctx context.Context, details ...any) {
 			sdkactivity.RecordHeartbeat(ctx, details...)
 		}),
+		retirement.WithRowParallelism(a.config.Workflows.SingleBlockRetention.RowParallelism),
 	)
 	return a.selector, a.planner, nil
 }
@@ -490,6 +568,7 @@ func summarizeSingleBlockRetentionReport(
 	}
 	result := &SingleBlockRetentionRangeResult{
 		Cohort:                   cohort,
+		QuiescenceRetryAfter:     report.QuiescenceRetryAfter,
 		ScannedRows:              uint64(len(report.Items)),
 		VerifiedThroughExclusive: cohort.StartHeight,
 	}
@@ -658,6 +737,10 @@ func isDeferredRetentionReason(reason string) bool {
 	}
 }
 
+// retentionQuiescenceRetryGrace pads a remaining-quiescence retry so the retry
+// attempt lands after the window has actually closed.
+const retentionQuiescenceRetryGrace = 15 * time.Second
+
 func setSingleBlockRetentionRetry(result *SingleBlockRetentionRangeResult) bool {
 	if result == nil || result.FailedRows != 0 || result.DeferredRows == 0 || len(result.Blockers) != 1 {
 		return false
@@ -665,6 +748,10 @@ func setSingleBlockRetentionRetry(result *SingleBlockRetentionRangeResult) bool 
 	switch result.Blockers[0].Reason {
 	case retirement.SkipCSCBSafetyQuiescenceActive:
 		result.RetryAfter = retirement.RetentionSafetyQuiescencePeriod
+		if remaining := result.QuiescenceRetryAfter; remaining > 0 &&
+			remaining+retentionQuiescenceRetryGrace < result.RetryAfter {
+			result.RetryAfter = remaining + retentionQuiescenceRetryGrace
+		}
 	case retirement.SkipRetirementClaimActive:
 		result.RetryAfter = retirement.RetirementClaimLease
 	default:
