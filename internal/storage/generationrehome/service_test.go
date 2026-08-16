@@ -2,6 +2,7 @@ package generationrehome
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -13,10 +14,12 @@ type fakeRepository struct {
 	inspectErr    error
 	rehomeErr     error
 	alreadyTarget bool
+	inspectCalls  int
 	rehomeCalls   []RehomeRequest
 }
 
 func (r *fakeRepository) Inspect(ctx context.Context, tag uint32, objectKey string, targetGeneration string, evidenceSHA256 string) (Inspection, error) {
+	r.inspectCalls++
 	return r.inspection, r.inspectErr
 }
 
@@ -26,7 +29,12 @@ func (r *fakeRepository) Rehome(ctx context.Context, req RehomeRequest) (bool, e
 }
 
 type fakeObjectStore struct {
-	heads map[string]ObjectHead
+	heads              map[string]ObjectHead
+	retentionSafetyErr error
+}
+
+func (s *fakeObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket string, key string) error {
+	return s.retentionSafetyErr
 }
 
 func (s *fakeObjectStore) HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error) {
@@ -71,6 +79,21 @@ func TestServiceRunRejectsApprovalMismatchBeforeExternalInspection(t *testing.T)
 	_, err := service.Run(context.Background(), req, []Object{object})
 	require.ErrorContains(t, err, "approval row count mismatch")
 	require.Empty(t, repository.rehomeCalls)
+}
+
+func TestServiceRunRejectsUnsafeDestinationBeforeMetadataInspection(t *testing.T) {
+	object := testObject()
+	repository := &fakeRepository{inspection: legacyInspection(object)}
+	store := testObjectStore(object)
+	store.retentionSafetyErr = errors.New("destination bucket is mutable")
+	service := NewService(repository, store)
+
+	report, err := service.Run(context.Background(), testRequest(object, true), []Object{object})
+	require.ErrorContains(t, err, "destination retention safety verification failed")
+	require.ErrorContains(t, err, "destination bucket is mutable")
+	require.Zero(t, repository.inspectCalls)
+	require.Empty(t, repository.rehomeCalls)
+	require.Equal(t, ActionFailed, report.Items[0].Action)
 }
 
 func TestServiceRunRejectsMixedGenerationCohort(t *testing.T) {

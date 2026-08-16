@@ -111,6 +111,7 @@ type (
 	}
 
 	ObjectStore interface {
+		InspectObjectRetentionSafety(ctx context.Context, bucket string, key string) error
 		HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error)
 		HeadObjectVersion(ctx context.Context, bucket string, key string, versionID string) (ObjectHead, error)
 	}

@@ -263,6 +263,9 @@ func (s *Service) verifyObjectCopy(ctx context.Context, req Request, object Obje
 			)
 		}
 	}
+	if err := s.store.InspectObjectRetentionSafety(ctx, req.DestinationBucket, object.ObjectKey); err != nil {
+		return xerrors.Errorf("destination retention safety verification failed: %w", err)
+	}
 	return nil
 }
 

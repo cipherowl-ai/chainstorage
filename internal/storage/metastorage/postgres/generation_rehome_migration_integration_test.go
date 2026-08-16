@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepairlock"
 	"github.com/coinbase/chainstorage/internal/storage/generationrehome"
 )
 
@@ -142,6 +143,42 @@ func TestIntegrationFencedStorageGenerationRehomeGuard(t *testing.T) {
 		})
 		require.NoError(t, err)
 		require.True(t, alreadyTarget)
+	})
+
+	t.Run("repository waits for repair tag lock before object lock", func(t *testing.T) {
+		tx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		_, tag, height, objectKey := insertFencedRehomeFixture(t, ctx, tx, uint64(time.Now().UnixNano())+3)
+		require.NoError(t, tx.Commit())
+
+		ledger := fmt.Sprintf(`{"type":"audit_object","object_key":%q,"min_height":%d,"end_height_exclusive":%d,"referenced_rows":1,"canonical_rows":1,"valid_placement_rows":1,"consistent_shadow_rows":1,"fenced_rows":1,"deleted_retention_rows":1,"copy_eligible":true}
+{"type":"copy_verified","object_key":%q,"source_size":128,"source_etag":"source-etag","source_version_id":"source-version","destination_size":128,"destination_etag":"destination-etag","destination_version_id":"destination-version","verification":"complete"}
+`, objectKey, height, height+1, objectKey)
+		objects, err := generationrehome.LoadFencedCopyLedger(strings.NewReader(ledger))
+		require.NoError(t, err)
+		require.Len(t, objects, 1)
+		req := generationrehome.RehomeRequest{
+			Tag:               tag,
+			SourceBucket:      "legacy-bucket",
+			DestinationBucket: "v2-bucket",
+			TargetGeneration:  "v2",
+			Object:            objects[0],
+		}
+
+		lockTx, err := db.BeginTx(ctx, nil)
+		require.NoError(t, err)
+		defer func() { _ = lockTx.Rollback() }()
+		require.NoError(t, cscbrepairlock.AcquireTag(ctx, lockTx, tag))
+
+		blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		defer cancel()
+		_, err = generationrehome.NewPostgresRepository(db).Rehome(blockedCtx, req)
+		require.ErrorContains(t, err, "failed to acquire CSCB repair tag lock")
+		require.NoError(t, lockTx.Rollback())
+
+		alreadyTarget, err := generationrehome.NewPostgresRepository(db).Rehome(ctx, req)
+		require.NoError(t, err)
+		require.False(t, alreadyTarget)
 	})
 }
 

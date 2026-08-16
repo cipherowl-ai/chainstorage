@@ -11,6 +11,7 @@ import (
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/s3"
+	"github.com/coinbase/chainstorage/internal/storage/retirement"
 )
 
 type S3ObjectStore struct {
@@ -19,6 +20,14 @@ type S3ObjectStore struct {
 
 func NewS3ObjectStore(client s3.Client) *S3ObjectStore {
 	return &S3ObjectStore{client: client}
+}
+
+func (s *S3ObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket string, key string) error {
+	if s == nil {
+		return xerrors.New("s3 client is required to verify destination retention safety")
+	}
+	_, err := retirement.NewS3ObjectStore(s.client).InspectObjectRetentionSafety(ctx, bucket, key)
+	return err
 }
 
 func (s *S3ObjectStore) HeadObject(ctx context.Context, bucket string, key string) (ObjectHead, error) {

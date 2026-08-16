@@ -8,6 +8,7 @@ import (
 
 	"golang.org/x/xerrors"
 
+	"github.com/coinbase/chainstorage/internal/storage/cscbrepairlock"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -57,6 +58,9 @@ func (r *PostgresRepository) Rehome(ctx context.Context, req RehomeRequest) (boo
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := cscbrepairlock.AcquireTag(ctx, tx, req.Tag); err != nil {
+		return false, err
+	}
 	if _, err := tx.ExecContext(
 		ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1, 1))`,
