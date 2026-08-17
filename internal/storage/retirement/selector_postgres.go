@@ -116,7 +116,7 @@ func listPendingRetentionCohorts(
 	if limit <= 0 {
 		return nil, nil
 	}
-	const query = `
+	query := `
 		SELECT
 			retention.consolidated_object_key_main,
 			MIN(retention.height),
@@ -133,23 +133,20 @@ func listPendingRetentionCohorts(
 			AND metadata.tag = retention.tag
 			AND metadata.height = retention.height
 		WHERE retention.tag = $1
-			AND retention.state IN ($2, $3, $4)
-			AND ($6::BIGINT = 0 OR (retention.height >= $5 AND retention.height < $6))
-			AND shadow.single_block_delete_after <= $7
-			AND retention.bucket = $9
-			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND retention.state IN (` + pendingRetirementStatesSQL + `)
+			AND ($3::BIGINT = 0 OR (retention.height >= $2 AND retention.height < $3))
+			AND shadow.single_block_delete_after <= $4
+			AND retention.bucket = $6
+			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
 		GROUP BY retention.consolidated_object_key_main
 		ORDER BY MIN(retention.prepared_at), MIN(retention.height), retention.consolidated_object_key_main
-		LIMIT $8`
+		LIMIT $5`
 	rows, err := db.QueryContext(
 		ctx,
 		query,
 		tag,
-		RetirementStateEligible,
-		RetirementStateDeleting,
-		RetirementStateDeletedPendingVerification,
 		startHeight,
 		endHeight,
 		eligibilityCutoff,
@@ -232,7 +229,7 @@ func listDueRetentionCohorts(
 	if limit <= 0 {
 		return nil, nil
 	}
-	const queryTemplate = `
+	queryTemplate := `
 		WITH due_keys AS (
 			SELECT
 				shadow.consolidated_object_key_main,
@@ -258,16 +255,16 @@ func listDueRetentionCohorts(
 				AND due_metadata.skipped = FALSE
 				AND due_metadata.object_format = $4
 				AND due_metadata.object_key_main = shadow.consolidated_object_key_main
-				AND due_metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-				AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+				AND due_metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+				AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 				AND NOT EXISTS (
 					SELECT 1
 					FROM block_single_block_retention retention
 					WHERE retention.block_metadata_id = shadow.block_metadata_id
 						AND retention.tag = shadow.tag
-						AND retention.state IN ($7, $8, $9)
+						AND retention.state IN (` + pendingRetirementStatesSQL + `)
 				)
 			GROUP BY shadow.consolidated_object_key_main
 		)
@@ -296,9 +293,9 @@ func listDueRetentionCohorts(
 			AND shadow.single_block_object_key_main <> ''
 			AND metadata.skipped = FALSE
 			AND metadata.object_format = $4
-			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
-			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($10, '')
+			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
 			AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 			AND metadata.object_key_main = shadow.consolidated_object_key_main
 			AND NOT EXISTS (
@@ -306,7 +303,7 @@ func listDueRetentionCohorts(
 				FROM block_single_block_retention retention
 				WHERE retention.block_metadata_id = shadow.block_metadata_id
 					AND retention.tag = shadow.tag
-					AND retention.state IN ($7, $8, $9)
+					AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			)
 			AND NOT EXISTS (
 				SELECT 1
@@ -332,9 +329,6 @@ func listDueRetentionCohorts(
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		limit,
 		eligibilityCutoff,
-		RetirementStateEligible,
-		RetirementStateDeleting,
-		RetirementStateDeletedPendingVerification,
 		storageGeneration,
 	)
 	if err != nil {

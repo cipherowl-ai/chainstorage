@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/lib/pq"
@@ -69,6 +71,40 @@ const metadataRowColumns = `
 	retirement.last_attempt_at,
 	retirement.deleted_at,
 	retirement.verified_at`
+
+// pendingRetirementStatesSQL renders the pending retirement states as SQL
+// literals.
+//
+// idx_block_single_block_retention_pending is a partial index whose predicate
+// lists these exact states. Postgres can only use it when the query supplies
+// the states as literals: it cannot prove that a parameterized `state IN
+// ($n, ...)` implies the index predicate, so bind parameters silently degrade
+// every pending lookup to a full scan of the manifest table. That table only
+// grows (finalized manifests are retained as audit records), so the regression
+// scales with history — it timed out retention activities in production once
+// the table reached ~520k rows (INF-1330).
+var pendingRetirementStatesSQL = renderRetirementStateLiterals(
+	RetirementStateEligible,
+	RetirementStateDeleting,
+	RetirementStateDeletedPendingVerification,
+)
+
+var retirementStateLiteralPattern = regexp.MustCompile(`^[a-z][a-z_]*$`)
+
+// renderRetirementStateLiterals builds the quoted, comma-separated literal list
+// embedded in the queries above. The states are compile-time constants and are
+// never caller input; the pattern guard exists so that a future state name
+// needing escaping fails loudly at startup instead of producing malformed SQL.
+func renderRetirementStateLiterals(states ...string) string {
+	quoted := make([]string, 0, len(states))
+	for _, state := range states {
+		if !retirementStateLiteralPattern.MatchString(state) {
+			panic(fmt.Sprintf("retirement state %q cannot be inlined as a SQL literal", state))
+		}
+		quoted = append(quoted, "'"+state+"'")
+	}
+	return strings.Join(quoted, ", ")
+}
 
 const metadataRowFrom = `
 	FROM canonical_blocks cb
@@ -864,7 +900,7 @@ func (r *PostgresRepository) ListPendingRetirements(
 	if limit == 0 {
 		limit = endHeight - startHeight
 	}
-	const query = `
+	query := `
 		SELECT
 			retention.block_metadata_id, retention.tag, retention.height, COALESCE(retention.hash, ''),
 			retention.state, retention.bucket,
@@ -886,20 +922,17 @@ func (r *PostgresRepository) ListPendingRetirements(
 		WHERE retention.tag = $1
 			AND retention.height >= $2
 			AND retention.height < $3
-			AND retention.state IN ($4, $5, $6)
+			AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			AND shadow.single_block_delete_after IS NOT NULL
-			AND shadow.single_block_delete_after <= $7
+			AND shadow.single_block_delete_after <= $4
 		ORDER BY retention.height ASC
-		LIMIT $8`
+		LIMIT $5`
 	rows, err := r.db.QueryContext(
 		ctx,
 		query,
 		tag,
 		startHeight,
 		endHeight,
-		RetirementStateEligible,
-		RetirementStateDeleting,
-		RetirementStateDeletedPendingVerification,
 		eligibilityCutoff,
 		limit,
 	)
