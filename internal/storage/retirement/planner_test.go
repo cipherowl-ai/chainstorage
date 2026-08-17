@@ -14,6 +14,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -2315,61 +2316,61 @@ func TestPlannerPlanAndApply_RowParallelismMatchesSerial(t *testing.T) {
 
 // TestBudgetedRowParallelismUsesRealSolanaChunkSize pins the sizing against
 // the production numbers behind INF-1330: a Solana 1000-block CSCB is ~11.1 GB
-// uncompressed over 100 chunks, so one chunk is ~111 MB and a configured
-// parallelism of 8 pinned ~1.8 GB in Apply, OOM-killing the worker.
+// uncompressed over 100 chunks, so the largest chunk is ~111 MB and a
+// configured parallelism of 8 pinned ~1.8 GB in Apply, OOM-killing the worker.
 func TestBudgetedRowParallelismUsesRealSolanaChunkSize(t *testing.T) {
 	require := require.New(t)
-	const solanaCSCBUncompressed = uint64(11107751767)
-	req := PlanRequest{
-		StartHeight:            439116000,
-		EndHeight:              439117000,
-		CompressionChunkBlocks: 10,
-		RowMemoryBudgetBytes:   uint64(1) << 30,
-	}
-	chunkBytes := cohortChunkBytes(req, solanaCSCBUncompressed)
-	require.InDelta(111_000_000, chunkBytes, 1_000_000, "one Solana chunk should be ~111 MB")
-
+	const solanaChunkBytes = uint64(111_077_517)
+	req := PlanRequest{RowMemoryBudgetBytes: uint64(1) << 30}
 	planner := &Planner{rowParallelism: 8}
+
 	// Apply pins two chunks per worker, so a 1 GiB budget affords 4 workers.
-	require.Equal(4, planner.budgetedRowParallelism(req, chunkBytes, 2))
+	require.Equal(4, planner.budgetedRowParallelism(req, solanaChunkBytes, 2))
 	// Plan pins one chunk per worker, so the same budget affords more, still
 	// clamped by the configured value.
-	require.Equal(8, planner.budgetedRowParallelism(req, chunkBytes, 1))
+	require.Equal(8, planner.budgetedRowParallelism(req, solanaChunkBytes, 1))
 	// A budget smaller than a single worker still yields a usable worker.
 	tiny := req
 	tiny.RowMemoryBudgetBytes = 1024
-	require.Equal(1, planner.budgetedRowParallelism(tiny, chunkBytes, 2))
+	require.Equal(1, planner.budgetedRowParallelism(tiny, solanaChunkBytes, 2))
 	// An unset budget must not disable the guard.
 	unset := req
 	unset.RowMemoryBudgetBytes = 0
-	require.Equal(4, planner.budgetedRowParallelism(unset, chunkBytes, 2))
-	// Unknown chunk geometry leaves the configured value untouched.
-	require.Equal(8, planner.budgetedRowParallelism(req, 0, 2))
-	require.Zero(cohortChunkBytes(PlanRequest{StartHeight: 1, EndHeight: 2}, solanaCSCBUncompressed))
+	require.Equal(4, planner.budgetedRowParallelism(unset, solanaChunkBytes, 2))
+	// A serial planner is never widened by sizing.
+	require.Equal(1, (&Planner{rowParallelism: 1}).budgetedRowParallelism(req, solanaChunkBytes, 2))
 }
 
-func TestPlanRespectsRowMemoryBudget(t *testing.T) {
+// TestBudgetedRowParallelismFailsClosed covers the inputs that must never
+// widen a pass: unmeasurable chunks, and a declared length large enough to
+// overflow the per-worker product (which at the 2^63 boundary with two
+// verifiers would otherwise divide by zero).
+func TestBudgetedRowParallelismFailsClosed(t *testing.T) {
 	require := require.New(t)
-	_, store, planner, req := newRowParallelismFixture(t, 8)
-	// Declare a chunk geometry whose Apply footprint only affords one worker.
-	req.CompressionChunkBlocks = 10
-	req.RowMemoryBudgetBytes = 64 << 20
-	head := store.heads["consolidated/first.cscb.zstd"]
-	head.Metadata = cscbObjectMetadata("11107751767", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)
-	store.heads["consolidated/first.cscb.zstd"] = head
-	store.heads["consolidated/second.cscb.zstd"] = head
+	req := PlanRequest{RowMemoryBudgetBytes: uint64(1) << 30}
+	planner := &Planner{rowParallelism: 8}
 
-	chunkBytes := cohortChunkBytes(req, 11107751767)
-	require.Positive(chunkBytes)
-	require.Equal(1, planner.budgetedRowParallelism(req, chunkBytes, 2))
+	require.Equal(1, planner.budgetedRowParallelism(req, 0, 2), "unmeasurable chunk must reduce to serial")
+	require.Equal(1, planner.budgetedRowParallelism(req, 1<<20, 0), "invalid verifier count must reduce to serial")
+	require.Equal(1, planner.budgetedRowParallelism(req, uint64(1)<<63, 2), "overflow must reduce to serial")
+	require.Equal(1, planner.budgetedRowParallelism(req, ^uint64(0), 2), "overflow must reduce to serial")
+}
 
-	// The plan still produces a complete, correct report at the reduced width.
-	report, err := planner.Plan(context.Background(), req)
-	require.NoError(err)
-	require.Len(report.Items, 6)
-	for _, item := range report.Items {
-		require.Equal(ActionDeleteObjectVersion, item.Action)
-	}
+// TestMaxChunkUncompressedBytesUsesLargestChunk proves sizing bounds the worst
+// chunk rather than an average: chunk payloads are uneven, and an immutable
+// object may have been encoded under different chunk settings than the current
+// configuration.
+func TestMaxChunkUncompressedBytesUsesLargestChunk(t *testing.T) {
+	require := require.New(t)
+	require.Zero(maxChunkUncompressedBytes(nil))
+	require.Zero(maxChunkUncompressedBytes(&cscb.Index{}))
+	require.Equal(uint64(900), maxChunkUncompressedBytes(&cscb.Index{
+		Chunks: []cscb.ChunkDescriptor{
+			{UncompressedLength: 100},
+			{UncompressedLength: 900},
+			{UncompressedLength: 300},
+		},
+	}), "an average would report 433 and under-bound the peak")
 }
 
 func TestPlannerApply_DoesNotFenceWhenCSCBVanishesAfterPlan(t *testing.T) {

@@ -255,15 +255,20 @@ func (p *Planner) configuredRowParallelism() int {
 // Apply — enough to OOM-kill a 6 G worker mid-activity, which surfaces only as
 // an opaque Temporal heartbeat timeout (INF-1330).
 //
-// The size is knowable before any row runs: the CSCB object declares its
-// uncompressed length, and the consolidation config fixes blocks per chunk, so
-// chunk bytes = uncompressed length x chunk blocks / cohort blocks. Deriving
-// the worker count from that means a chain with larger blocks quietly runs
-// fewer workers instead of dying.
+// The size is knowable before any row runs: the pinned CSCB index records each
+// chunk's decompressed length, so the largest of those is the true ceiling on
+// what one verifier's chunk cache can hold. Deriving the worker count from that
+// means a chain with larger blocks quietly runs fewer workers instead of dying.
+//
+// chunkBytes of 0 means sizing failed, and this fails closed to serial: an
+// unmeasurable cohort must not run at a width nobody has bounded.
 func (p *Planner) budgetedRowParallelism(req PlanRequest, chunkBytes uint64, verifiersPerWorker int) int {
 	configured := p.configuredRowParallelism()
-	if configured <= 1 || chunkBytes == 0 || verifiersPerWorker <= 0 {
+	if configured <= 1 {
 		return configured
+	}
+	if chunkBytes == 0 || verifiersPerWorker <= 0 {
+		return 1
 	}
 	// The budget defaults rather than disabling: an operator who raises
 	// parallelism without also setting a budget must still not be able to
@@ -272,7 +277,13 @@ func (p *Planner) budgetedRowParallelism(req PlanRequest, chunkBytes uint64, ver
 	if budget == 0 {
 		budget = defaultRetirementRowMemoryBudgetBytes
 	}
+	// A parseable but absurd declared length must not wrap this product into a
+	// small number (or zero, which would divide by zero) and over-admit
+	// workers, so overflow fails closed too.
 	perWorker := chunkBytes * uint64(verifiersPerWorker)
+	if perWorker/uint64(verifiersPerWorker) != chunkBytes {
+		return 1
+	}
 	affordable := budget / perWorker
 	if affordable < 1 {
 		return 1
@@ -283,25 +294,11 @@ func (p *Planner) budgetedRowParallelism(req PlanRequest, chunkBytes uint64, ver
 	return configured
 }
 
-// cohortChunkBytes estimates one decompressed CSCB chunk for this cohort from
-// the object's declared uncompressed length. It returns 0 when the inputs are
-// unavailable, which leaves the configured parallelism unchanged.
-func cohortChunkBytes(req PlanRequest, uncompressedLength uint64) uint64 {
-	cohortBlocks := req.EndHeight - req.StartHeight
-	if uncompressedLength == 0 || cohortBlocks == 0 || req.CompressionChunkBlocks == 0 {
-		return 0
-	}
-	chunkBlocks := req.CompressionChunkBlocks
-	if chunkBlocks > cohortBlocks {
-		chunkBlocks = cohortBlocks
-	}
-	return uncompressedLength / cohortBlocks * chunkBlocks
-}
-
-// cohortConsolidatedChunkBytes heads the cohort's CSCB object once, through the
-// shared plan cache so the per-row path reuses it, and derives the chunk size.
-// Any failure returns 0 and leaves parallelism at its configured value; the
-// per-row path re-heads and fails those rows closed on its own terms.
+// cohortConsolidatedChunkBytes reads the cohort's pinned CSCB index once and
+// returns its largest decompressed chunk. The HEAD goes through the shared plan
+// cache so the per-row path reuses it. Any failure returns 0, which callers
+// treat as "unmeasurable" and reduce to serial; the per-row path re-heads and
+// fails those rows closed on its own terms.
 func (p *Planner) cohortConsolidatedChunkBytes(
 	ctx context.Context,
 	req PlanRequest,
@@ -314,14 +311,17 @@ func (p *Planner) cohortConsolidatedChunkBytes(
 	head, err := shared.headFor(ctx, func(ctx context.Context) (ObjectHead, error) {
 		return p.store.HeadObject(ctx, req.Bucket, consolidatedKey)
 	}, consolidatedKey)
-	if err != nil || !head.Exists {
+	if err != nil || !head.Exists || !isImmutableVersionID(head.VersionID) {
 		return 0
 	}
-	logicalBytes, ok := cscbLogicalPayloadBytes(head)
-	if !ok {
+	if _, ok := cscbLogicalPayloadBytes(head); !ok {
 		return 0
 	}
-	return cohortChunkBytes(req, logicalBytes)
+	index, err := readCSCBIndex(ctx, p.store, req.Bucket, consolidatedKey, head.VersionID)
+	if err != nil {
+		return 0
+	}
+	return maxChunkUncompressedBytes(index)
 }
 
 // firstConsolidatedKey returns the cohort's CSCB key from the first row that
