@@ -453,6 +453,9 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
 		SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
 		FallbackErrorCount:          request.FallbackErrorCount,
+		// The budget lets the planner lower row parallelism on chains whose
+		// decompressed CSCB chunks are large.
+		RowMemoryBudgetBytes: a.config.Workflows.SingleBlockRetention.RowMemoryBudgetBytes,
 		// The approval is the operator's assertion passed through unchanged.
 		// The planner independently re-verifies the actual chain and requires
 		// the cohort under deletion to be contained by this immutable envelope.

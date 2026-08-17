@@ -167,6 +167,11 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackErrorCount          uint64
 		Approval                    Approval
+		// RowMemoryBudgetBytes caps the decompressed CSCB chunk working set a
+		// cohort may pin. The planner lowers row parallelism until the
+		// cohort's largest chunk fits. Zero applies the package default
+		// rather than disabling the bound.
+		RowMemoryBudgetBytes uint64
 	}
 
 	Approval struct {

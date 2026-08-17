@@ -204,14 +204,25 @@ func (v *payloadVerifier) readIndex(ctx context.Context, candidate Candidate) (*
 	if index, ok := v.indexes[cacheKey]; ok {
 		return index, nil
 	}
-	first, err := v.store.ReadObjectVersionRange(
-		ctx,
-		candidate.Bucket,
-		candidate.ConsolidatedKey,
-		candidate.CSCBVersionID,
-		0,
-		retirementInitialIndexReadSize,
-	)
+	index, err := readCSCBIndex(ctx, v.store, candidate.Bucket, candidate.ConsolidatedKey, candidate.CSCBVersionID)
+	if err != nil {
+		return nil, err
+	}
+	v.indexes[cacheKey] = index
+	return index, nil
+}
+
+// readCSCBIndex reads and parses a pinned CSCB object's index envelope. It is
+// shared by payload verification and by the planner's memory sizing so both
+// observe exactly the same index bytes.
+func readCSCBIndex(
+	ctx context.Context,
+	store ObjectStore,
+	bucket string,
+	key string,
+	versionID string,
+) (*cscb.Index, error) {
+	first, err := store.ReadObjectVersionRange(ctx, bucket, key, versionID, 0, retirementInitialIndexReadSize)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to read pinned CSCB index prefix: %w", err)
 	}
@@ -221,11 +232,11 @@ func (v *payloadVerifier) readIndex(ctx context.Context, candidate Candidate) (*
 	}
 	data := first
 	if required > uint64(len(first)) {
-		remaining, err := v.store.ReadObjectVersionRange(
+		remaining, err := store.ReadObjectVersionRange(
 			ctx,
-			candidate.Bucket,
-			candidate.ConsolidatedKey,
-			candidate.CSCBVersionID,
+			bucket,
+			key,
+			versionID,
 			uint64(len(first)),
 			required-uint64(len(first)),
 		)
@@ -236,12 +247,25 @@ func (v *payloadVerifier) readIndex(ctx context.Context, candidate Candidate) (*
 		data = append(data, first...)
 		data = append(data, remaining...)
 	}
-	index, err := cscb.ParseIndex(data)
-	if err != nil {
-		return nil, err
+	return cscb.ParseIndex(data)
+}
+
+// maxChunkUncompressedBytes returns the largest decompressed chunk the index
+// describes. Chunk payloads are uneven and an immutable object may have been
+// encoded under different chunk settings than the current configuration, so
+// this — not an average derived from the object's total length — is the bound
+// a verifier's chunk cache can actually reach.
+func maxChunkUncompressedBytes(index *cscb.Index) uint64 {
+	if index == nil {
+		return 0
 	}
-	v.indexes[cacheKey] = index
-	return index, nil
+	var max uint64
+	for i := range index.Chunks {
+		if index.Chunks[i].UncompressedLength > max {
+			max = index.Chunks[i].UncompressedLength
+		}
+	}
+	return max
 }
 
 func (v *payloadVerifier) readChunk(

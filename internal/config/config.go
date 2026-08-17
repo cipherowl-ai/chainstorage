@@ -364,6 +364,11 @@ type (
 		// cap also bounds worker memory: each Apply worker pins up to two
 		// decompressed CSCB chunks.
 		RowParallelism int `mapstructure:"row_parallelism" validate:"omitempty,gte=0,lte=16"`
+		// RowMemoryBudgetBytes caps the decompressed CSCB chunk working set a
+		// cohort may pin. The planner lowers RowParallelism until the cohort's
+		// measured chunk size fits, so a chain with large blocks runs fewer
+		// workers instead of exhausting the pod (INF-1330).
+		RowMemoryBudgetBytes uint64 `mapstructure:"row_memory_budget_bytes"`
 	}
 
 	RosettaConfig struct {
