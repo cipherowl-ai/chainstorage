@@ -72,7 +72,7 @@ const (
 	batchConsolidatorRepairParallelismChangeID     = "batch-consolidator-repair-parallelism"
 	batchConsolidatorRepairParallelismVersion      = 1
 	batchConsolidatorPreviousMaxParallelism        = 10
-	batchConsolidatorMaxParallelism                = 20
+	batchConsolidatorMaxParallelism                = 50
 	maxUint64                                      = ^uint64(0)
 )
 
