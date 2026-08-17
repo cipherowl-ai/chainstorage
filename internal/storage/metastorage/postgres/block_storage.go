@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lib/pq"
 	"golang.org/x/xerrors"
 	"google.golang.org/protobuf/proto"
 
@@ -1124,6 +1125,45 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	if len(placements) == 0 {
 		return nil
 	}
+	nonNilPlacements := make([]*internal.ConsolidationShadowPlacement, 0, len(placements))
+	for _, placement := range placements {
+		if placement != nil {
+			nonNilPlacements = append(nonNilPlacements, placement)
+		}
+	}
+	if len(nonNilPlacements) == 0 {
+		return nil
+	}
+
+	tags := make([]uint32, 0, len(nonNilPlacements))
+	blockMetadataIDs := make([]int64, 0, len(nonNilPlacements))
+	tagValues := make([]int64, 0, len(nonNilPlacements))
+	heights := make([]int64, 0, len(nonNilPlacements))
+	hashes := make([]string, 0, len(nonNilPlacements))
+	singleBlockObjectKeys := make([]string, 0, len(nonNilPlacements))
+	consolidatedObjectKeys := make([]string, 0, len(nonNilPlacements))
+	singleBlockStorageGenerations := make([]string, 0, len(nonNilPlacements))
+	consolidatedStorageGenerations := make([]string, 0, len(nonNilPlacements))
+	objectFormats := make([]int64, 0, len(nonNilPlacements))
+	byteOffsets := make([]int64, 0, len(nonNilPlacements))
+	byteLengths := make([]int64, 0, len(nonNilPlacements))
+	uncompressedLengths := make([]int64, 0, len(nonNilPlacements))
+	for _, placement := range nonNilPlacements {
+		tags = append(tags, placement.Tag)
+		blockMetadataIDs = append(blockMetadataIDs, placement.BlockMetadataID)
+		tagValues = append(tagValues, int64(placement.Tag))
+		heights = append(heights, int64(placement.Height))
+		hashes = append(hashes, placement.Hash)
+		singleBlockObjectKeys = append(singleBlockObjectKeys, placement.SingleBlockObjectKeyMain)
+		consolidatedObjectKeys = append(consolidatedObjectKeys, placement.ConsolidatedObjectKeyMain)
+		singleBlockStorageGenerations = append(singleBlockStorageGenerations, placement.SingleBlockStorageGeneration)
+		consolidatedStorageGenerations = append(consolidatedStorageGenerations, placement.ConsolidatedStorageGeneration)
+		objectFormats = append(objectFormats, int64(placement.ObjectFormat))
+		byteOffsets = append(byteOffsets, int64(placement.ByteOffset))
+		byteLengths = append(byteLengths, int64(placement.ByteLength))
+		uncompressedLengths = append(uncompressedLengths, int64(placement.UncompressedLength))
+	}
+
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return xerrors.Errorf("failed to begin consolidation shadow transaction: %w", err)
@@ -1134,34 +1174,77 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			_ = tx.Rollback()
 		}
 	}()
-	tags := make([]uint32, 0, len(placements))
-	for _, placement := range placements {
-		if placement != nil {
-			tags = append(tags, placement.Tag)
-		}
-	}
 	if err := cscbrepairlock.AcquireTags(ctx, tx, tags); err != nil {
 		return err
 	}
 
 	const query = `
-		INSERT INTO block_consolidation_shadow (
+		WITH input AS (
+			SELECT
+				placement.block_metadata_id,
+				placement.tag,
+				placement.height,
+				placement.hash,
+				placement.single_block_object_key_main,
+				placement.consolidated_object_key_main,
+				NULLIF(placement.single_block_storage_generation, '') AS single_block_storage_generation,
+				NULLIF(placement.consolidated_storage_generation, '') AS consolidated_storage_generation,
+				placement.object_format,
+				placement.byte_offset,
+				placement.byte_length,
+				placement.uncompressed_length,
+				placement.ordinal
+			FROM UNNEST(
+				$1::BIGINT[],
+				$2::INTEGER[],
+				$3::BIGINT[],
+				$4::TEXT[],
+				$5::TEXT[],
+				$6::TEXT[],
+				$7::TEXT[],
+				$8::TEXT[],
+				$9::SMALLINT[],
+				$10::BIGINT[],
+				$11::BIGINT[],
+				$12::BIGINT[]
+			) WITH ORDINALITY AS placement(
+				block_metadata_id,
+				tag,
+				height,
+				hash,
+				single_block_object_key_main,
+				consolidated_object_key_main,
+				single_block_storage_generation,
+				consolidated_storage_generation,
+				object_format,
+				byte_offset,
+				byte_length,
+				uncompressed_length,
+				ordinal
+			)
+		), matched AS MATERIALIZED (
+			SELECT input.*
+			FROM input
+			JOIN block_metadata bm
+				ON bm.id = input.block_metadata_id
+				AND bm.tag = input.tag
+				AND bm.height = input.height
+				AND bm.hash = input.hash
+				AND bm.object_key_main = input.single_block_object_key_main
+				AND bm.storage_generation IS NOT DISTINCT FROM input.single_block_storage_generation
+				AND bm.skipped = false
+			FOR UPDATE OF bm
+		), upserted AS (
+			INSERT INTO block_consolidation_shadow (
 			block_metadata_id, tag, height, hash, single_block_object_key_main, consolidated_object_key_main,
 			single_block_storage_generation, consolidated_storage_generation,
 			object_format, byte_offset, byte_length, uncompressed_length, validated_at
 		)
 		SELECT
-			bm.id, bm.tag, bm.height, bm.hash, bm.object_key_main, $6,
-			bm.storage_generation, $8, $9, $10, $11, $12, NOW()
-		FROM block_metadata bm
-		WHERE bm.id = $1
-			AND bm.tag = $2
-			AND bm.height = $3
-			AND bm.hash = $4
-			AND bm.object_key_main = $5
-			AND bm.storage_generation IS NOT DISTINCT FROM $7
-			AND bm.skipped = false
-		FOR UPDATE OF bm
+			block_metadata_id, tag, height, hash, single_block_object_key_main, consolidated_object_key_main,
+			single_block_storage_generation, consolidated_storage_generation,
+			object_format, byte_offset, byte_length, uncompressed_length, NOW()
+		FROM matched
 		ON CONFLICT (block_metadata_id) DO UPDATE SET
 			tag = EXCLUDED.tag,
 			height = EXCLUDED.height,
@@ -1188,35 +1271,86 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			END,
 			validated_at = EXCLUDED.validated_at
 		WHERE block_consolidation_shadow.single_block_object_deleted_at IS NULL
-		RETURNING block_metadata_id`
+			RETURNING block_metadata_id
+		)
+		SELECT
+			(SELECT COUNT(*) FROM input),
+			(SELECT COUNT(*) FROM matched),
+			(SELECT COUNT(*) FROM upserted),
+			COALESCE((
+				SELECT input.block_metadata_id
+				FROM input
+				LEFT JOIN matched USING (ordinal)
+				WHERE matched.ordinal IS NULL
+				ORDER BY input.ordinal
+				LIMIT 1
+			), 0),
+			COALESCE((
+				SELECT input.height
+				FROM input
+				LEFT JOIN matched USING (ordinal)
+				WHERE matched.ordinal IS NULL
+				ORDER BY input.ordinal
+				LIMIT 1
+			), 0),
+			COALESCE((
+				SELECT matched.block_metadata_id
+				FROM matched
+				LEFT JOIN upserted USING (block_metadata_id)
+				WHERE upserted.block_metadata_id IS NULL
+				ORDER BY matched.ordinal
+				LIMIT 1
+			), 0),
+			COALESCE((
+				SELECT matched.height
+				FROM matched
+				LEFT JOIN upserted USING (block_metadata_id)
+				WHERE upserted.block_metadata_id IS NULL
+				ORDER BY matched.ordinal
+				LIMIT 1
+			), 0)`
 
-	for _, placement := range placements {
-		if placement == nil {
-			continue
-		}
-		var id int64
-		err := tx.QueryRowContext(
-			ctx,
-			query,
-			placement.BlockMetadataID,
-			placement.Tag,
-			placement.Height,
-			placement.Hash,
-			placement.SingleBlockObjectKeyMain,
-			placement.ConsolidatedObjectKeyMain,
-			nullableStorageGeneration(placement.SingleBlockStorageGeneration),
-			nullableStorageGeneration(placement.ConsolidatedStorageGeneration),
-			int32(placement.ObjectFormat),
-			placement.ByteOffset,
-			placement.ByteLength,
-			placement.UncompressedLength,
-		).Scan(&id)
-		if err != nil {
-			if err == sql.ErrNoRows {
-				return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: primary metadata identity mismatch", placement.BlockMetadataID, placement.Height)
-			}
-			return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: %w", placement.BlockMetadataID, placement.Height, err)
-		}
+	var inputCount int64
+	var matchedCount int64
+	var upsertedCount int64
+	var unmatchedMetadataID int64
+	var unmatchedHeight int64
+	var rejectedMetadataID int64
+	var rejectedHeight int64
+	if err := tx.QueryRowContext(
+		ctx,
+		query,
+		pq.Array(blockMetadataIDs),
+		pq.Array(tagValues),
+		pq.Array(heights),
+		pq.Array(hashes),
+		pq.Array(singleBlockObjectKeys),
+		pq.Array(consolidatedObjectKeys),
+		pq.Array(singleBlockStorageGenerations),
+		pq.Array(consolidatedStorageGenerations),
+		pq.Array(objectFormats),
+		pq.Array(byteOffsets),
+		pq.Array(byteLengths),
+		pq.Array(uncompressedLengths),
+	).Scan(
+		&inputCount,
+		&matchedCount,
+		&upsertedCount,
+		&unmatchedMetadataID,
+		&unmatchedHeight,
+		&rejectedMetadataID,
+		&rejectedHeight,
+	); err != nil {
+		return xerrors.Errorf("failed to persist consolidation shadows: %w", err)
+	}
+	if inputCount != int64(len(nonNilPlacements)) {
+		return xerrors.Errorf("failed to persist consolidation shadows: expected %d inputs, got %d", len(nonNilPlacements), inputCount)
+	}
+	if matchedCount != inputCount {
+		return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: primary metadata identity mismatch", unmatchedMetadataID, unmatchedHeight)
+	}
+	if upsertedCount != matchedCount {
+		return xerrors.Errorf("failed to persist consolidation shadow for metadata_id=%d height=%d: existing shadow is not writable", rejectedMetadataID, rejectedHeight)
 	}
 	if err := tx.Commit(); err != nil {
 		return xerrors.Errorf("failed to commit consolidation shadows: %w", err)
