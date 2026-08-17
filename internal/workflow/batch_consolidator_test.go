@@ -301,7 +301,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRejectsExcessiveParall
 		Parallelism: batchConsolidatorMaxParallelism + 1,
 	})
 	require.Error(err)
-	require.Contains(err.Error(), "parallelism(21) exceeds max(20)")
+	require.Contains(err.Error(), "parallelism(51) exceeds max(50)")
 }
 
 func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParallelism() {
@@ -315,7 +315,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.ShardSize = 10000
 	var requests []*activity.BatchConsolidatorRequest
 	var requestsMu sync.Mutex
-	s.mockAutoConsolidateLatestHeight(120010)
+	s.mockAutoConsolidateLatestHeight(150010)
 	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
@@ -335,13 +335,13 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 		Mode:        config.ConsolidationModeHistoricalBackfill,
 		Tag:         2,
 		StartHeight: 100000,
-		EndHeight:   120000,
-		BatchSize:   20000,
+		EndHeight:   150000,
+		BatchSize:   50000,
 		MaxBlocks:   1000,
-		Parallelism: 20,
+		Parallelism: 50,
 	})
 	require.NoError(err)
-	require.Len(requests, 20)
+	require.Len(requests, 50)
 	sort.Slice(requests, func(i, j int) bool {
 		return requests[i].StartHeight < requests[j].StartHeight
 	})
