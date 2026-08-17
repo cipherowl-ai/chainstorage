@@ -2313,6 +2313,65 @@ func TestPlannerPlanAndApply_RowParallelismMatchesSerial(t *testing.T) {
 	}
 }
 
+// TestBudgetedRowParallelismUsesRealSolanaChunkSize pins the sizing against
+// the production numbers behind INF-1330: a Solana 1000-block CSCB is ~11.1 GB
+// uncompressed over 100 chunks, so one chunk is ~111 MB and a configured
+// parallelism of 8 pinned ~1.8 GB in Apply, OOM-killing the worker.
+func TestBudgetedRowParallelismUsesRealSolanaChunkSize(t *testing.T) {
+	require := require.New(t)
+	const solanaCSCBUncompressed = uint64(11107751767)
+	req := PlanRequest{
+		StartHeight:            439116000,
+		EndHeight:              439117000,
+		CompressionChunkBlocks: 10,
+		RowMemoryBudgetBytes:   uint64(1) << 30,
+	}
+	chunkBytes := cohortChunkBytes(req, solanaCSCBUncompressed)
+	require.InDelta(111_000_000, chunkBytes, 1_000_000, "one Solana chunk should be ~111 MB")
+
+	planner := &Planner{rowParallelism: 8}
+	// Apply pins two chunks per worker, so a 1 GiB budget affords 4 workers.
+	require.Equal(4, planner.budgetedRowParallelism(req, chunkBytes, 2))
+	// Plan pins one chunk per worker, so the same budget affords more, still
+	// clamped by the configured value.
+	require.Equal(8, planner.budgetedRowParallelism(req, chunkBytes, 1))
+	// A budget smaller than a single worker still yields a usable worker.
+	tiny := req
+	tiny.RowMemoryBudgetBytes = 1024
+	require.Equal(1, planner.budgetedRowParallelism(tiny, chunkBytes, 2))
+	// An unset budget must not disable the guard.
+	unset := req
+	unset.RowMemoryBudgetBytes = 0
+	require.Equal(4, planner.budgetedRowParallelism(unset, chunkBytes, 2))
+	// Unknown chunk geometry leaves the configured value untouched.
+	require.Equal(8, planner.budgetedRowParallelism(req, 0, 2))
+	require.Zero(cohortChunkBytes(PlanRequest{StartHeight: 1, EndHeight: 2}, solanaCSCBUncompressed))
+}
+
+func TestPlanRespectsRowMemoryBudget(t *testing.T) {
+	require := require.New(t)
+	_, store, planner, req := newRowParallelismFixture(t, 8)
+	// Declare a chunk geometry whose Apply footprint only affords one worker.
+	req.CompressionChunkBlocks = 10
+	req.RowMemoryBudgetBytes = 64 << 20
+	head := store.heads["consolidated/first.cscb.zstd"]
+	head.Metadata = cscbObjectMetadata("11107751767", cscbFormatMetadataValue, cscbCompressionScopeMetadataValue)
+	store.heads["consolidated/first.cscb.zstd"] = head
+	store.heads["consolidated/second.cscb.zstd"] = head
+
+	chunkBytes := cohortChunkBytes(req, 11107751767)
+	require.Positive(chunkBytes)
+	require.Equal(1, planner.budgetedRowParallelism(req, chunkBytes, 2))
+
+	// The plan still produces a complete, correct report at the reduced width.
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	require.Len(report.Items, 6)
+	for _, item := range report.Items {
+		require.Equal(ActionDeleteObjectVersion, item.Action)
+	}
+}
+
 func TestPlannerApply_DoesNotFenceWhenCSCBVanishesAfterPlan(t *testing.T) {
 	require := require.New(t)
 	row, repo, store, planner, _, req, report := newExecutableTestFixture(t)

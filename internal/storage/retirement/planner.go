@@ -43,8 +43,13 @@ const (
 	// two payload verifiers, and each verifier pins one decompressed CSCB
 	// chunk (tens of MB for Solana), so the cap must fit worker pod limits.
 	maxRetirementRowParallelism = 16
-	s3MutableNullVersionID      = "null"
-	versionedDeleteMode         = "exact_pinned_versions_and_delete_markers"
+	// defaultRetirementRowMemoryBudgetBytes caps the decompressed CSCB chunk
+	// working set when no budget is configured. 1 GiB keeps a comfortable
+	// margin inside the smallest retention worker reservation while still
+	// allowing real concurrency on chains with modest chunks.
+	defaultRetirementRowMemoryBudgetBytes = uint64(1) << 30
+	s3MutableNullVersionID                = "null"
+	versionedDeleteMode                   = "exact_pinned_versions_and_delete_markers"
 )
 
 var unverifiedRetentionSafetySHA256 = keySHA256("unverified-retention-safety-configuration")
@@ -168,10 +173,21 @@ func (p *Planner) Plan(ctx context.Context, req PlanRequest) (*Report, error) {
 	report := newReport(req)
 	shared := newPlanShared()
 	items := make([]Candidate, len(rows))
+	// Plan runs one verifier per worker, so it pins one chunk per worker. The
+	// sizing HEAD is skipped entirely when the planner is serial, so a serial
+	// pass still touches object storage only for rows that reach inspection.
+	parallelism := p.configuredRowParallelism()
+	if parallelism > 1 {
+		parallelism = p.budgetedRowParallelism(
+			req,
+			p.cohortConsolidatedChunkBytes(ctx, req, shared, firstConsolidatedKey(rows)),
+			1,
+		)
+	}
 	group, groupCtx := errgroup.WithContext(ctx)
 	// Contiguous segments keep each worker's verifier chunk cache local to
 	// height-adjacent rows, which share CSCB chunks.
-	for _, segment := range rowSegments(len(rows), p.effectiveRowParallelism()) {
+	for _, segment := range rowSegments(len(rows), parallelism) {
 		group.Go(func() error {
 			verifier := p.verifierFactory()
 			for i := segment.start; i < segment.end; i++ {
@@ -218,7 +234,7 @@ func rowSegments(total int, parallelism int) []rowSegment {
 	return segments
 }
 
-func (p *Planner) effectiveRowParallelism() int {
+func (p *Planner) configuredRowParallelism() int {
 	if p.rowParallelism <= 1 {
 		return 1
 	}
@@ -226,6 +242,97 @@ func (p *Planner) effectiveRowParallelism() int {
 		return maxRetirementRowParallelism
 	}
 	return p.rowParallelism
+}
+
+// budgetedRowParallelism lowers the configured worker count until the pinned
+// decompressed-chunk working set fits the memory budget.
+//
+// Each worker's payload verifier caches one decompressed CSCB chunk, and Apply
+// runs two verifiers per worker (pre- and post-delete), so the pinned set is
+// workers x verifiersPerWorker x chunk size. Chunk size is chain-specific and
+// large: a Solana 1000-block CSCB is ~11.1 GB uncompressed across 100 chunks,
+// so one chunk is ~111 MB and a hand-set parallelism of 8 pinned ~1.8 GB in
+// Apply — enough to OOM-kill a 6 G worker mid-activity, which surfaces only as
+// an opaque Temporal heartbeat timeout (INF-1330).
+//
+// The size is knowable before any row runs: the CSCB object declares its
+// uncompressed length, and the consolidation config fixes blocks per chunk, so
+// chunk bytes = uncompressed length x chunk blocks / cohort blocks. Deriving
+// the worker count from that means a chain with larger blocks quietly runs
+// fewer workers instead of dying.
+func (p *Planner) budgetedRowParallelism(req PlanRequest, chunkBytes uint64, verifiersPerWorker int) int {
+	configured := p.configuredRowParallelism()
+	if configured <= 1 || chunkBytes == 0 || verifiersPerWorker <= 0 {
+		return configured
+	}
+	// The budget defaults rather than disabling: an operator who raises
+	// parallelism without also setting a budget must still not be able to
+	// configure the worker into an OOM.
+	budget := req.RowMemoryBudgetBytes
+	if budget == 0 {
+		budget = defaultRetirementRowMemoryBudgetBytes
+	}
+	perWorker := chunkBytes * uint64(verifiersPerWorker)
+	affordable := budget / perWorker
+	if affordable < 1 {
+		return 1
+	}
+	if affordable < uint64(configured) {
+		return int(affordable)
+	}
+	return configured
+}
+
+// cohortChunkBytes estimates one decompressed CSCB chunk for this cohort from
+// the object's declared uncompressed length. It returns 0 when the inputs are
+// unavailable, which leaves the configured parallelism unchanged.
+func cohortChunkBytes(req PlanRequest, uncompressedLength uint64) uint64 {
+	cohortBlocks := req.EndHeight - req.StartHeight
+	if uncompressedLength == 0 || cohortBlocks == 0 || req.CompressionChunkBlocks == 0 {
+		return 0
+	}
+	chunkBlocks := req.CompressionChunkBlocks
+	if chunkBlocks > cohortBlocks {
+		chunkBlocks = cohortBlocks
+	}
+	return uncompressedLength / cohortBlocks * chunkBlocks
+}
+
+// cohortConsolidatedChunkBytes heads the cohort's CSCB object once, through the
+// shared plan cache so the per-row path reuses it, and derives the chunk size.
+// Any failure returns 0 and leaves parallelism at its configured value; the
+// per-row path re-heads and fails those rows closed on its own terms.
+func (p *Planner) cohortConsolidatedChunkBytes(
+	ctx context.Context,
+	req PlanRequest,
+	shared *planShared,
+	consolidatedKey string,
+) uint64 {
+	if consolidatedKey == "" {
+		return 0
+	}
+	head, err := shared.headFor(ctx, func(ctx context.Context) (ObjectHead, error) {
+		return p.store.HeadObject(ctx, req.Bucket, consolidatedKey)
+	}, consolidatedKey)
+	if err != nil || !head.Exists {
+		return 0
+	}
+	logicalBytes, ok := cscbLogicalPayloadBytes(head)
+	if !ok {
+		return 0
+	}
+	return cohortChunkBytes(req, logicalBytes)
+}
+
+// firstConsolidatedKey returns the cohort's CSCB key from the first row that
+// carries one. Every row in a cohort shares the same consolidated object.
+func firstConsolidatedKey(rows []MetadataRow) string {
+	for _, row := range rows {
+		if row.Shadow != nil && row.Shadow.ConsolidatedObjectKey != "" {
+			return row.Shadow.ConsolidatedObjectKey
+		}
+	}
+	return ""
 }
 
 func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) error {
@@ -261,12 +368,27 @@ func (p *Planner) Apply(ctx context.Context, req PlanRequest, report *Report) er
 			deleteIndexes = append(deleteIndexes, i)
 		}
 	}
+	// Apply runs a pre- and a post-delete verifier per worker, so it pins two
+	// chunks per worker — the heaviest phase, and the one to budget against.
+	parallelism := p.configuredRowParallelism()
+	if parallelism > 1 && len(deleteIndexes) > 0 {
+		parallelism = p.budgetedRowParallelism(
+			req,
+			p.cohortConsolidatedChunkBytes(
+				ctx,
+				req,
+				newPlanShared(),
+				report.Items[deleteIndexes[0]].ConsolidatedKey,
+			),
+			2,
+		)
+	}
 	group, groupCtx := errgroup.WithContext(ctx)
 	// Contiguous segments keep each worker's verifiers local to height-adjacent
 	// rows. Rows are independent single-block objects; the first error cancels
 	// the pass and every not-yet-started row is marked not-attempted, matching
 	// the serial halt-on-failure contract.
-	for _, segment := range rowSegments(len(deleteIndexes), p.effectiveRowParallelism()) {
+	for _, segment := range rowSegments(len(deleteIndexes), parallelism) {
 		group.Go(func() error {
 			preVerifier := p.verifierFactory()
 			postVerifier := p.verifierFactory()

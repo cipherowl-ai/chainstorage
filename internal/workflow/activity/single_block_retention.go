@@ -453,6 +453,10 @@ func (a *SingleBlockRetention) planRequest(request *SingleBlockRetentionProcessR
 		DirectStorageClientsGuarded: request.DirectStorageClientsGuarded,
 		SingleBlockWritersGuarded:   request.SingleBlockWritersGuarded,
 		FallbackErrorCount:          request.FallbackErrorCount,
+		// Chunk geometry and the memory budget let the planner lower row
+		// parallelism on chains whose decompressed chunks are large.
+		CompressionChunkBlocks: a.config.AWS.Storage.Consolidation.CompressionChunkBlocks,
+		RowMemoryBudgetBytes:   a.config.Workflows.SingleBlockRetention.RowMemoryBudgetBytes,
 		// The approval is the operator's assertion passed through unchanged.
 		// The planner independently re-verifies the actual chain and requires
 		// the cohort under deletion to be contained by this immutable envelope.

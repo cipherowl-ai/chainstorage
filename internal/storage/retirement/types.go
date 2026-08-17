@@ -167,6 +167,12 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackErrorCount          uint64
 		Approval                    Approval
+		// CompressionChunkBlocks and RowMemoryBudgetBytes bound row
+		// parallelism to the memory a cohort's decompressed CSCB chunks
+		// actually cost. Zero in either field leaves the configured
+		// parallelism unchanged.
+		CompressionChunkBlocks uint64
+		RowMemoryBudgetBytes   uint64
 	}
 
 	Approval struct {
