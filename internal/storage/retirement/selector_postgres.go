@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"golang.org/x/xerrors"
@@ -13,6 +14,39 @@ import (
 
 type retentionCohortQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+// storageGenerationMatch renders an indexable generation match for each column.
+//
+// The null-safe IS NOT DISTINCT FROM form these queries used, against a
+// NULLIF of the generation parameter, cannot use a btree index at all —
+// verified with EXPLAIN against production:
+// `height = 439200000` plans an Index Only Scan while
+// `height IS NOT DISTINCT FROM 439200000` falls back to a parallel sequential
+// scan. Because the generation value is known when the query is built, the
+// same semantics are expressible as plain equality (concrete generation) or an
+// IS NULL test (the legacy generation, stored as NULL), both of which the
+// planner can seek on. Adding a generation column to an index is worthless
+// until the query is written this way (INF-1330).
+//
+// placeholder is referenced only for a concrete generation; callers must bind
+// the generation argument exactly when storageGenerationIsBound reports true.
+func storageGenerationMatch(generation string, placeholder string, columns ...string) string {
+	predicates := make([]string, 0, len(columns))
+	for _, column := range columns {
+		if generation == "" {
+			predicates = append(predicates, column+" IS NULL")
+			continue
+		}
+		predicates = append(predicates, column+" = "+placeholder)
+	}
+	return strings.Join(predicates, "\n\t\t\tAND ")
+}
+
+// storageGenerationIsBound reports whether storageGenerationMatch referenced
+// its placeholder, so callers append the argument only when the query uses it.
+func storageGenerationIsBound(generation string) bool {
+	return generation != ""
 }
 
 // ListRetentionCohorts reads pending and newly due work from one repeatable-read
@@ -137,23 +171,21 @@ func listPendingRetentionCohorts(
 			AND ($3::BIGINT = 0 OR (retention.height >= $2 AND retention.height < $3))
 			AND shadow.single_block_delete_after <= $4
 			AND retention.bucket = $6
-			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND ` + storageGenerationMatch(
+		storageGeneration,
+		"$7",
+		"metadata.storage_generation",
+		"shadow.single_block_storage_generation",
+		"shadow.consolidated_storage_generation",
+	) + `
 		GROUP BY retention.consolidated_object_key_main
 		ORDER BY MIN(retention.prepared_at), MIN(retention.height), retention.consolidated_object_key_main
 		LIMIT $5`
-	rows, err := db.QueryContext(
-		ctx,
-		query,
-		tag,
-		startHeight,
-		endHeight,
-		eligibilityCutoff,
-		limit,
-		bucket,
-		storageGeneration,
-	)
+	args := []any{tag, startHeight, endHeight, eligibilityCutoff, limit, bucket}
+	if storageGenerationIsBound(storageGeneration) {
+		args = append(args, storageGeneration)
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query pending retention cohorts: %w", err)
 	}
@@ -255,9 +287,7 @@ func listDueRetentionCohorts(
 				AND due_metadata.skipped = FALSE
 				AND due_metadata.object_format = $4
 				AND due_metadata.object_key_main = shadow.consolidated_object_key_main
-				AND due_metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-				AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+				AND %s
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 				AND NOT EXISTS (
 					SELECT 1
@@ -293,9 +323,7 @@ func listDueRetentionCohorts(
 			AND shadow.single_block_object_key_main <> ''
 			AND metadata.skipped = FALSE
 			AND metadata.object_format = $4
-			AND metadata.storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
-			AND shadow.consolidated_storage_generation IS NOT DISTINCT FROM NULLIF($7, '')
+			AND %s
 			AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
 			AND metadata.object_key_main = shadow.consolidated_object_key_main
 			AND NOT EXISTS (
@@ -319,18 +347,36 @@ func listDueRetentionCohorts(
 		HAVING MAX(shadow.single_block_delete_after) <= $6
 		ORDER BY %s
 		LIMIT $5`
-	query := fmt.Sprintf(queryTemplate, dueRetentionCohortOrdering(endHeight))
-	rows, err := db.QueryContext(
-		ctx,
-		query,
+	query := fmt.Sprintf(
+		queryTemplate,
+		storageGenerationMatch(
+			storageGeneration,
+			"$7",
+			"due_metadata.storage_generation",
+			"shadow.single_block_storage_generation",
+			"shadow.consolidated_storage_generation",
+		),
+		storageGenerationMatch(
+			storageGeneration,
+			"$7",
+			"metadata.storage_generation",
+			"shadow.single_block_storage_generation",
+			"shadow.consolidated_storage_generation",
+		),
+		dueRetentionCohortOrdering(endHeight),
+	)
+	args := []any{
 		tag,
 		startHeight,
 		endHeight,
 		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
 		limit,
 		eligibilityCutoff,
-		storageGeneration,
-	)
+	}
+	if storageGenerationIsBound(storageGeneration) {
+		args = append(args, storageGeneration)
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to query due retention cohorts: %w", err)
 	}
