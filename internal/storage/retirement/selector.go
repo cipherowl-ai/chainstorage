@@ -34,6 +34,21 @@ type (
 			eligibilityCutoff time.Time,
 			limit int,
 		) ([]RetentionCohort, []RetentionCohort, error)
+
+		// RetentionFloorWatermark returns the lowest height at or above
+		// minHeight that still holds an undeleted single-block object, and
+		// whether such a row exists. It is part of this interface rather than
+		// an optional one the implementation may satisfy: a missing watermark
+		// silently stops the probe floor from advancing, and the resulting
+		// range growth is exactly the failure this mechanism exists to
+		// prevent. Compile-time enforcement is cheaper than discovering it in
+		// production.
+		RetentionFloorWatermark(
+			ctx context.Context,
+			storageGeneration string,
+			tag uint32,
+			minHeight uint64,
+		) (uint64, bool, error)
 	}
 
 	Selector struct {
@@ -213,4 +228,39 @@ func (s *Selector) LookaheadKeys(
 		}
 	}
 	return keys, nil
+}
+
+// FloorWatermark resolves the height the next probe should start from, given
+// the operator's approved floor.
+//
+// The returned height is never below approvedStartHeight: that value is the
+// authorization boundary and retention may not delete underneath it, so work
+// found below it — a repair promoted into an old height, say — must not pull
+// the probe down there. Everything between approvedStartHeight and the
+// watermark has already been retired, so skipping it loses nothing.
+//
+// When the generation has no outstanding work at all, the approved floor is
+// returned unchanged rather than some higher value. Advancing past the end of
+// known work would put freshly consolidated rows below the floor before their
+// retention delay expires, which is precisely how a floor strands data.
+func (s *Selector) FloorWatermark(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	approvedStartHeight uint64,
+) (uint64, error) {
+	if s == nil || s.repo == nil {
+		return 0, xerrors.New("retention cohort repository is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return 0, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+	}
+	watermark, found, err := s.repo.RetentionFloorWatermark(ctx, storageGeneration, tag, approvedStartHeight)
+	if err != nil {
+		return 0, xerrors.Errorf("failed to resolve retention floor watermark: %w", err)
+	}
+	if !found || watermark < approvedStartHeight {
+		return approvedStartHeight, nil
+	}
+	return watermark, nil
 }
