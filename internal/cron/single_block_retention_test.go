@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -476,4 +477,102 @@ func TestSingleBlockRetentionCronPropagatesWatermarkErrors(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "watermark")
 	require.Empty(t, runtime.executions)
+}
+
+// recordingScope captures gauge writes so the probe_failed contract can be
+// asserted directly rather than inferred.
+type recordingScope struct {
+	tally.Scope
+	mu     sync.Mutex
+	gauges map[string]float64
+}
+
+func newRecordingScope() *recordingScope {
+	return &recordingScope{Scope: tally.NoopScope, gauges: make(map[string]float64)}
+}
+
+func (s *recordingScope) SubScope(string) tally.Scope { return s }
+
+func (s *recordingScope) Gauge(name string) tally.Gauge {
+	return &recordingGauge{scope: s, name: name}
+}
+
+func (s *recordingScope) get(name string) (float64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	v, ok := s.gauges[name]
+	return v, ok
+}
+
+type recordingGauge struct {
+	scope *recordingScope
+	name  string
+}
+
+func (g *recordingGauge) Update(v float64) {
+	g.scope.mu.Lock()
+	defer g.scope.mu.Unlock()
+	g.scope.gauges[g.name] = v
+}
+
+// TestSingleBlockRetentionCronProbeFailedGaugeTracksOutcome pins the signal the
+// failure alert depends on.
+//
+// It must be a gauge written on every exit path, not the instrument's
+// result_type="error" counter: tally suppresses zero counter deltas, so that
+// counter emits nothing until the first failure and then goes silent, leaving a
+// single isolated sample that PromQL increase() cannot turn into a delta. The
+// first outage would be missed — the one case the alert exists for.
+func TestSingleBlockRetentionCronProbeFailedGaugeTracksOutcome(t *testing.T) {
+	t.Run("failure reports 1", func(t *testing.T) {
+		task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+		defer ctrl.Finish()
+		scope := newRecordingScope()
+		task.metrics = scope
+		cohortRepository.watermarkErr = errors.New("probe exploded")
+
+		require.Error(t, task.Run(context.Background()))
+		require.Empty(t, runtime.executions)
+
+		got, ok := scope.get("probe_failed")
+		require.True(t, ok, "a failed tick must still write the gauge")
+		require.Equal(t, float64(1), got)
+	})
+
+	t.Run("idle tick reports 0", func(t *testing.T) {
+		// Nothing due is a success, not a failure — otherwise the alert would
+		// fire every time retention has simply caught up.
+		task, runtime, _, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+		defer ctrl.Finish()
+		scope := newRecordingScope()
+		task.metrics = scope
+
+		require.NoError(t, task.Run(context.Background()))
+		require.Empty(t, runtime.executions)
+
+		got, ok := scope.get("probe_failed")
+		require.True(t, ok, "an idle tick must write a 0 baseline, not stay silent")
+		require.Equal(t, float64(0), got)
+	})
+
+	t.Run("successful sweep reports 0", func(t *testing.T) {
+		task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+		defer ctrl.Finish()
+		scope := newRecordingScope()
+		task.metrics = scope
+		cohortRepository.due = []retirement.RetentionCohort{{
+			ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+			StartHeight:           430_000_000,
+			EndHeight:             430_001_000,
+			RowCount:              1_000,
+			EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+		}}
+
+		require.NoError(t, task.Run(context.Background()))
+		require.Len(t, runtime.executions, 1)
+
+		got, ok := scope.get("probe_failed")
+		require.True(t, ok)
+		require.Equal(t, float64(0), got)
+	})
 }

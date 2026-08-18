@@ -96,7 +96,32 @@ func (t *singleBlockRetentionTask) DelayStartDuration() time.Duration {
 // when its retirement is finalized as deleted-and-verified), so anchoring every
 // window at the due minimum guarantees deferred, failed, or repair-re-created
 // rows are re-selected by a later tick instead of skipped past.
-func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
+func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
+	// probe_failed is the only signal that reliably detects a failed tick, and
+	// it has to be a gauge written on EVERY exit path rather than a counter.
+	//
+	// Tally suppresses zero deltas for counters (stats.go: `if delta == 0 {
+	// return }`), so the instrument's result_type="error" counter emits nothing
+	// until the first failure and then falls silent again. A single isolated
+	// sample gives PromQL increase() no delta to compute, so an
+	// increase(...) > 0 alert on it never fires — the first outage, which is
+	// exactly the one worth catching, is missed entirely.
+	//
+	// Gauges report whenever they were updated since the last flush, so writing
+	// 0 on every successful tick keeps a continuous baseline and a plain
+	// `> 0` threshold fires on the first failure with no delta involved.
+	//
+	// Deferred on the named return so every path is covered: the early
+	// non-failure exits (workflow already open, no approved range, nothing due)
+	// report 0, and anything returning an error reports 1.
+	defer func() {
+		failed := float64(0)
+		if err != nil {
+			failed = 1
+		}
+		t.metrics.Gauge("probe_failed").Update(failed)
+	}()
+
 	cronConfig := t.config.Cron.SingleBlockRetention
 	if err := t.validateStandingApproval(cronConfig); err != nil {
 		return err
