@@ -420,3 +420,101 @@ func scanRetentionCohorts(rows *sql.Rows, pending bool) ([]RetentionCohort, erro
 	}
 	return result, nil
 }
+
+// RetentionFloorWatermark returns the lowest height at or above minHeight that
+// still holds an undeleted single-block object for storageGeneration.
+//
+// Everything below the returned height has already been retired, so the probe
+// can start there instead of at the operator's approved_start_height. That
+// matters because the due-cohort query's cohort-expansion join is bounded only
+// by the height range: past roughly 1.5M heights of width the planner abandons
+// idx_block_consolidation_shadow_tag_height for a sequential scan of the whole
+// table, and the probe stops finishing inside its statement timeout. A fixed
+// floor widens at the chain's block rate and reaches that point on its own; the
+// watermark holds the range at the retention delay expressed in blocks.
+//
+// The predicate is deliberately conservative by omission. It does not filter on
+// due time, validated_at, skipped metadata, repair state or pending retention
+// state, because each of those is a reason a row is *not deleted yet* and must
+// therefore hold the floor down rather than let it pass. Anything that leaves
+// an undeleted single-block object blocks the watermark — including a crash
+// between the S3 delete and the database update, which stalls the floor instead
+// of stepping over the row. It fails safe in the only direction that matters.
+//
+// found is false when no such row exists, meaning the generation has no
+// outstanding single-block work at or above minHeight.
+func (r *PostgresRepository) RetentionFloorWatermark(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+) (uint64, bool, error) {
+	if r == nil || r.db == nil {
+		return 0, false, xerrors.New("postgres db is required")
+	}
+	return retentionFloorWatermark(ctx, r.db, storageGeneration, tag, minHeight)
+}
+
+func retentionFloorWatermark(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+) (uint64, bool, error) {
+	// minHeight keeps this lookup cheap even before the watermark index exists,
+	// so the code is safe to deploy ahead of its migration: without the bound it
+	// walks (tag, height) from the bottom of the table through every legacy and
+	// already-deleted row. Bounding it at the approval floor is also exactly
+	// right semantically — retention may not delete below that height, so work
+	// underneath it can never change where the probe should start.
+	//
+	// The generation clause is repeated as an explicit IS NOT NULL for a
+	// concrete generation so the partial watermark index is matched
+	// syntactically rather than by inference from the equality test.
+	query := `
+		SELECT MIN(shadow.height)
+		FROM block_consolidation_shadow shadow
+		WHERE shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.single_block_object_deleted_at IS NULL
+			AND shadow.single_block_object_key_main IS NOT NULL
+			AND shadow.single_block_object_key_main <> ''
+			AND ` + storageGenerationMatch(storageGeneration, "$3", "shadow.single_block_storage_generation")
+	if storageGenerationIsBound(storageGeneration) {
+		query += "\n\t\t\tAND shadow.single_block_storage_generation IS NOT NULL"
+	}
+
+	args := []any{tag, minHeight}
+	if storageGenerationIsBound(storageGeneration) {
+		args = append(args, storageGeneration)
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to query retention floor watermark: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, false, xerrors.Errorf("failed to read retention floor watermark: %w", err)
+		}
+		return 0, false, nil
+	}
+	// MIN over an empty set is SQL NULL, which is the no-outstanding-work case.
+	var watermark sql.NullInt64
+	if err := rows.Scan(&watermark); err != nil {
+		return 0, false, xerrors.Errorf("failed to scan retention floor watermark: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, xerrors.Errorf("failed to iterate retention floor watermark: %w", err)
+	}
+	if !watermark.Valid {
+		return 0, false, nil
+	}
+	if watermark.Int64 < 0 {
+		return 0, false, xerrors.Errorf("retention floor watermark returned a negative height %d", watermark.Int64)
+	}
+	return uint64(watermark.Int64), true, nil
+}

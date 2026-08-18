@@ -29,6 +29,27 @@ type retentionCronCohortRepository struct {
 	requestedStartHeight uint64
 	requestedEndHeight   uint64
 	requestedLimit       int
+
+	// watermark drives the probe floor. found=false makes the selector fall
+	// back to the operator's approved_start_height, which is the behaviour
+	// every pre-existing case in this file expects.
+	watermark          uint64
+	watermarkFound     bool
+	watermarkErr       error
+	watermarkMinHeight uint64
+}
+
+func (r *retentionCronCohortRepository) RetentionFloorWatermark(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+) (uint64, bool, error) {
+	r.watermarkMinHeight = minHeight
+	if r.watermarkErr != nil {
+		return 0, false, r.watermarkErr
+	}
+	return r.watermark, r.watermarkFound, nil
 }
 
 func (r *retentionCronCohortRepository) ListRetentionCohorts(
@@ -369,4 +390,90 @@ func TestSingleBlockRetentionCronDefaults(t *testing.T) {
 	require.True(t, task.Enabled())
 	cfg.Cron.SingleBlockRetention.Enabled = false
 	require.False(t, task.Enabled())
+}
+
+// TestSingleBlockRetentionCronProbesFromTheFloorWatermark is the regression
+// guard for INF-1330. The probe must start at the watermark, not the operator's
+// approved floor: the due-cohort query's cohort-expansion join is bounded only
+// by the height range, and past roughly 1.5M heights of width the planner drops
+// idx_block_consolidation_shadow_tag_height for a sequential scan and the probe
+// stops finishing inside its statement timeout.
+func TestSingleBlockRetentionCronProbesFromTheFloorWatermark(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.watermark = 436_000_000
+	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+		StartHeight:           436_000_000,
+		EndHeight:             436_001_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+
+	// The watermark bounds the probe...
+	require.Equal(t, uint64(436_000_000), cohortRepository.requestedStartHeight)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.watermarkMinHeight,
+		"the approved floor must bound the watermark lookup so it stays cheap")
+
+	// ...but authorization is unchanged. The workflow still carries the
+	// operator's approved envelope, so narrowing the probe can never widen what
+	// the sweep is permitted to delete.
+	require.Len(t, runtime.executions, 1)
+	request, ok := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.True(t, ok)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, request.ApprovedStartHeight)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, request.ApprovedEndHeight)
+}
+
+// TestSingleBlockRetentionCronKeepsApprovedFloorWhenWatermarkIsLower pins that
+// a watermark below the approval floor never drags the probe underneath it.
+// Retention may not delete there, so work found below is not the probe's
+// business.
+func TestSingleBlockRetentionCronKeepsApprovedFloorWhenWatermarkIsLower(t *testing.T) {
+	task, _, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.watermark = 1_000
+	cohortRepository.watermarkFound = true
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
+}
+
+// TestSingleBlockRetentionCronIdlesWhenWatermarkPassesApprovedEnd covers the
+// finished-sweep case: with no outstanding work at or below the approved end
+// there is nothing to probe for, so the tick must idle instead of launching a
+// workflow over an empty range.
+func TestSingleBlockRetentionCronIdlesWhenWatermarkPassesApprovedEnd(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedEndHeight
+	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+		StartHeight:           430_000_000,
+		EndHeight:             430_001_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+	require.Zero(t, cohortRepository.requestedStartHeight, "the probe must not run at all")
+}
+
+// TestSingleBlockRetentionCronPropagatesWatermarkErrors keeps a failing
+// watermark lookup loud. Falling back to the approved floor would work today
+// and quietly reintroduce the unbounded range this mechanism exists to prevent.
+func TestSingleBlockRetentionCronPropagatesWatermarkErrors(t *testing.T) {
+	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.watermarkErr = errors.New("watermark unavailable")
+
+	err := task.Run(context.Background())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "watermark")
+	require.Empty(t, runtime.executions)
 }

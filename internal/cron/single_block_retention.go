@@ -150,22 +150,69 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 		return err
 	}
 	eligibilityCutoff := time.Now().UTC()
-	// The probe's cost is bounded by the undeleted backlog through the partial
-	// retention-due index, never by the width of the approved range. It asks
-	// for a full workflow batch because the selector sorts pending (in-flight)
-	// cohorts by prepared_at ahead of height-ordered due cohorts: anchoring on
-	// the first cohort alone could hide older due work behind a stuck pending
-	// cohort indefinitely.
+	// Probe from the watermark rather than the operator's approved floor.
+	//
+	// The probe's cost is NOT bounded by the undeleted backlog alone, which is
+	// what an earlier version of this comment claimed and what justified
+	// dropping the floor to 0 in production. The due-cohort query joins its
+	// due_keys CTE back to block_consolidation_shadow to expand each cohort,
+	// and that join is bounded only by the height range: measured on
+	// solana-mainnet prod, past roughly 1.5M heights of width the planner
+	// abandons idx_block_consolidation_shadow_tag_height for a sequential scan
+	// of the whole table and the probe stops finishing inside its 60s statement
+	// timeout. A fixed floor widens at the chain's block rate and reaches that
+	// point unaided (INF-1330).
+	//
+	// The watermark is the lowest height still holding an undeleted single-block
+	// object, so it tracks live work and holds the range at the retention delay
+	// expressed in blocks. It is recomputed every tick rather than persisted:
+	// a stored floor would need its own reconciliation for repairs and failed
+	// sweeps, and a stale one strands data silently.
+	probeStart, err := selector.FloorWatermark(ctx, storageGeneration, tag, cronConfig.ApprovedStartHeight)
+	if err != nil {
+		return xerrors.Errorf("failed to resolve retention floor watermark: %w", err)
+	}
+	if probeStart >= approvedEnd {
+		// Everything approved has been retired. Report a zero-width range so the
+		// width alarm cannot mistake a finished sweep for unbounded growth.
+		t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
+		t.metrics.Gauge("probe_range_blocks").Update(0)
+		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
+		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		t.logger.Info(
+			"single_block_retention cron found no outstanding single-block work",
+			zap.Uint32("tag", tag),
+			zap.String("bucket", bucket),
+			zap.String("storage_generation", storageGeneration),
+			zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
+			zap.Uint64("approved_end_height", approvedEnd),
+			zap.Uint64("floor_watermark_height", probeStart),
+		)
+		return nil
+	}
+	// probe_range_blocks is the leading indicator for the plan flip described
+	// above: it is the one number that predicts the timeout before it happens,
+	// where oldest_due_age_seconds cannot — that gauge is derived from this very
+	// probe, so it reads zero exactly when the probe fails.
+	t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
+	t.metrics.Gauge("probe_range_blocks").Update(float64(approvedEnd - probeStart))
+
+	probeStartedAt := time.Now()
+	// Asks for a full workflow batch because the selector sorts pending
+	// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
+	// anchoring on the first cohort alone could hide older due work behind a
+	// stuck pending cohort indefinitely.
 	cohorts, hasMore, err := selector.Select(
 		ctx,
 		bucket,
 		storageGeneration,
 		tag,
-		cronConfig.ApprovedStartHeight,
+		probeStart,
 		approvedEnd,
 		eligibilityCutoff,
 		retirement.MaxRetentionCohortsPerWorkflow,
 	)
+	t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
 	if err != nil {
 		return xerrors.Errorf("failed to probe due retention cohorts: %w", err)
 	}
@@ -179,6 +226,8 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 			zap.String("storage_generation", storageGeneration),
 			zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
 			zap.Uint64("approved_end_height", approvedEnd),
+			zap.Uint64("floor_watermark_height", probeStart),
+			zap.Uint64("probe_range_blocks", approvedEnd-probeStart),
 			zap.Bool("has_more", hasMore),
 		)
 		return nil
@@ -268,6 +317,8 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) error {
 		zap.Uint64("window_end_height", windowEnd),
 		zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
 		zap.Uint64("approved_end_height", approvedEnd),
+		zap.Uint64("floor_watermark_height", probeStart),
+		zap.Uint64("probe_range_blocks", approvedEnd-probeStart),
 		zap.Time("eligibility_cutoff", eligibilityCutoff),
 		zap.Duration("oldest_due_age", oldestDueAge),
 		zap.Int("max_object_ranges", cronConfig.MaxObjectRanges),
