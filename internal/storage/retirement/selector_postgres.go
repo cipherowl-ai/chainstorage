@@ -427,11 +427,16 @@ func scanRetentionCohorts(rows *sql.Rows, pending bool) ([]RetentionCohort, erro
 // Everything below the returned height has already been retired, so the probe
 // can start there instead of at the operator's approved_start_height. That
 // matters because the due-cohort query's cohort-expansion join is bounded only
-// by the height range: past roughly 1.5M heights of width the planner abandons
+// by the height range: past roughly 1.8M heights of width the planner abandons
 // idx_block_consolidation_shadow_tag_height for a sequential scan of the whole
 // table, and the probe stops finishing inside its statement timeout. A fixed
 // floor widens at the chain's block rate and reaches that point on its own; the
 // watermark holds the range at the retention delay expressed in blocks.
+//
+// Measured on solana-mainnet prod: watermark 439,331,000 against an approval
+// floor of 439,000,000 and a consolidation cursor of 439,880,000, so the probe
+// range narrows from 880,000 to 549,000 — plan cost 1,004,709 rather than
+// 1,695,921 — and stays there as the chain advances.
 //
 // The predicate is deliberately conservative by omission. It does not filter on
 // due time, validated_at, skipped metadata, repair state or pending retention
@@ -462,16 +467,19 @@ func retentionFloorWatermark(
 	tag uint32,
 	minHeight uint64,
 ) (uint64, bool, error) {
-	// minHeight keeps this lookup cheap even before the watermark index exists,
-	// so the code is safe to deploy ahead of its migration: without the bound it
-	// walks (tag, height) from the bottom of the table through every legacy and
-	// already-deleted row. Bounding it at the approval floor is also exactly
-	// right semantically — retention may not delete below that height, so work
-	// underneath it can never change where the probe should start.
+	// minHeight is what keeps this lookup affordable, and it is the load-bearing
+	// part of this query rather than an optimisation. Without it the scan walks
+	// (tag, height) from the bottom of the table through every legacy and
+	// already-retired row: 58s on solana-mainnet prod versus 97ms bounded at the
+	// approval floor.
 	//
-	// The generation clause is repeated as an explicit IS NOT NULL for a
-	// concrete generation so the partial watermark index is matched
-	// syntactically rather than by inference from the equality test.
+	// The bound is also exactly right semantically — retention may not delete
+	// below approved_start_height, so work underneath it can never change where
+	// the probe should start. That is why no dedicated index is needed here: a
+	// partial index for this query was tried (migration 20260818000001) and
+	// dropped in 20260818000002 because the planner also applied it to the
+	// due-cohort probe and made that 2.5x slower. See those migrations before
+	// reaching for an index again.
 	query := `
 		SELECT MIN(shadow.height)
 		FROM block_consolidation_shadow shadow
@@ -481,9 +489,6 @@ func retentionFloorWatermark(
 			AND shadow.single_block_object_key_main IS NOT NULL
 			AND shadow.single_block_object_key_main <> ''
 			AND ` + storageGenerationMatch(storageGeneration, "$3", "shadow.single_block_storage_generation")
-	if storageGenerationIsBound(storageGeneration) {
-		query += "\n\t\t\tAND shadow.single_block_storage_generation IS NOT NULL"
-	}
 
 	args := []any{tag, minHeight}
 	if storageGenerationIsBound(storageGeneration) {
