@@ -1099,6 +1099,19 @@ func TestConsolidationSingleBlockObjectRetentionMustBePositiveWhenEnabled(t *tes
 	require.Contains(err.Error(), "single_block_object_retention must be positive")
 }
 
+func TestConsolidationMaxChunkUncompressedBytesMustBePositiveWhenEnabled(t *testing.T) {
+	require := testutil.Require(t)
+
+	t.Setenv("CHAINSTORAGE_STORAGE_TYPE_META", "POSTGRES")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_ENABLED", "true")
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MODE", string(config.ConsolidationModeAutoConsolidate))
+	t.Setenv("CHAINSTORAGE_AWS_STORAGE_CONSOLIDATION_MAX_CHUNK_UNCOMPRESSED_BYTES", "0")
+
+	_, err := config.New()
+	require.Error(err)
+	require.Contains(err.Error(), "max_chunk_uncompressed_bytes must be positive when set")
+}
+
 func TestConsolidationPromoteFinalizedRequiresSafePromotionLag(t *testing.T) {
 	tests := []struct {
 		name        string

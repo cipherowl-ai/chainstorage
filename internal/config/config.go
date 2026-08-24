@@ -802,6 +802,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
 	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
 	v.SetDefault("aws.storage.consolidation.single_block_object_retention", DefaultSingleBlockObjectRetention.String())
+	if err := v.BindEnv("aws.storage.consolidation.max_chunk_uncompressed_bytes"); err != nil {
+		return nil, xerrors.Errorf("failed to bind max_chunk_uncompressed_bytes env: %w", err)
+	}
 	if err := v.BindEnv("aws.storage.consolidation.promotion_gate_height"); err != nil {
 		return nil, xerrors.Errorf("failed to bind promotion_gate_height env: %w", err)
 	}
@@ -1053,6 +1056,9 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.CompressionChunkBlocks == 0 {
 		return xerrors.New("consolidation compression_chunk_blocks must be positive")
+	}
+	if consolidation.MaxChunkUncompressedBytes != nil && *consolidation.MaxChunkUncompressedBytes == 0 {
+		return xerrors.New("consolidation max_chunk_uncompressed_bytes must be positive when set")
 	}
 	if consolidation.ShardSize == 0 {
 		return xerrors.New("consolidation shard_size must be positive")
