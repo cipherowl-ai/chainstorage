@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -672,6 +673,67 @@ func TestEndpointGroupWithRPSCountBatch(t *testing.T) {
 	var endpointGroupDefault config.EndpointGroup
 	require.NoError(endpointGroupDefault.UnmarshalText([]byte(text)))
 	require.False(endpointGroupDefault.Endpoints[0].RPSCountBatch)
+}
+
+// The endpoint group reaches the config through two decoders: encoding/json
+// when it is supplied as a JSON string (env var), and mapstructure when it is
+// supplied as a YAML mapping. mapstructure only falls back to a
+// case-insensitive field-name match, so a struct field without a mapstructure
+// tag silently loses every snake_case key. Load a YAML config end to end to
+// make sure both decoders agree.
+func TestEndpointGroupParsedFromYAML(t *testing.T) {
+	require := testutil.Require(t)
+
+	const yamlEndpointGroup = `    master:
+      endpoint_group:
+        endpoints:
+          - name: primary
+            provider_id: quicknode
+            url: https://primary.example.com
+            weight: 1
+            rps: 100
+            rps_count_batch: true
+            extra_urls:
+              trace: https://trace.example.com
+        endpoints_failover:
+          - name: backup
+            url: https://backup.example.com
+            weight: 1
+            rps: 50
+        endpoint_config:
+          headers:
+            x-api-key: secret
+`
+
+	base, err := os.ReadFile("../../config/chainstorage/ethereum/mainnet/base.yml")
+	require.NoError(err)
+
+	const placeholder = "    master:\n      endpoint_group: \"\"\n"
+	require.Contains(string(base), placeholder)
+	patched := strings.Replace(string(base), placeholder, yamlEndpointGroup, 1)
+
+	configPath := filepath.Join(t.TempDir(), "base.yml")
+	require.NoError(os.WriteFile(configPath, []byte(patched), 0600))
+	require.NoError(os.Setenv(config.EnvVarConfigPath, configPath))
+	defer os.Unsetenv(config.EnvVarConfigPath)
+
+	cfg, err := config.New()
+	require.NoError(err)
+
+	group := cfg.Chain.Client.Master.EndpointGroup
+	require.Equal(1, len(group.Endpoints))
+
+	endpoint := group.Endpoints[0]
+	require.Equal("primary", endpoint.Name)
+	require.Equal("quicknode", endpoint.ProviderID)
+	require.Equal("https://primary.example.com", endpoint.Url)
+	require.Equal(100, endpoint.RPS)
+	require.True(endpoint.RPSCountBatch)
+	require.Equal(map[string]string{"trace": "https://trace.example.com"}, endpoint.ExtraUrls)
+
+	require.Equal(1, len(group.EndpointsFailover))
+	require.Equal("backup", group.EndpointsFailover[0].Name)
+	require.Equal(map[string]string{"x-api-key": "secret"}, group.EndpointConfig.Headers)
 }
 
 func TestEndpointGroup(t *testing.T) {

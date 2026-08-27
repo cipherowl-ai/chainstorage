@@ -379,12 +379,18 @@ type (
 		FromRosetta             bool    `mapstructure:"from_rosetta"`
 	}
 
+	// EndpointGroup is decoded from two different sources, so every field needs
+	// both tags: encoding/json when the group arrives as a JSON string (e.g. the
+	// CHAINSTORAGE_CHAIN_CLIENT_MASTER_ENDPOINT_GROUP env var, see UnmarshalText),
+	// and mapstructure when it arrives as a YAML mapping. mapstructure falls back
+	// to a case-insensitive field-name match, which silently drops any key with
+	// an underscore in it, so the tags are not optional.
 	EndpointGroup struct {
-		Endpoints              []Endpoint     `json:"endpoints"`
-		EndpointsFailover      []Endpoint     `json:"endpoints_failover"`
-		UseFailover            bool           `json:"use_failover"`
-		EndpointConfig         EndpointConfig `json:"endpoint_config"`
-		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover"`
+		Endpoints              []Endpoint     `json:"endpoints" mapstructure:"endpoints"`
+		EndpointsFailover      []Endpoint     `json:"endpoints_failover" mapstructure:"endpoints_failover"`
+		UseFailover            bool           `json:"use_failover" mapstructure:"use_failover"`
+		EndpointConfig         EndpointConfig `json:"endpoint_config" mapstructure:"endpoint_config"`
+		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover" mapstructure:"endpoint_config_failover"`
 	}
 
 	// endpointGroup must be in sync with EndpointGroup
@@ -397,34 +403,34 @@ type (
 	}
 
 	Endpoint struct {
-		Name       string            `json:"name"`
-		ProviderID string            `json:"provider_id"`
-		Url        string            `json:"url"`
-		User       string            `json:"user"`
-		Password   string            `json:"password"`
-		Weight     uint8             `json:"weight"`
-		ExtraUrls  map[string]string `json:"extra_urls"`
-		RPS        int               `json:"rps"`
+		Name       string            `json:"name" mapstructure:"name"`
+		ProviderID string            `json:"provider_id" mapstructure:"provider_id"`
+		Url        string            `json:"url" mapstructure:"url"`
+		User       string            `json:"user" mapstructure:"user"`
+		Password   string            `json:"password" mapstructure:"password"`
+		Weight     uint8             `json:"weight" mapstructure:"weight"`
+		ExtraUrls  map[string]string `json:"extra_urls" mapstructure:"extra_urls"`
+		RPS        int               `json:"rps" mapstructure:"rps"`
 		// RPSCountBatch makes the rate limiter charge one token per call inside
 		// a JSON-RPC batch request, for providers whose rate limit counts each
 		// batched call individually. Has no effect unless RPS is set.
-		RPSCountBatch bool `json:"rps_count_batch"`
+		RPSCountBatch bool `json:"rps_count_batch" mapstructure:"rps_count_batch"`
 	}
 
 	EndpointConfig struct {
-		StickySession StickySessionConfig `json:"sticky_session"`
-		Headers       map[string]string   `json:"headers"`
+		StickySession StickySessionConfig `json:"sticky_session" mapstructure:"sticky_session"`
+		Headers       map[string]string   `json:"headers" mapstructure:"headers"`
 	}
 
 	StickySessionConfig struct {
 		// The CookieHash method consistently maps a cookie value to a specific node.
-		CookieHash string `json:"cookie_hash"`
+		CookieHash string `json:"cookie_hash" mapstructure:"cookie_hash"`
 
 		// The CookiePassive method persists the cookie value provided by the server.
-		CookiePassive bool `json:"cookie_passive"`
+		CookiePassive bool `json:"cookie_passive" mapstructure:"cookie_passive"`
 
 		// The HeaderHash method consistently maps a header value to a specific node.
-		HeaderHash string `json:"header_hash"`
+		HeaderHash string `json:"header_hash" mapstructure:"header_hash"`
 	}
 
 	ApiConfig struct {
