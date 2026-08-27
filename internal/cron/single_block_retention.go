@@ -246,10 +246,52 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	if windowBlocks == 0 {
 		windowBlocks = defaultSingleBlockRetentionWindowBlocks
 	}
+	// Anchor the window on the earliest DUE height, not on the watermark.
+	//
+	// The watermark is conservative by omission and pins to any undeleted row,
+	// due or not. Windowing the probe from there is unsafe: if a not-yet-due row
+	// sits at the watermark while due work sits above the window, the probe
+	// returns nothing, the tick idles, and the next tick recomputes the same
+	// watermark and idles again -- the due work is never discovered until the low
+	// row matures. The pre-windowed probe spanned the whole approved range and so
+	// could not hide it. Out-of-order backfill and repair promotion set each
+	// row's retention clock independently, so that interleaving is reachable.
+	//
+	// Anchoring here makes an empty window mean "nothing is due", which is the
+	// only reading under which idling is correct.
+	dueFloor, dueFound, err := selector.DueFloor(ctx, storageGeneration, tag, probeStart, eligibilityCutoff)
+	if err != nil {
+		t.metrics.Gauge("probe_failed").Update(1)
+		return xerrors.Errorf("failed to resolve retention due floor: %w", err)
+	}
+	// dueFloor >= probeStart, so it can sit at or above approvedEnd even though
+	// the watermark did not. Treat that as nothing due rather than letting
+	// probeEnd-probeStart underflow into an unbounded window.
+	if dueFound && dueFloor >= approvedEnd {
+		dueFound = false
+	}
+	if !dueFound {
+		t.metrics.Gauge("probe_failed").Update(0)
+		t.metrics.Gauge("probe_window_blocks").Update(0)
+		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
+		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		t.logger.Info(
+			"single_block_retention cron found nothing due",
+			zap.Uint32("tag", tag),
+			zap.String("bucket", bucket),
+			zap.String("storage_generation", storageGeneration),
+			zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
+			zap.Uint64("approved_end_height", approvedEnd),
+			zap.Uint64("floor_watermark_height", probeStart),
+		)
+		return nil
+	}
+	probeStart = dueFloor
 	probeEnd := approvedEnd
 	if probeEnd-probeStart > windowBlocks {
 		probeEnd = probeStart + windowBlocks
 	}
+	t.metrics.Gauge("due_floor_height").Update(float64(probeStart))
 	t.metrics.Gauge("probe_window_blocks").Update(float64(probeEnd - probeStart))
 
 	probeStartedAt := time.Now()

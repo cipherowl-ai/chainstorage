@@ -26,6 +26,29 @@ type fakeCohortRepository struct {
 	watermarkGenArg  string
 	watermarkTagArg  uint32
 	watermarkCallCnt int
+
+	dueFloor        uint64
+	dueFloorFound   bool
+	dueFloorErr     error
+	dueFloorMinArg  uint64
+	dueFloorCutoff  time.Time
+	dueFloorCallCnt int
+}
+
+func (r *fakeCohortRepository) RetentionDueFloor(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	eligibilityCutoff time.Time,
+) (uint64, bool, error) {
+	r.dueFloorCallCnt++
+	r.dueFloorMinArg = minHeight
+	r.dueFloorCutoff = eligibilityCutoff
+	if r.dueFloorErr != nil {
+		return 0, false, r.dueFloorErr
+	}
+	return r.dueFloor, r.dueFloorFound, nil
 }
 
 func (r *fakeCohortRepository) RetentionFloorWatermark(

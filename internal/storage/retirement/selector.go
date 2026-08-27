@@ -49,6 +49,28 @@ type (
 			tag uint32,
 			minHeight uint64,
 		) (uint64, bool, error)
+
+		// RetentionDueFloor returns the lowest height at or above minHeight
+		// that is actually DUE at eligibilityCutoff, and whether such a row
+		// exists.
+		//
+		// This is not the same question as RetentionFloorWatermark, and the
+		// difference is load-bearing once the probe is windowed. The watermark
+		// is deliberately conservative by omission and pins to any undeleted
+		// row, due or not. A windowed probe anchored on the watermark can
+		// therefore search [notDueRow, notDueRow+window) forever: it returns no
+		// cohorts, the tick idles, the watermark is recomputed to the same
+		// not-due row next tick, and due work above the window is never
+		// discovered until the low row matures. Anchoring the window here
+		// instead makes an empty window mean "nothing is due", which is the
+		// only reading under which idling is correct.
+		RetentionDueFloor(
+			ctx context.Context,
+			storageGeneration string,
+			tag uint32,
+			minHeight uint64,
+			eligibilityCutoff time.Time,
+		) (uint64, bool, error)
 	}
 
 	Selector struct {
@@ -263,4 +285,33 @@ func (s *Selector) FloorWatermark(
 		return approvedStartHeight, nil
 	}
 	return watermark, nil
+}
+
+// DueFloor resolves the lowest height at or above floorHeight that is due at
+// eligibilityCutoff. found is false when nothing is due, which is the caller's
+// signal to idle rather than to probe a window that cannot contain work.
+func (s *Selector) DueFloor(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	floorHeight uint64,
+	eligibilityCutoff time.Time,
+) (uint64, bool, error) {
+	if s == nil || s.repo == nil {
+		return 0, false, xerrors.New("retention cohort repository is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return 0, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+	}
+	dueFloor, found, err := s.repo.RetentionDueFloor(ctx, storageGeneration, tag, floorHeight, eligibilityCutoff)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to resolve retention due floor: %w", err)
+	}
+	if !found {
+		return 0, false, nil
+	}
+	if dueFloor < floorHeight {
+		return floorHeight, true, nil
+	}
+	return dueFloor, true, nil
 }

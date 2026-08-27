@@ -38,6 +38,59 @@ type retentionCronCohortRepository struct {
 	watermarkFound     bool
 	watermarkErr       error
 	watermarkMinHeight uint64
+
+	// dueFloor drives where the windowed probe anchors. found=false means
+	// nothing is due. When rangeAware is set the double derives both the due
+	// floor and the returned cohorts from the requested range instead of
+	// replaying canned values, which is what lets a test observe a window that
+	// hides due work rather than only asserting the arguments (INF-1416).
+	dueFloor          uint64
+	dueFloorFound     bool
+	dueFloorErr       error
+	dueFloorMinArg    uint64
+	noDueWork         bool
+	rangeAware        bool
+	dueFloorCallCount int
+}
+
+func (r *retentionCronCohortRepository) RetentionDueFloor(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	eligibilityCutoff time.Time,
+) (uint64, bool, error) {
+	r.dueFloorCallCount++
+	r.dueFloorMinArg = minHeight
+	if r.dueFloorErr != nil {
+		return 0, false, r.dueFloorErr
+	}
+	if !r.rangeAware {
+		if r.noDueWork {
+			return 0, false, nil
+		}
+		if r.dueFloorFound {
+			return r.dueFloor, true, nil
+		}
+		// Default: due work begins exactly at the probe floor. That is what
+		// every pre-existing case in this file assumes, so they keep probing
+		// from the watermark as before.
+		return minHeight, true, nil
+	}
+	// Range-aware: the lowest DUE cohort at or above minHeight, mirroring what
+	// the SQL does rather than replaying a canned answer.
+	found := false
+	lowest := uint64(0)
+	for _, cohort := range r.due {
+		if cohort.StartHeight < minHeight || cohort.EligibleAt.After(eligibilityCutoff) {
+			continue
+		}
+		if !found || cohort.StartHeight < lowest {
+			found = true
+			lowest = cohort.StartHeight
+		}
+	}
+	return lowest, found, nil
 }
 
 func (r *retentionCronCohortRepository) RetentionFloorWatermark(
@@ -69,7 +122,25 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	if r.err != nil {
 		return nil, nil, r.err
 	}
-	return r.pending, r.due, nil
+	if !r.rangeAware {
+		return r.pending, r.due, nil
+	}
+	// Honour the requested height range. Without this the double returns due
+	// cohorts no matter what window was asked for, so a probe that searches the
+	// wrong window still looks correct and the bug is invisible to tests.
+	return filterCohortsToRange(r.pending, startHeight, endHeight),
+		filterCohortsToRange(r.due, startHeight, endHeight),
+		nil
+}
+
+func filterCohortsToRange(cohorts []retirement.RetentionCohort, startHeight, endHeight uint64) []retirement.RetentionCohort {
+	filtered := make([]retirement.RetentionCohort, 0, len(cohorts))
+	for _, cohort := range cohorts {
+		if cohort.StartHeight >= startHeight && cohort.StartHeight < endHeight {
+			filtered = append(filtered, cohort)
+		}
+	}
+	return filtered
 }
 
 func newSingleBlockRetentionCronTask(t *testing.T, configOpts ...config.ConfigOption) (
@@ -656,4 +727,71 @@ func TestSingleBlockRetentionCronKeepsSweepAuthorizationAtApprovedEnd(t *testing
 		"the sweep window must never extend past the approved end")
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, request.ApprovedStartHeight)
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, request.ApprovedEndHeight)
+}
+
+// TestSingleBlockRetentionCronFindsDueWorkBeyondAnEmptyFirstWindow is the
+// regression guard for the review finding on INF-1416: a windowed probe must not
+// be able to hide due work behind a not-yet-due row at its floor.
+//
+// RetentionFloorWatermark is the lowest UNDELETED height and deliberately does
+// not filter on due time, so it pins to a row that is not due yet. Anchoring a
+// bounded probe there searches [watermark, watermark+window), finds nothing, and
+// idles -- and because the watermark is recomputed identically every tick, due
+// work above the window is never discovered until the low row matures. The
+// pre-windowed probe spanned the whole approved range and could not hide it.
+//
+// The interleaving is reachable in production: out-of-order backfill and repair
+// promotion set each row's retention clock independently.
+//
+// This case is range-aware on purpose. A double that returns due cohorts
+// regardless of the requested window cannot observe this bug at all -- it would
+// pass while the probe searched entirely the wrong range.
+func TestSingleBlockRetentionCronFindsDueWorkBeyondAnEmptyFirstWindow(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
+	cohortRepository.rangeAware = true
+
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// The watermark pins here: undeleted, but NOT due for another hour.
+	cohortRepository.watermark = floor
+	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{{
+		// Due, but 300 blocks up — outside a 200-block window anchored at the
+		// watermark.
+		ConsolidatedObjectKey: "consolidated/later.cscb.zstd",
+		StartHeight:           floor + 300,
+		EndHeight:             floor + 400,
+		RowCount:              100,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Len(t, runtime.executions, 1,
+		"due work 300 blocks above a 200-block window must still be found; anchoring the window on the not-yet-due watermark hides it forever")
+	request := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.Equal(t, floor+300, request.StartHeight)
+	// The probe anchored on the due floor, not the watermark.
+	require.Equal(t, floor+300, cohortRepository.requestedStartHeight)
+	require.Equal(t, floor+500, cohortRepository.requestedEndHeight)
+	// Authorization is still the operator's envelope, unchanged.
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, request.ApprovedStartHeight)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, request.ApprovedEndHeight)
+}
+
+// TestSingleBlockRetentionCronIdlesWhenNothingIsDueAnywhere pins the other
+// reading of an empty probe: with the window anchored on the due floor, "no due
+// floor" genuinely means nothing is due in the whole approved range, and idling
+// is then correct rather than a hidden backlog.
+func TestSingleBlockRetentionCronIdlesWhenNothingIsDueAnywhere(t *testing.T) {
+	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.noDueWork = true
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Empty(t, runtime.executions)
+	require.Zero(t, cohortRepository.requestedEndHeight,
+		"with nothing due the cron must not run the expensive due-cohort probe at all")
 }
