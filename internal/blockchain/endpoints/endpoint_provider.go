@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 
@@ -163,6 +164,8 @@ func newEndpointProvider(logger *zap.Logger, cfg *config.Config, scope tally.Sco
 		primaryPicker, secondaryPicker = secondaryPicker, primaryPicker
 	}
 
+	logEndpointGroup(logger, name, primaryEndpoints, secondaryEndpoints)
+
 	return &endpointProvider{
 		name:               name,
 		endpointGroup:      endpointGroup,
@@ -173,6 +176,42 @@ func newEndpointProvider(logger *zap.Logger, cfg *config.Config, scope tally.Sco
 		secondaryPicker:    secondaryPicker,
 		secondaryEndpoints: secondaryEndpoints,
 	}, nil
+}
+
+// logEndpointGroup records the endpoint settings that are actually in effect,
+// so that a misconfigured deployment can be diagnosed from the startup log
+// instead of by inspecting the provider's rate-limit errors. Note that the rate
+// limiter is per endpoint per group: the same URL configured in several groups
+// gets an independent budget in each of them.
+func logEndpointGroup(logger *zap.Logger, name string, primary []*Endpoint, secondary []*Endpoint) {
+	if len(primary) == 0 {
+		logger.Warn("endpoint group is empty", zap.String("endpoint_group", name))
+		return
+	}
+
+	for _, endpoint := range primary {
+		logger.Info(
+			"endpoint config",
+			zap.String("endpoint_group", name),
+			zap.String("endpoint", endpoint.Name),
+			zap.String("host", endpointHost(endpoint.Config.Url)),
+			zap.Uint8("weight", endpoint.Config.Weight),
+			zap.Int("rps", endpoint.Config.RPS),
+			zap.Bool("rps_count_batch", endpoint.Config.RPSCountBatch),
+			zap.Int("num_failover_endpoints", len(secondary)),
+		)
+	}
+}
+
+// endpointHost strips the path and the userinfo from the url, since providers
+// such as QuickNode embed the API key in them.
+func endpointHost(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "unknown"
+	}
+
+	return parsed.Host
 }
 
 func newEndpoints(
