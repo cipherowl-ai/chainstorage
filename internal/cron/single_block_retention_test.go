@@ -177,11 +177,14 @@ func TestSingleBlockRetentionCronLaunchesWindowAnchoredAtOldestDueCohort(t *test
 	require.WithinDuration(t, time.Now().UTC(), request.EligibilityCutoff, time.Minute)
 	require.Nil(t, request.Checkpoint)
 	require.Equal(t, cfg.GetEffectiveBlockTag(0), request.Tag)
-	// The probe walks the approved envelope, not an unbounded range, and asks
-	// for a full workflow batch so pending-cohort ordering cannot mask the
-	// oldest due work.
+	// The probe walks ONE WINDOW of the approved envelope, not the whole
+	// envelope and not an unbounded range, and asks for a full workflow batch so
+	// pending-cohort ordering cannot mask the oldest due work.
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
-	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, cohortRepository.requestedEndHeight)
+	require.Equal(t,
+		cfg.Cron.SingleBlockRetention.ApprovedStartHeight+cfg.Cron.SingleBlockRetention.WindowBlocks,
+		cohortRepository.requestedEndHeight,
+		"the probe must be clipped to one window; spanning to ApprovedEndHeight is what times out (INF-1416)")
 	require.Equal(t, retirement.MaxRetentionCohortsPerWorkflow+1, cohortRepository.requestedLimit)
 }
 
@@ -575,4 +578,82 @@ func TestSingleBlockRetentionCronProbeFailedGaugeTracksOutcome(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, float64(0), got)
 	})
+}
+
+// TestSingleBlockRetentionCronBoundsProbeByWindowBlocks is the regression guard
+// for INF-1416. WindowBlocks used to bound only the launched sweep, so the probe
+// spanned [watermark, approvedEnd] however far behind retention had fallen and
+// its cost grew with the backlog instead of with one tick's work.
+//
+// That is not a tuning nit. Past roughly 2-3M blocks of width the planner
+// abandons the index path for the due-cohort expansion join and sequentially
+// scans the whole block_metadata table; measured on robinhood-mainnet prod, 250k
+// of width ran in 20.7s, 1M in 49.2s, and 6.74M did not finish inside the 60s
+// statement timeout. Nor can it recover on its own: the watermark only advances
+// once deletes land, deletes need the probe to return cohorts, and the frontier
+// keeps widening the range meanwhile.
+func TestSingleBlockRetentionCronBoundsProbeByWindowBlocks(t *testing.T) {
+	task, _, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200_000
+	// A cold backlog: the watermark sits at the approved floor while the
+	// approved end is ~13.7M blocks above it.
+	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	cohortRepository.watermarkFound = true
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
+	require.Equal(t,
+		cfg.Cron.SingleBlockRetention.ApprovedStartHeight+200_000,
+		cohortRepository.requestedEndHeight,
+		"probe must span exactly one window regardless of how large the backlog is")
+	require.Less(t,
+		cohortRepository.requestedEndHeight-cohortRepository.requestedStartHeight,
+		cfg.Cron.SingleBlockRetention.ApprovedEndHeight-cfg.Cron.SingleBlockRetention.ApprovedStartHeight,
+		"the whole point is that the probe is narrower than the approved envelope")
+}
+
+// TestSingleBlockRetentionCronProbesWholeRangeWhenNarrowerThanWindow pins the
+// other side: when the remaining range is already smaller than one window the
+// probe must not be padded out past the approved end.
+func TestSingleBlockRetentionCronProbesWholeRangeWhenNarrowerThanWindow(t *testing.T) {
+	task, _, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000_000
+	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedEndHeight - 50_000
+	cohortRepository.watermarkFound = true
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight-50_000, cohortRepository.requestedStartHeight)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, cohortRepository.requestedEndHeight,
+		"a range narrower than the window must not be widened past the approved end")
+}
+
+// TestSingleBlockRetentionCronKeepsSweepAuthorizationAtApprovedEnd pins that
+// narrowing the probe never narrows -- or widens -- what the sweep is authorized
+// to delete. An earlier revision of the INF-1416 fix clipped the sweep window to
+// the probe end too; that underflowed when the anchor sat above the probe end
+// and silently pushed the window PAST the approved envelope.
+func TestSingleBlockRetentionCronKeepsSweepAuthorizationAtApprovedEnd(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200_000
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/tail.cscb.zstd",
+		StartHeight:           cfg.Cron.SingleBlockRetention.ApprovedEndHeight - 1_000,
+		EndHeight:             cfg.Cron.SingleBlockRetention.ApprovedEndHeight,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Len(t, runtime.executions, 1)
+	request := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.LessOrEqual(t, request.EndHeight, cfg.Cron.SingleBlockRetention.ApprovedEndHeight,
+		"the sweep window must never extend past the approved end")
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, request.ApprovedStartHeight)
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, request.ApprovedEndHeight)
 }

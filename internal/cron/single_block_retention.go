@@ -222,6 +222,36 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
 	t.metrics.Gauge("probe_range_blocks").Update(float64(approvedEnd - probeStart))
 
+	// Bound the PROBE by the same window that bounds the sweep.
+	//
+	// Without this the probe spans [watermark, approvedEnd] no matter how far
+	// behind retention is, and its cost grows with the backlog rather than with
+	// the work one tick can do. Past roughly 2-3M blocks of width the planner
+	// abandons the index path for the due-cohort expansion join and sequentially
+	// scans the whole block_metadata table, so the probe stops finishing inside
+	// its statement timeout. Measured on robinhood-mainnet prod: 250k blocks of
+	// width runs in 20.7s, 1M in 49.2s, and 6.74M does not complete in 60s.
+	//
+	// That failure cannot clear itself. The watermark is the lowest height still
+	// holding an undeleted single-block object, so it only advances once deletes
+	// land, deletes need the probe to return cohorts, and the frontier keeps
+	// widening the range in the meantime. Enabling retention against a cold
+	// backlog therefore lands past the flip on the very first tick and stays
+	// there (INF-1416; same plan flip as INF-1330 on solana-mainnet).
+	//
+	// probe_range_blocks above deliberately still reports the FULL approved
+	// range, so the backlog remains visible to alerting; probe_window_blocks
+	// reports what was actually scanned.
+	windowBlocks := cronConfig.WindowBlocks
+	if windowBlocks == 0 {
+		windowBlocks = defaultSingleBlockRetentionWindowBlocks
+	}
+	probeEnd := approvedEnd
+	if probeEnd-probeStart > windowBlocks {
+		probeEnd = probeStart + windowBlocks
+	}
+	t.metrics.Gauge("probe_window_blocks").Update(float64(probeEnd - probeStart))
+
 	probeStartedAt := time.Now()
 	// Asks for a full workflow batch because the selector sorts pending
 	// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
@@ -233,7 +263,7 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		storageGeneration,
 		tag,
 		probeStart,
-		approvedEnd,
+		probeEnd,
 		eligibilityCutoff,
 		retirement.MaxRetentionCohortsPerWorkflow,
 	)
@@ -253,6 +283,8 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 			zap.Uint64("approved_end_height", approvedEnd),
 			zap.Uint64("floor_watermark_height", probeStart),
 			zap.Uint64("probe_range_blocks", approvedEnd-probeStart),
+			zap.Uint64("probe_end_height", probeEnd),
+			zap.Uint64("probe_window_blocks", probeEnd-probeStart),
 			zap.Bool("has_more", hasMore),
 		)
 		return nil
@@ -279,12 +311,13 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	}
 	t.metrics.Gauge("probe_backlog_truncated").Update(backlogTruncated)
 
-	windowBlocks := cronConfig.WindowBlocks
-	if windowBlocks == 0 {
-		windowBlocks = defaultSingleBlockRetentionWindowBlocks
-	}
 	// The selected cohort lies inside the approved range, so the window is
 	// always non-empty; it is clipped to keep each sweep bounded.
+	//
+	// This deliberately still clips to approvedEnd, NOT to probeEnd. The sweep's
+	// authorization is the operator's approved envelope and narrowing the probe
+	// must never change it. Clipping to probeEnd also underflows when the anchor
+	// sits above it, which silently widened the window past approvedEnd.
 	windowStart := anchor.StartHeight
 	windowEnd := approvedEnd
 	if windowEnd-windowStart > windowBlocks {
