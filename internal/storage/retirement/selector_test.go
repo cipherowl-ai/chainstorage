@@ -31,6 +31,7 @@ type fakeCohortRepository struct {
 	dueFloorFound   bool
 	dueFloorErr     error
 	dueFloorMinArg  uint64
+	dueFloorEndArg  uint64
 	dueFloorCutoff  time.Time
 	dueFloorCallCnt int
 }
@@ -40,10 +41,12 @@ func (r *fakeCohortRepository) RetentionDueFloor(
 	_ string,
 	_ uint32,
 	minHeight uint64,
+	endHeight uint64,
 	eligibilityCutoff time.Time,
 ) (uint64, bool, error) {
 	r.dueFloorCallCnt++
 	r.dueFloorMinArg = minHeight
+	r.dueFloorEndArg = endHeight
 	r.dueFloorCutoff = eligibilityCutoff
 	if r.dueFloorErr != nil {
 		return 0, false, r.dueFloorErr

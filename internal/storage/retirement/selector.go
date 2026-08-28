@@ -50,7 +50,7 @@ type (
 			minHeight uint64,
 		) (uint64, bool, error)
 
-		// RetentionDueFloor returns the lowest height at or above minHeight
+		// RetentionDueFloor returns the lowest height in [minHeight, endHeight)
 		// that is actually DUE at eligibilityCutoff, and whether such a row
 		// exists.
 		//
@@ -62,13 +62,20 @@ type (
 		// cohorts, the tick idles, the watermark is recomputed to the same
 		// not-due row next tick, and due work above the window is never
 		// discovered until the low row matures. Anchoring the window here
-		// instead makes an empty window mean "nothing is due", which is the
-		// only reading under which idling is correct.
+		// instead keeps the probe on due work.
+		//
+		// The returned floor is a CANDIDATE: never above the earliest
+		// selectable row, but possibly below it, because join-level
+		// selectability (canonical membership, metadata match, pending and
+		// repair exclusion) is deliberately not evaluated here — see the
+		// implementation for why folding it in reintroduces the timeout. The
+		// cron advances the search window past floors that select nothing.
 		RetentionDueFloor(
 			ctx context.Context,
 			storageGeneration string,
 			tag uint32,
 			minHeight uint64,
+			endHeight uint64,
 			eligibilityCutoff time.Time,
 		) (uint64, bool, error)
 	}
@@ -287,14 +294,18 @@ func (s *Selector) FloorWatermark(
 	return watermark, nil
 }
 
-// DueFloor resolves the lowest height at or above floorHeight that is due at
-// eligibilityCutoff. found is false when nothing is due, which is the caller's
-// signal to idle rather than to probe a window that cannot contain work.
+// DueFloor resolves the lowest height in [floorHeight, endHeight) that is due
+// at eligibilityCutoff. found is false when nothing is due there, which is the
+// caller's signal to idle rather than to probe a window that cannot contain
+// work. The result is clamped into [floorHeight, endHeight): a repository
+// answer outside the requested range is a bug, and failing closed to
+// "nothing due" beats anchoring a window outside the approved envelope.
 func (s *Selector) DueFloor(
 	ctx context.Context,
 	storageGeneration string,
 	tag uint32,
 	floorHeight uint64,
+	endHeight uint64,
 	eligibilityCutoff time.Time,
 ) (uint64, bool, error) {
 	if s == nil || s.repo == nil {
@@ -303,11 +314,14 @@ func (s *Selector) DueFloor(
 	if !isValidStorageGeneration(storageGeneration) {
 		return 0, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
 	}
-	dueFloor, found, err := s.repo.RetentionDueFloor(ctx, storageGeneration, tag, floorHeight, eligibilityCutoff)
+	if endHeight <= floorHeight {
+		return 0, false, nil
+	}
+	dueFloor, found, err := s.repo.RetentionDueFloor(ctx, storageGeneration, tag, floorHeight, endHeight, eligibilityCutoff)
 	if err != nil {
 		return 0, false, xerrors.Errorf("failed to resolve retention due floor: %w", err)
 	}
-	if !found {
+	if !found || dueFloor >= endHeight {
 		return 0, false, nil
 	}
 	if dueFloor < floorHeight {

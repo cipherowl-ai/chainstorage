@@ -39,18 +39,39 @@ type retentionCronCohortRepository struct {
 	watermarkErr       error
 	watermarkMinHeight uint64
 
-	// dueFloor drives where the windowed probe anchors. found=false means
-	// nothing is due. When rangeAware is set the double derives both the due
-	// floor and the returned cohorts from the requested range instead of
-	// replaying canned values, which is what lets a test observe a window that
-	// hides due work rather than only asserting the arguments (INF-1416).
-	dueFloor          uint64
-	dueFloorFound     bool
-	dueFloorErr       error
-	dueFloorMinArg    uint64
-	noDueWork         bool
-	rangeAware        bool
-	dueFloorCallCount int
+	// The due/pending cohort fixtures are the SELECTABLE universe: what
+	// production's ListRetentionCohorts could return. rawDueHeights models due
+	// shadow rows that the due-floor candidate sees but the cohort query
+	// excludes (active repair, canonical or metadata mismatch) — the gap
+	// between the two is exactly what the cron's advance loop exists for.
+	//
+	// This double honors range semantics UNCONDITIONALLY, in both the floor
+	// and the cohort listing. An earlier version returned every fixture
+	// regardless of the requested window, so a probe searching entirely the
+	// wrong range still looked correct and the INF-1416 starvation bug was
+	// invisible to every test in this file.
+	rawDueHeights  []uint64
+	dueFloorErr    error
+	dueFloorMinArg uint64
+	dueFloorEndArg uint64
+	dueFloorCalls  int
+}
+
+// dueFloorFixtures returns every height the production due-floor candidate
+// would see: raw due rows plus the start height of every due-eligible or
+// pending cohort (pending rows carry a passed delete_after, so the raw floor
+// sees them too).
+func (r *retentionCronCohortRepository) dueFloorFixtures(eligibilityCutoff time.Time) []uint64 {
+	heights := append([]uint64{}, r.rawDueHeights...)
+	for _, cohort := range r.due {
+		if !cohort.EligibleAt.After(eligibilityCutoff) {
+			heights = append(heights, cohort.StartHeight)
+		}
+	}
+	for _, cohort := range r.pending {
+		heights = append(heights, cohort.StartHeight)
+	}
+	return heights
 }
 
 func (r *retentionCronCohortRepository) RetentionDueFloor(
@@ -58,36 +79,24 @@ func (r *retentionCronCohortRepository) RetentionDueFloor(
 	_ string,
 	_ uint32,
 	minHeight uint64,
+	endHeight uint64,
 	eligibilityCutoff time.Time,
 ) (uint64, bool, error) {
-	r.dueFloorCallCount++
+	r.dueFloorCalls++
 	r.dueFloorMinArg = minHeight
+	r.dueFloorEndArg = endHeight
 	if r.dueFloorErr != nil {
 		return 0, false, r.dueFloorErr
 	}
-	if !r.rangeAware {
-		if r.noDueWork {
-			return 0, false, nil
-		}
-		if r.dueFloorFound {
-			return r.dueFloor, true, nil
-		}
-		// Default: due work begins exactly at the probe floor. That is what
-		// every pre-existing case in this file assumes, so they keep probing
-		// from the watermark as before.
-		return minHeight, true, nil
-	}
-	// Range-aware: the lowest DUE cohort at or above minHeight, mirroring what
-	// the SQL does rather than replaying a canned answer.
 	found := false
 	lowest := uint64(0)
-	for _, cohort := range r.due {
-		if cohort.StartHeight < minHeight || cohort.EligibleAt.After(eligibilityCutoff) {
+	for _, height := range r.dueFloorFixtures(eligibilityCutoff) {
+		if height < minHeight || height >= endHeight {
 			continue
 		}
-		if !found || cohort.StartHeight < lowest {
+		if !found || height < lowest {
 			found = true
-			lowest = cohort.StartHeight
+			lowest = height
 		}
 	}
 	return lowest, found, nil
@@ -122,12 +131,10 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	if r.err != nil {
 		return nil, nil, r.err
 	}
-	if !r.rangeAware {
-		return r.pending, r.due, nil
-	}
-	// Honour the requested height range. Without this the double returns due
-	// cohorts no matter what window was asked for, so a probe that searches the
-	// wrong window still looks correct and the bug is invisible to tests.
+	// Honour the requested height range unconditionally. Without this the
+	// double returns due cohorts no matter what window was asked for, so a
+	// probe that searches the wrong window still looks correct and the bug is
+	// invisible to tests.
 	return filterCohortsToRange(r.pending, startHeight, endHeight),
 		filterCohortsToRange(r.due, startHeight, endHeight),
 		nil
@@ -248,14 +255,18 @@ func TestSingleBlockRetentionCronLaunchesWindowAnchoredAtOldestDueCohort(t *test
 	require.WithinDuration(t, time.Now().UTC(), request.EligibilityCutoff, time.Minute)
 	require.Nil(t, request.Checkpoint)
 	require.Equal(t, cfg.GetEffectiveBlockTag(0), request.Tag)
-	// The probe walks ONE WINDOW of the approved envelope, not the whole
-	// envelope and not an unbounded range, and asks for a full workflow batch so
-	// pending-cohort ordering cannot mask the oldest due work.
-	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
-	require.Equal(t,
-		cfg.Cron.SingleBlockRetention.ApprovedStartHeight+cfg.Cron.SingleBlockRetention.WindowBlocks,
-		cohortRepository.requestedEndHeight,
-		"the probe must be clipped to one window; spanning to ApprovedEndHeight is what times out (INF-1416)")
+	// The probe walks ONE WINDOW anchored at the due floor — not the whole
+	// envelope (that is what times out, INF-1416) and not the watermark (a
+	// not-yet-due row there would hide due work above the window) — and asks
+	// for a full workflow batch so pending-cohort ordering cannot mask the
+	// oldest due work.
+	require.Equal(t, uint64(430_000_000), cohortRepository.requestedStartHeight)
+	require.Equal(t, uint64(431_000_000), cohortRepository.requestedEndHeight,
+		"the probe must be clipped to one window above the due floor")
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.dueFloorMinArg,
+		"the floor candidate search is bounded below by the approved floor")
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedEndHeight, cohortRepository.dueFloorEndArg,
+		"the floor candidate search is bounded above by the approved end")
 	require.Equal(t, retirement.MaxRetentionCohortsPerWorkflow+1, cohortRepository.requestedLimit)
 }
 
@@ -445,8 +456,17 @@ func TestSingleBlockRetentionCronRequiresProductionDeleteEnablementInProduction(
 }
 
 func TestSingleBlockRetentionCronPropagatesProbeErrors(t *testing.T) {
-	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
 	defer ctrl.Finish()
+	// A due row must exist for the cohort probe to run at all; without one the
+	// floor candidate reports nothing due and the tick idles before Select.
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/cold.cscb.zstd",
+		StartHeight:           cfg.Cron.SingleBlockRetention.ApprovedStartHeight,
+		EndHeight:             cfg.Cron.SingleBlockRetention.ApprovedStartHeight + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-time.Hour),
+	}}
 	cohortRepository.err = errors.New("connection reset")
 
 	err := task.Run(context.Background())
@@ -512,8 +532,17 @@ func TestSingleBlockRetentionCronKeepsApprovedFloorWhenWatermarkIsLower(t *testi
 	defer ctrl.Finish()
 	cohortRepository.watermark = 1_000
 	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/floor.cscb.zstd",
+		StartHeight:           cfg.Cron.SingleBlockRetention.ApprovedStartHeight,
+		EndHeight:             cfg.Cron.SingleBlockRetention.ApprovedStartHeight + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-time.Hour),
+	}}
 
 	require.NoError(t, task.Run(context.Background()))
+	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.dueFloorMinArg,
+		"a watermark below the approved floor must not lower the floor search")
 	require.Equal(t, cfg.Cron.SingleBlockRetention.ApprovedStartHeight, cohortRepository.requestedStartHeight)
 }
 
@@ -668,9 +697,11 @@ func TestSingleBlockRetentionCronBoundsProbeByWindowBlocks(t *testing.T) {
 	defer ctrl.Finish()
 	cfg.Cron.SingleBlockRetention.WindowBlocks = 200_000
 	// A cold backlog: the watermark sits at the approved floor while the
-	// approved end is ~13.7M blocks above it.
+	// approved end is ~13.7M blocks above it, and due work starts right at
+	// the floor.
 	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedStartHeight
 	cohortRepository.watermarkFound = true
+	cohortRepository.rawDueHeights = []uint64{cfg.Cron.SingleBlockRetention.ApprovedStartHeight}
 
 	require.NoError(t, task.Run(context.Background()))
 
@@ -694,6 +725,13 @@ func TestSingleBlockRetentionCronProbesWholeRangeWhenNarrowerThanWindow(t *testi
 	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000_000
 	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedEndHeight - 50_000
 	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/tail.cscb.zstd",
+		StartHeight:           cfg.Cron.SingleBlockRetention.ApprovedEndHeight - 50_000,
+		EndHeight:             cfg.Cron.SingleBlockRetention.ApprovedEndHeight - 50_000 + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-time.Hour),
+	}}
 
 	require.NoError(t, task.Run(context.Background()))
 
@@ -750,7 +788,6 @@ func TestSingleBlockRetentionCronFindsDueWorkBeyondAnEmptyFirstWindow(t *testing
 	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
 	defer ctrl.Finish()
 	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
-	cohortRepository.rangeAware = true
 
 	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
 	// The watermark pins here: undeleted, but NOT due for another hour.
@@ -787,11 +824,114 @@ func TestSingleBlockRetentionCronFindsDueWorkBeyondAnEmptyFirstWindow(t *testing
 func TestSingleBlockRetentionCronIdlesWhenNothingIsDueAnywhere(t *testing.T) {
 	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
 	defer ctrl.Finish()
-	cohortRepository.noDueWork = true
 
 	require.NoError(t, task.Run(context.Background()))
 
 	require.Empty(t, runtime.executions)
 	require.Zero(t, cohortRepository.requestedEndHeight,
 		"with nothing due the cron must not run the expensive due-cohort probe at all")
+}
+
+// TestSingleBlockRetentionCronAdvancesPastUnselectableWindow is the regression
+// guard for the second-round review finding on INF-1416. The due-floor
+// candidate deliberately does not evaluate join-level selectability, so a due
+// row covered by an active repair (or missing canonical membership) can sit at
+// the floor. Anchoring one window there and idling when it selects nothing
+// would pin the search on that row forever — the deeper version of the same
+// starvation the first fix addressed. The cron must step past such a window
+// and find the selectable cohort above it, in the same tick.
+func TestSingleBlockRetentionCronAdvancesPastUnselectableWindow(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// A due shadow row the cohort query cannot return (e.g. repair-covered):
+	// visible to the floor candidate, absent from the selectable fixtures.
+	cohortRepository.rawDueHeights = []uint64{floor}
+	// The selectable cohort sits beyond the first 200-block window.
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/selectable.cscb.zstd",
+		StartHeight:           floor + 300,
+		EndHeight:             floor + 400,
+		RowCount:              100,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Len(t, runtime.executions, 1,
+		"a due-but-unselectable row at the floor must not hide the selectable cohort above the window")
+	request := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.Equal(t, floor+300, request.StartHeight)
+	require.Equal(t, floor+300, cohortRepository.requestedStartHeight,
+		"the second probe attempt must anchor on the next due floor, past the dead window")
+	require.GreaterOrEqual(t, cohortRepository.dueFloorCalls, 2,
+		"stepping past a dead window requires a fresh floor lookup")
+}
+
+// TestSingleBlockRetentionCronAlarmsWhenAdvancesAreExhausted pins that a tick
+// which steps past its full advance budget without finding selectable work
+// raises probe_advance_exhausted instead of idling silently. Due work exists
+// and nothing was launched; the next tick will walk the same dead windows, so
+// this state needs a human, not quiet.
+func TestSingleBlockRetentionCronAlarmsWhenAdvancesAreExhausted(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	scope := newRecordingScope()
+	task.metrics = scope
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// Unselectable due rows in every window the advance budget can reach.
+	for i := uint64(0); i <= uint64(maxRetentionProbeAdvances); i++ {
+		cohortRepository.rawDueHeights = append(cohortRepository.rawDueHeights, floor+i*200)
+	}
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Empty(t, runtime.executions)
+	got, ok := scope.get("probe_advance_exhausted")
+	require.True(t, ok, "an exhausted tick must write the gauge")
+	require.Equal(t, float64(1), got)
+	require.Equal(t, maxRetentionProbeAdvances, cohortRepository.dueFloorCalls)
+}
+
+// TestSingleBlockRetentionCronResetsProbeGaugesOnNoProbeTicks is the two-tick
+// regression for the gauge-staleness review warning: after a tick that probed a
+// real window, a later tick that never probes (approved range fully retired)
+// must not keep exposing the previous tick's scanned width or floor — a stale
+// probe_window_blocks claims a scan that never ran.
+func TestSingleBlockRetentionCronResetsProbeGaugesOnNoProbeTicks(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	scope := newRecordingScope()
+	task.metrics = scope
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+		StartHeight:           floor,
+		EndHeight:             floor + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-time.Hour),
+	}}
+
+	// Tick 1: a real probe over a real window.
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	width, ok := scope.get("probe_window_blocks")
+	require.True(t, ok)
+	require.Greater(t, width, float64(0))
+
+	// Tick 2: everything approved is retired — the completed-range early
+	// return, which never probes.
+	cohortRepository.watermark = cfg.Cron.SingleBlockRetention.ApprovedEndHeight
+	cohortRepository.watermarkFound = true
+	runtime.openWorkflowID = nil
+	require.NoError(t, task.Run(context.Background()))
+
+	width, ok = scope.get("probe_window_blocks")
+	require.True(t, ok)
+	require.Zero(t, width, "a no-probe tick must not expose the previous tick's scanned width")
+	dueFloorHeight, ok := scope.get("due_floor_height")
+	require.True(t, ok)
+	require.Zero(t, dueFloorHeight)
 }
