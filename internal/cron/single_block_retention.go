@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/uber-go/tally/v4"
@@ -40,6 +41,26 @@ type (
 		singleBlockRetention *workflow.SingleBlockRetention
 
 		selectorFactory func(ctx context.Context) (*retirement.Selector, error)
+
+		// probeResumeHeight is where the next tick's advance walk continues
+		// after a tick exhausts maxRetentionProbeAdvances without finding
+		// selectable work. Without it every tick restarts from the watermark
+		// and re-walks the same dead windows, so selectable work beyond the
+		// advance budget is starved permanently; with it consecutive exhausted
+		// ticks ratchet through the dead zone, budget-sized step by step, and
+		// reach whatever lies beyond.
+		//
+		// Deliberately in-memory, not persisted: a stored cursor would need
+		// its own reconciliation against repairs and completed sweeps (the
+		// same reason the watermark is recomputed every tick), while losing
+		// this one on restart merely restarts the walk from the watermark —
+		// the safe direction, re-inspecting windows rather than skipping any.
+		// It is cleared whenever a tick launches, finds nothing due, or finds
+		// the approved range complete, so dead-prefix rows that later become
+		// selectable are re-inspected on the next full pass of the ring.
+		// Atomic only as insurance against a misconfigured parallelism > 1;
+		// the cron runs this task single-flight.
+		probeResumeHeight atomic.Uint64
 	}
 )
 
@@ -57,8 +78,10 @@ const (
 	// per-tick cost, not correctness: at 4 advances a tick steps over up to
 	// 4 x window_blocks of solidly unselectable due rows, and a dead zone
 	// larger than that (hundreds of consecutive broken consolidated objects)
-	// is an incident to alarm on — probe_advance_exhausted goes to 1 — rather
-	// than something to silently walk past.
+	// is an incident to alarm on — probe_advance_exhausted goes to 1 — but the
+	// walk also RESUMES where it stopped (probeResumeHeight), so consecutive
+	// ticks ratchet through a dead zone of any width instead of retrying the
+	// same prefix forever.
 	maxRetentionProbeAdvances        = 4
 	singleBlockRetentionOpenPageSize = 1000
 )
@@ -232,6 +255,7 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		t.metrics.Gauge("probe_advance_exhausted").Update(0)
 		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
 		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		t.probeResumeHeight.Store(0)
 		t.logger.Info(
 			"single_block_retention cron found no outstanding single-block work",
 			zap.Uint32("tag", tag),
@@ -293,6 +317,15 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	)
 	found := false
 	searchStart := probeStart
+	// Resume an exhausted walk. A cursor at or below the watermark is stale
+	// (the watermark caught up past it) and one at or beyond the approved end
+	// has finished the ring; both restart the walk from the watermark so
+	// dead-prefix rows that have since become selectable are re-inspected.
+	if resume := t.probeResumeHeight.Load(); resume > searchStart && resume < approvedEnd {
+		searchStart = resume
+	} else {
+		t.probeResumeHeight.Store(0)
+	}
 	for attempt := 0; attempt < maxRetentionProbeAdvances; attempt++ {
 		dueFloor, dueFound, err := selector.DueFloor(ctx, storageGeneration, tag, searchStart, approvedEnd, eligibilityCutoff)
 		if err != nil {
@@ -311,6 +344,10 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 			t.metrics.Gauge("probe_advance_exhausted").Update(0)
 			t.metrics.Gauge("oldest_due_age_seconds").Update(0)
 			t.metrics.Gauge("probe_backlog_truncated").Update(0)
+			// Wrap the ring: nothing due above searchStart, so the next tick
+			// walks from the watermark again and re-inspects any dead prefix
+			// whose rows may have become selectable since.
+			t.probeResumeHeight.Store(0)
 			t.logger.Info(
 				"single_block_retention cron found nothing due",
 				zap.Uint32("tag", tag),
@@ -378,6 +415,11 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		t.metrics.Gauge("probe_advance_exhausted").Update(1)
 		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
 		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		// Resume here next tick instead of re-walking the same dead prefix —
+		// searchStart is the end of the last window inspected. Consecutive
+		// exhausted ticks therefore ratchet forward budget-by-budget until
+		// they reach selectable work, nothing due, or the approved end.
+		t.probeResumeHeight.Store(searchStart)
 		t.logger.Warn(
 			"single_block_retention cron exhausted probe advances without selectable work",
 			zap.Uint32("tag", tag),
@@ -385,11 +427,13 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 			zap.String("storage_generation", storageGeneration),
 			zap.Uint64("approved_end_height", approvedEnd),
 			zap.Uint64("last_window_end_height", probeEnd),
+			zap.Uint64("resume_height", searchStart),
 			zap.Int("probe_advances", maxRetentionProbeAdvances),
 		)
 		return nil
 	}
 	t.metrics.Gauge("probe_advance_exhausted").Update(0)
+	t.probeResumeHeight.Store(0)
 	// Anchor at the minimum start height and age the gauge from the oldest
 	// eligibility across the whole probe set, so neither is masked by
 	// pending-cohort ordering. Stuck pending cohorts are themselves overdue,

@@ -50,11 +50,12 @@ type retentionCronCohortRepository struct {
 	// regardless of the requested window, so a probe searching entirely the
 	// wrong range still looked correct and the INF-1416 starvation bug was
 	// invisible to every test in this file.
-	rawDueHeights  []uint64
-	dueFloorErr    error
-	dueFloorMinArg uint64
-	dueFloorEndArg uint64
-	dueFloorCalls  int
+	rawDueHeights   []uint64
+	dueFloorErr     error
+	dueFloorMinArg  uint64
+	dueFloorMinArgs []uint64
+	dueFloorEndArg  uint64
+	dueFloorCalls   int
 }
 
 // dueFloorFixtures returns every height the production due-floor candidate
@@ -84,6 +85,7 @@ func (r *retentionCronCohortRepository) RetentionDueFloor(
 ) (uint64, bool, error) {
 	r.dueFloorCalls++
 	r.dueFloorMinArg = minHeight
+	r.dueFloorMinArgs = append(r.dueFloorMinArgs, minHeight)
 	r.dueFloorEndArg = endHeight
 	if r.dueFloorErr != nil {
 		return 0, false, r.dueFloorErr
@@ -934,4 +936,93 @@ func TestSingleBlockRetentionCronResetsProbeGaugesOnNoProbeTicks(t *testing.T) {
 	dueFloorHeight, ok := scope.get("due_floor_height")
 	require.True(t, ok)
 	require.Zero(t, dueFloorHeight)
+}
+
+// TestSingleBlockRetentionCronResumesBeyondDeadPrefixAcrossTicks is the
+// regression guard for the third-round review finding on INF-1416: exhausting
+// the advance budget must not permanently starve selectable work beyond the
+// dead prefix. Without the resume cursor every tick restarts from the
+// watermark, re-walks the same four dead windows, and the selectable cohort in
+// the fifth window is never probed — alarmed, but starved forever. With it,
+// consecutive ticks ratchet through the dead zone and launch.
+func TestSingleBlockRetentionCronResumesBeyondDeadPrefixAcrossTicks(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	scope := newRecordingScope()
+	task.metrics = scope
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// Five consecutive dead windows: due rows the cohort query cannot return.
+	for i := uint64(0); i <= uint64(maxRetentionProbeAdvances); i++ {
+		cohortRepository.rawDueHeights = append(cohortRepository.rawDueHeights, floor+i*200)
+	}
+	// The selectable cohort sits in the window after the dead zone.
+	target := floor + uint64(maxRetentionProbeAdvances+1)*200
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/beyond.cscb.zstd",
+		StartHeight:           target,
+		EndHeight:             target + 100,
+		RowCount:              100,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+
+	// Tick 1: walks the first four dead windows, exhausts, launches nothing.
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+	exhausted, ok := scope.get("probe_advance_exhausted")
+	require.True(t, ok)
+	require.Equal(t, float64(1), exhausted)
+
+	// Tick 2: resumes where tick 1 stopped, steps past the last dead window,
+	// and launches on the selectable cohort.
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1,
+		"selectable work beyond the advance budget must be reached by the next tick, not starved")
+	request := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.Equal(t, target, request.StartHeight)
+	exhausted, ok = scope.get("probe_advance_exhausted")
+	require.True(t, ok)
+	require.Zero(t, exhausted, "a launching tick clears the exhaustion alarm")
+
+	// Tick 3: the launch reset the ring — the floor search starts from the
+	// watermark again, so dead-prefix rows that later become selectable are
+	// re-inspected rather than skipped forever.
+	runtime.executions = nil
+	cohortRepository.dueFloorMinArgs = nil
+	require.NoError(t, task.Run(context.Background()))
+	require.NotEmpty(t, cohortRepository.dueFloorMinArgs)
+	require.Equal(t, floor, cohortRepository.dueFloorMinArgs[0],
+		"after a launch the walk must restart from the watermark, not the old cursor")
+}
+
+// TestSingleBlockRetentionCronWrapsRingWhenNothingDueBeyondDeadZone pins the
+// other end of the ring: when the walk resumes past the dead zone and finds
+// nothing due above it, the cursor resets so the next tick re-inspects the
+// dead prefix from the watermark — its rows mature (repairs complete, clocks
+// pass) and must not be skipped forever either.
+func TestSingleBlockRetentionCronWrapsRingWhenNothingDueBeyondDeadZone(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 200
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// A dead zone one window wider than the advance budget, nothing beyond it.
+	for i := uint64(0); i <= uint64(maxRetentionProbeAdvances); i++ {
+		cohortRepository.rawDueHeights = append(cohortRepository.rawDueHeights, floor+i*200)
+	}
+
+	// Tick 1 exhausts inside the dead zone.
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	// Tick 2 resumes, clears the final dead window, finds nothing due above,
+	// and wraps.
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	// Tick 3 starts from the watermark again.
+	cohortRepository.dueFloorMinArgs = nil
+	require.NoError(t, task.Run(context.Background()))
+	require.NotEmpty(t, cohortRepository.dueFloorMinArgs)
+	require.Equal(t, floor, cohortRepository.dueFloorMinArgs[0],
+		"after the ring wraps, the walk must restart from the watermark")
 }
