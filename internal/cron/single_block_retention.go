@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/uber-go/tally/v4"
@@ -40,6 +41,26 @@ type (
 		singleBlockRetention *workflow.SingleBlockRetention
 
 		selectorFactory func(ctx context.Context) (*retirement.Selector, error)
+
+		// probeResumeHeight is where the next tick's advance walk continues
+		// after a tick exhausts maxRetentionProbeAdvances without finding
+		// selectable work. Without it every tick restarts from the watermark
+		// and re-walks the same dead windows, so selectable work beyond the
+		// advance budget is starved permanently; with it consecutive exhausted
+		// ticks ratchet through the dead zone, budget-sized step by step, and
+		// reach whatever lies beyond.
+		//
+		// Deliberately in-memory, not persisted: a stored cursor would need
+		// its own reconciliation against repairs and completed sweeps (the
+		// same reason the watermark is recomputed every tick), while losing
+		// this one on restart merely restarts the walk from the watermark —
+		// the safe direction, re-inspecting windows rather than skipping any.
+		// It is cleared whenever a tick launches, finds nothing due, or finds
+		// the approved range complete, so dead-prefix rows that later become
+		// selectable are re-inspected on the next full pass of the ring.
+		// Atomic only as insurance against a misconfigured parallelism > 1;
+		// the cron runs this task single-flight.
+		probeResumeHeight atomic.Uint64
 	}
 )
 
@@ -47,7 +68,22 @@ const (
 	autoRetainSuffix                        = "auto_retain"
 	defaultSingleBlockRetentionCronSpec     = "@every 1h"
 	defaultSingleBlockRetentionWindowBlocks = uint64(250_000)
-	singleBlockRetentionOpenPageSize        = 1000
+
+	// maxRetentionProbeAdvances bounds how many consecutive probe windows one
+	// tick may step past when a window's due rows all turn out unselectable
+	// (covered by an active repair, missing canonical membership, and so on —
+	// the due-floor candidate deliberately does not evaluate those; see
+	// RetentionDueFloor). Each advance costs one cheap floor lookup plus one
+	// bounded probe over a window that selects nothing, so the cap bounds
+	// per-tick cost, not correctness: at 4 advances a tick steps over up to
+	// 4 x window_blocks of solidly unselectable due rows, and a dead zone
+	// larger than that (hundreds of consecutive broken consolidated objects)
+	// is an incident to alarm on — probe_advance_exhausted goes to 1 — but the
+	// walk also RESUMES where it stopped (probeResumeHeight), so consecutive
+	// ticks ratchet through a dead zone of any width instead of retrying the
+	// same prefix forever.
+	maxRetentionProbeAdvances        = 4
+	singleBlockRetentionOpenPageSize = 1000
 )
 
 func NewSingleBlockRetention(params SingleBlockRetentionTaskParams) (Task, error) {
@@ -139,6 +175,15 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		return err
 	}
 	if open {
+		// A no-probe tick writes the probe-only gauges as zero rather than
+		// leaving them holding the previous tick's values: a stale
+		// probe_window_blocks would claim this tick scanned a window it never
+		// ran. oldest_due_age_seconds is deliberately NOT reset here — the
+		// backlog it measures still exists while the open sweep works it, and
+		// zeroing it would silence the age alarm exactly when a sweep is stuck.
+		t.metrics.Gauge("probe_window_blocks").Update(0)
+		t.metrics.Gauge("due_floor_height").Update(0)
+		t.metrics.Gauge("probe_advance_exhausted").Update(0)
 		t.logger.Info(
 			"single_block_retention cron skipped because a retention workflow is already open",
 			zap.String("open_workflow_id", openWorkflowID),
@@ -200,10 +245,17 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	if probeStart >= approvedEnd {
 		// Everything approved has been retired. Report a zero-width range so the
 		// width alarm cannot mistake a finished sweep for unbounded growth.
+		// Every probe-only gauge is reset here as well: a gauge left holding the
+		// previous tick's value would report a scanned window on a tick that
+		// never probed, contradicting the gauge's meaning.
 		t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
 		t.metrics.Gauge("probe_range_blocks").Update(0)
+		t.metrics.Gauge("probe_window_blocks").Update(0)
+		t.metrics.Gauge("due_floor_height").Update(0)
+		t.metrics.Gauge("probe_advance_exhausted").Update(0)
 		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
 		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		t.probeResumeHeight.Store(0)
 		t.logger.Info(
 			"single_block_retention cron found no outstanding single-block work",
 			zap.Uint32("tag", tag),
@@ -222,41 +274,166 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
 	t.metrics.Gauge("probe_range_blocks").Update(float64(approvedEnd - probeStart))
 
-	probeStartedAt := time.Now()
-	// Asks for a full workflow batch because the selector sorts pending
-	// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
-	// anchoring on the first cohort alone could hide older due work behind a
-	// stuck pending cohort indefinitely.
-	cohorts, hasMore, err := selector.Select(
-		ctx,
-		bucket,
-		storageGeneration,
-		tag,
-		probeStart,
-		approvedEnd,
-		eligibilityCutoff,
-		retirement.MaxRetentionCohortsPerWorkflow,
-	)
-	t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
-	if err != nil {
-		return xerrors.Errorf("failed to probe due retention cohorts: %w", err)
+	// Bound the PROBE by the same window that bounds the sweep.
+	//
+	// Without this the probe spans [watermark, approvedEnd] no matter how far
+	// behind retention is, and its cost grows with the backlog rather than with
+	// the work one tick can do. Past roughly 2-3M blocks of width the planner
+	// abandons the index path for the due-cohort expansion join and sequentially
+	// scans the whole block_metadata table, so the probe stops finishing inside
+	// its statement timeout. Measured on robinhood-mainnet prod: 250k blocks of
+	// width runs in 20.7s, 1M in 49.2s, and 6.74M does not complete in 60s.
+	//
+	// That failure cannot clear itself. The watermark is the lowest height still
+	// holding an undeleted single-block object, so it only advances once deletes
+	// land, deletes need the probe to return cohorts, and the frontier keeps
+	// widening the range in the meantime. Enabling retention against a cold
+	// backlog therefore lands past the flip on the very first tick and stays
+	// there (INF-1416; same plan flip as INF-1330 on solana-mainnet).
+	//
+	// The window is anchored on the earliest DUE height, not on the watermark:
+	// the watermark pins to any undeleted row, due or not, and a window anchored
+	// on a not-yet-due row can be empty while due work sits above it — recomputed
+	// identically every tick, forever. The due floor is a candidate rather than a
+	// selectability proof (see RetentionDueFloor), so a window whose due rows all
+	// turn out unselectable advances instead of idling; the advance count is
+	// bounded and its exhaustion is alarmed, never silent.
+	//
+	// probe_range_blocks above deliberately still reports the FULL approved
+	// range, so the backlog remains visible to alerting; probe_window_blocks
+	// reports what was actually scanned.
+	windowBlocks := cronConfig.WindowBlocks
+	if windowBlocks == 0 {
+		windowBlocks = defaultSingleBlockRetentionWindowBlocks
 	}
-	if len(cohorts) == 0 {
+
+	// probe_duration_seconds covers the whole search — floor lookups, probes,
+	// and advances — so a slow tick is visible no matter which stage is slow.
+	probeStartedAt := time.Now()
+	var (
+		cohorts  []retirement.RetentionCohort
+		hasMore  bool
+		probeEnd uint64
+	)
+	found := false
+	searchStart := probeStart
+	// Resume an exhausted walk. A cursor at or below the watermark is stale
+	// (the watermark caught up past it) and one at or beyond the approved end
+	// has finished the ring; both restart the walk from the watermark so
+	// dead-prefix rows that have since become selectable are re-inspected.
+	if resume := t.probeResumeHeight.Load(); resume > searchStart && resume < approvedEnd {
+		searchStart = resume
+	} else {
+		t.probeResumeHeight.Store(0)
+	}
+	for attempt := 0; attempt < maxRetentionProbeAdvances; attempt++ {
+		dueFloor, dueFound, err := selector.DueFloor(ctx, storageGeneration, tag, searchStart, approvedEnd, eligibilityCutoff)
+		if err != nil {
+			t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+			return xerrors.Errorf("failed to resolve retention due floor: %w", err)
+		}
+		if !dueFound {
+			// Nothing due in [searchStart, approvedEnd). Because the floor
+			// candidate matches a superset of selectable rows, this is proof
+			// there is nothing to select, and idling is correct. Reset every
+			// probe gauge so this tick cannot exhibit the previous tick's
+			// values.
+			t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+			t.metrics.Gauge("due_floor_height").Update(0)
+			t.metrics.Gauge("probe_window_blocks").Update(0)
+			t.metrics.Gauge("probe_advance_exhausted").Update(0)
+			t.metrics.Gauge("oldest_due_age_seconds").Update(0)
+			t.metrics.Gauge("probe_backlog_truncated").Update(0)
+			// Wrap the ring: nothing due above searchStart, so the next tick
+			// walks from the watermark again and re-inspects any dead prefix
+			// whose rows may have become selectable since.
+			t.probeResumeHeight.Store(0)
+			t.logger.Info(
+				"single_block_retention cron found nothing due",
+				zap.Uint32("tag", tag),
+				zap.String("bucket", bucket),
+				zap.String("storage_generation", storageGeneration),
+				zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
+				zap.Uint64("approved_end_height", approvedEnd),
+				zap.Uint64("floor_watermark_height", probeStart),
+				zap.Uint64("search_start_height", searchStart),
+				zap.Int("probe_advances", attempt),
+			)
+			return nil
+		}
+		probeStart = dueFloor
+		probeEnd = approvedEnd
+		if probeEnd-probeStart > windowBlocks {
+			probeEnd = probeStart + windowBlocks
+		}
+		t.metrics.Gauge("due_floor_height").Update(float64(probeStart))
+		t.metrics.Gauge("probe_window_blocks").Update(float64(probeEnd - probeStart))
+
+		// Asks for a full workflow batch because the selector sorts pending
+		// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
+		// anchoring on the first cohort alone could hide older due work behind a
+		// stuck pending cohort indefinitely.
+		cohorts, hasMore, err = selector.Select(
+			ctx,
+			bucket,
+			storageGeneration,
+			tag,
+			probeStart,
+			probeEnd,
+			eligibilityCutoff,
+			retirement.MaxRetentionCohortsPerWorkflow,
+		)
+		if err != nil {
+			t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+			return xerrors.Errorf("failed to probe due retention cohorts: %w", err)
+		}
+		if len(cohorts) > 0 {
+			found = true
+			break
+		}
+		// The floor saw due rows in this window but the probe selected none of
+		// them: every due row here is excluded at the join level (active
+		// repair, pending manifest, canonical or metadata mismatch). Step past
+		// the window rather than idling on it — idling would pin the search
+		// here forever, hiding selectable work above.
+		t.logger.Info(
+			"single_block_retention cron advancing past a window with no selectable cohorts",
+			zap.Uint32("tag", tag),
+			zap.Uint64("window_start_height", probeStart),
+			zap.Uint64("window_end_height", probeEnd),
+			zap.Int("probe_advances", attempt+1),
+		)
+		searchStart = probeEnd
+	}
+	t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+	if !found {
+		// Every window we were willing to inspect this tick holds only
+		// unselectable due rows. This is an alarm state, not an idle: due work
+		// exists, nothing was launched, and the next tick will walk the same
+		// windows. A dead zone this wide means a mass of repair-covered or
+		// inconsistent objects that needs a human.
+		t.metrics.Gauge("probe_advance_exhausted").Update(1)
 		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
 		t.metrics.Gauge("probe_backlog_truncated").Update(0)
-		t.logger.Info(
-			"single_block_retention cron found no due cohorts",
+		// Resume here next tick instead of re-walking the same dead prefix —
+		// searchStart is the end of the last window inspected. Consecutive
+		// exhausted ticks therefore ratchet forward budget-by-budget until
+		// they reach selectable work, nothing due, or the approved end.
+		t.probeResumeHeight.Store(searchStart)
+		t.logger.Warn(
+			"single_block_retention cron exhausted probe advances without selectable work",
 			zap.Uint32("tag", tag),
 			zap.String("bucket", bucket),
 			zap.String("storage_generation", storageGeneration),
-			zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
 			zap.Uint64("approved_end_height", approvedEnd),
-			zap.Uint64("floor_watermark_height", probeStart),
-			zap.Uint64("probe_range_blocks", approvedEnd-probeStart),
-			zap.Bool("has_more", hasMore),
+			zap.Uint64("last_window_end_height", probeEnd),
+			zap.Uint64("resume_height", searchStart),
+			zap.Int("probe_advances", maxRetentionProbeAdvances),
 		)
 		return nil
 	}
+	t.metrics.Gauge("probe_advance_exhausted").Update(0)
+	t.probeResumeHeight.Store(0)
 	// Anchor at the minimum start height and age the gauge from the oldest
 	// eligibility across the whole probe set, so neither is masked by
 	// pending-cohort ordering. Stuck pending cohorts are themselves overdue,
@@ -279,12 +456,13 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	}
 	t.metrics.Gauge("probe_backlog_truncated").Update(backlogTruncated)
 
-	windowBlocks := cronConfig.WindowBlocks
-	if windowBlocks == 0 {
-		windowBlocks = defaultSingleBlockRetentionWindowBlocks
-	}
 	// The selected cohort lies inside the approved range, so the window is
 	// always non-empty; it is clipped to keep each sweep bounded.
+	//
+	// This deliberately still clips to approvedEnd, NOT to probeEnd. The sweep's
+	// authorization is the operator's approved envelope and narrowing the probe
+	// must never change it. Clipping to probeEnd also underflows when the anchor
+	// sits above it, which silently widened the window past approvedEnd.
 	windowStart := anchor.StartHeight
 	windowEnd := approvedEnd
 	if windowEnd-windowStart > windowBlocks {

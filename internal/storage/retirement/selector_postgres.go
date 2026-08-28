@@ -448,6 +448,116 @@ func scanRetentionCohorts(rows *sql.Rows, pending bool) ([]RetentionCohort, erro
 //
 // found is false when no such row exists, meaning the generation has no
 // outstanding single-block work at or above minHeight.
+// RetentionDueFloor returns the lowest height in [minHeight, endHeight) that is
+// DUE at eligibilityCutoff, and whether such a row exists.
+//
+// It answers a different question from RetentionFloorWatermark, and the
+// difference is load-bearing once the probe is windowed (INF-1416). The
+// watermark pins to any undeleted row, due or not; a window anchored there can
+// be empty while due work sits above it, and because the watermark is
+// recomputed identically every tick the cron would idle forever instead of
+// finding that work.
+//
+// This is deliberately a single-table query — a floor CANDIDATE, not a
+// selectability proof. It matches a superset of the rows the due-cohort query
+// can return (every predicate here also appears there), so the returned floor
+// is never above the earliest selectable row. It can, however, be below it: a
+// due row excluded by the cohort query's join-level predicates (canonical
+// membership, metadata match, pending-retention or active-repair exclusion)
+// still matches here. The cron compensates by advancing the search window when
+// a probe at this floor selects nothing — see maxRetentionProbeAdvances. The
+// join-level predicates are deliberately NOT folded in: with them the planner
+// abandons early termination (it estimates one surviving row, materializes
+// every due row through the joins, and sorts — measured >60s on
+// robinhood-mainnet prod), which would reintroduce the very timeout this
+// query exists to avoid.
+//
+// Every predicate of idx_block_consolidation_shadow_retention_due_generation's
+// WHERE clause is stated verbatim so the partial index is provable. That gives
+// the planner two good regimes, both measured on robinhood-mainnet prod
+// (47.8M-row shadow table, 6.7M-row due backlog):
+//
+//   - backlog due: ascending (tag, height) first-match — 2.7ms
+//   - nothing due: partial due index finds the empty due set — 0.08ms
+//
+// The [minHeight, endHeight) bound keeps the worst case inside the approved
+// range rather than the table tail.
+func (r *PostgresRepository) RetentionDueFloor(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+) (uint64, bool, error) {
+	if r == nil || r.db == nil {
+		return 0, false, xerrors.New("postgres db is required")
+	}
+	return retentionDueFloor(ctx, r.db, storageGeneration, tag, minHeight, endHeight, eligibilityCutoff)
+}
+
+func retentionDueFloor(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+	eligibilityCutoff time.Time,
+) (uint64, bool, error) {
+	if endHeight <= minHeight {
+		return 0, false, nil
+	}
+	query := `
+		SELECT MIN(shadow.height)
+		FROM block_consolidation_shadow shadow
+		WHERE shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.height < $3
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_delete_after <= $4
+			AND shadow.single_block_object_deleted_at IS NULL
+			AND shadow.single_block_object_key_main IS NOT NULL
+			AND shadow.single_block_object_key_main <> ''
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''
+			AND ` + storageGenerationMatch(
+		storageGeneration,
+		"$5",
+		"shadow.single_block_storage_generation",
+		"shadow.consolidated_storage_generation",
+	)
+
+	args := []any{tag, minHeight, endHeight, eligibilityCutoff.UTC()}
+	if storageGenerationIsBound(storageGeneration) {
+		args = append(args, storageGeneration)
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to query retention due floor: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return 0, false, xerrors.Errorf("failed to iterate retention due floor: %w", err)
+		}
+		return 0, false, nil
+	}
+	var height sql.NullInt64
+	if err := rows.Scan(&height); err != nil {
+		return 0, false, xerrors.Errorf("failed to scan retention due floor: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, false, xerrors.Errorf("failed to iterate retention due floor: %w", err)
+	}
+	if !height.Valid || height.Int64 < 0 {
+		return 0, false, nil
+	}
+	return uint64(height.Int64), true, nil
+}
+
 func (r *PostgresRepository) RetentionFloorWatermark(
 	ctx context.Context,
 	storageGeneration string,
