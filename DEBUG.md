@@ -80,3 +80,4 @@ Ordinary tag-2 metadata and consolidation writers use the repair fence's exclusi
 - Prove shared/shared compatibility and shared/exclusive exclusion in PostgreSQL integration coverage.
 - Add the effective consolidation mode to workflow metrics.
 - Raise the Solana deployment's activity attempts from 3 to 8 as a bounded stopgap and add a focused alert for terminal Solana batch-consolidator failures. The current Temporal lifecycle metric has no request-mode label, so the alert intentionally covers both `historical_backfill` and `auto_consolidate`.
+- Emit a completion counter only when the batch consolidator reaches its true terminal return, so historical backfill completion can notify without firing on Continue-As-New checkpoints.
