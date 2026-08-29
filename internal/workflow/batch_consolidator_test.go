@@ -38,6 +38,19 @@ func TestBatchConsolidatorWorkflowTestSuite(t *testing.T) {
 	suite.Run(t, new(batchConsolidatorTestSuite))
 }
 
+func TestBatchConsolidatorRequestGetTags(t *testing.T) {
+	require := testutil.Require(t)
+	request := &BatchConsolidatorRequest{
+		Mode: config.ConsolidationModeHistoricalBackfill,
+		Tag:  2,
+	}
+
+	require.Equal(map[string]string{
+		tagBlockTag:          "2",
+		tagConsolidationMode: string(config.ConsolidationModeHistoricalBackfill),
+	}, request.GetTags())
+}
+
 func (s *batchConsolidatorTestSuite) SetupTest() {
 	require := testutil.Require(s.T())
 

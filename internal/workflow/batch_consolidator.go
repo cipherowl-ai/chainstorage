@@ -55,6 +55,7 @@ var (
 )
 
 const (
+	tagConsolidationMode                           = "mode"
 	batchConsolidatorHeightGauge                   = "workflow.batch_consolidator.height"
 	batchConsolidatorObjectCounter                 = "workflow.batch_consolidator.object"
 	batchConsolidatorConsolidatedBlockCounter      = "workflow.batch_consolidator.consolidated_block"
@@ -104,7 +105,8 @@ func (w *BatchConsolidator) Execute(ctx context.Context, request *BatchConsolida
 
 func (r *BatchConsolidatorRequest) GetTags() map[string]string {
 	return map[string]string{
-		tagBlockTag: strconv.Itoa(int(r.Tag)),
+		tagBlockTag:          strconv.Itoa(int(r.Tag)),
+		tagConsolidationMode: string(r.Mode),
 	}
 }
 

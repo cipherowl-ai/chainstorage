@@ -245,7 +245,7 @@ func (b *blockStorageImpl) PersistBlockMetas(
 				tags = append(tags, block.Tag)
 			}
 		}
-		if err := cscbrepairlock.AcquireTags(txCtx, tx, tags); err != nil {
+		if err := cscbrepairlock.AcquireTagsShared(txCtx, tx, tags); err != nil {
 			return err
 		}
 
@@ -1174,7 +1174,7 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 			_ = tx.Rollback()
 		}
 	}()
-	if err := cscbrepairlock.AcquireTags(ctx, tx, tags); err != nil {
+	if err := cscbrepairlock.AcquireTagsShared(ctx, tx, tags); err != nil {
 		return err
 	}
 
@@ -1389,7 +1389,7 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 			_ = tx.Rollback()
 		}
 	}()
-	if err := cscbrepairlock.AcquireTag(ctx, tx, tag); err != nil {
+	if err := cscbrepairlock.AcquireTagShared(ctx, tx, tag); err != nil {
 		return nil, err
 	}
 
