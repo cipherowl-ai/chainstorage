@@ -197,10 +197,10 @@ const (
 	// dueRetentionCohortOrderingByDueTime retires whatever has been due longest
 	// first. It is the right policy for an unbounded selection, where the caller
 	// is asking "find the most overdue work anywhere".
-	dueRetentionCohortOrderingByDueTime = "due.eligible_at, MIN(shadow.height), due.consolidated_object_key_main"
+	dueRetentionCohortOrderingByDueTime = "c.eligible_at, c.start_height, c.consolidated_object_key_main"
 	// dueRetentionCohortOrderingByHeight walks a caller-supplied range in height
 	// order so the selection is deterministic and prefix-shaped.
-	dueRetentionCohortOrderingByHeight = "MIN(shadow.height), due.consolidated_object_key_main"
+	dueRetentionCohortOrderingByHeight = "c.start_height, c.consolidated_object_key_main"
 )
 
 // dueRetentionCohortOrdering picks the cohort ordering for a selection. Both
@@ -248,6 +248,33 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	)
 }
 
+// listDueRetentionCohorts selects due cohorts at COHORT granularity: the
+// shadow-only predicates aggregate the window first (index-driven, cheap), and
+// the join-level checks — canonical membership, metadata pointing at the
+// consolidated object, pending-retention exclusion, active-repair exclusion —
+// run once per cohort against its start-height row, not once per shadow row.
+//
+// The per-row shape this replaces cost ~800k index lookups per 200k-block
+// window (~200k rows x canonical pk + metadata pk + two anti-joins): measured
+// 25.3s on robinhood-mainnet prod in the healthy case, blowing the 60s
+// statement timeout whenever consolidation bulk-upserts ran concurrently
+// (INF-1448; the retention cron failed three consecutive ticks during the
+// 2026-08-29 ingestion catch-up). Restructuring the two-pass CTE into one pass
+// changed nothing (27.0s measured) — the joins were the cost, not the CTE.
+// This shape measured 0.54s on the same window under the same load, returning
+// identical cohorts.
+//
+// Representative-row validation is sufficient because SELECTION NEVER DELETES:
+// the sweep re-proves every row before anything irreversible — applyCandidate
+// runs revalidateMetadataAndCSCB per row (canonical metadata + live pinned
+// CSCB object, fresh current and versioned HEADs) before the retirement fence,
+// and reconcileManifest handles cohorts left partially pending by a crash. A
+// cohort whose interior holds a broken row is selected here and that row is
+// rejected inside the sweep with a skip reason, exactly as a mid-sweep repair
+// would be. Two deliberate semantic deltas from the per-row shape: RowCount
+// counts every shadow row of the cohort rather than only join-validated ones
+// (the planner re-derives per row anyway), and join-level exclusion keys off
+// the start-height row.
 func listDueRetentionCohorts(
 	ctx context.Context,
 	db retentionCohortQuerier,
@@ -262,89 +289,75 @@ func listDueRetentionCohorts(
 		return nil, nil
 	}
 	queryTemplate := `
-		WITH due_keys AS (
+		WITH cohorts AS (
 			SELECT
 				shadow.consolidated_object_key_main,
-				MIN(shadow.single_block_delete_after) AS eligible_at
+				MIN(shadow.height) AS start_height,
+				MAX(shadow.height) + 1 AS end_height,
+				COUNT(*) AS row_count,
+				MIN(shadow.single_block_delete_after) AS eligible_at,
+				MAX(shadow.single_block_delete_after) AS latest_due_at
 			FROM block_consolidation_shadow shadow
-			JOIN canonical_blocks due_canonical
-				ON due_canonical.tag = shadow.tag
-				AND due_canonical.height = shadow.height
-				AND due_canonical.block_metadata_id = shadow.block_metadata_id
-			JOIN block_metadata due_metadata
-				ON due_metadata.id = due_canonical.block_metadata_id
-				AND due_metadata.tag = due_canonical.tag
-				AND due_metadata.height = due_canonical.height
 			WHERE shadow.tag = $1
 				AND shadow.validated_at IS NOT NULL
 				AND shadow.single_block_delete_after IS NOT NULL
-				AND shadow.single_block_delete_after <= $6
 				AND shadow.single_block_object_deleted_at IS NULL
 				AND shadow.single_block_object_key_main IS NOT NULL
 				AND shadow.single_block_object_key_main <> ''
 				AND shadow.consolidated_object_key_main IS NOT NULL
 				AND shadow.consolidated_object_key_main <> ''
-				AND due_metadata.skipped = FALSE
-				AND due_metadata.object_format = $4
-				AND due_metadata.object_key_main = shadow.consolidated_object_key_main
 				AND %s
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
-				AND NOT EXISTS (
-					SELECT 1
-					FROM block_single_block_retention retention
-					WHERE retention.block_metadata_id = shadow.block_metadata_id
-						AND retention.tag = shadow.tag
-						AND retention.state IN (` + pendingRetirementStatesSQL + `)
-				)
 			GROUP BY shadow.consolidated_object_key_main
+			HAVING MAX(shadow.single_block_delete_after) <= $6
 		)
 		SELECT
-			due.consolidated_object_key_main,
-			MIN(shadow.height),
-			MAX(shadow.height) + 1,
-			COUNT(*),
-			MAX(shadow.single_block_delete_after)
-		FROM due_keys due
-		JOIN block_consolidation_shadow shadow
-			ON shadow.tag = $1
-			AND shadow.consolidated_object_key_main = due.consolidated_object_key_main
-		JOIN canonical_blocks canonical
-			ON canonical.tag = shadow.tag
-			AND canonical.height = shadow.height
-			AND canonical.block_metadata_id = shadow.block_metadata_id
-		JOIN block_metadata metadata
-			ON metadata.id = canonical.block_metadata_id
-			AND metadata.tag = canonical.tag
-			AND metadata.height = canonical.height
-		WHERE shadow.validated_at IS NOT NULL
-			AND shadow.single_block_delete_after IS NOT NULL
-			AND shadow.single_block_object_deleted_at IS NULL
-			AND shadow.single_block_object_key_main IS NOT NULL
-			AND shadow.single_block_object_key_main <> ''
-			AND metadata.skipped = FALSE
-			AND metadata.object_format = $4
-			AND %s
-			AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
-			AND metadata.object_key_main = shadow.consolidated_object_key_main
+			c.consolidated_object_key_main,
+			c.start_height,
+			c.end_height,
+			c.row_count,
+			c.latest_due_at
+		FROM cohorts c
+		WHERE EXISTS (
+				SELECT 1
+				FROM block_consolidation_shadow s
+				JOIN canonical_blocks canonical
+					ON canonical.tag = s.tag
+					AND canonical.height = s.height
+					AND canonical.block_metadata_id = s.block_metadata_id
+				JOIN block_metadata metadata
+					ON metadata.id = canonical.block_metadata_id
+					AND metadata.tag = canonical.tag
+					AND metadata.height = canonical.height
+				WHERE s.tag = $1
+					AND s.height = c.start_height
+					AND s.consolidated_object_key_main = c.consolidated_object_key_main
+					AND metadata.skipped = FALSE
+					AND metadata.object_format = $4
+					AND metadata.object_key_main = c.consolidated_object_key_main
+					AND %s
+			)
 			AND NOT EXISTS (
 				SELECT 1
-				FROM block_single_block_retention retention
-				WHERE retention.block_metadata_id = shadow.block_metadata_id
-					AND retention.tag = shadow.tag
+				FROM block_consolidation_shadow s2
+				JOIN block_single_block_retention retention
+					ON retention.block_metadata_id = s2.block_metadata_id
+					AND retention.tag = s2.tag
+				WHERE s2.tag = $1
+					AND s2.height = c.start_height
+					AND s2.consolidated_object_key_main = c.consolidated_object_key_main
 					AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			)
 			AND NOT EXISTS (
 				SELECT 1
 				FROM cscb_repair_manifest repair
-				WHERE repair.tag = shadow.tag
+				WHERE repair.tag = $1
 					AND repair.state <> 'completed'
 					AND (
-						repair.old_consolidated_object_key_main = shadow.consolidated_object_key_main
-						OR repair.new_consolidated_object_key_main = shadow.consolidated_object_key_main
+						repair.old_consolidated_object_key_main = c.consolidated_object_key_main
+						OR repair.new_consolidated_object_key_main = c.consolidated_object_key_main
 					)
 			)
-		GROUP BY due.consolidated_object_key_main, due.eligible_at
-		HAVING MAX(shadow.single_block_delete_after) <= $6
 		ORDER BY %s
 		LIMIT $5`
 	query := fmt.Sprintf(
@@ -352,7 +365,6 @@ func listDueRetentionCohorts(
 		storageGenerationMatch(
 			storageGeneration,
 			"$7",
-			"due_metadata.storage_generation",
 			"shadow.single_block_storage_generation",
 			"shadow.consolidated_storage_generation",
 		),
@@ -360,8 +372,6 @@ func listDueRetentionCohorts(
 			storageGeneration,
 			"$7",
 			"metadata.storage_generation",
-			"shadow.single_block_storage_generation",
-			"shadow.consolidated_storage_generation",
 		),
 		dueRetentionCohortOrdering(endHeight),
 	)
