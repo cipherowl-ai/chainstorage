@@ -271,10 +271,18 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 // and reconcileManifest handles cohorts left partially pending by a crash. A
 // cohort whose interior holds a broken row is selected here and that row is
 // rejected inside the sweep with a skip reason, exactly as a mid-sweep repair
-// would be. Two deliberate semantic deltas from the per-row shape: RowCount
-// counts every shadow row of the cohort rather than only join-validated ones
-// (the planner re-derives per row anyway), and join-level exclusion keys off
-// the start-height row.
+// would be.
+//
+// The pending-retirement exclusion deliberately stays PER-ROW, inside the
+// aggregate: a cohort with fenced rows must shrink to its unfenced remainder
+// (the integration suite pins this — a crashed sweep's leftovers reconcile
+// through the pending path while the remainder stays selectable as due), and
+// unlike the canonical/metadata joins this anti-join probes the pending
+// partial index, which holds only in-flight rows and is empty on a quiet
+// system. Two deliberate semantic deltas from the per-row shape: RowCount
+// counts every remaining shadow row of the cohort rather than only
+// join-validated ones (the planner re-derives per row anyway), and the
+// canonical/metadata checks key off the start-height row.
 func listDueRetentionCohorts(
 	ctx context.Context,
 	db retentionCohortQuerier,
@@ -308,6 +316,14 @@ func listDueRetentionCohorts(
 				AND shadow.consolidated_object_key_main <> ''
 				AND %s
 				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
+				AND NOT EXISTS (
+					SELECT 1
+					FROM block_single_block_retention retention
+					WHERE retention.tag = shadow.tag
+						AND retention.height = shadow.height
+						AND retention.block_metadata_id = shadow.block_metadata_id
+						AND retention.state IN (` + pendingRetirementStatesSQL + `)
+				)
 			GROUP BY shadow.consolidated_object_key_main
 			HAVING MAX(shadow.single_block_delete_after) <= $6
 		)
@@ -336,17 +352,6 @@ func listDueRetentionCohorts(
 					AND metadata.object_format = $4
 					AND metadata.object_key_main = c.consolidated_object_key_main
 					AND %s
-			)
-			AND NOT EXISTS (
-				SELECT 1
-				FROM block_consolidation_shadow s2
-				JOIN block_single_block_retention retention
-					ON retention.block_metadata_id = s2.block_metadata_id
-					AND retention.tag = s2.tag
-				WHERE s2.tag = $1
-					AND s2.height = c.start_height
-					AND s2.consolidated_object_key_main = c.consolidated_object_key_main
-					AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			)
 			AND NOT EXISTS (
 				SELECT 1
