@@ -970,3 +970,105 @@ func openRetirementIntegrationDB(ctx context.Context, cfg *config.PostgresConfig
 	}
 	return db, nil
 }
+
+// TestIntegrationDueCohortBoundsComeFromEnumerableRows is the regression guard
+// for the INF-1448 review finding: cohort bounds and row counts must derive
+// only from rows the sweep can enumerate — shadow rows that are canonical and
+// whose metadata still points at the cohort's consolidated object. Bounds
+// widened by an orphaned (non-canonical) or re-pointed edge row fail the
+// sweep's contiguous execution-plan validation repeatedly, and an orphaned
+// lowest row must not hide the cohort's valid remainder.
+func TestIntegrationDueCohortBoundsComeFromEnumerableRows(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_200_000_000 + unique%100_000_000)
+	startHeight := uint64(8_300_000_000 + unique%100_000_000)
+	cohortKey := fmt.Sprintf("consolidated/enumerable-%d.cscb.gzip", unique)
+	otherKey := fmt.Sprintf("consolidated/repointed-%d.cscb.gzip", unique)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, 5)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// Five heights, all with due shadow rows for cohortKey:
+	//   h+0: shadow row is NOT canonical (orphaned by a reorg)
+	//   h+1: canonical, metadata re-pointed at another object
+	//   h+2, h+3: fully enumerable
+	//   h+4: shadow row is NOT canonical (orphaned upper edge)
+	insert := func(height uint64, canonicalRow bool, metadataKey string) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, metadataKey, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		if canonicalRow {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+				VALUES ($1, $2, $3)`, height, id, tag)
+			require.NoError(err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			cohortKey,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+	}
+	insert(startHeight, false, cohortKey)   // orphaned lower edge
+	insert(startHeight+1, true, otherKey)   // canonical but re-pointed
+	insert(startHeight+2, true, cohortKey)  // enumerable
+	insert(startHeight+3, true, cohortKey)  // enumerable
+	insert(startHeight+4, false, cohortKey) // orphaned upper edge
+
+	repo := NewPostgresRepository(db)
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
+	require.NoError(err)
+	require.Len(cohorts, 1,
+		"orphaned and re-pointed edge rows must not hide the enumerable remainder")
+	require.Equal(startHeight+2, cohorts[0].StartHeight,
+		"bounds must start at the first ENUMERABLE row, not the first due shadow row")
+	require.Equal(startHeight+4, cohorts[0].EndHeight,
+		"bounds must end after the last ENUMERABLE row, not the orphaned upper edge")
+	require.Equal(uint64(2), cohorts[0].RowCount,
+		"row count must count only rows the sweep can enumerate")
+}

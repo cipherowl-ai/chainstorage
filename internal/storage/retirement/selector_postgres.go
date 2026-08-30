@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -11,6 +12,11 @@ import (
 
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
+
+// The expansion query inlines object_format = 1 as a literal because a bind
+// parameter cannot prove idx_block_metadata_cscb_repair_candidate's partial
+// predicate; this guard breaks the build if the enum value ever moves.
+var _ = [1]struct{}{}[api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH-1]
 
 type retentionCohortQuerier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -197,10 +203,10 @@ const (
 	// dueRetentionCohortOrderingByDueTime retires whatever has been due longest
 	// first. It is the right policy for an unbounded selection, where the caller
 	// is asking "find the most overdue work anywhere".
-	dueRetentionCohortOrderingByDueTime = "c.eligible_at, c.start_height, c.consolidated_object_key_main"
+	dueRetentionCandidateOrderingByDueTime = "eligible_at, candidate_start_height, shadow.consolidated_object_key_main"
 	// dueRetentionCohortOrderingByHeight walks a caller-supplied range in height
 	// order so the selection is deterministic and prefix-shaped.
-	dueRetentionCohortOrderingByHeight = "c.start_height, c.consolidated_object_key_main"
+	dueRetentionCandidateOrderingByHeight = "candidate_start_height, shadow.consolidated_object_key_main"
 )
 
 // dueRetentionCohortOrdering picks the cohort ordering for a selection. Both
@@ -217,11 +223,11 @@ const (
 // single_block_delete_after, so the same approved range can resolve to a
 // different subset later — meaning a clean dry run would no longer predict what
 // an execute run over that range deletes.
-func dueRetentionCohortOrdering(endHeight uint64) string {
+func dueRetentionCandidateOrdering(endHeight uint64) string {
 	if endHeight > 0 {
-		return dueRetentionCohortOrderingByHeight
+		return dueRetentionCandidateOrderingByHeight
 	}
-	return dueRetentionCohortOrderingByDueTime
+	return dueRetentionCandidateOrderingByDueTime
 }
 
 func (r *PostgresRepository) ListDueRetentionCohorts(
@@ -248,41 +254,49 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	)
 }
 
-// listDueRetentionCohorts selects due cohorts at COHORT granularity: the
-// shadow-only predicates aggregate the window first (index-driven, cheap), and
-// the join-level checks — canonical membership, metadata pointing at the
-// consolidated object, pending-retention exclusion, active-repair exclusion —
-// run once per cohort against its start-height row, not once per shadow row.
+// listDueRetentionCohorts derives every cohort's bounds and row count from
+// rows the SWEEP CAN ENUMERATE: shadow rows that are canonical and whose
+// metadata still points at the cohort's consolidated object. The execution
+// path rebuilds ranges through canonical_blocks and requires one contiguous
+// executable row per height, so bounds computed from a looser set are not an
+// optimization but a liveness bug — an orphaned (non-canonical) or re-pointed
+// row at a cohort edge widens the bounds past what the sweep can validate,
+// failing the plan repeatedly, and an orphaned lowest row would hide the
+// cohort's valid remainder forever (both caught in review, INF-1448).
 //
-// The per-row shape this replaces cost ~800k index lookups per 200k-block
-// window (~200k rows x canonical pk + metadata pk + two anti-joins): measured
-// 25.3s on robinhood-mainnet prod in the healthy case, blowing the 60s
-// statement timeout whenever consolidation bulk-upserts ran concurrently
-// (INF-1448; the retention cron failed three consecutive ticks during the
-// 2026-08-29 ingestion catch-up). Restructuring the two-pass CTE into one pass
-// changed nothing (27.0s measured) — the joins were the cost, not the CTE.
-// This shape measured 0.54s on the same window under the same load, returning
-// identical cohorts.
+// The selection is deliberately TWO statements, because every single-statement
+// shape tried here lost to the parameterized planner in a different way, all
+// measured on robinhood-mainnet prod via PREPARE/EXECUTE (lib/pq speaks the
+// extended protocol, so literal-SQL timings prove nothing):
 //
-// Representative-row validation is sufficient because SELECTION NEVER DELETES:
-// the sweep re-proves every row before anything irreversible — applyCandidate
-// runs revalidateMetadataAndCSCB per row (canonical metadata + live pinned
-// CSCB object, fresh current and versioned HEADs) before the retirement fence,
-// and reconcileManifest handles cohorts left partially pending by a crash. A
-// cohort whose interior holds a broken row is selected here and that row is
-// rejected inside the sweep with a skip reason, exactly as a mid-sweep repair
-// would be.
+//   - per-row canonical/metadata joins by primary key: ~200k heap fetches per
+//     200k window, 25.3s, timing out under concurrent consolidation load —
+//     the outage that motivated this rewrite;
+//   - the same joins as index-only probes inside one aggregate: the planner
+//     flips its driver to the due-generation partial index and scans the
+//     entire multi-million-row due backlog per tick (statement timeout), with
+//     or without a MATERIALIZED fence, and the representative EXISTS against
+//     an aggregated column plans as a semi-join over a full scan.
 //
-// The pending-retirement exclusion deliberately stays PER-ROW, inside the
-// aggregate: a cohort with fenced rows must shrink to its unfenced remainder
-// (the integration suite pins this — a crashed sweep's leftovers reconcile
-// through the pending path while the remainder stays selectable as due), and
-// unlike the canonical/metadata joins this anti-join probes the pending
-// partial index, which holds only in-flight rows and is empty on a quiet
-// system. Two deliberate semantic deltas from the per-row shape: RowCount
-// counts every remaining shadow row of the cohort rather than only
-// join-validated ones (the planner re-derives per row anyway), and the
-// canonical/metadata checks key off the start-height row.
+// Statement 1 (candidates) aggregates shadow-only predicates plus the per-row
+// pending anti-join — 0.37-0.54s per 200k window across six prepared
+// executions. Statement 2 (expansion) runs once per candidate, pinned to the
+// cohort's object key so the only sane driver is the object-key hash index —
+// 55-67ms warm per cohort. Its joins carry the enumerable-rows contract with
+// index-only probes (canonical via its unique (height, tag,
+// block_metadata_id) index; the metadata object-key match via
+// idx_block_metadata_cscb_repair_candidate, whose partial predicate
+// object_format = 1 is inlined as a literal because a bind parameter cannot
+// prove a partial index). The HAVING EXISTS runs once per cohort and carries
+// the two columns no index covers (skipped, storage_generation).
+//
+// Edge drift shrinks bounds to the enumerable remainder, exactly as the
+// original per-row shape did; drift strictly interior to a cohort still
+// yields bounds spanning a hole the sweep cannot execute — identical to the
+// original, resolvable only by repair. Selection never deletes: the sweep
+// re-proves every row (applyCandidate -> revalidateMetadataAndCSCB) before
+// anything irreversible, and reconcileManifest absorbs cohorts left partially
+// pending by a crash.
 func listDueRetentionCohorts(
 	ctx context.Context,
 	db retentionCohortQuerier,
@@ -296,62 +310,126 @@ func listDueRetentionCohorts(
 	if limit <= 0 {
 		return nil, nil
 	}
-	queryTemplate := `
-		WITH cohorts AS (
-			SELECT
-				shadow.consolidated_object_key_main,
-				MIN(shadow.height) AS start_height,
-				MAX(shadow.height) + 1 AS end_height,
-				COUNT(*) AS row_count,
-				MIN(shadow.single_block_delete_after) AS eligible_at,
-				MAX(shadow.single_block_delete_after) AS latest_due_at
-			FROM block_consolidation_shadow shadow
-			WHERE shadow.tag = $1
-				AND shadow.validated_at IS NOT NULL
-				AND shadow.single_block_delete_after IS NOT NULL
-				AND shadow.single_block_object_deleted_at IS NULL
-				AND shadow.single_block_object_key_main IS NOT NULL
-				AND shadow.single_block_object_key_main <> ''
-				AND shadow.consolidated_object_key_main IS NOT NULL
-				AND shadow.consolidated_object_key_main <> ''
-				AND %s
-				AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
-				AND NOT EXISTS (
-					SELECT 1
-					FROM block_single_block_retention retention
-					WHERE retention.tag = shadow.tag
-						AND retention.height = shadow.height
-						AND retention.block_metadata_id = shadow.block_metadata_id
-						AND retention.state IN (` + pendingRetirementStatesSQL + `)
-				)
-			GROUP BY shadow.consolidated_object_key_main
-			HAVING MAX(shadow.single_block_delete_after) <= $6
-		)
+	// STATEMENT 1 — candidate discovery. Shadow-only per-row predicates plus
+	// the pending anti-join, aggregated per consolidated object. This shape is
+	// measured planner-robust under the extended protocol (PREPARE/EXECUTE x6
+	// on robinhood-mainnet prod: 0.37-0.54s per 200k window); adding the
+	// canonical/metadata joins to it is NOT — the planner flips its driver to
+	// the due-generation index and scans the entire multi-million-row due
+	// backlog per tick (measured: statement timeout), which is why enumerable
+	// bounds are computed by the per-cohort second statement instead.
+	candidateTemplate := `
 		SELECT
-			c.consolidated_object_key_main,
-			c.start_height,
-			c.end_height,
-			c.row_count,
-			c.latest_due_at
-		FROM cohorts c
-		WHERE EXISTS (
+			shadow.consolidated_object_key_main,
+			MIN(shadow.single_block_delete_after) AS eligible_at,
+			MIN(shadow.height) AS candidate_start_height
+		FROM block_consolidation_shadow shadow
+		WHERE shadow.tag = $1
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_object_deleted_at IS NULL
+			AND shadow.single_block_object_key_main IS NOT NULL
+			AND shadow.single_block_object_key_main <> ''
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''
+			AND %s
+			AND ($3::BIGINT = 0 OR (shadow.height >= $2 AND shadow.height < $3))
+			AND NOT EXISTS (
 				SELECT 1
-				FROM block_consolidation_shadow s
-				JOIN canonical_blocks canonical
-					ON canonical.tag = s.tag
-					AND canonical.height = s.height
-					AND canonical.block_metadata_id = s.block_metadata_id
-				JOIN block_metadata metadata
-					ON metadata.id = canonical.block_metadata_id
-					AND metadata.tag = canonical.tag
-					AND metadata.height = canonical.height
-				WHERE s.tag = $1
-					AND s.height = c.start_height
-					AND s.consolidated_object_key_main = c.consolidated_object_key_main
-					AND metadata.skipped = FALSE
-					AND metadata.object_format = $4
-					AND metadata.object_key_main = c.consolidated_object_key_main
-					AND %s
+				FROM block_single_block_retention retention
+				WHERE retention.tag = shadow.tag
+					AND retention.height = shadow.height
+					AND retention.block_metadata_id = shadow.block_metadata_id
+					AND retention.state IN (` + pendingRetirementStatesSQL + `)
+			)
+		GROUP BY shadow.consolidated_object_key_main
+		HAVING MAX(shadow.single_block_delete_after) <= $5
+		ORDER BY %s
+		LIMIT $4`
+	candidateQuery := fmt.Sprintf(
+		candidateTemplate,
+		storageGenerationMatch(
+			storageGeneration,
+			"$6",
+			"shadow.single_block_storage_generation",
+			"shadow.consolidated_storage_generation",
+		),
+		dueRetentionCandidateOrdering(endHeight),
+	)
+	candidateArgs := []any{tag, startHeight, endHeight, limit, eligibilityCutoff}
+	if storageGenerationIsBound(storageGeneration) {
+		candidateArgs = append(candidateArgs, storageGeneration)
+	}
+	candidateRows, err := db.QueryContext(ctx, candidateQuery, candidateArgs...)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to query due retention cohort candidates: %w", err)
+	}
+	type dueCandidate struct {
+		objectKey  string
+		eligibleAt time.Time
+	}
+	candidates := make([]dueCandidate, 0, limit)
+	for candidateRows.Next() {
+		var candidate dueCandidate
+		var candidateStart int64
+		if err := candidateRows.Scan(&candidate.objectKey, &candidate.eligibleAt, &candidateStart); err != nil {
+			_ = candidateRows.Close()
+			return nil, xerrors.Errorf("failed to scan due retention cohort candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	closeErr := candidateRows.Err()
+	_ = candidateRows.Close()
+	if closeErr != nil {
+		return nil, xerrors.Errorf("failed to iterate due retention cohort candidates: %w", closeErr)
+	}
+
+	// STATEMENT 2 — per-candidate enumerable expansion, pinned to the cohort's
+	// object key so the planner has exactly one sane driver (the object-key
+	// hash index) no matter what the parameters look like. Measured on
+	// robinhood-mainnet prod: 55-67ms warm per cohort. The joins are the
+	// index-only enumerable-rows contract (canonical through its unique
+	// (height, tag, block_metadata_id) index; the metadata object-key match
+	// through idx_block_metadata_cscb_repair_candidate, whose partial
+	// predicate object_format = 1 is inlined as a literal because a parameter
+	// cannot prove a partial index). The HAVING EXISTS runs once per cohort at
+	// aggregate time and carries the two columns no index covers (skipped,
+	// storage_generation).
+	expandTemplate := `
+		SELECT
+			MIN(s.height),
+			MAX(s.height) + 1,
+			COUNT(*),
+			MAX(s.single_block_delete_after)
+		FROM block_consolidation_shadow s
+		JOIN canonical_blocks canonical
+			ON canonical.height = s.height
+			AND canonical.tag = $1
+			AND canonical.block_metadata_id = s.block_metadata_id
+		JOIN block_metadata metadata
+			ON metadata.tag = $1
+			AND metadata.height = s.height
+			AND metadata.object_key_main = s.consolidated_object_key_main
+			AND metadata.id = s.block_metadata_id
+			AND metadata.object_format = 1
+			AND metadata.object_key_main IS NOT NULL
+			AND metadata.object_key_main <> ''
+		WHERE s.tag = $1
+			AND s.consolidated_object_key_main = $2
+			AND s.validated_at IS NOT NULL
+			AND s.single_block_delete_after IS NOT NULL
+			AND s.single_block_object_deleted_at IS NULL
+			AND s.single_block_object_key_main IS NOT NULL
+			AND s.single_block_object_key_main <> ''
+			AND %s
+			AND ($4::BIGINT = 0 OR (s.height >= $3 AND s.height < $4))
+			AND NOT EXISTS (
+				SELECT 1
+				FROM block_single_block_retention retention
+				WHERE retention.tag = $1
+					AND retention.height = s.height
+					AND retention.block_metadata_id = s.block_metadata_id
+					AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			)
 			AND NOT EXISTS (
 				SELECT 1
@@ -359,44 +437,123 @@ func listDueRetentionCohorts(
 				WHERE repair.tag = $1
 					AND repair.state <> 'completed'
 					AND (
-						repair.old_consolidated_object_key_main = c.consolidated_object_key_main
-						OR repair.new_consolidated_object_key_main = c.consolidated_object_key_main
+						repair.old_consolidated_object_key_main = $2
+						OR repair.new_consolidated_object_key_main = $2
 					)
 			)
-		ORDER BY %s
-		LIMIT $5`
-	query := fmt.Sprintf(
-		queryTemplate,
+		HAVING COUNT(*) > 0
+			AND MAX(s.single_block_delete_after) <= $5
+			AND EXISTS (
+				SELECT 1
+				FROM block_metadata rep
+				WHERE rep.tag = $1
+					AND rep.height = MIN(s.height)
+					AND rep.object_key_main = $2
+					AND rep.object_format = 1
+					AND rep.skipped = FALSE
+					AND %s
+			)`
+	expandQuery := fmt.Sprintf(
+		expandTemplate,
 		storageGenerationMatch(
 			storageGeneration,
-			"$7",
-			"shadow.single_block_storage_generation",
-			"shadow.consolidated_storage_generation",
+			"$6",
+			"s.single_block_storage_generation",
+			"s.consolidated_storage_generation",
 		),
 		storageGenerationMatch(
 			storageGeneration,
-			"$7",
-			"metadata.storage_generation",
+			"$6",
+			"rep.storage_generation",
 		),
-		dueRetentionCohortOrdering(endHeight),
 	)
-	args := []any{
-		tag,
-		startHeight,
-		endHeight,
-		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
-		limit,
-		eligibilityCutoff,
+
+	result := make([]RetentionCohort, 0, len(candidates))
+	for _, candidate := range candidates {
+		expandArgs := []any{tag, candidate.objectKey, startHeight, endHeight, eligibilityCutoff}
+		if storageGenerationIsBound(storageGeneration) {
+			expandArgs = append(expandArgs, storageGeneration)
+		}
+		rows, err := db.QueryContext(ctx, expandQuery, expandArgs...)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to expand due retention cohort: %w", err)
+		}
+		expanded, err := scanRetentionCohortBounds(rows, candidate.objectKey, candidate.eligibleAt)
+		if err != nil {
+			return nil, err
+		}
+		if expanded != nil {
+			result = append(result, *expanded)
+		}
 	}
-	if storageGenerationIsBound(storageGeneration) {
-		args = append(args, storageGeneration)
-	}
-	rows, err := db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to query due retention cohorts: %w", err)
-	}
+	// Candidate order derives from raw shadow rows; enumerable bounds can
+	// shrink a cohort's start upward past a drifted edge, so re-sort on the
+	// bounds actually returned. A dropped candidate (nothing enumerable) can
+	// under-fill the limit even when more work exists beyond it; the caller's
+	// hasMore then reads pessimistically low, which self-corrects on the next
+	// hourly tick.
+	sortDueRetentionCohorts(result, endHeight)
+	return result, nil
+}
+
+// scanRetentionCohortBounds reads the single aggregate row of the expansion
+// query. A NULL MIN (no enumerable rows — every shadow row of the candidate is
+// orphaned, re-pointed, or newly fenced) or a filtered-out HAVING yields nil,
+// which drops the candidate exactly as the per-row shape dropped rows.
+func scanRetentionCohortBounds(rows *sql.Rows, objectKey string, eligibleAt time.Time) (*RetentionCohort, error) {
 	defer func() { _ = rows.Close() }()
-	return scanRetentionCohorts(rows, false)
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return nil, xerrors.Errorf("failed to iterate due retention cohort expansion: %w", err)
+		}
+		return nil, nil
+	}
+	var (
+		start sql.NullInt64
+		end   sql.NullInt64
+		count sql.NullInt64
+		due   sql.NullTime
+	)
+	if err := rows.Scan(&start, &end, &count, &due); err != nil {
+		return nil, xerrors.Errorf("failed to scan due retention cohort expansion: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, xerrors.Errorf("failed to iterate due retention cohort expansion: %w", err)
+	}
+	if !start.Valid || !end.Valid || !count.Valid || count.Int64 <= 0 || start.Int64 < 0 || end.Int64 <= start.Int64 {
+		return nil, nil
+	}
+	return &RetentionCohort{
+		ConsolidatedObjectKey: objectKey,
+		StartHeight:           uint64(start.Int64),
+		EndHeight:             uint64(end.Int64),
+		RowCount:              uint64(count.Int64),
+		EligibleAt:            eligibleAt,
+	}, nil
+}
+
+// sortDueRetentionCohorts re-applies the selection ordering to the final
+// enumerable bounds: height order for bounded ranges (deterministic,
+// prefix-shaped walks) and due-time order for open-ended selection.
+func sortDueRetentionCohorts(cohorts []RetentionCohort, endHeight uint64) {
+	if endHeight > 0 {
+		sort.Slice(cohorts, func(i, j int) bool {
+			if cohorts[i].StartHeight != cohorts[j].StartHeight {
+				return cohorts[i].StartHeight < cohorts[j].StartHeight
+			}
+			return cohorts[i].ConsolidatedObjectKey < cohorts[j].ConsolidatedObjectKey
+		})
+		return
+	}
+	sort.Slice(cohorts, func(i, j int) bool {
+		if !cohorts[i].EligibleAt.Equal(cohorts[j].EligibleAt) {
+			return cohorts[i].EligibleAt.Before(cohorts[j].EligibleAt)
+		}
+		if cohorts[i].StartHeight != cohorts[j].StartHeight {
+			return cohorts[i].StartHeight < cohorts[j].StartHeight
+		}
+		return cohorts[i].ConsolidatedObjectKey < cohorts[j].ConsolidatedObjectKey
+	})
 }
 
 func scanRetentionCohorts(rows *sql.Rows, pending bool) ([]RetentionCohort, error) {

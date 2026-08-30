@@ -219,9 +219,29 @@ func TestSelectorReportsRemainingBacklog(t *testing.T) {
 	require.Equal(t, "consolidated/a.cscb.zstd", cohorts[0].ConsolidatedObjectKey)
 }
 
-func TestDueRetentionCohortOrdering(t *testing.T) {
-	require.Equal(t, dueRetentionCohortOrderingByHeight, dueRetentionCohortOrdering(100))
-	require.Equal(t, dueRetentionCohortOrderingByDueTime, dueRetentionCohortOrdering(0))
+func TestDueRetentionCandidateOrdering(t *testing.T) {
+	require.Equal(t, dueRetentionCandidateOrderingByHeight, dueRetentionCandidateOrdering(100))
+	require.Equal(t, dueRetentionCandidateOrderingByDueTime, dueRetentionCandidateOrdering(0))
+}
+
+// TestSortDueRetentionCohorts pins the final re-sort that runs on ENUMERABLE
+// bounds: candidate order derives from raw shadow rows, and a drifted lower
+// edge can move a cohort's real start past a neighbor's.
+func TestSortDueRetentionCohorts(t *testing.T) {
+	byHeight := []RetentionCohort{
+		{ConsolidatedObjectKey: "b", StartHeight: 300},
+		{ConsolidatedObjectKey: "a", StartHeight: 100},
+	}
+	sortDueRetentionCohorts(byHeight, 1_000)
+	require.Equal(t, uint64(100), byHeight[0].StartHeight)
+
+	early := time.Date(2026, 7, 23, 0, 0, 0, 0, time.UTC)
+	byDue := []RetentionCohort{
+		{ConsolidatedObjectKey: "b", StartHeight: 100, EligibleAt: early.Add(time.Hour)},
+		{ConsolidatedObjectKey: "a", StartHeight: 300, EligibleAt: early},
+	}
+	sortDueRetentionCohorts(byDue, 0)
+	require.Equal(t, "a", byDue[0].ConsolidatedObjectKey)
 }
 
 func TestSelectorLookaheadKeysReturnsDistinctKeysBeyondWorkflowCap(t *testing.T) {
