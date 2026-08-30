@@ -343,45 +343,68 @@ func listDueRetentionCohorts(
 					AND retention.state IN (` + pendingRetirementStatesSQL + `)
 			)
 		GROUP BY shadow.consolidated_object_key_main
-		HAVING MAX(shadow.single_block_delete_after) <= $5
+		HAVING MAX(shadow.single_block_delete_after) <= $5%s
 		ORDER BY %s
 		LIMIT $4`
-	candidateQuery := fmt.Sprintf(
-		candidateTemplate,
-		storageGenerationMatch(
-			storageGeneration,
-			"$6",
-			"shadow.single_block_storage_generation",
-			"shadow.consolidated_storage_generation",
-		),
-		dueRetentionCandidateOrdering(endHeight),
+	genMatch := storageGenerationMatch(
+		storageGeneration,
+		"$6",
+		"shadow.single_block_storage_generation",
+		"shadow.consolidated_storage_generation",
 	)
-	candidateArgs := []any{tag, startHeight, endHeight, limit, eligibilityCutoff}
-	if storageGenerationIsBound(storageGeneration) {
-		candidateArgs = append(candidateArgs, storageGeneration)
-	}
-	candidateRows, err := db.QueryContext(ctx, candidateQuery, candidateArgs...)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to query due retention cohort candidates: %w", err)
-	}
+	// Keyset continuation: the candidate LIMIT applies to RAW candidates, so a
+	// page whose every candidate expands to nothing (active repairs, orphaned
+	// cohorts) must not end the search — a valid cohort behind a dead prefix
+	// larger than one page would otherwise be starved indefinitely, with the
+	// cron advancing past the whole window each tick (review catch, round 5).
+	// The cursor rides in the HAVING clause because it compares aggregates;
+	// row-value comparison keeps it one predicate in either ordering mode.
+	byHeight := endHeight > 0
 	type dueCandidate struct {
 		objectKey  string
 		eligibleAt time.Time
+		startKey   int64
 	}
-	candidates := make([]dueCandidate, 0, limit)
-	for candidateRows.Next() {
-		var candidate dueCandidate
-		var candidateStart int64
-		if err := candidateRows.Scan(&candidate.objectKey, &candidate.eligibleAt, &candidateStart); err != nil {
-			_ = candidateRows.Close()
-			return nil, xerrors.Errorf("failed to scan due retention cohort candidate: %w", err)
+	fetchCandidatePage := func(afterEligible time.Time, afterStart int64, afterKey string, first bool) ([]dueCandidate, error) {
+		continuation := ""
+		args := []any{tag, startHeight, endHeight, limit, eligibilityCutoff}
+		if storageGenerationIsBound(storageGeneration) {
+			args = append(args, storageGeneration)
 		}
-		candidates = append(candidates, candidate)
-	}
-	closeErr := candidateRows.Err()
-	_ = candidateRows.Close()
-	if closeErr != nil {
-		return nil, xerrors.Errorf("failed to iterate due retention cohort candidates: %w", closeErr)
+		if !first {
+			if byHeight {
+				p1 := fmt.Sprintf("$%d", len(args)+1)
+				p2 := fmt.Sprintf("$%d", len(args)+2)
+				continuation = "\n\t\t\tAND (MIN(shadow.height), shadow.consolidated_object_key_main) > (" + p1 + "::BIGINT, " + p2 + ")"
+				args = append(args, afterStart, afterKey)
+			} else {
+				p1 := fmt.Sprintf("$%d", len(args)+1)
+				p2 := fmt.Sprintf("$%d", len(args)+2)
+				p3 := fmt.Sprintf("$%d", len(args)+3)
+				continuation = "\n\t\t\tAND (MIN(shadow.single_block_delete_after), MIN(shadow.height), shadow.consolidated_object_key_main) > (" + p1 + "::TIMESTAMPTZ, " + p2 + "::BIGINT, " + p3 + ")"
+				args = append(args, afterEligible, afterStart, afterKey)
+			}
+		}
+		query := fmt.Sprintf(candidateTemplate, genMatch, continuation, dueRetentionCandidateOrdering(endHeight))
+		rows, err := db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to query due retention cohort candidates: %w", err)
+		}
+		page := make([]dueCandidate, 0, limit)
+		for rows.Next() {
+			var candidate dueCandidate
+			if err := rows.Scan(&candidate.objectKey, &candidate.eligibleAt, &candidate.startKey); err != nil {
+				_ = rows.Close()
+				return nil, xerrors.Errorf("failed to scan due retention cohort candidate: %w", err)
+			}
+			page = append(page, candidate)
+		}
+		iterErr := rows.Err()
+		_ = rows.Close()
+		if iterErr != nil {
+			return nil, xerrors.Errorf("failed to iterate due retention cohort candidates: %w", iterErr)
+		}
+		return page, nil
 	}
 
 	// STATEMENT 2 — per-candidate enumerable expansion, pinned to the cohort's
@@ -468,30 +491,57 @@ func listDueRetentionCohorts(
 		),
 	)
 
-	result := make([]RetentionCohort, 0, len(candidates))
-	for _, candidate := range candidates {
-		expandArgs := []any{tag, candidate.objectKey, startHeight, endHeight, eligibilityCutoff}
-		if storageGenerationIsBound(storageGeneration) {
-			expandArgs = append(expandArgs, storageGeneration)
-		}
-		rows, err := db.QueryContext(ctx, expandQuery, expandArgs...)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to expand due retention cohort: %w", err)
-		}
-		expanded, err := scanRetentionCohortBounds(rows, candidate.objectKey, candidate.eligibleAt)
+	// Accumulate expanded cohorts across candidate pages until the limit is
+	// satisfied or candidates run out. maxCandidatePages bounds a pathological
+	// window (every candidate dead) to a known per-tick cost — beyond it the
+	// tick returns what it has, and the cron's advance/resume machinery plus
+	// the probe_advance_exhausted alarm own the pathology; a dead zone wider
+	// than maxCandidatePages x limit object keys is repair-scale breakage, not
+	// something selection should silently walk.
+	const maxCandidatePages = 8
+	result := make([]RetentionCohort, 0, limit)
+	var (
+		afterEligible time.Time
+		afterStart    int64
+		afterKey      string
+	)
+	for page := 0; page < maxCandidatePages && len(result) < limit; page++ {
+		candidates, err := fetchCandidatePage(afterEligible, afterStart, afterKey, page == 0)
 		if err != nil {
 			return nil, err
 		}
-		if expanded != nil {
-			result = append(result, *expanded)
+		if len(candidates) == 0 {
+			break
+		}
+		last := candidates[len(candidates)-1]
+		afterEligible, afterStart, afterKey = last.eligibleAt, last.startKey, last.objectKey
+		for _, candidate := range candidates {
+			if len(result) >= limit {
+				break
+			}
+			expandArgs := []any{tag, candidate.objectKey, startHeight, endHeight, eligibilityCutoff}
+			if storageGenerationIsBound(storageGeneration) {
+				expandArgs = append(expandArgs, storageGeneration)
+			}
+			rows, err := db.QueryContext(ctx, expandQuery, expandArgs...)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to expand due retention cohort: %w", err)
+			}
+			expanded, err := scanRetentionCohortBounds(rows, candidate.objectKey, candidate.eligibleAt)
+			if err != nil {
+				return nil, err
+			}
+			if expanded != nil {
+				result = append(result, *expanded)
+			}
+		}
+		if len(candidates) < limit {
+			break
 		}
 	}
 	// Candidate order derives from raw shadow rows; enumerable bounds can
 	// shrink a cohort's start upward past a drifted edge, so re-sort on the
-	// bounds actually returned. A dropped candidate (nothing enumerable) can
-	// under-fill the limit even when more work exists beyond it; the caller's
-	// hasMore then reads pessimistically low, which self-corrects on the next
-	// hourly tick.
+	// bounds actually returned.
 	sortDueRetentionCohorts(result, endHeight)
 	return result, nil
 }
