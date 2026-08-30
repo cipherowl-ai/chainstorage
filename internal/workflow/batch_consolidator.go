@@ -55,7 +55,9 @@ var (
 )
 
 const (
+	tagConsolidationMode                           = "mode"
 	batchConsolidatorHeightGauge                   = "workflow.batch_consolidator.height"
+	batchConsolidatorCompletedCounter              = "workflow.batch_consolidator.completed"
 	batchConsolidatorObjectCounter                 = "workflow.batch_consolidator.object"
 	batchConsolidatorConsolidatedBlockCounter      = "workflow.batch_consolidator.consolidated_block"
 	batchConsolidatorEmptyBatchCounter             = "workflow.batch_consolidator.empty_batch"
@@ -104,7 +106,8 @@ func (w *BatchConsolidator) Execute(ctx context.Context, request *BatchConsolida
 
 func (r *BatchConsolidatorRequest) GetTags() map[string]string {
 	return map[string]string{
-		tagBlockTag: strconv.Itoa(int(r.Tag)),
+		tagBlockTag:          strconv.Itoa(int(r.Tag)),
+		tagConsolidationMode: string(r.Mode),
 	}
 }
 
@@ -160,7 +163,8 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 		}
 		tag := cfg.GetEffectiveBlockTag(request.Tag)
 		metrics := w.getMetricsHandler(ctx).WithTags(map[string]string{
-			tagBlockTag: strconv.Itoa(int(tag)),
+			tagBlockTag:          strconv.Itoa(int(tag)),
+			tagConsolidationMode: string(mode),
 		})
 		logger := w.getLogger(ctx).With(
 			zap.Reflect("request", request),
@@ -516,6 +520,7 @@ func (w *BatchConsolidator) execute(ctx workflow.Context, request *BatchConsolid
 			logger.Info("updated auto_consolidate cursor", zap.Uint32("tag", tag), zap.Uint64("height", workflowEndHeight))
 		}
 
+		metrics.Counter(batchConsolidatorCompletedCounter).Inc(1)
 		logger.Info("workflow finished")
 		return nil
 	})
