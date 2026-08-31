@@ -67,19 +67,19 @@ func (r *PostgresRepository) ListRetentionCohorts(
 	endHeight uint64,
 	eligibilityCutoff time.Time,
 	limit int,
-) ([]RetentionCohort, []RetentionCohort, error) {
+) ([]RetentionCohort, []RetentionCohort, uint64, error) {
 	if r == nil || r.db == nil {
-		return nil, nil, xerrors.New("postgres db is required")
+		return nil, nil, 0, xerrors.New("postgres db is required")
 	}
 	if limit <= 0 {
-		return nil, nil, nil
+		return nil, nil, 0, nil
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelRepeatableRead,
 		ReadOnly:  true,
 	})
 	if err != nil {
-		return nil, nil, xerrors.Errorf("failed to begin retention cohort snapshot: %w", err)
+		return nil, nil, 0, xerrors.Errorf("failed to begin retention cohort snapshot: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -95,9 +95,9 @@ func (r *PostgresRepository) ListRetentionCohorts(
 		limit,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	due, err := listDueRetentionCohorts(
+	due, resumeAfter, err := listDueRetentionCohorts(
 		ctx,
 		tx,
 		storageGeneration,
@@ -108,12 +108,12 @@ func (r *PostgresRepository) ListRetentionCohorts(
 		limit,
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, nil, xerrors.Errorf("failed to commit retention cohort snapshot: %w", err)
+		return nil, nil, 0, xerrors.Errorf("failed to commit retention cohort snapshot: %w", err)
 	}
-	return pending, due, nil
+	return pending, due, resumeAfter, nil
 }
 
 func (r *PostgresRepository) ListPendingRetentionCohorts(
@@ -238,9 +238,9 @@ func (r *PostgresRepository) ListDueRetentionCohorts(
 	endHeight uint64,
 	eligibilityCutoff time.Time,
 	limit int,
-) ([]RetentionCohort, error) {
+) ([]RetentionCohort, uint64, error) {
 	if r == nil || r.db == nil {
-		return nil, xerrors.New("postgres db is required")
+		return nil, 0, xerrors.New("postgres db is required")
 	}
 	return listDueRetentionCohorts(
 		ctx,
@@ -306,9 +306,9 @@ func listDueRetentionCohorts(
 	endHeight uint64,
 	eligibilityCutoff time.Time,
 	limit int,
-) ([]RetentionCohort, error) {
+) ([]RetentionCohort, uint64, error) {
 	if limit <= 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	// STATEMENT 1 — candidate discovery. Shadow-only per-row predicates plus
 	// the pending anti-join, aggregated per consolidated object. This shape is
@@ -322,7 +322,8 @@ func listDueRetentionCohorts(
 		SELECT
 			shadow.consolidated_object_key_main,
 			MIN(shadow.single_block_delete_after) AS eligible_at,
-			MIN(shadow.height) AS candidate_start_height
+			MIN(shadow.height) AS candidate_start_height,
+			MAX(shadow.height) AS candidate_end_height
 		FROM block_consolidation_shadow shadow
 		WHERE shadow.tag = $1
 			AND shadow.validated_at IS NOT NULL
@@ -341,6 +342,16 @@ func listDueRetentionCohorts(
 					AND retention.height = shadow.height
 					AND retention.block_metadata_id = shadow.block_metadata_id
 					AND retention.state IN (` + pendingRetirementStatesSQL + `)
+			)
+			AND NOT EXISTS (
+				SELECT 1
+				FROM cscb_repair_manifest repair
+				WHERE repair.tag = shadow.tag
+					AND repair.state <> 'completed'
+					AND (
+						repair.old_consolidated_object_key_main = shadow.consolidated_object_key_main
+						OR repair.new_consolidated_object_key_main = shadow.consolidated_object_key_main
+					)
 			)
 		GROUP BY shadow.consolidated_object_key_main
 		HAVING MAX(shadow.single_block_delete_after) <= $5%s
@@ -364,6 +375,7 @@ func listDueRetentionCohorts(
 		objectKey  string
 		eligibleAt time.Time
 		startKey   int64
+		endKey     int64
 	}
 	fetchCandidatePage := func(afterEligible time.Time, afterStart int64, afterKey string, first bool) ([]dueCandidate, error) {
 		continuation := ""
@@ -393,7 +405,7 @@ func listDueRetentionCohorts(
 		page := make([]dueCandidate, 0, limit)
 		for rows.Next() {
 			var candidate dueCandidate
-			if err := rows.Scan(&candidate.objectKey, &candidate.eligibleAt, &candidate.startKey); err != nil {
+			if err := rows.Scan(&candidate.objectKey, &candidate.eligibleAt, &candidate.startKey, &candidate.endKey); err != nil {
 				_ = rows.Close()
 				return nil, xerrors.Errorf("failed to scan due retention cohort candidate: %w", err)
 			}
@@ -499,64 +511,94 @@ func listDueRetentionCohorts(
 	)
 
 	// Accumulate expanded cohorts across candidate pages until the limit is
-	// satisfied or candidates are EXHAUSTED. There is deliberately no page cap:
-	// a cap truncates silently, the cron reads an empty result as proof the
-	// window holds nothing selectable and advances past candidates nobody
-	// examined, so work behind a dead prefix wider than the cap is stranded
-	// (review, round 6).
+	// satisfied, candidates are exhausted, or the expansion budget is spent.
 	//
-	// Termination and cost are bounded by the probe window rather than by an
-	// arbitrary page budget: a bounded window of window_blocks heights holds at
-	// most window_blocks/max_blocks consolidated objects (200,000/10,000 = 20 on
-	// robinhood), so the cron's calls never reach a second page and the whole
-	// expansion costs ~20 x 60ms. Open-ended selection (endHeight = 0) is an
-	// admin/test path whose candidate set is bounded by the caller's range and
-	// ultimately by ctx cancellation, which QueryContext honours.
+	// Both failure modes this has been through are real, and the design has to
+	// refuse both at once:
+	//
+	//   - a page cap that truncates SILENTLY lets the cron read an empty result
+	//     as "this window holds nothing selectable" and advance past candidates
+	//     nobody examined, stranding work behind a dead prefix;
+	//   - unbounded exhaustion makes one call's cost proportional to the dead
+	//     prefix, which can run past the activity timeout and error every tick,
+	//     so nothing progresses at all.
+	//
+	// So the budget is explicit AND reported. maxCandidateExpansions bounds the
+	// call (each expansion is a separate ~60ms statement, so ~2000 of them is
+	// ~2 minutes — comfortably inside the tick, nowhere near the activity
+	// timeout), and when it is spent the pass returns resumeAfterHeight: the
+	// first height NOT yet examined, one past the end of the last candidate it
+	// looked at. The caller advances its window there instead of past the whole
+	// window, so consecutive ticks walk a dead prefix of any size
+	// cohort-by-cohort with bounded work each, and no cohort behind it is
+	// stranded. There is deliberately no reliance on window_blocks/max_blocks
+	// arithmetic to bound the candidate count: window_blocks is configurable to
+	// 2,000,000, max_blocks is a ceiling rather than a floor on object size,
+	// and nothing in the schema caps distinct keys per window.
+	const maxCandidateExpansions = 2000
 	result := make([]RetentionCohort, 0, limit)
 	var (
 		afterEligible time.Time
 		afterStart    int64
 		afterKey      string
+		resumeAfter   uint64
+		expansions    int
 	)
 	for page := 0; len(result) < limit; page++ {
 		candidates, err := fetchCandidatePage(afterEligible, afterStart, afterKey, page == 0)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if len(candidates) == 0 {
 			break
 		}
 		last := candidates[len(candidates)-1]
 		afterEligible, afterStart, afterKey = last.eligibleAt, last.startKey, last.objectKey
+
+		budgetSpent := false
 		for _, candidate := range candidates {
 			if len(result) >= limit {
 				break
 			}
+			if expansions >= maxCandidateExpansions {
+				budgetSpent = true
+				break
+			}
+			expansions++
 			expandArgs := []any{tag, candidate.objectKey, startHeight, endHeight, eligibilityCutoff}
 			if storageGenerationIsBound(storageGeneration) {
 				expandArgs = append(expandArgs, storageGeneration)
 			}
 			rows, err := db.QueryContext(ctx, expandQuery, expandArgs...)
 			if err != nil {
-				return nil, xerrors.Errorf("failed to expand due retention cohort: %w", err)
+				return nil, 0, xerrors.Errorf("failed to expand due retention cohort: %w", err)
 			}
-			expanded, err := scanRetentionCohortBounds(rows, candidate.objectKey, candidate.eligibleAt)
+			expanded, err := scanRetentionCohortBounds(rows, candidate.objectKey)
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
 			if expanded != nil {
 				result = append(result, *expanded)
 			}
+			// One past this candidate's last height: resuming here cannot
+			// re-examine any part of a cohort already inspected, so a dead
+			// prefix is walked cohort-by-cohort rather than row-by-row.
+			if candidate.endKey >= 0 {
+				resumeAfter = uint64(candidate.endKey) + 1
+			}
+		}
+		if budgetSpent {
+			sortDueRetentionCohorts(result, endHeight)
+			return result, resumeAfter, nil
 		}
 		if len(candidates) < limit {
 			break
 		}
 	}
-	// Candidate order derives from raw shadow rows; enumerable bounds can
-	// shrink a cohort's start upward past a drifted edge, so re-sort on the
-	// bounds actually returned.
+	// Candidates were exhausted (or the limit was filled): there is nothing
+	// unexamined left in this range, so report no continuation.
 	sortDueRetentionCohorts(result, endHeight)
-	return result, nil
+	return result, 0, nil
 }
 
 // scanRetentionCohortBounds reads the single aggregate row of the expansion
@@ -564,7 +606,14 @@ func listDueRetentionCohorts(
 // orphaned, re-pointed, newly fenced, or repair-covered) or a filtered-out
 // HAVING yields nil, which drops the candidate exactly as the per-row shape
 // dropped rows.
-func scanRetentionCohortBounds(rows *sql.Rows, objectKey string, eligibleAt time.Time) (*RetentionCohort, error) {
+//
+// EligibleAt comes from the expansion's MAX(single_block_delete_after) over the
+// ENUMERABLE rows, matching the pre-rewrite query: a cohort is eligible when
+// its last row is due (the HAVING gates on exactly that), so the max is the
+// moment the cohort as a whole became retirable and is what oldest_due_age
+// should measure. The candidate query's MIN drives ordering only, as it always
+// did.
+func scanRetentionCohortBounds(rows *sql.Rows, objectKey string) (*RetentionCohort, error) {
 	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
 		if err := rows.Err(); err != nil {
@@ -584,7 +633,8 @@ func scanRetentionCohortBounds(rows *sql.Rows, objectKey string, eligibleAt time
 	if err := rows.Err(); err != nil {
 		return nil, xerrors.Errorf("failed to iterate due retention cohort expansion: %w", err)
 	}
-	if !start.Valid || !end.Valid || !count.Valid || count.Int64 <= 0 || start.Int64 < 0 || end.Int64 <= start.Int64 {
+	if !start.Valid || !end.Valid || !count.Valid || !due.Valid ||
+		count.Int64 <= 0 || start.Int64 < 0 || end.Int64 <= start.Int64 {
 		return nil, nil
 	}
 	return &RetentionCohort{
@@ -592,7 +642,7 @@ func scanRetentionCohortBounds(rows *sql.Rows, objectKey string, eligibleAt time
 		StartHeight:           uint64(start.Int64),
 		EndHeight:             uint64(end.Int64),
 		RowCount:              uint64(count.Int64),
-		EligibleAt:            eligibleAt,
+		EligibleAt:            due.Time.UTC(),
 	}, nil
 }
 

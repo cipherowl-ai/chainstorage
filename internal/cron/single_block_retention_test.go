@@ -51,6 +51,8 @@ type retentionCronCohortRepository struct {
 	// wrong range still looked correct and the INF-1416 starvation bug was
 	// invisible to every test in this file.
 	rawDueHeights   []uint64
+	resumeAfter     uint64
+	selectCalls     [][2]uint64
 	dueFloorErr     error
 	dueFloorMinArg  uint64
 	dueFloorMinArgs []uint64
@@ -126,19 +128,25 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	endHeight uint64,
 	_ time.Time,
 	limit int,
-) ([]retirement.RetentionCohort, []retirement.RetentionCohort, error) {
+) ([]retirement.RetentionCohort, []retirement.RetentionCohort, uint64, error) {
 	r.requestedStartHeight = startHeight
 	r.requestedEndHeight = endHeight
 	r.requestedLimit = limit
+	r.selectCalls = append(r.selectCalls, [2]uint64{startHeight, endHeight})
 	if r.err != nil {
-		return nil, nil, r.err
+		return nil, nil, 0, r.err
 	}
 	// Honour the requested height range unconditionally. Without this the
 	// double returns due cohorts no matter what window was asked for, so a
 	// probe that searches the wrong window still looks correct and the bug is
 	// invisible to tests.
+	//
+	// resumeAfter models a budget-truncated selection: non-zero means real
+	// candidates in this window were never examined, so the cron must resume
+	// there rather than step past the window.
 	return filterCohortsToRange(r.pending, startHeight, endHeight),
 		filterCohortsToRange(r.due, startHeight, endHeight),
+		r.resumeAfter,
 		nil
 }
 
@@ -1025,4 +1033,64 @@ func TestSingleBlockRetentionCronWrapsRingWhenNothingDueBeyondDeadZone(t *testin
 	require.NotEmpty(t, cohortRepository.dueFloorMinArgs)
 	require.Equal(t, floor, cohortRepository.dueFloorMinArgs[0],
 		"after the ring wraps, the walk must restart from the watermark")
+}
+
+// TestSingleBlockRetentionCronResumesAtTruncatedSelectionHeight is the round-7
+// regression guard: when due selection stops on its expansion budget with
+// candidates still unexamined, it reports the first unexamined height, and the
+// cron must resume its search THERE rather than stepping past the whole window.
+// Stepping past would skip cohorts nobody looked at, stranding them exactly as
+// the old silent page cap did.
+func TestSingleBlockRetentionCronResumesAtTruncatedSelectionHeight(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// Due rows exist across the window, but selection returns no cohorts and
+	// reports that it only got as far as floor+400.
+	// Due rows at both the floor and the resume point, so the floor lookup
+	// still finds work after the search advances.
+	cohortRepository.rawDueHeights = []uint64{floor, floor + 400}
+	cohortRepository.resumeAfter = floor + 400
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	require.GreaterOrEqual(t, len(cohortRepository.selectCalls), 2,
+		"the cron should probe again after a truncated selection")
+	// The second probe must start at the reported resume height, NOT at the
+	// end of the first window.
+	first := cohortRepository.selectCalls[0]
+	second := cohortRepository.selectCalls[1]
+	require.Equal(t, floor, first[0])
+	require.Equal(t, floor+400, second[0],
+		"cron must resume at the first unexamined height, not skip the window")
+	require.Less(t, second[0], first[1],
+		"resuming inside the window is the whole point; skipping to its end strands work")
+}
+
+// TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow pins the other side:
+// when selection reports NO continuation (candidates exhausted), the window
+// really is dead and the cron must step past it. Conflating the two directions
+// is what this pair exists to prevent.
+func TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	cohortRepository.rawDueHeights = []uint64{floor, floor + 1_400}
+	cohortRepository.resumeAfter = 0 // exhausted, not truncated
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	require.GreaterOrEqual(t, len(cohortRepository.selectCalls), 2)
+	first := cohortRepository.selectCalls[0]
+	second := cohortRepository.selectCalls[1]
+	// The cron anchors each probe on the due floor at or above its search
+	// cursor, so the second window starts at the next due height — what matters
+	// is that it is at or beyond the first window's end, i.e. the dead window
+	// was stepped past rather than re-probed.
+	require.GreaterOrEqual(t, second[0], first[1],
+		"an exhausted window must be stepped past, not re-probed")
 }

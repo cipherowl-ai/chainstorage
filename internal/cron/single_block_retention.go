@@ -311,9 +311,10 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	// and advances — so a slow tick is visible no matter which stage is slow.
 	probeStartedAt := time.Now()
 	var (
-		cohorts  []retirement.RetentionCohort
-		hasMore  bool
-		probeEnd uint64
+		cohorts     []retirement.RetentionCohort
+		hasMore     bool
+		resumeAfter uint64
+		probeEnd    uint64
 	)
 	found := false
 	searchStart := probeStart
@@ -373,7 +374,7 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
 		// anchoring on the first cohort alone could hide older due work behind a
 		// stuck pending cohort indefinitely.
-		cohorts, hasMore, err = selector.Select(
+		cohorts, hasMore, resumeAfter, err = selector.Select(
 			ctx,
 			bucket,
 			storageGeneration,
@@ -391,19 +392,34 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 			found = true
 			break
 		}
-		// The floor saw due rows in this window but the probe selected none of
-		// them: every due row here is excluded at the join level (active
-		// repair, pending manifest, canonical or metadata mismatch). Step past
-		// the window rather than idling on it — idling would pin the search
-		// here forever, hiding selectable work above.
+		// The probe selected nothing here. There are two very different reasons
+		// for that and they must not be conflated:
+		//
+		//   - candidates were EXHAUSTED: every due row in this window is
+		//     excluded at the join level (active repair, pending manifest,
+		//     canonical or metadata mismatch), so the window really is dead and
+		//     the search steps past it. Idling instead would pin the search
+		//     here forever, hiding selectable work above.
+		//   - selection stopped on its expansion BUDGET with candidates still
+		//     unexamined (resumeAfter > 0). Stepping past the window would skip
+		//     cohorts nobody looked at, stranding them; the search resumes at
+		//     the first unexamined height instead, so a dead prefix of any size
+		//     is walked with bounded work per tick.
+		nextStart := probeEnd
+		truncated := resumeAfter > probeStart && resumeAfter < probeEnd
+		if truncated {
+			nextStart = resumeAfter
+		}
 		t.logger.Info(
 			"single_block_retention cron advancing past a window with no selectable cohorts",
 			zap.Uint32("tag", tag),
 			zap.Uint64("window_start_height", probeStart),
 			zap.Uint64("window_end_height", probeEnd),
+			zap.Uint64("next_search_height", nextStart),
+			zap.Bool("selection_budget_truncated", truncated),
 			zap.Int("probe_advances", attempt+1),
 		)
-		searchStart = probeEnd
+		searchStart = nextStart
 	}
 	t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
 	if !found {

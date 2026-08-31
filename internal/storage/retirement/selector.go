@@ -23,6 +23,12 @@ type (
 	// CohortRepository must return row-disjoint pending and due aggregates.
 	// Both slices must come from one database snapshot. Selector merges
 	// aggregates for the same consolidated object by summing their row counts.
+	//
+	// ListRetentionCohorts also returns a resume height: non-zero when due
+	// selection stopped on its expansion budget with candidates still
+	// unexamined, naming the first height it did not look at. Callers that
+	// advance a search window on an empty result must advance to that height
+	// instead, or work behind a large dead prefix is stranded.
 	CohortRepository interface {
 		ListRetentionCohorts(
 			ctx context.Context,
@@ -33,7 +39,7 @@ type (
 			endHeight uint64,
 			eligibilityCutoff time.Time,
 			limit int,
-		) ([]RetentionCohort, []RetentionCohort, error)
+		) ([]RetentionCohort, []RetentionCohort, uint64, error)
 
 		// RetentionFloorWatermark returns the lowest height at or above
 		// minHeight that still holds an undeleted single-block object, and
@@ -98,35 +104,35 @@ func (s *Selector) Select(
 	endHeight uint64,
 	eligibilityCutoff time.Time,
 	limit int,
-) ([]RetentionCohort, bool, error) {
+) ([]RetentionCohort, bool, uint64, error) {
 	if s == nil || s.repo == nil {
-		return nil, false, xerrors.New("retention cohort repository is required")
+		return nil, false, 0, xerrors.New("retention cohort repository is required")
 	}
 	if bucket == "" {
-		return nil, false, xerrors.New("retention cohort bucket is required")
+		return nil, false, 0, xerrors.New("retention cohort bucket is required")
 	}
 	if !isValidStorageGeneration(storageGeneration) {
-		return nil, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+		return nil, false, 0, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
 	}
 	if limit <= 0 || limit > MaxRetentionCohortsPerWorkflow {
-		return nil, false, xerrors.Errorf(
+		return nil, false, 0, xerrors.Errorf(
 			"retention cohort limit must be between 1 and %d: %d",
 			MaxRetentionCohortsPerWorkflow,
 			limit,
 		)
 	}
 	if endHeight == 0 && startHeight != 0 {
-		return nil, false, xerrors.New("retention selection end height is required when start height is set")
+		return nil, false, 0, xerrors.New("retention selection end height is required when start height is set")
 	}
 	if endHeight != 0 && endHeight <= startHeight {
-		return nil, false, xerrors.Errorf("invalid retention selection range [%d, %d)", startHeight, endHeight)
+		return nil, false, 0, xerrors.Errorf("invalid retention selection range [%d, %d)", startHeight, endHeight)
 	}
 	if eligibilityCutoff.IsZero() {
-		return nil, false, xerrors.New("retention selection eligibility cutoff is required")
+		return nil, false, 0, xerrors.New("retention selection eligibility cutoff is required")
 	}
 
 	queryLimit := limit + 1
-	pending, due, err := s.repo.ListRetentionCohorts(
+	pending, due, resumeAfter, err := s.repo.ListRetentionCohorts(
 		ctx,
 		bucket,
 		storageGeneration,
@@ -137,7 +143,7 @@ func (s *Selector) Select(
 		queryLimit,
 	)
 	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list retention cohorts: %w", err)
+		return nil, false, 0, xerrors.Errorf("failed to list retention cohorts: %w", err)
 	}
 
 	result := make([]RetentionCohort, 0, queryLimit)
@@ -178,19 +184,24 @@ func (s *Selector) Select(
 	for _, cohort := range pending {
 		cohort.Pending = true
 		if err := appendOrMerge(cohort); err != nil {
-			return nil, false, err
+			return nil, false, 0, err
 		}
 	}
 	for _, cohort := range due {
 		if err := appendOrMerge(cohort); err != nil {
-			return nil, false, err
+			return nil, false, 0, err
 		}
 	}
 	hasMore := len(result) > limit
 	if hasMore {
 		result = result[:limit]
 	}
-	return result, hasMore, nil
+	// resumeAfter is non-zero only when due selection stopped on its expansion
+	// budget with candidates still unexamined. The caller MUST advance its
+	// search to that height rather than past the whole window; treating a short
+	// or empty page as "nothing selectable here" is what strands work behind a
+	// dead prefix.
+	return result, hasMore, resumeAfter, nil
 }
 
 // MaxRetentionPrimingLookahead bounds how many upcoming cohorts one Select pass
@@ -228,7 +239,9 @@ func (s *Selector) LookaheadKeys(
 			limit,
 		)
 	}
-	pending, due, err := s.repo.ListRetentionCohorts(
+	// Lookahead only primes safety observations for upcoming keys; it never
+	// advances a search window, so the continuation height is not its concern.
+	pending, due, _, err := s.repo.ListRetentionCohorts(
 		ctx,
 		bucket,
 		storageGeneration,

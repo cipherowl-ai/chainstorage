@@ -102,7 +102,7 @@ func TestDueCohortQueryBindsGenerationOnlyWhenReferenced(t *testing.T) {
 	require := require.New(t)
 	for _, generation := range []string{"v2", ""} {
 		recorder := &recordingCohortQuerier{}
-		_, err := listDueRetentionCohorts(
+		_, _, err := listDueRetentionCohorts(
 			context.Background(), recorder, generation, 2, 0, 0, time.Now().UTC(), 10,
 		)
 		// The recorder never returns rows; the query text and bound arguments
