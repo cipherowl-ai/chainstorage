@@ -521,9 +521,19 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	}
 	t.metrics.Gauge("probe_advance_exhausted").Update(0)
 	t.probeResumeHeight.Store(0)
-	// A launch means this window produced real work; the next tick re-derives
-	// its position from the watermark rather than resuming a stale walk.
-	t.storeDueCursor(0, retirement.DueCohortCursor{})
+	// Preserve a budget-truncated continuation ACROSS the launch. A non-empty
+	// page does NOT mean the window is finished: selection can return an early
+	// selectable cohort and still have spent its budget on the dead prefix
+	// behind it. Clearing here would restart the next tick at the head of this
+	// window, and if the cohort just launched stays due — a deferred or failed
+	// sweep leaves it due — every subsequent tick would re-select that same
+	// cohort and never reach work behind the prefix.
+	//
+	// storeDueCursor clears when handed a zero cursor, so the exhausted case
+	// still resets to a fresh walk. The cursor is keyed to this window, so once
+	// the launched cohort is actually retired and the floor moves, it is
+	// discarded rather than misapplied.
+	t.storeDueCursor(probeStart, nextCursor)
 	// Anchor at the minimum start height and age the gauge from the oldest
 	// eligibility across the whole probe set, so neither is masked by
 	// pending-cohort ordering. Stuck pending cohorts are themselves overdue,
