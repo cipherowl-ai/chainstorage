@@ -1186,3 +1186,120 @@ func TestIntegrationCandidatePaginationSurvivesDeadPrefix(t *testing.T) {
 	require.Len(cohorts, 1)
 	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
 }
+
+// TestIntegrationCandidatePaginationExhaustsHugeDeadPrefix is the round-6
+// regression guard: pagination must run to EXHAUSTION, not to a page cap. The
+// previous revision capped at 8 pages, and a cap is a silent truncation — the
+// cron reads the empty result as proof the window holds nothing selectable and
+// advances past candidates nobody examined, stranding the valid cohort.
+//
+// The fixture builds a dead prefix far wider than any fixed page budget: 60
+// repair-covered cohorts selected with limit 2 forces 30+ pages, where the old
+// cap allowed 8. The selectable cohort sits last, so only exhaustive
+// pagination can reach it.
+func TestIntegrationCandidatePaginationExhaustsHugeDeadPrefix(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	const deadCohorts = 60
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_400_000_000 + unique%100_000_000)
+	baseHeight := uint64(8_700_000_000 + unique%100_000_000)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, deadCohorts+1)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest DISABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_manifest WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest ENABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	insertCohort := func(height uint64, key string, repairCovered bool) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, key, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)`, height, id, tag)
+		require.NoError(err)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			key,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+		if repairCovered {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO cscb_repair_manifest (
+					tag, state, bucket, old_consolidated_object_key_main,
+					start_height, end_height, canonical_block_count, total_block_count,
+					row_set_sha256
+				) VALUES ($1, 'preparing', $2, $3, $4, $5, 1, 1, $6)`,
+				tag, integrationRetentionBucket, key, height, height+1,
+				strings.Repeat("c", 64),
+			)
+			require.NoError(err)
+		}
+	}
+
+	for i := 0; i < deadCohorts; i++ {
+		insertCohort(baseHeight+uint64(i), fmt.Sprintf("consolidated/dead-%d-%04d.cscb.gzip", unique, i), true)
+	}
+	validKey := fmt.Sprintf("consolidated/valid-%d.cscb.gzip", unique)
+	insertCohort(baseHeight+uint64(deadCohorts), validKey, false)
+
+	repo := NewPostgresRepository(db)
+
+	// limit 2 => 30+ candidate pages of pure dead prefix before the valid one.
+	cohorts, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, baseHeight+uint64(deadCohorts)+10, now, 2)
+	require.NoError(err)
+	require.Len(cohorts, 1,
+		"pagination must exhaust a dead prefix far wider than any fixed page budget")
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+	require.Equal(baseHeight+uint64(deadCohorts), cohorts[0].StartHeight)
+
+	// Same through the open-ended (by-due-time) cursor shape.
+	cohorts, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 2)
+	require.NoError(err)
+	require.Len(cohorts, 1)
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+}

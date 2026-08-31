@@ -407,17 +407,24 @@ func listDueRetentionCohorts(
 		return page, nil
 	}
 
-	// STATEMENT 2 — per-candidate enumerable expansion, pinned to the cohort's
-	// object key so the planner has exactly one sane driver (the object-key
-	// hash index) no matter what the parameters look like. Measured on
-	// robinhood-mainnet prod: 55-67ms warm per cohort. The joins are the
-	// index-only enumerable-rows contract (canonical through its unique
-	// (height, tag, block_metadata_id) index; the metadata object-key match
-	// through idx_block_metadata_cscb_repair_candidate, whose partial
-	// predicate object_format = 1 is inlined as a literal because a parameter
-	// cannot prove a partial index). The HAVING EXISTS runs once per cohort at
-	// aggregate time and carries the two columns no index covers (skipped,
-	// storage_generation).
+	// STATEMENT 2 — enumerable expansion for ONE candidate, pinned to its object
+	// key so the planner's only sane driver is the object-key hash index no
+	// matter what the parameters look like. Measured on robinhood-mainnet prod:
+	// 55-67ms warm per cohort.
+	//
+	// Deliberately NOT batched over a page with = ANY(array): measured on prod,
+	// the array form makes the planner abandon the per-key driver and fall back
+	// to the height range — 24.4s for five keys, versus ~0.3s running those
+	// same five one at a time. Single-key pinning is the whole reason this
+	// statement is affordable.
+	//
+	// The joins are the index-only enumerable-rows contract (canonical through
+	// its unique (height, tag, block_metadata_id) index; the metadata
+	// object-key match through idx_block_metadata_cscb_repair_candidate, whose
+	// partial predicate object_format = 1 is inlined as a literal because a
+	// bind parameter cannot prove a partial index). The HAVING EXISTS runs once
+	// per cohort at aggregate time and carries the two columns no index covers
+	// (skipped, storage_generation).
 	expandTemplate := `
 		SELECT
 			MIN(s.height),
@@ -492,20 +499,26 @@ func listDueRetentionCohorts(
 	)
 
 	// Accumulate expanded cohorts across candidate pages until the limit is
-	// satisfied or candidates run out. maxCandidatePages bounds a pathological
-	// window (every candidate dead) to a known per-tick cost — beyond it the
-	// tick returns what it has, and the cron's advance/resume machinery plus
-	// the probe_advance_exhausted alarm own the pathology; a dead zone wider
-	// than maxCandidatePages x limit object keys is repair-scale breakage, not
-	// something selection should silently walk.
-	const maxCandidatePages = 8
+	// satisfied or candidates are EXHAUSTED. There is deliberately no page cap:
+	// a cap truncates silently, the cron reads an empty result as proof the
+	// window holds nothing selectable and advances past candidates nobody
+	// examined, so work behind a dead prefix wider than the cap is stranded
+	// (review, round 6).
+	//
+	// Termination and cost are bounded by the probe window rather than by an
+	// arbitrary page budget: a bounded window of window_blocks heights holds at
+	// most window_blocks/max_blocks consolidated objects (200,000/10,000 = 20 on
+	// robinhood), so the cron's calls never reach a second page and the whole
+	// expansion costs ~20 x 60ms. Open-ended selection (endHeight = 0) is an
+	// admin/test path whose candidate set is bounded by the caller's range and
+	// ultimately by ctx cancellation, which QueryContext honours.
 	result := make([]RetentionCohort, 0, limit)
 	var (
 		afterEligible time.Time
 		afterStart    int64
 		afterKey      string
 	)
-	for page := 0; page < maxCandidatePages && len(result) < limit; page++ {
+	for page := 0; len(result) < limit; page++ {
 		candidates, err := fetchCandidatePage(afterEligible, afterStart, afterKey, page == 0)
 		if err != nil {
 			return nil, err
@@ -548,8 +561,9 @@ func listDueRetentionCohorts(
 
 // scanRetentionCohortBounds reads the single aggregate row of the expansion
 // query. A NULL MIN (no enumerable rows — every shadow row of the candidate is
-// orphaned, re-pointed, or newly fenced) or a filtered-out HAVING yields nil,
-// which drops the candidate exactly as the per-row shape dropped rows.
+// orphaned, re-pointed, newly fenced, or repair-covered) or a filtered-out
+// HAVING yields nil, which drops the candidate exactly as the per-row shape
+// dropped rows.
 func scanRetentionCohortBounds(rows *sql.Rows, objectKey string, eligibleAt time.Time) (*RetentionCohort, error) {
 	defer func() { _ = rows.Close() }()
 	if !rows.Next() {
