@@ -173,6 +173,7 @@ func (a *SingleBlockRetention) executeSelect(
 		request.EndHeight,
 		eligibilityCutoff,
 		request.Limit,
+		retirement.DueCohortCursor{},
 	)
 	if err != nil {
 		return nil, err

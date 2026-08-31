@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,14 @@ type (
 		// Atomic only as insurance against a misconfigured parallelism > 1;
 		// the cron runs this task single-flight.
 		probeResumeHeight atomic.Uint64
+
+		// dueCursorMu guards the budget-truncation cursor and the window it
+		// belongs to. Like probeResumeHeight this is deliberately in-memory:
+		// losing it on restart merely restarts the walk from the watermark,
+		// which re-examines candidates rather than skipping any.
+		dueCursorMu     sync.Mutex
+		dueCursor       retirement.DueCohortCursor
+		dueCursorWindow uint64
 	}
 )
 
@@ -97,6 +106,33 @@ func NewSingleBlockRetention(params SingleBlockRetentionTaskParams) (Task, error
 	}
 	task.selectorFactory = task.newPostgresSelector
 	return task, nil
+}
+
+// takeDueCursor returns the persisted budget-truncation cursor when it belongs
+// to windowStart, and the zero cursor otherwise. A cursor from a different
+// window must never be applied: its keyset position would skip candidates the
+// current window has not examined.
+func (t *singleBlockRetentionTask) takeDueCursor(windowStart uint64) retirement.DueCohortCursor {
+	t.dueCursorMu.Lock()
+	defer t.dueCursorMu.Unlock()
+	if t.dueCursorWindow != windowStart || t.dueCursor.IsZero() {
+		return retirement.DueCohortCursor{}
+	}
+	return t.dueCursor
+}
+
+// storeDueCursor persists a truncation cursor for windowStart, or clears it
+// when passed a zero cursor.
+func (t *singleBlockRetentionTask) storeDueCursor(windowStart uint64, cursor retirement.DueCohortCursor) {
+	t.dueCursorMu.Lock()
+	defer t.dueCursorMu.Unlock()
+	if cursor.IsZero() {
+		t.dueCursorWindow = 0
+		t.dueCursor = retirement.DueCohortCursor{}
+		return
+	}
+	t.dueCursorWindow = windowStart
+	t.dueCursor = cursor
 }
 
 func (t *singleBlockRetentionTask) Name() string {
@@ -311,11 +347,18 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	// and advances — so a slow tick is visible no matter which stage is slow.
 	probeStartedAt := time.Now()
 	var (
-		cohorts     []retirement.RetentionCohort
-		hasMore     bool
-		resumeAfter uint64
-		probeEnd    uint64
+		cohorts    []retirement.RetentionCohort
+		hasMore    bool
+		nextCursor retirement.DueCohortCursor
+		probeEnd   uint64
 	)
+	// dueCursor carries a budget-truncated selection forward. It is a keyset
+	// cursor into candidate enumeration, so re-probing the SAME window with it
+	// resumes exactly where the last pass stopped — no window movement, and no
+	// height filter that could discard an unexamined candidate overlapping the
+	// examined ones. It is seeded from the previous tick once the window is
+	// known, and persisted again if this tick also runs out of budget.
+	var dueCursor retirement.DueCohortCursor
 	found := false
 	searchStart := probeStart
 	// Resume an exhausted walk. A cursor at or below the watermark is stale
@@ -369,12 +412,18 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		}
 		t.metrics.Gauge("due_floor_height").Update(float64(probeStart))
 		t.metrics.Gauge("probe_window_blocks").Update(float64(probeEnd - probeStart))
+		if attempt == 0 {
+			// Resume a previous tick's truncated walk, but only if it belongs
+			// to this exact window: a cursor from a different window would skip
+			// candidates this one has never examined.
+			dueCursor = t.takeDueCursor(probeStart)
+		}
 
 		// Asks for a full workflow batch because the selector sorts pending
 		// (in-flight) cohorts by prepared_at ahead of height-ordered due cohorts:
 		// anchoring on the first cohort alone could hide older due work behind a
 		// stuck pending cohort indefinitely.
-		cohorts, hasMore, resumeAfter, err = selector.Select(
+		cohorts, hasMore, nextCursor, err = selector.Select(
 			ctx,
 			bucket,
 			storageGeneration,
@@ -383,6 +432,7 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 			probeEnd,
 			eligibilityCutoff,
 			retirement.MaxRetentionCohortsPerWorkflow,
+			dueCursor,
 		)
 		if err != nil {
 			t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
@@ -405,21 +455,42 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 		//     cohorts nobody looked at, stranding them; the search resumes at
 		//     the first unexamined height instead, so a dead prefix of any size
 		//     is walked with bounded work per tick.
-		nextStart := probeEnd
-		truncated := resumeAfter > probeStart && resumeAfter < probeEnd
-		if truncated {
-			nextStart = resumeAfter
+		// The probe selected nothing here. There are two very different reasons
+		// for that and they must not be conflated:
+		//
+		//   - selection stopped on its expansion BUDGET with candidates still
+		//     unexamined (non-zero cursor). Moving the window would skip
+		//     cohorts nobody looked at; instead the SAME window is re-probed
+		//     with the cursor, which resumes exactly past the examined
+		//     candidates and cannot filter out an overlapping unexamined one.
+		//   - candidates were EXHAUSTED: every due row in this window is
+		//     excluded at the join level (pending manifest, canonical or
+		//     metadata mismatch), so the window really is dead and the search
+		//     steps past it. Idling instead would pin the search here forever.
+		if !nextCursor.IsZero() {
+			dueCursor = nextCursor
+			t.storeDueCursor(probeStart, nextCursor)
+			t.logger.Info(
+				"single_block_retention cron re-probing a window after a budget-truncated selection",
+				zap.Uint32("tag", tag),
+				zap.Uint64("window_start_height", probeStart),
+				zap.Uint64("window_end_height", probeEnd),
+				zap.Uint64("resume_candidate_height", nextCursor.StartHeight),
+				zap.Int("probe_advances", attempt+1),
+			)
+			continue
 		}
+		dueCursor = retirement.DueCohortCursor{}
+		t.storeDueCursor(0, retirement.DueCohortCursor{})
 		t.logger.Info(
 			"single_block_retention cron advancing past a window with no selectable cohorts",
 			zap.Uint32("tag", tag),
 			zap.Uint64("window_start_height", probeStart),
 			zap.Uint64("window_end_height", probeEnd),
-			zap.Uint64("next_search_height", nextStart),
-			zap.Bool("selection_budget_truncated", truncated),
+			zap.Uint64("next_search_height", probeEnd),
 			zap.Int("probe_advances", attempt+1),
 		)
-		searchStart = nextStart
+		searchStart = probeEnd
 	}
 	t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
 	if !found {
@@ -450,6 +521,9 @@ func (t *singleBlockRetentionTask) Run(ctx context.Context) (err error) {
 	}
 	t.metrics.Gauge("probe_advance_exhausted").Update(0)
 	t.probeResumeHeight.Store(0)
+	// A launch means this window produced real work; the next tick re-derives
+	// its position from the watermark rather than resuming a stale walk.
+	t.storeDueCursor(0, retirement.DueCohortCursor{})
 	// Anchor at the minimum start height and age the gauge from the oldest
 	// eligibility across the whole probe set, so neither is masked by
 	// pending-cohort ordering. Stuck pending cohorts are themselves overdue,

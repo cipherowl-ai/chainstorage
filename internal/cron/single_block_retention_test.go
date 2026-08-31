@@ -51,7 +51,8 @@ type retentionCronCohortRepository struct {
 	// wrong range still looked correct and the INF-1416 starvation bug was
 	// invisible to every test in this file.
 	rawDueHeights   []uint64
-	resumeAfter     uint64
+	nextCursor      retirement.DueCohortCursor
+	afterCursors    []retirement.DueCohortCursor
 	selectCalls     [][2]uint64
 	dueFloorErr     error
 	dueFloorMinArg  uint64
@@ -128,13 +129,15 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	endHeight uint64,
 	_ time.Time,
 	limit int,
-) ([]retirement.RetentionCohort, []retirement.RetentionCohort, uint64, error) {
+	after retirement.DueCohortCursor,
+) ([]retirement.RetentionCohort, []retirement.RetentionCohort, retirement.DueCohortCursor, error) {
+	r.afterCursors = append(r.afterCursors, after)
 	r.requestedStartHeight = startHeight
 	r.requestedEndHeight = endHeight
 	r.requestedLimit = limit
 	r.selectCalls = append(r.selectCalls, [2]uint64{startHeight, endHeight})
 	if r.err != nil {
-		return nil, nil, 0, r.err
+		return nil, nil, retirement.DueCohortCursor{}, r.err
 	}
 	// Honour the requested height range unconditionally. Without this the
 	// double returns due cohorts no matter what window was asked for, so a
@@ -146,7 +149,7 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	// there rather than step past the window.
 	return filterCohortsToRange(r.pending, startHeight, endHeight),
 		filterCohortsToRange(r.due, startHeight, endHeight),
-		r.resumeAfter,
+		r.nextCursor,
 		nil
 }
 
@@ -1051,22 +1054,30 @@ func TestSingleBlockRetentionCronResumesAtTruncatedSelectionHeight(t *testing.T)
 	// Due rows at both the floor and the resume point, so the floor lookup
 	// still finds work after the search advances.
 	cohortRepository.rawDueHeights = []uint64{floor, floor + 400}
-	cohortRepository.resumeAfter = floor + 400
+	cohortRepository.nextCursor = retirement.DueCohortCursor{
+		StartHeight: floor + 400,
+		ObjectKey:   "consolidated/truncated.cscb.zstd",
+	}
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)
 
 	require.GreaterOrEqual(t, len(cohortRepository.selectCalls), 2,
 		"the cron should probe again after a truncated selection")
-	// The second probe must start at the reported resume height, NOT at the
-	// end of the first window.
+	// The re-probe must cover the SAME window — moving it would skip candidates
+	// nobody examined, and a height bound could discard an unexamined candidate
+	// overlapping the examined ones.
 	first := cohortRepository.selectCalls[0]
 	second := cohortRepository.selectCalls[1]
-	require.Equal(t, floor, first[0])
-	require.Equal(t, floor+400, second[0],
-		"cron must resume at the first unexamined height, not skip the window")
-	require.Less(t, second[0], first[1],
-		"resuming inside the window is the whole point; skipping to its end strands work")
+	require.Equal(t, first, second,
+		"a budget-truncated selection must re-probe the same window, not move it")
+	// ...and it must carry the returned keyset cursor, which is what actually
+	// skips the examined candidates.
+	require.GreaterOrEqual(t, len(cohortRepository.afterCursors), 2)
+	require.True(t, cohortRepository.afterCursors[0].IsZero(),
+		"the first probe of a window starts from the beginning")
+	require.Equal(t, cohortRepository.nextCursor, cohortRepository.afterCursors[1],
+		"the re-probe must carry the exact cursor selection returned")
 }
 
 // TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow pins the other side:
@@ -1079,7 +1090,7 @@ func TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow(t *testing.T) {
 	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000
 	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
 	cohortRepository.rawDueHeights = []uint64{floor, floor + 1_400}
-	cohortRepository.resumeAfter = 0 // exhausted, not truncated
+	cohortRepository.nextCursor = retirement.DueCohortCursor{} // exhausted, not truncated
 
 	require.NoError(t, task.Run(context.Background()))
 	require.Empty(t, runtime.executions)
@@ -1093,4 +1104,7 @@ func TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow(t *testing.T) {
 	// was stepped past rather than re-probed.
 	require.GreaterOrEqual(t, second[0], first[1],
 		"an exhausted window must be stepped past, not re-probed")
+	require.GreaterOrEqual(t, len(cohortRepository.afterCursors), 2)
+	require.True(t, cohortRepository.afterCursors[1].IsZero(),
+		"stepping past a dead window must not carry a stale cursor into the next one")
 }
