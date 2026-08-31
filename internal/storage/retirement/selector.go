@@ -20,9 +20,37 @@ type (
 		Pending               bool      `json:"pending"`
 	}
 
+	// DueCohortCursor marks exactly how far due-candidate enumeration got when
+	// a pass stopped on its expansion budget. It is a KEYSET cursor, not a
+	// height watermark, because candidate groups are not height-disjoint: a
+	// reorg can leave several consolidated objects covering the same or
+	// overlapping heights while canonical_blocks points at only one. Resuming
+	// from "last examined end height + 1" would filter out an unexamined
+	// candidate that happens to start at or below that height, and if no due
+	// work exists above the bound the ring resets and re-walks the same dead
+	// prefix, starving that candidate permanently.
+	//
+	// The fields mirror the two candidate orderings exactly: bounded selection
+	// compares (StartHeight, ObjectKey); open-ended selection compares
+	// (EligibleAt, StartHeight, ObjectKey). A zero cursor starts from the
+	// beginning of the requested range.
+	DueCohortCursor struct {
+		EligibleAt  time.Time
+		StartHeight uint64
+		ObjectKey   string
+	}
+
 	// CohortRepository must return row-disjoint pending and due aggregates.
 	// Both slices must come from one database snapshot. Selector merges
 	// aggregates for the same consolidated object by summing their row counts.
+	//
+	// ListRetentionCohorts takes an `after` cursor and returns the next one: a
+	// non-zero returned cursor means due selection stopped on its expansion
+	// budget with candidates still unexamined, and names exactly where to
+	// resume. Callers that advance a search window on an empty result must
+	// instead re-probe the SAME window with that cursor, or work behind a large
+	// dead prefix is stranded. A zero returned cursor means candidates were
+	// exhausted and the window really is done.
 	CohortRepository interface {
 		ListRetentionCohorts(
 			ctx context.Context,
@@ -33,7 +61,8 @@ type (
 			endHeight uint64,
 			eligibilityCutoff time.Time,
 			limit int,
-		) ([]RetentionCohort, []RetentionCohort, error)
+			after DueCohortCursor,
+		) ([]RetentionCohort, []RetentionCohort, DueCohortCursor, error)
 
 		// RetentionFloorWatermark returns the lowest height at or above
 		// minHeight that still holds an undeleted single-block object, and
@@ -98,35 +127,36 @@ func (s *Selector) Select(
 	endHeight uint64,
 	eligibilityCutoff time.Time,
 	limit int,
-) ([]RetentionCohort, bool, error) {
+	after DueCohortCursor,
+) ([]RetentionCohort, bool, DueCohortCursor, error) {
 	if s == nil || s.repo == nil {
-		return nil, false, xerrors.New("retention cohort repository is required")
+		return nil, false, DueCohortCursor{}, xerrors.New("retention cohort repository is required")
 	}
 	if bucket == "" {
-		return nil, false, xerrors.New("retention cohort bucket is required")
+		return nil, false, DueCohortCursor{}, xerrors.New("retention cohort bucket is required")
 	}
 	if !isValidStorageGeneration(storageGeneration) {
-		return nil, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+		return nil, false, DueCohortCursor{}, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
 	}
 	if limit <= 0 || limit > MaxRetentionCohortsPerWorkflow {
-		return nil, false, xerrors.Errorf(
+		return nil, false, DueCohortCursor{}, xerrors.Errorf(
 			"retention cohort limit must be between 1 and %d: %d",
 			MaxRetentionCohortsPerWorkflow,
 			limit,
 		)
 	}
 	if endHeight == 0 && startHeight != 0 {
-		return nil, false, xerrors.New("retention selection end height is required when start height is set")
+		return nil, false, DueCohortCursor{}, xerrors.New("retention selection end height is required when start height is set")
 	}
 	if endHeight != 0 && endHeight <= startHeight {
-		return nil, false, xerrors.Errorf("invalid retention selection range [%d, %d)", startHeight, endHeight)
+		return nil, false, DueCohortCursor{}, xerrors.Errorf("invalid retention selection range [%d, %d)", startHeight, endHeight)
 	}
 	if eligibilityCutoff.IsZero() {
-		return nil, false, xerrors.New("retention selection eligibility cutoff is required")
+		return nil, false, DueCohortCursor{}, xerrors.New("retention selection eligibility cutoff is required")
 	}
 
 	queryLimit := limit + 1
-	pending, due, err := s.repo.ListRetentionCohorts(
+	pending, due, nextCursor, err := s.repo.ListRetentionCohorts(
 		ctx,
 		bucket,
 		storageGeneration,
@@ -135,9 +165,10 @@ func (s *Selector) Select(
 		endHeight,
 		eligibilityCutoff,
 		queryLimit,
+		after,
 	)
 	if err != nil {
-		return nil, false, xerrors.Errorf("failed to list retention cohorts: %w", err)
+		return nil, false, DueCohortCursor{}, xerrors.Errorf("failed to list retention cohorts: %w", err)
 	}
 
 	result := make([]RetentionCohort, 0, queryLimit)
@@ -178,20 +209,33 @@ func (s *Selector) Select(
 	for _, cohort := range pending {
 		cohort.Pending = true
 		if err := appendOrMerge(cohort); err != nil {
-			return nil, false, err
+			return nil, false, DueCohortCursor{}, err
 		}
 	}
 	for _, cohort := range due {
 		if err := appendOrMerge(cohort); err != nil {
-			return nil, false, err
+			return nil, false, DueCohortCursor{}, err
 		}
 	}
 	hasMore := len(result) > limit
 	if hasMore {
 		result = result[:limit]
 	}
-	return result, hasMore, nil
+	// A non-zero cursor means selection stopped on its expansion budget with
+	// candidates still unexamined, so there is more work regardless of how many
+	// cohorts this page produced. Reporting hasMore only from the page length
+	// would tell the caller "that is everything" while unexamined candidates
+	// remain.
+	if !nextCursor.IsZero() {
+		hasMore = true
+	}
+	return result, hasMore, nextCursor, nil
 }
+
+// IsZero reports whether the cursor is unset, meaning enumeration should start
+// at the beginning of the requested range (or, when returned, that candidates
+// were exhausted).
+func (c DueCohortCursor) IsZero() bool { return c.ObjectKey == "" }
 
 // MaxRetentionPrimingLookahead bounds how many upcoming cohorts one Select pass
 // primes safety observations for. Two workflow batches of lookahead lets the
@@ -228,7 +272,9 @@ func (s *Selector) LookaheadKeys(
 			limit,
 		)
 	}
-	pending, due, err := s.repo.ListRetentionCohorts(
+	// Lookahead only primes safety observations for upcoming keys; it never
+	// advances a search window, so the continuation height is not its concern.
+	pending, due, _, err := s.repo.ListRetentionCohorts(
 		ctx,
 		bucket,
 		storageGeneration,
@@ -237,6 +283,7 @@ func (s *Selector) LookaheadKeys(
 		endHeight,
 		eligibilityCutoff,
 		limit,
+		DueCohortCursor{},
 	)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to list retention cohorts for priming: %w", err)

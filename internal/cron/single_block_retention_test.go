@@ -51,6 +51,9 @@ type retentionCronCohortRepository struct {
 	// wrong range still looked correct and the INF-1416 starvation bug was
 	// invisible to every test in this file.
 	rawDueHeights   []uint64
+	nextCursor      retirement.DueCohortCursor
+	afterCursors    []retirement.DueCohortCursor
+	selectCalls     [][2]uint64
 	dueFloorErr     error
 	dueFloorMinArg  uint64
 	dueFloorMinArgs []uint64
@@ -126,19 +129,27 @@ func (r *retentionCronCohortRepository) ListRetentionCohorts(
 	endHeight uint64,
 	_ time.Time,
 	limit int,
-) ([]retirement.RetentionCohort, []retirement.RetentionCohort, error) {
+	after retirement.DueCohortCursor,
+) ([]retirement.RetentionCohort, []retirement.RetentionCohort, retirement.DueCohortCursor, error) {
+	r.afterCursors = append(r.afterCursors, after)
 	r.requestedStartHeight = startHeight
 	r.requestedEndHeight = endHeight
 	r.requestedLimit = limit
+	r.selectCalls = append(r.selectCalls, [2]uint64{startHeight, endHeight})
 	if r.err != nil {
-		return nil, nil, r.err
+		return nil, nil, retirement.DueCohortCursor{}, r.err
 	}
 	// Honour the requested height range unconditionally. Without this the
 	// double returns due cohorts no matter what window was asked for, so a
 	// probe that searches the wrong window still looks correct and the bug is
 	// invisible to tests.
+	//
+	// resumeAfter models a budget-truncated selection: non-zero means real
+	// candidates in this window were never examined, so the cron must resume
+	// there rather than step past the window.
 	return filterCohortsToRange(r.pending, startHeight, endHeight),
 		filterCohortsToRange(r.due, startHeight, endHeight),
+		r.nextCursor,
 		nil
 }
 
@@ -1025,4 +1036,150 @@ func TestSingleBlockRetentionCronWrapsRingWhenNothingDueBeyondDeadZone(t *testin
 	require.NotEmpty(t, cohortRepository.dueFloorMinArgs)
 	require.Equal(t, floor, cohortRepository.dueFloorMinArgs[0],
 		"after the ring wraps, the walk must restart from the watermark")
+}
+
+// TestSingleBlockRetentionCronResumesAtTruncatedSelectionHeight is the round-7
+// regression guard: when due selection stops on its expansion budget with
+// candidates still unexamined, it reports the first unexamined height, and the
+// cron must resume its search THERE rather than stepping past the whole window.
+// Stepping past would skip cohorts nobody looked at, stranding them exactly as
+// the old silent page cap did.
+func TestSingleBlockRetentionCronResumesAtTruncatedSelectionHeight(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// Due rows exist across the window, but selection returns no cohorts and
+	// reports that it only got as far as floor+400.
+	// Due rows at both the floor and the resume point, so the floor lookup
+	// still finds work after the search advances.
+	cohortRepository.rawDueHeights = []uint64{floor, floor + 400}
+	cohortRepository.nextCursor = retirement.DueCohortCursor{
+		StartHeight: floor + 400,
+		ObjectKey:   "consolidated/truncated.cscb.zstd",
+	}
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	require.GreaterOrEqual(t, len(cohortRepository.selectCalls), 2,
+		"the cron should probe again after a truncated selection")
+	// The re-probe must cover the SAME window — moving it would skip candidates
+	// nobody examined, and a height bound could discard an unexamined candidate
+	// overlapping the examined ones.
+	first := cohortRepository.selectCalls[0]
+	second := cohortRepository.selectCalls[1]
+	require.Equal(t, first, second,
+		"a budget-truncated selection must re-probe the same window, not move it")
+	// ...and it must carry the returned keyset cursor, which is what actually
+	// skips the examined candidates.
+	require.GreaterOrEqual(t, len(cohortRepository.afterCursors), 2)
+	require.True(t, cohortRepository.afterCursors[0].IsZero(),
+		"the first probe of a window starts from the beginning")
+	require.Equal(t, cohortRepository.nextCursor, cohortRepository.afterCursors[1],
+		"the re-probe must carry the exact cursor selection returned")
+}
+
+// TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow pins the other side:
+// when selection reports NO continuation (candidates exhausted), the window
+// really is dead and the cron must step past it. Conflating the two directions
+// is what this pair exists to prevent.
+func TestSingleBlockRetentionCronStepsPastGenuinelyDeadWindow(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cfg.Cron.SingleBlockRetention.WindowBlocks = 1_000
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	cohortRepository.rawDueHeights = []uint64{floor, floor + 1_400}
+	cohortRepository.nextCursor = retirement.DueCohortCursor{} // exhausted, not truncated
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+
+	require.GreaterOrEqual(t, len(cohortRepository.selectCalls), 2)
+	first := cohortRepository.selectCalls[0]
+	second := cohortRepository.selectCalls[1]
+	// The cron anchors each probe on the due floor at or above its search
+	// cursor, so the second window starts at the next due height — what matters
+	// is that it is at or beyond the first window's end, i.e. the dead window
+	// was stepped past rather than re-probed.
+	require.GreaterOrEqual(t, second[0], first[1],
+		"an exhausted window must be stepped past, not re-probed")
+	require.GreaterOrEqual(t, len(cohortRepository.afterCursors), 2)
+	require.True(t, cohortRepository.afterCursors[1].IsZero(),
+		"stepping past a dead window must not carry a stale cursor into the next one")
+}
+
+// TestSingleBlockRetentionCronKeepsCursorAcrossLaunch is the round-9 regression
+// guard: a non-empty selection does NOT mean the window is finished. Selection
+// can return an early selectable cohort AND report a budget-truncated
+// continuation because the dead prefix behind it exhausted the expansion
+// budget. Clearing the cursor on launch restarts the next tick at the head of
+// the window, so if the launched cohort stays due — a deferred or failed sweep
+// leaves it due — every tick re-selects it and work behind the prefix is never
+// reached.
+func TestSingleBlockRetentionCronKeepsCursorAcrossLaunch(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	// An early selectable cohort...
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/early.cscb.zstd",
+		StartHeight:           floor,
+		EndHeight:             floor + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+	// ...and a budget-truncated continuation pointing past the dead prefix.
+	truncated := retirement.DueCohortCursor{
+		StartHeight: floor + 5_000,
+		ObjectKey:   "consolidated/dead-last.cscb.zstd",
+	}
+	cohortRepository.nextCursor = truncated
+
+	// Tick 1 launches on the early cohort while selection was still truncated.
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.GreaterOrEqual(t, len(cohortRepository.afterCursors), 1)
+	require.True(t, cohortRepository.afterCursors[0].IsZero())
+
+	// Tick 2 models the launched cohort remaining due (deferred/failed sweep):
+	// the fixtures are unchanged. It must resume from the persisted cursor
+	// rather than re-selecting the same early cohort from the window head.
+	runtime.executions = nil
+	runtime.openWorkflowID = nil
+	cohortRepository.afterCursors = nil
+	require.NoError(t, task.Run(context.Background()))
+
+	require.NotEmpty(t, cohortRepository.afterCursors)
+	require.Equal(t, truncated, cohortRepository.afterCursors[0],
+		"the next tick must resume from the truncation cursor, not restart at the window head")
+}
+
+// TestSingleBlockRetentionCronClearsCursorWhenSelectionExhausts pins the other
+// direction: when selection reports no continuation, a launch must leave no
+// stale cursor behind, so the following tick walks the window from its head.
+func TestSingleBlockRetentionCronClearsCursorWhenSelectionExhausts(t *testing.T) {
+	task, runtime, cohortRepository, _, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	floor := cfg.Cron.SingleBlockRetention.ApprovedStartHeight
+	cohortRepository.due = []retirement.RetentionCohort{{
+		ConsolidatedObjectKey: "consolidated/only.cscb.zstd",
+		StartHeight:           floor,
+		EndHeight:             floor + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}}
+	cohortRepository.nextCursor = retirement.DueCohortCursor{} // exhausted
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+
+	runtime.executions = nil
+	runtime.openWorkflowID = nil
+	cohortRepository.afterCursors = nil
+	require.NoError(t, task.Run(context.Background()))
+
+	require.NotEmpty(t, cohortRepository.afterCursors)
+	require.True(t, cohortRepository.afterCursors[0].IsZero(),
+		"an exhausted selection must not leave a cursor that skips the window head")
 }

@@ -161,7 +161,10 @@ func (a *SingleBlockRetention) executeSelect(
 		return nil, xerrors.Errorf("failed to resolve write block storage generation: %w", err)
 	}
 	sdkactivity.RecordHeartbeat(ctx, "single_block_retention.select.started", tag, request.Limit)
-	cohorts, hasMore, err := selector.Select(
+	// The sweep selects inside a window the cron already approved and does not
+	// advance a search cursor of its own; a budget-truncated selection simply
+	// does less work this run and the next run re-selects.
+	cohorts, hasMore, _, err := selector.Select(
 		ctx,
 		bucket,
 		storageGeneration,
@@ -170,6 +173,7 @@ func (a *SingleBlockRetention) executeSelect(
 		request.EndHeight,
 		eligibilityCutoff,
 		request.Limit,
+		retirement.DueCohortCursor{},
 	)
 	if err != nil {
 		return nil, err
