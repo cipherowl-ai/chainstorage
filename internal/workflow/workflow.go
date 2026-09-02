@@ -335,6 +335,10 @@ func IsNodeProviderFailed(err error) bool {
 	return strings.Contains(err.Error(), a.ErrTypeNodeProvider)
 }
 
+func IsOutOfSyncNodeFailure(err error) bool {
+	return strings.Contains(err.Error(), a.ErrTypeOutOfSyncNode)
+}
+
 func IsConsensusClusterFailure(err error) bool {
 	return strings.Contains(err.Error(), a.ErrTypeConsensusClusterFailure)
 }
