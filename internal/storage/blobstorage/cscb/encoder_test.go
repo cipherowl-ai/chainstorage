@@ -167,15 +167,37 @@ func TestEncodeCSCB_SpillsWhenMemoryBudgetExceeded(t *testing.T) {
 	require.True(os.IsNotExist(err))
 }
 
-func TestEncodeCSCB_EnforcesMaxChunkUncompressedBytesForSingleBlock(t *testing.T) {
+func TestEncodeCSCB_AllowsOversizedSingleBlockAsDedicatedChunk(t *testing.T) {
 	require := testutil.Require(t)
 
-	maxChunkUncompressedBytes := uint64(4)
+	maxChunkUncompressedBytes := uint64(10)
 	cfg := testEncodeConfig(api.Compression_ZSTD)
 	cfg.MaxChunkUncompressedBytes = &maxChunkUncompressedBytes
-	_, err := Encode(context.Background(), cfg, testPayloads())
-	require.Error(err)
-	require.Contains(err.Error(), "CSCB block payload length 5 exceeds max_chunk_uncompressed_bytes 4 at height 100")
+	object, err := Encode(context.Background(), cfg, testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := ParseIndex(data)
+	require.NoError(err)
+	require.Len(index.Chunks, 3)
+	require.Equal([]uint64{5, 11, 7}, []uint64{
+		index.Chunks[0].UncompressedLength,
+		index.Chunks[1].UncompressedLength,
+		index.Chunks[2].UncompressedLength,
+	})
+	require.Equal([]uint32{1, 1, 1}, []uint32{
+		index.Chunks[0].BlockCount,
+		index.Chunks[1].BlockCount,
+		index.Chunks[2].BlockCount,
+	})
+	require.Equal([]uint32{0, 1, 2}, []uint32{
+		index.Blocks[0].ChunkIndex,
+		index.Blocks[1].ChunkIndex,
+		index.Blocks[2].ChunkIndex,
+	})
+	require.Greater(index.Chunks[1].UncompressedLength, maxChunkUncompressedBytes)
 }
 
 func TestEncodeCSCB_SplitsAtMaxChunkUncompressedBytes(t *testing.T) {
