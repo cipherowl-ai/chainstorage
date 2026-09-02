@@ -996,6 +996,82 @@ func (s *pollerTestSuite) TestPollerFailureWithScheduleToStartTimeout() {
 	require.True(IsContinueAsNewError(err))
 }
 
+func (s *pollerTestSuite) TestPollerFailureWithOutOfSyncNode() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.Poller.FailoverEnabled = false
+	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
+		&activity.SyncerResponse{},
+		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
+	)
+
+	_, err := s.poller.Execute(context.Background(), &PollerRequest{
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit - 1,
+	})
+	require.Error(err)
+	require.True(IsContinueAsNewError(err))
+}
+
+func (s *pollerTestSuite) TestPollerFailureTooManyOutOfSyncNode() {
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.Poller.FailoverEnabled = false
+	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
+		&activity.SyncerResponse{},
+		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
+	)
+
+	_, err := s.poller.Execute(context.Background(), &PollerRequest{
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit,
+	})
+	require.Error(err)
+	require.False(IsContinueAsNewError(err))
+	require.ErrorContains(err, "retryable errors exceeded threshold")
+	require.ErrorContains(err, errors.ErrTypeOutOfSyncNode)
+}
+
+func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeFailsOverFirst() {
+	// When failover is enabled, an out-of-sync master still triggers failover before the wait-and-retry
+	// path, even after the retry budget is exhausted.
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.Poller.FailoverEnabled = true
+	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
+		&activity.SyncerResponse{},
+		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
+	)
+
+	_, err := s.poller.Execute(context.Background(), &PollerRequest{
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit,
+	})
+	require.Error(err)
+	require.True(IsContinueAsNewError(err))
+}
+
+func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeInFailover() {
+	// Once the poller is already on the failover cluster, an out-of-sync master reaches the wait-and-retry
+	// path; here the retry budget is exhausted, so the workflow fails instead of failing over again.
+	require := testutil.Require(s.T())
+
+	s.cfg.Workflows.Poller.FailoverEnabled = true
+	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
+		&activity.SyncerResponse{},
+		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
+	)
+
+	_, err := s.poller.Execute(context.Background(), &PollerRequest{
+		Tag:                 tag,
+		Failover:            true,
+		RetryableErrorCount: RetryableErrorLimit,
+	})
+	require.Error(err)
+	require.False(IsContinueAsNewError(err))
+	require.ErrorContains(err, "retryable errors exceeded threshold")
+}
+
 func (s *pollerTestSuite) TestPollerWithTransactionIndexingSuccess() {
 	require := testutil.Require(s.T())
 

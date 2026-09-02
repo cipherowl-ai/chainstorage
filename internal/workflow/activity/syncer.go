@@ -181,7 +181,7 @@ func (a *Syncer) execute(ctx context.Context, request *SyncerRequest) (*SyncerRe
 
 	result, err := a.handleReorg(ctx, logger, request.Tag, request.FastSync, request.IrreversibleDistance, request.NumBlocksToSkip)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to handle reorg: %w", err)
+		return nil, asOutOfSyncNodeError(xerrors.Errorf("failed to handle reorg: %w", err))
 	}
 	if result.forkHeight >= result.canonicalChainTipHeight {
 		// The master block node is behind the local block store.
@@ -222,7 +222,7 @@ func (a *Syncer) execute(ctx context.Context, request *SyncerRequest) (*SyncerRe
 		a.heartbeater.RecordHeartbeat(ctx)
 		inMetadatas, err = a.masterBlockchainClient.BatchGetBlockMetadata(ctx, request.Tag, start, end)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to get metadata for blocks from %d to %d: %w", start, end-1, err)
+			return nil, asOutOfSyncNodeError(xerrors.Errorf("failed to get metadata for blocks from %d to %d: %w", start, end-1, err))
 		}
 		// Record heartbeat after blockchain call
 		a.heartbeater.RecordHeartbeat(ctx)
@@ -840,4 +840,15 @@ func parseConsensusErrorType(failureReason string) string {
 		return errors.ErrTypeConsensusClusterFailure
 	}
 	return errors.ErrTypeConsensusValidationFailure
+}
+
+// asOutOfSyncNodeError converts ErrBlockNotFound from the master node into a typed application error.
+// The syncer only asks the master for heights at or below the tip the master itself just reported, so a
+// missing block means the endpoint group routed the call to a node that is behind the one that reported
+// the tip. The poller treats this as transient and retries after a backoff instead of failing.
+func asOutOfSyncNodeError(err error) error {
+	if xerrors.Is(err, client.ErrBlockNotFound) {
+		return temporal.NewApplicationErrorWithCause("master node cannot serve a height it reported", errors.ErrTypeOutOfSyncNode, err)
+	}
+	return err
 }

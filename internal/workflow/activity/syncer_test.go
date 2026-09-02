@@ -757,6 +757,93 @@ func (s *SyncerTestSuite) TestBatchGetBlockMetadataFailure() {
 	require.Contains(err.Error(), "master node BatchGetBlockMetadata failure")
 }
 
+func (s *SyncerTestSuite) TestSearchForkBlockOutOfSyncNode() {
+	// The master reported tip 102, but the node that served the fork search is behind and cannot serve
+	// heights it should already have. The error must be tagged so that the poller waits and retries.
+	require := testutil.Require(s.T())
+
+	s.masterBlockchainClient.EXPECT().GetLatestHeight(gomock.Any()).Return(uint64(102), nil)
+	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Return(&api.BlockMetadata{Height: 100}, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		Return(testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag), nil).
+		AnyTimes()
+	s.masterBlockchainClient.EXPECT().
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
+		Return(nil, xerrors.Errorf("block not found by heights [98, 101): RPCError -8: Block height out of range: %w", client.ErrBlockNotFound))
+
+	request := &SyncerRequest{
+		Tag:             tag,
+		MaxBlocksToSync: 100,
+		Parallelism:     4,
+	}
+	_, err := s.syncer.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.ErrorContains(err, "Block height out of range")
+	require.ErrorContains(err, errors.ErrTypeOutOfSyncNode)
+}
+
+func (s *SyncerTestSuite) TestBatchGetBlockMetadataOutOfSyncNode() {
+	// The fork search succeeded, but the node that served the metadata fetch for [101, 103) is behind
+	// the tip reported by GetLatestHeight. The error must be tagged so that the poller waits and retries.
+	require := testutil.Require(s.T())
+
+	s.masterBlockchainClient.EXPECT().GetLatestHeight(gomock.Any()).Return(uint64(102), nil)
+	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Return(&api.BlockMetadata{Height: 100}, nil)
+
+	beforeFork := testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag)
+	s.masterBlockchainClient.EXPECT().
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
+		Return(beforeFork, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		Return(beforeFork, nil)
+
+	s.masterBlockchainClient.EXPECT().
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(101), uint64(103)).
+		Return(nil, xerrors.Errorf("block not found by heights [101, 103): RPCError -8: Block height out of range: %w", client.ErrBlockNotFound))
+
+	request := &SyncerRequest{
+		Tag:             tag,
+		MaxBlocksToSync: 100,
+		Parallelism:     4,
+	}
+	_, err := s.syncer.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.ErrorContains(err, "Block height out of range")
+	require.ErrorContains(err, errors.ErrTypeOutOfSyncNode)
+}
+
+func (s *SyncerTestSuite) TestBatchGetBlockMetadataGenericFailureNotOutOfSyncNode() {
+	// Only ErrBlockNotFound is treated as an out-of-sync node; any other master failure keeps its type.
+	require := testutil.Require(s.T())
+
+	s.masterBlockchainClient.EXPECT().GetLatestHeight(gomock.Any()).Return(uint64(102), nil)
+	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Return(&api.BlockMetadata{Height: 100}, nil)
+
+	beforeFork := testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag)
+	s.masterBlockchainClient.EXPECT().
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
+		Return(beforeFork, nil)
+	s.metaStorage.EXPECT().
+		GetBlocksByHeightRange(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		Return(beforeFork, nil)
+
+	s.masterBlockchainClient.EXPECT().
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(101), uint64(103)).
+		Return(nil, xerrors.Errorf("master node BatchGetBlockMetadata failure"))
+
+	request := &SyncerRequest{
+		Tag:             tag,
+		MaxBlocksToSync: 100,
+		Parallelism:     4,
+	}
+	_, err := s.syncer.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+	require.ErrorContains(err, "master node BatchGetBlockMetadata failure")
+	require.NotContains(err.Error(), errors.ErrTypeOutOfSyncNode)
+}
+
 func (s *SyncerTestSuite) TestAddOrUpdateTransactionsInParallel() {
 	require := testutil.Require(s.T())
 
