@@ -1005,15 +1005,15 @@ func (s *pollerTestSuite) TestPollerFailureWithOutOfSyncNode() {
 		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
 	)
 
-	// First failure of an episode: wait and retry.
 	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag: tag,
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit - 1,
 	})
 	require.Error(err)
 	require.True(IsContinueAsNewError(err))
 }
 
-func (s *pollerTestSuite) TestPollerFailureWithOutOfSyncNodeWithinTimeout() {
+func (s *pollerTestSuite) TestPollerFailureTooManyOutOfSyncNode() {
 	require := testutil.Require(s.T())
 
 	s.cfg.Workflows.Poller.FailoverEnabled = false
@@ -1022,64 +1022,19 @@ func (s *pollerTestSuite) TestPollerFailureWithOutOfSyncNodeWithinTimeout() {
 		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
 	)
 
-	start := time.Now()
-	s.env.SetStartTime(start)
 	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag:   tag,
-		State: &PollerState{OutOfSyncNodeSince: start.Add(-OutOfSyncNodeRetryTimeout / 2).Unix()},
-	})
-	require.Error(err)
-	require.True(IsContinueAsNewError(err))
-}
-
-func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeTimeout() {
-	require := testutil.Require(s.T())
-
-	s.cfg.Workflows.Poller.FailoverEnabled = false
-	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
-		&activity.SyncerResponse{},
-		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
-	)
-
-	start := time.Now()
-	s.env.SetStartTime(start)
-	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag:   tag,
-		State: &PollerState{OutOfSyncNodeSince: start.Add(-OutOfSyncNodeRetryTimeout - time.Minute).Unix()},
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit,
 	})
 	require.Error(err)
 	require.False(IsContinueAsNewError(err))
-	require.ErrorContains(err, "master node out of sync since")
+	require.ErrorContains(err, "retryable errors exceeded threshold")
 	require.ErrorContains(err, errors.ErrTypeOutOfSyncNode)
-}
-
-func (s *pollerTestSuite) TestPollerSuccessResetsOutOfSyncNode() {
-	// The episode started long ago, but the successful cycle in between resets it, so the following
-	// failure starts a fresh episode and is retried instead of failing the workflow.
-	require := testutil.Require(s.T())
-
-	s.cfg.Workflows.Poller.FailoverEnabled = false
-	s.cfg.Workflows.Poller.LivenessCheckEnabled = false
-	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Once().Return(&activity.SyncerResponse{LatestSyncedHeight: 100}, nil)
-	s.env.OnActivity(activity.ActivitySyncer, mock.Anything, mock.Anything).Return(
-		&activity.SyncerResponse{},
-		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
-	)
-
-	start := time.Now()
-	s.env.SetStartTime(start)
-	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag:            tag,
-		CheckpointSize: 2,
-		State:          &PollerState{OutOfSyncNodeSince: start.Add(-2 * OutOfSyncNodeRetryTimeout).Unix()},
-	})
-	require.Error(err)
-	require.True(IsContinueAsNewError(err))
 }
 
 func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeFailsOverFirst() {
 	// When failover is enabled, an out-of-sync master still triggers failover before the wait-and-retry
-	// path, even after the retry timeout has been exceeded.
+	// path, even after the retry budget is exhausted.
 	require := testutil.Require(s.T())
 
 	s.cfg.Workflows.Poller.FailoverEnabled = true
@@ -1088,11 +1043,9 @@ func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeFailsOverFirst() {
 		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
 	)
 
-	start := time.Now()
-	s.env.SetStartTime(start)
 	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag:   tag,
-		State: &PollerState{OutOfSyncNodeSince: start.Add(-OutOfSyncNodeRetryTimeout - time.Minute).Unix()},
+		Tag:                 tag,
+		RetryableErrorCount: RetryableErrorLimit,
 	})
 	require.Error(err)
 	require.True(IsContinueAsNewError(err))
@@ -1100,7 +1053,7 @@ func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeFailsOverFirst() {
 
 func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeInFailover() {
 	// Once the poller is already on the failover cluster, an out-of-sync master reaches the wait-and-retry
-	// path; here the episode has exceeded the timeout, so the workflow fails instead of failing over again.
+	// path; here the retry budget is exhausted, so the workflow fails instead of failing over again.
 	require := testutil.Require(s.T())
 
 	s.cfg.Workflows.Poller.FailoverEnabled = true
@@ -1109,31 +1062,14 @@ func (s *pollerTestSuite) TestPollerFailureOutOfSyncNodeInFailover() {
 		temporal.NewApplicationError("block not found by heights [101, 103): RPCError -8: Block height out of range", errors.ErrTypeOutOfSyncNode),
 	)
 
-	start := time.Now()
-	s.env.SetStartTime(start)
 	_, err := s.poller.Execute(context.Background(), &PollerRequest{
-		Tag:      tag,
-		Failover: true,
-		State:    &PollerState{OutOfSyncNodeSince: start.Add(-OutOfSyncNodeRetryTimeout - time.Minute).Unix()},
+		Tag:                 tag,
+		Failover:            true,
+		RetryableErrorCount: RetryableErrorLimit,
 	})
 	require.Error(err)
 	require.False(IsContinueAsNewError(err))
-	require.ErrorContains(err, "master node out of sync since")
-}
-
-func (s *pollerTestSuite) TestShouldRetryOutOfSyncNode() {
-	require := testutil.Require(s.T())
-	now := time.Now()
-
-	state := &PollerState{}
-	require.True(s.poller.shouldRetryOutOfSyncNode(state, now))
-	require.Equal(now.Unix(), state.OutOfSyncNodeSince)
-
-	require.True(s.poller.shouldRetryOutOfSyncNode(state, now.Add(OutOfSyncNodeRetryTimeout-time.Second)))
-	require.Equal(now.Unix(), state.OutOfSyncNodeSince)
-
-	require.False(s.poller.shouldRetryOutOfSyncNode(state, now.Add(OutOfSyncNodeRetryTimeout)))
-	require.Equal(now.Unix(), state.OutOfSyncNodeSince)
+	require.ErrorContains(err, "retryable errors exceeded threshold")
 }
 
 func (s *pollerTestSuite) TestPollerWithTransactionIndexingSuccess() {

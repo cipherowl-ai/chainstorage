@@ -58,18 +58,11 @@ type (
 	PollerState struct {
 		LastLivenessCheckTimestamp  int64
 		LivenessCheckViolationCount uint64
-		// OutOfSyncNodeSince is the unix time at which the current run of consecutive out-of-sync-node
-		// failures started. Zero when the last syncer cycle succeeded.
-		OutOfSyncNodeSince int64
 	}
 )
 
 const (
 	RetryableErrorLimit = 10
-
-	// OutOfSyncNodeRetryTimeout bounds how long the poller keeps retrying while the master node cannot
-	// serve a height it reported. A node that is really down fails the workflow after this long.
-	OutOfSyncNodeRetryTimeout = 30 * time.Minute
 
 	// poller metrics. need to have `workflow.poller` as prefix
 	pollerHeightGauge                      = "workflow.poller.height"
@@ -316,29 +309,24 @@ func (w *Poller) execute(ctx workflow.Context, request *PollerRequest) error {
 				// The master node could not serve a height it reported moments earlier, i.e. the endpoint
 				// group routed consecutive calls to nodes at different heights. The lagging node catches up
 				// on its own, so wait for one backoff interval and retry instead of failing the workflow.
-				// OutOfSyncNodeRetryTimeout bounds the episode so that a node that is really down still
-				// fails the workflow loudly.
+				// RetryableErrorLimit bounds the number of such failures within one checkpoint window
+				// (RetryableErrorCount resets after a full checkpoint loop), so a node that is really down
+				// still fails the workflow loudly.
 				if IsOutOfSyncNodeFailure(err) {
+					request.RetryableErrorCount += 1
 					metrics.Counter(w.getRetryableErrorMetricName(sessionCtx, err)).Inc(1)
 
-					if w.shouldRetryOutOfSyncNode(request.State, workflow.Now(ctx)) {
+					if request.RetryableErrorCount <= RetryableErrorLimit {
 						if err := workflow.Sleep(ctx, backoffInterval); err != nil {
 							return err
 						}
 						return w.continueAsNew(ctx, request)
 					}
-					return xerrors.Errorf(
-						"master node out of sync since %v, exceeded %v: %w",
-						time.Unix(request.State.OutOfSyncNodeSince, 0).UTC().Format(time.RFC3339),
-						OutOfSyncNodeRetryTimeout,
-						err,
-					)
+					return xerrors.Errorf("retryable errors exceeded threshold: %w", err)
 				}
 				return xerrors.Errorf("failed to execute syncer: %w", err)
 			}
 
-			// A successful cycle ends any out-of-sync-node episode.
-			request.State.OutOfSyncNodeSince = 0
 			metrics.Gauge(pollerHeightGauge).Update(float64(syncerResponse.LatestSyncedHeight))
 			metrics.Gauge(pollerGapGauge).Update(float64(syncerResponse.SyncGap))
 			if syncerResponse.TimeSinceLastBlock > 0 {
@@ -400,15 +388,6 @@ func (r *PollerRequest) GetTags() map[string]string {
 	return map[string]string{
 		tagBlockTag: strconv.Itoa(int(r.Tag)),
 	}
-}
-
-// shouldRetryOutOfSyncNode stamps the start of an out-of-sync-node episode on its first failure and
-// reports whether the episode is still within OutOfSyncNodeRetryTimeout.
-func (w *Poller) shouldRetryOutOfSyncNode(state *PollerState, now time.Time) bool {
-	if state.OutOfSyncNodeSince == 0 {
-		state.OutOfSyncNodeSince = now.Unix()
-	}
-	return now.Sub(time.Unix(state.OutOfSyncNodeSince, 0)) < OutOfSyncNodeRetryTimeout
 }
 
 func (w *Poller) shouldCheckLiveness(lastLivenessCheckTimestamp int64, currentTimestamp int64, interval time.Duration) bool {
