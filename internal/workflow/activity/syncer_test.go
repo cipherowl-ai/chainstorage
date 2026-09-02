@@ -769,7 +769,7 @@ func (s *SyncerTestSuite) TestSearchForkBlockOutOfSyncNode() {
 		Return(testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag), nil).
 		AnyTimes()
 	s.masterBlockchainClient.EXPECT().
-		BatchGetBlockMetadata(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
 		Return(nil, xerrors.Errorf("block not found by heights [98, 101): RPCError -8: Block height out of range: %w", client.ErrBlockNotFound))
 
 	request := &SyncerRequest{
@@ -793,7 +793,7 @@ func (s *SyncerTestSuite) TestBatchGetBlockMetadataOutOfSyncNode() {
 
 	beforeFork := testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag)
 	s.masterBlockchainClient.EXPECT().
-		BatchGetBlockMetadata(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
 		Return(beforeFork, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksByHeightRange(gomock.Any(), tag, gomock.Any(), gomock.Any()).
@@ -823,7 +823,7 @@ func (s *SyncerTestSuite) TestBatchGetBlockMetadataGenericFailureNotOutOfSyncNod
 
 	beforeFork := testutil.MakeBlockMetadatasFromStartHeight(98, 3, tag)
 	s.masterBlockchainClient.EXPECT().
-		BatchGetBlockMetadata(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		BatchGetBlockMetadata(gomock.Any(), tag, uint64(98), uint64(101)).
 		Return(beforeFork, nil)
 	s.metaStorage.EXPECT().
 		GetBlocksByHeightRange(gomock.Any(), tag, gomock.Any(), gomock.Any()).

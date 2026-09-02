@@ -848,7 +848,7 @@ func parseConsensusErrorType(failureReason string) string {
 // the tip. The poller treats this as transient and retries after a backoff instead of failing.
 func asOutOfSyncNodeError(err error) error {
 	if xerrors.Is(err, client.ErrBlockNotFound) {
-		return temporal.NewApplicationErrorWithCause(err.Error(), errors.ErrTypeOutOfSyncNode, err)
+		return temporal.NewApplicationErrorWithCause("master node cannot serve a height it reported", errors.ErrTypeOutOfSyncNode, err)
 	}
 	return err
 }

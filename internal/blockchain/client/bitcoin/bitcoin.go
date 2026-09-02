@@ -597,8 +597,8 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 	responses, err := b.client.BatchCall(ctx, b.methods.getBlockHash, params)
 	if err != nil {
 		if isBlockHeightOutOfRange(err) {
-			// The node that served this call is behind the tip reported by another node in the same
-			// endpoint group. Surface ErrBlockNotFound so that callers can treat it as transient.
+			// The serving node's tip is below one of the requested heights. Surface ErrBlockNotFound,
+			// as GetBlockByHeight does, so that callers can decide whether that is expected.
 			return nil, xerrors.Errorf("block not found by heights [%v, %v): %v: %w", from, to, err, internal.ErrBlockNotFound)
 		}
 		return nil, xerrors.Errorf("failed to get block hashes for heights: %w", err)
