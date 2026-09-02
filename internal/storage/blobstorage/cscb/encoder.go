@@ -222,14 +222,6 @@ func Encode(ctx context.Context, cfg EncodeConfig, blocks []internal.Consolidate
 		if err != nil {
 			return nil, xerrors.Errorf("invalid CSCB payload at height %d: %w", metadata.Height, err)
 		}
-		if cfg.MaxChunkUncompressedBytes != nil && payloadLength > *cfg.MaxChunkUncompressedBytes {
-			return nil, xerrors.Errorf(
-				"CSCB block payload length %d exceeds max_chunk_uncompressed_bytes %d at height %d",
-				payloadLength,
-				*cfg.MaxChunkUncompressedBytes,
-				metadata.Height,
-			)
-		}
 		if err := validateAdd(totalUncompressed, payloadLength, uint64(len(blocks)), cfg.MaxUncompressedBytes); err != nil {
 			return nil, err
 		}
@@ -440,6 +432,8 @@ func shouldFlushChunk(chunk *chunkBuilder, nextPayloadLength uint64, cfg EncodeC
 		return false
 	}
 	maxChunkUncompressedBytes := *cfg.MaxChunkUncompressedBytes
+	// A block is indivisible in CSCB v1, so an oversized block is allowed as a
+	// one-block chunk. Flush it before adding the following block.
 	return chunk.uncompressedLength > maxChunkUncompressedBytes ||
 		nextPayloadLength > maxChunkUncompressedBytes-chunk.uncompressedLength
 }
