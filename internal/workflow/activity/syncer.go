@@ -552,27 +552,31 @@ func (a *Syncer) getBlocks(
 ) ([]*api.BlockMetadata, error) {
 	batchSize := len(blockMetadatas)
 	outMetadatas := make([]*api.BlockMetadata, 0, batchSize)
-	processed, reprocess, err := a.getBlocksInParallel(ctx, logger, blockMetadatas, parallelism, false, dataCompression, fastSync, transactionIndexingParallelism)
+	processed, failures, err := a.getBlocksInParallel(ctx, logger, blockMetadatas, parallelism, false, dataCompression, fastSync, transactionIndexingParallelism)
 	if err != nil {
 		return nil, err
 	}
 	outMetadatas = append(outMetadatas, processed...)
-	if len(reprocess) > 0 {
+	if len(failures) > 0 {
 		// Enable best-effort tracing when reprocessing blocks that are failed in the first time.
 		// This option is only applied to the reprocessing phase so that chances of getting partial
 		// block data is minimized.
+		reprocess := blockMetadatasOf(failures)
 		a.metrics.reprocessCounter.Inc(int64(len(reprocess)))
 		logger.Warn(
 			"reprocessing blocks",
 			zap.Int("numBlocks", len(reprocess)),
 			zap.Reflect("blocks", a.shortenBlocks(reprocess)),
+			zap.String("cause", summarizeBlockFailures(failures)),
 		)
 		reprocessed, failed, err := a.getBlocksInParallel(ctx, logger, reprocess, parallelismOfBestEffort, true, dataCompression, fastSync, transactionIndexingParallelism)
 		if err != nil {
 			return nil, err
 		}
 		if len(failed) > 0 {
-			return nil, xerrors.Errorf("failed to get %d blocks after attempting twice: %+v", len(failed), failed)
+			// Report why the blocks failed, not just which ones: this error is what Temporal records
+			// and what the alert surfaces, and the underlying cause is otherwise only in the pod logs.
+			return nil, xerrors.Errorf("failed to get %d blocks after attempting twice: %v", len(failed), summarizeBlockFailures(failed))
 		}
 		outMetadatas = append(outMetadatas, reprocessed...)
 	}
@@ -594,7 +598,7 @@ func (a *Syncer) getBlocksInParallel(
 	dataCompression api.Compression,
 	fastSync bool,
 	transactionIndexingParallelism int,
-) ([]*api.BlockMetadata, []*api.BlockMetadata, error) {
+) ([]*api.BlockMetadata, []*blockFailure, error) {
 	batchSize := len(blockMetadatas)
 	if parallelism > batchSize {
 		parallelism = batchSize
@@ -607,7 +611,7 @@ func (a *Syncer) getBlocksInParallel(
 
 	outChannel := make(chan *api.BlockMetadata, batchSize)
 	defer close(outChannel)
-	reprocessChannel := make(chan *api.BlockMetadata, batchSize)
+	reprocessChannel := make(chan *blockFailure, batchSize)
 	defer close(reprocessChannel)
 	g, ctx := syncgroup.New(ctx)
 
@@ -623,7 +627,7 @@ func (a *Syncer) getBlocksInParallel(
 						zap.Error(err),
 						zap.Bool("best_effort", withBestEffort),
 						zap.Reflect("block", metadata))
-					reprocessChannel <- metadata
+					reprocessChannel <- &blockFailure{metadata: metadata, err: err}
 					outChannel <- nil
 				} else {
 					reprocessChannel <- nil
@@ -641,7 +645,7 @@ func (a *Syncer) getBlocksInParallel(
 		return nil, nil, xerrors.Errorf("failed to get blocks: %w", err)
 	}
 	processed := make([]*api.BlockMetadata, 0, batchSize)
-	reprocess := make([]*api.BlockMetadata, 0, batchSize)
+	failures := make([]*blockFailure, 0, batchSize)
 	for i := 0; i < batchSize; i++ {
 		processedBlock := <-outChannel
 		if processedBlock != nil {
@@ -649,10 +653,10 @@ func (a *Syncer) getBlocksInParallel(
 		}
 		failed := <-reprocessChannel
 		if failed != nil {
-			reprocess = append(reprocess, failed)
+			failures = append(failures, failed)
 		}
 	}
-	return processed, reprocess, nil
+	return processed, failures, nil
 }
 
 func (a *Syncer) safeGetBlock(

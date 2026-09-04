@@ -1063,6 +1063,36 @@ func (s *SyncerTestSuite) TestBlockValidationFailure() {
 	require.Error(err)
 }
 
+func (s *SyncerTestSuite) TestBlockFetchFailureReportsCause() {
+	require := testutil.Require(s.T())
+
+	s.masterBlockchainClient.EXPECT().GetLatestHeight(gomock.Any()).Return(uint64(101), nil)
+
+	forkBlock := testutil.MakeBlockMetadata(100, tag)
+	s.metaStorage.EXPECT().GetLatestBlock(gomock.Any(), tag).Return(forkBlock, nil)
+
+	// Both the initial fetch and the best-effort reprocess are throttled by the same endpoint.
+	s.slaveBlockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, gomock.Any()).
+		Return(nil, rateLimitedError("nownodes-jsonrpc-slave", 101))
+	s.masterBlockchainClient.EXPECT().GetBlockByHeight(gomock.Any(), tag, gomock.Any(), gomock.Any()).
+		Return(nil, rateLimitedError("nownodes-jsonrpc-slave", 101))
+
+	request := &SyncerRequest{
+		Tag:             tag,
+		MaxBlocksToSync: 100,
+		Parallelism:     4,
+		FastSync:        true,
+	}
+	_, err := s.syncer.Execute(s.env.BackgroundContext(), request)
+	require.Error(err)
+
+	// The activity error is what Temporal records, so it must name the cause and the endpoint.
+	require.Contains(err.Error(), "failed to get 1 blocks after attempting twice")
+	require.Contains(err.Error(), "RateLimitError (HTTPError 429)")
+	require.Contains(err.Error(), "endpoint=nownodes-jsonrpc-slave")
+	require.Contains(err.Error(), "heights=[101]")
+}
+
 func (s *SyncerTestSuite) TestConsensusValidation_Success() {
 	// This test verifies the following case:
 	// master: [98] <- [99] <- [100] <- [101] <- [102]
