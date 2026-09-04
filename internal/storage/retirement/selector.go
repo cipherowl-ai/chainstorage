@@ -79,6 +79,21 @@ type (
 			minHeight uint64,
 		) (uint64, bool, error)
 
+		// RetentionFloorWatermarkInRange is RetentionFloorWatermark bounded
+		// above: the lowest height in [minHeight, endHeight) that still holds
+		// an undeleted single-block object. The cron uses it to reconcile a
+		// persisted floor one bounded chunk at a time (INF-1571): a stray
+		// undeleted row below the persisted floor is exactly what an
+		// unbounded walk would find and a persisted hint would skip, so the
+		// bound is what keeps that check affordable per tick.
+		RetentionFloorWatermarkInRange(
+			ctx context.Context,
+			storageGeneration string,
+			tag uint32,
+			minHeight uint64,
+			endHeight uint64,
+		) (uint64, bool, error)
+
 		// RetentionDueFloor returns the lowest height in [minHeight, endHeight)
 		// that is actually DUE at eligibilityCutoff, and whether such a row
 		// exists.
@@ -339,6 +354,33 @@ func (s *Selector) FloorWatermark(
 		return approvedStartHeight, nil
 	}
 	return watermark, nil
+}
+
+// FloorWatermarkInRange reports the lowest undeleted single-block height in
+// [minHeight, endHeight), and whether one exists. Unlike FloorWatermark it
+// does not clamp: the caller is checking a range it already believes to be
+// fully retired, so a found row is the finding.
+func (s *Selector) FloorWatermarkInRange(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (uint64, bool, error) {
+	if s == nil || s.repo == nil {
+		return 0, false, xerrors.New("retention cohort repository is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return 0, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+	}
+	if endHeight <= minHeight {
+		return 0, false, nil
+	}
+	height, found, err := s.repo.RetentionFloorWatermarkInRange(ctx, storageGeneration, tag, minHeight, endHeight)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to resolve bounded retention floor watermark: %w", err)
+	}
+	return height, found, nil
 }
 
 // DueFloor resolves the lowest height in [floorHeight, endHeight) that is due

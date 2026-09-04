@@ -860,12 +860,56 @@ func (r *PostgresRepository) RetentionFloorWatermark(
 	return retentionFloorWatermark(ctx, r.db, storageGeneration, tag, minHeight)
 }
 
+func (r *PostgresRepository) RetentionFloorWatermarkInRange(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (uint64, bool, error) {
+	if r == nil || r.db == nil {
+		return 0, false, xerrors.New("postgres db is required")
+	}
+	return retentionFloorWatermarkInRange(ctx, r.db, storageGeneration, tag, minHeight, endHeight)
+}
+
 func retentionFloorWatermark(
 	ctx context.Context,
 	db retentionCohortQuerier,
 	storageGeneration string,
 	tag uint32,
 	minHeight uint64,
+) (uint64, bool, error) {
+	return retentionFloorWatermarkBounded(ctx, db, storageGeneration, tag, minHeight, 0, false)
+}
+
+// retentionFloorWatermarkInRange is the bounded form used for reconciling a
+// persisted floor (INF-1571). Both bounds ride the same (tag, height) index
+// path; the upper bound is what makes a walk over already-retired history a
+// fixed per-tick cost instead of one that grows with the retired range —
+// measured on robinhood-mainnet prod, 3M retired rows walk in ~11s bounded.
+func retentionFloorWatermarkInRange(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (uint64, bool, error) {
+	if endHeight <= minHeight {
+		return 0, false, nil
+	}
+	return retentionFloorWatermarkBounded(ctx, db, storageGeneration, tag, minHeight, endHeight, true)
+}
+
+func retentionFloorWatermarkBounded(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+	bounded bool,
 ) (uint64, bool, error) {
 	// minHeight is what keeps this lookup affordable, and it is the load-bearing
 	// part of this query rather than an optimisation. Without it the scan walks
@@ -880,17 +924,25 @@ func retentionFloorWatermark(
 	// dropped in 20260818000002 because the planner also applied it to the
 	// due-cohort probe and made that 2.5x slower. See those migrations before
 	// reaching for an index again.
+	upperBound := ""
+	generationPlaceholder := "$3"
+	args := []any{tag, minHeight}
+	if bounded {
+		upperBound = `
+			AND shadow.height < $3`
+		generationPlaceholder = "$4"
+		args = append(args, endHeight)
+	}
 	query := `
 		SELECT MIN(shadow.height)
 		FROM block_consolidation_shadow shadow
 		WHERE shadow.tag = $1
-			AND shadow.height >= $2
+			AND shadow.height >= $2` + upperBound + `
 			AND shadow.single_block_object_deleted_at IS NULL
 			AND shadow.single_block_object_key_main IS NOT NULL
 			AND shadow.single_block_object_key_main <> ''
-			AND ` + storageGenerationMatch(storageGeneration, "$3", "shadow.single_block_storage_generation")
+			AND ` + storageGenerationMatch(storageGeneration, generationPlaceholder, "shadow.single_block_storage_generation")
 
-	args := []any{tag, minHeight}
 	if storageGenerationIsBound(storageGeneration) {
 		args = append(args, storageGeneration)
 	}

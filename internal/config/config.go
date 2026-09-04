@@ -501,6 +501,18 @@ type (
 		SingleBlockWritersGuarded   bool   `mapstructure:"single_block_writers_guarded"`
 		FallbackReadsValidated      bool   `mapstructure:"fallback_reads_validated"`
 		ProductionDeleteEnabled     bool   `mapstructure:"production_delete_enabled"`
+		// PersistFloorWatermark starts each tick's floor walk from the floor
+		// the previous walk found (persisted as a consolidation cursor) rather
+		// than from ApprovedStartHeight, and reconciles the skipped range one
+		// bounded chunk per tick (INF-1571). Off by default: with it off the
+		// walk re-scans every retired row above ApprovedStartHeight on every
+		// tick, which grows at the retention drain rate until it crosses the
+		// statement timeout and stalls retention (INF-1569).
+		PersistFloorWatermark bool `mapstructure:"persist_floor_watermark"`
+		// ReconcileChunkBlocks bounds the per-tick reconciliation walk below
+		// the persisted floor; 0 selects the default. Sized so one chunk of
+		// fully retired rows stays well inside the statement timeout.
+		ReconcileChunkBlocks uint64 `mapstructure:"reconcile_chunk_blocks" validate:"omitempty,lte=5000000"`
 	}
 
 	StorageConfig struct {
