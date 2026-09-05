@@ -509,10 +509,11 @@ type (
 		// tick, which grows at the retention drain rate until it crosses the
 		// statement timeout and stalls retention (INF-1569).
 		PersistFloorWatermark bool `mapstructure:"persist_floor_watermark"`
-		// ReconcileChunkBlocks bounds the per-tick reconciliation walk below
-		// the persisted floor; 0 selects the default. Sized so one chunk of
-		// fully retired rows stays well inside the statement timeout.
-		ReconcileChunkBlocks uint64 `mapstructure:"reconcile_chunk_blocks" validate:"omitempty,lte=5000000"`
+		// FloorWalkChunkBlocks bounds every chunk of the persisted-floor walk:
+		// the walk above the floor that resolves the tick's probe start, and
+		// the reconciliation walk below it. 0 selects the default. Sized so one
+		// chunk of fully retired rows stays well inside the statement timeout.
+		FloorWalkChunkBlocks uint64 `mapstructure:"floor_walk_chunk_blocks" validate:"omitempty,lte=5000000"`
 	}
 
 	StorageConfig struct {

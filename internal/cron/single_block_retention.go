@@ -102,13 +102,20 @@ const (
 	maxRetentionProbeAdvances        = 4
 	singleBlockRetentionOpenPageSize = 1000
 
-	// defaultSingleBlockRetentionReconcileChunkBlocks bounds one tick's
-	// reconciliation walk below the persisted floor. Measured on
+	// defaultSingleBlockRetentionFloorWalkChunkBlocks bounds one chunk of the
+	// persisted-floor walk, above and below the floor. Measured on
 	// robinhood-mainnet prod: a bounded walk over 3M fully retired rows takes
 	// ~11s on the reader and ~10-18s per million cold on the writer, so 1M
 	// stays an order of magnitude inside the 180s statement timeout even when
 	// a sweep is running concurrently.
-	defaultSingleBlockRetentionReconcileChunkBlocks = uint64(1_000_000)
+	defaultSingleBlockRetentionFloorWalkChunkBlocks = uint64(1_000_000)
+	// maxSingleBlockRetentionFloorWalkChunksPerTick caps the chunks the
+	// walk ABOVE the floor runs in one tick. Bounds a tick's cost at a few
+	// minutes worst case (4M cold rows on the writer) while a bootstrap from
+	// an old approval floor — 13M retired rows on robinhood today — completes
+	// in a handful of ticks. Every empty chunk is persisted before the next
+	// runs, so the cap only spreads the walk over ticks; it never repeats it.
+	maxSingleBlockRetentionFloorWalkChunksPerTick = 4
 )
 
 func NewSingleBlockRetention(params SingleBlockRetentionTaskParams) (Task, error) {
@@ -306,60 +313,52 @@ func (t *singleBlockRetentionTask) runTick(ctx context.Context) error {
 	// a stored floor would need its own reconciliation for repairs and failed
 	// sweeps, and a stale one strands data silently.
 	//
-	// With PersistFloorWatermark on, the walk starts from the floor the previous
-	// tick found instead (INF-1571). The unbounded walk from
-	// approved_start_height re-scans every row retention has already retired,
-	// and that count grows at the drain rate — on robinhood-mainnet it crossed
-	// the 60s statement timeout at ~6.6M rows and stalled retention for 12h
-	// twice (INF-1569). The persisted floor is only ever a starting point for
-	// the same walk, never a substitute for it: the walk still finds the first
-	// undeleted row above it, and reconcileFloorWatermark re-checks the range
-	// beneath it one bounded chunk per tick so a stray row that appears below
-	// (a repair, a re-ingest at an old height) lowers the floor within one pass
-	// instead of being skipped forever. approved_start_height keeps its
-	// meaning as the authorisation floor throughout.
-	walkStart := cronConfig.ApprovedStartHeight
-	var persistedFloor uint64
-	persistedFloorFound := false
+	// With PersistFloorWatermark on, the walk is BOUNDED and its progress is
+	// persisted (INF-1571). The unbounded walk from approved_start_height
+	// re-scans every row retention has already retired, and that count grows
+	// at the drain rate — on robinhood-mainnet it crossed the 60s statement
+	// timeout at ~6.6M rows and stalled retention for 12h twice (INF-1569).
+	// Instead the walk starts from the persisted floor (the approval floor
+	// when there is none) and proceeds one bounded chunk at a time, raising
+	// the persisted floor past every chunk that holds no undeleted row, up to
+	// a per-tick chunk budget. Each chunk is a fixed cost inside the statement
+	// timeout and each empty chunk's result is durable before the next one
+	// runs, so a first rollout from an old approval floor, or a lost cursor,
+	// is a walk that spans a few ticks instead of a query that can never
+	// finish, and a tick cut off mid-walk resumes where it stopped. The walk
+	// is capped at approvedEnd: rows above it are outside the sweep's range,
+	// and a walk that reaches it having found nothing proves every approved
+	// row retired, so the floor moves to approvedEnd and the next tick walks
+	// only what the envelope gained since — the fully-retired state costs a
+	// constant, never a re-scan of the retired tail.
+	//
+	// The persisted floor is only ever a starting point for the same walk,
+	// never a substitute for it: reconcileFloorWatermark re-checks the range
+	// beneath it one bounded chunk per tick, so a stray row that appears
+	// below (a repair, a re-ingest at an old height) lowers the floor within
+	// one pass instead of being skipped forever. approved_start_height keeps
+	// its meaning as the authorisation floor throughout.
+	var probeStart uint64
 	if cronConfig.PersistFloorWatermark {
-		persistedFloor, persistedFloorFound, err = t.metaStorage.GetBlockConsolidationCursor(
-			ctx,
-			metastorage.SingleBlockRetentionFloorWatermarkCursor,
-			tag,
-		)
+		var complete bool
+		probeStart, complete, err = t.walkPersistedFloor(ctx, selector, storageGeneration, tag, cronConfig, approvedEnd)
 		if err != nil {
-			return xerrors.Errorf("failed to read persisted retention floor watermark: %w", err)
+			return err
 		}
-		if persistedFloorFound && persistedFloor > walkStart {
-			walkStart = persistedFloor
+		if !complete {
+			// The chunk budget ran out before the walk found an undeleted row
+			// or reached approvedEnd. Its progress is persisted and the next
+			// tick continues from there; no sweep launches without a floor.
+			// Probe-only gauges are zeroed as on a skipped tick.
+			t.metrics.Gauge("probe_window_blocks").Update(0)
+			t.metrics.Gauge("due_floor_height").Update(0)
+			t.metrics.Gauge("probe_advance_exhausted").Update(0)
+			return nil
 		}
-		t.metrics.Gauge("persisted_floor_height").Update(float64(persistedFloor))
-	}
-	probeStart, err := selector.FloorWatermark(ctx, storageGeneration, tag, walkStart)
-	if err != nil {
-		return xerrors.Errorf("failed to resolve retention floor watermark: %w", err)
-	}
-	if cronConfig.PersistFloorWatermark && (!persistedFloorFound || probeStart > persistedFloor) {
-		// Raise only. The walk proved every row in [walkStart, probeStart) is
-		// retired, so starting there next tick skips nothing; lowering is
-		// reconciliation's job. A failed write is reported, not fatal: this
-		// tick already has its probe start and simply re-walks next time.
-		if err := t.metaStorage.SetBlockConsolidationCursor(
-			ctx,
-			metastorage.SingleBlockRetentionFloorWatermarkCursor,
-			tag,
-			probeStart,
-		); err != nil {
-			t.metrics.Gauge("floor_persist_failed").Update(1)
-			t.logger.Warn(
-				"single_block_retention cron failed to persist the retention floor watermark",
-				zap.Uint32("tag", tag),
-				zap.Uint64("floor_watermark_height", probeStart),
-				zap.Error(err),
-			)
-		} else {
-			t.metrics.Gauge("floor_persist_failed").Update(0)
-			t.metrics.Gauge("persisted_floor_height").Update(float64(probeStart))
+	} else {
+		probeStart, err = selector.FloorWatermark(ctx, storageGeneration, tag, cronConfig.ApprovedStartHeight)
+		if err != nil {
+			return xerrors.Errorf("failed to resolve retention floor watermark: %w", err)
 		}
 	}
 	if probeStart >= approvedEnd {
@@ -714,6 +713,110 @@ func (t *singleBlockRetentionTask) runTick(ctx context.Context) error {
 	return nil
 }
 
+func floorWalkChunkBlocks(cronConfig config.SingleBlockRetentionCronConfig) uint64 {
+	if cronConfig.FloorWalkChunkBlocks != 0 {
+		return cronConfig.FloorWalkChunkBlocks
+	}
+	return defaultSingleBlockRetentionFloorWalkChunkBlocks
+}
+
+// walkPersistedFloor resolves the tick's floor with the bounded, persisted
+// walk described at its call site in runTick. It returns the floor and
+// complete=true when the walk found the first undeleted row at or above the
+// persisted floor, or reached approvedEnd without finding one (the floor is
+// then approvedEnd); complete=false when the per-tick chunk budget ran out
+// first, with every empty chunk already persisted so the next tick resumes
+// from the last one.
+func (t *singleBlockRetentionTask) walkPersistedFloor(
+	ctx context.Context,
+	selector *retirement.Selector,
+	storageGeneration string,
+	tag uint32,
+	cronConfig config.SingleBlockRetentionCronConfig,
+	approvedEnd uint64,
+) (uint64, bool, error) {
+	persistedFloor, persistedFloorFound, err := t.metaStorage.GetBlockConsolidationCursor(
+		ctx,
+		metastorage.SingleBlockRetentionFloorWatermarkCursor,
+		tag,
+	)
+	if err != nil {
+		return 0, false, xerrors.Errorf("failed to read persisted retention floor watermark: %w", err)
+	}
+	t.metrics.Gauge("persisted_floor_height").Update(float64(persistedFloor))
+	start := cronConfig.ApprovedStartHeight
+	if persistedFloorFound && persistedFloor > start {
+		start = persistedFloor
+	}
+	chunk := floorWalkChunkBlocks(cronConfig)
+	// raise persists height as the floor when it is above the persisted one.
+	// Raise only: lowering is reconciliation's job. A failed write is
+	// reported, not fatal — the walk's result stands for this tick and the
+	// next tick re-walks whatever was not recorded.
+	raise := func(height uint64) {
+		if persistedFloorFound && height <= persistedFloor {
+			return
+		}
+		if err := t.metaStorage.SetBlockConsolidationCursor(
+			ctx,
+			metastorage.SingleBlockRetentionFloorWatermarkCursor,
+			tag,
+			height,
+		); err != nil {
+			t.metrics.Gauge("floor_persist_failed").Update(1)
+			t.logger.Warn(
+				"single_block_retention cron failed to persist the retention floor watermark",
+				zap.Uint32("tag", tag),
+				zap.Uint64("floor_watermark_height", height),
+				zap.Error(err),
+			)
+			return
+		}
+		persistedFloor, persistedFloorFound = height, true
+		t.metrics.Gauge("floor_persist_failed").Update(0)
+		t.metrics.Gauge("persisted_floor_height").Update(float64(height))
+	}
+	chunks := 0
+	for start < approvedEnd && chunks < maxSingleBlockRetentionFloorWalkChunksPerTick {
+		end := approvedEnd
+		if end-start > chunk {
+			end = start + chunk
+		}
+		chunks++
+		height, found, err := selector.FloorWatermarkInRange(ctx, storageGeneration, tag, start, end)
+		if err != nil {
+			t.metrics.Gauge("floor_walk_chunks").Update(float64(chunks))
+			return 0, false, xerrors.Errorf("failed to resolve retention floor watermark in [%d, %d): %w", start, end, err)
+		}
+		if found {
+			t.metrics.Gauge("floor_walk_chunks").Update(float64(chunks))
+			t.metrics.Gauge("floor_walk_incomplete").Update(0)
+			raise(height)
+			return height, true, nil
+		}
+		// Every row in [start, end) is retired: the floor may move to end.
+		start = end
+		raise(start)
+	}
+	t.metrics.Gauge("floor_walk_chunks").Update(float64(chunks))
+	if start >= approvedEnd {
+		t.metrics.Gauge("floor_walk_incomplete").Update(0)
+		return approvedEnd, true, nil
+	}
+	t.metrics.Gauge("floor_walk_incomplete").Update(1)
+	t.metrics.Gauge("floor_watermark_height").Update(float64(start))
+	t.metrics.Gauge("probe_range_blocks").Update(float64(approvedEnd - start))
+	t.logger.Info(
+		"single_block_retention cron floor walk paused at its chunk budget; it continues next tick",
+		zap.Uint32("tag", tag),
+		zap.Uint64("walk_height", start),
+		zap.Uint64("approved_end_height", approvedEnd),
+		zap.Int("chunks", chunks),
+		zap.Uint64("chunk_blocks", chunk),
+	)
+	return start, false, nil
+}
+
 // reconcileFloorWatermark re-walks one bounded chunk of the range below the
 // persisted floor looking for an undeleted single-block row, and lowers the
 // floor to it when one exists (INF-1571).
@@ -755,10 +858,7 @@ func (t *singleBlockRetentionTask) reconcileFloorWatermark(ctx context.Context) 
 		t.reconcileNextHeight.Store(0)
 		return
 	}
-	chunk := cronConfig.ReconcileChunkBlocks
-	if chunk == 0 {
-		chunk = defaultSingleBlockRetentionReconcileChunkBlocks
-	}
+	chunk := floorWalkChunkBlocks(cronConfig)
 	start := cronConfig.ApprovedStartHeight
 	if resume := t.reconcileNextHeight.Load(); resume > start && resume < persistedFloor {
 		start = resume
