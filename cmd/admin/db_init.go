@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/lib/pq"
 	_ "github.com/lib/pq"
-	"github.com/pressly/goose/v3"
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	"golang.org/x/xerrors"
@@ -198,45 +197,20 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 
 	// Run migrations on the network database
 	logger.Info("Running migrations")
-	if err := runMigrations(ctx, masterHost, masterPort, masterUser, masterPassword, dbName, logger); err != nil {
+	if err := runMigrations(
+		ctx,
+		masterHost,
+		masterPort,
+		masterUser,
+		masterPassword,
+		workerUsername,
+		serverUsername,
+		dbName,
+		logger,
+	); err != nil {
 		return xerrors.Errorf("failed to run migrations: %w", err)
 	}
 	logger.Info("Migrations completed successfully")
-
-	// Grant permissions
-	logger.Info("Setting up permissions")
-
-	// Grant CONNECT permission to server user
-	if err := grantConnectPermission(db, dbName, serverUsername, logger); err != nil {
-		return xerrors.Errorf("failed to grant CONNECT permission on %s to %s: %w",
-			dbName, serverUsername, err)
-	}
-
-	// Connect to the network database to grant permissions
-	netDSN := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
-		masterHost, masterPort, masterUser, masterPassword, dbName)
-
-	netDB, err := sql.Open("postgres", netDSN)
-	if err != nil {
-		return xerrors.Errorf("failed to connect to database %s: %w", dbName, err)
-	}
-	defer func() {
-		if closeErr := netDB.Close(); closeErr != nil {
-			logger.Warn("Failed to close network database connection", zap.Error(closeErr))
-		}
-	}()
-
-	// Grant full access to worker user (owner)
-	if err := grantFullAccess(netDB, workerUsername, logger); err != nil {
-		return xerrors.Errorf("failed to grant full access on %s to %s: %w", dbName, workerUsername, err)
-	}
-	logger.Info("Granted full access to worker user", zap.String("username", workerUsername))
-
-	// Grant permissions to server user
-	if err := grantReadOnlyAccess(netDB, serverUsername, workerUsername, logger); err != nil {
-		return xerrors.Errorf("failed to grant permissions on %s: %w", dbName, err)
-	}
-	logger.Info("Granted read-only access to server user", zap.String("username", serverUsername))
 
 	logger.Info("Database initialization completed successfully",
 		zap.String("network", fmt.Sprintf("%s-%s", blockchain, network)),
@@ -377,67 +351,20 @@ func createDatabase(db *sql.DB, dbName, owner string, logger *zap.Logger) error 
 	return nil
 }
 
-func grantConnectPermission(db *sql.DB, dbName, username string, logger *zap.Logger) error {
-	// Grant CONNECT permission on database
-	grantQuery := fmt.Sprintf("GRANT CONNECT ON DATABASE %s TO %s",
-		pq.QuoteIdentifier(dbName), pq.QuoteIdentifier(username))
-
-	if _, err := db.Exec(grantQuery); err != nil {
-		// This might fail if permission already exists, which is fine
-		return xerrors.Errorf("failed to grant connect permission: %w", err)
-	}
-
-	return nil
-}
-
-func grantReadOnlyAccess(db *sql.DB, readUser, ownerUser string, logger *zap.Logger) error {
-	queries := []string{
-		fmt.Sprintf("GRANT USAGE ON SCHEMA public TO %s", pq.QuoteIdentifier(readUser)),
-		fmt.Sprintf("GRANT SELECT ON ALL TABLES IN SCHEMA public TO %s", pq.QuoteIdentifier(readUser)),
-		fmt.Sprintf("GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO %s", pq.QuoteIdentifier(readUser)),
-		// Set default privileges for future objects created by the owner
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON TABLES TO %s",
-			pq.QuoteIdentifier(ownerUser), pq.QuoteIdentifier(readUser)),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES FOR USER %s IN SCHEMA public GRANT SELECT ON SEQUENCES TO %s",
-			pq.QuoteIdentifier(ownerUser), pq.QuoteIdentifier(readUser)),
-	}
-
-	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
-			// Some permissions might already exist, log but don't fail
-			logger.Warn("Failed to grant read-only permission (continuing)", zap.Error(err))
-		}
-	}
-
-	return nil
-}
-
-func grantFullAccess(db *sql.DB, username string, logger *zap.Logger) error {
-	queries := []string{
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON SCHEMA public TO %s", pq.QuoteIdentifier(username)),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO %s", pq.QuoteIdentifier(username)),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO %s", pq.QuoteIdentifier(username)),
-		fmt.Sprintf("GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO %s", pq.QuoteIdentifier(username)),
-		// Set default privileges for future objects
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO %s", pq.QuoteIdentifier(username)),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO %s", pq.QuoteIdentifier(username)),
-		fmt.Sprintf("ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO %s", pq.QuoteIdentifier(username)),
-	}
-
-	for _, q := range queries {
-		if _, err := db.Exec(q); err != nil {
-			// Some permissions might already exist, log but don't fail
-			logger.Warn("Failed to grant full access permission (continuing)", zap.Error(err))
-		}
-	}
-
-	return nil
-}
-
-func runMigrations(ctx context.Context, host string, port int, user, password, dbName string, logger *zap.Logger) error {
+func runMigrations(
+	ctx context.Context,
+	host string,
+	port int,
+	masterUser string,
+	masterPassword string,
+	workerUser string,
+	serverUser string,
+	dbName string,
+	logger *zap.Logger,
+) error {
 	// Connect to the network database to run migrations
-	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require",
-		host, port, dbName, user, password)
+	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require statement_timeout=%d",
+		host, port, dbName, masterUser, masterPassword, defaultMigrationStatementTimeout.Milliseconds())
 
 	migrationDB, err := sql.Open("postgres", migrationDSN)
 	if err != nil {
@@ -454,15 +381,17 @@ func runMigrations(ctx context.Context, host string, port int, user, password, d
 		return xerrors.Errorf("failed to ping migration database: %w", err)
 	}
 
-	// Set dialect for goose
-	if err := goose.SetDialect("postgres"); err != nil {
-		return xerrors.Errorf("failed to set goose dialect: %w", err)
-	}
-
-	// Run migrations using the file system path
-	migrationsDir := "/app/migrations"
-	if err := goose.UpContext(ctx, migrationDB, migrationsDir); err != nil {
-		return xerrors.Errorf("failed to run migrations: %w", err)
+	if _, err := runPrivilegedMigrations(
+		ctx,
+		migrationDB,
+		masterUser,
+		workerUser,
+		serverUser,
+		dbName,
+		defaultMigrationLockWaitTimeout,
+		logger,
+	); err != nil {
+		return xerrors.Errorf("failed to run locked database migration: %w", err)
 	}
 
 	return nil
