@@ -1121,6 +1121,25 @@ func (b *blockStorageImpl) SetBlockConsolidationCursor(ctx context.Context, name
 	return nil
 }
 
+func (b *blockStorageImpl) ResetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error {
+	if name == "" {
+		return xerrors.New("block consolidation cursor name must be non-empty")
+	}
+	// Exact write, no GREATEST: this is the lowering path reconciliation uses
+	// for the retention floor watermark (see ResetBlockConsolidationCursor on
+	// the interface). Nothing else should need a cursor to move backwards.
+	const query = `
+		INSERT INTO block_consolidation_cursor (name, tag, height, updated_at)
+		VALUES ($1, $2, $3, NOW())
+		ON CONFLICT (name, tag) DO UPDATE SET
+			height = EXCLUDED.height,
+			updated_at = NOW()`
+	if _, err := b.db.ExecContext(ctx, query, name, tag, height); err != nil {
+		return xerrors.Errorf("failed to reset block consolidation cursor %q for tag %d to height %d: %w", name, tag, height, err)
+	}
+	return nil
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	if len(placements) == 0 {
 		return nil

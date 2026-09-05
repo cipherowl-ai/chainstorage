@@ -33,6 +33,12 @@ type (
 		GetFirstPromotableBlockConsolidationShadow(ctx context.Context, tag uint32, startHeight, endHeight uint64) (uint64, bool, error)
 		GetBlockConsolidationCursor(ctx context.Context, name string, tag uint32) (uint64, bool, error)
 		SetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error
+		// ResetBlockConsolidationCursor writes the cursor exactly, allowing it
+		// to move DOWN. SetBlockConsolidationCursor is monotonic by design (a
+		// consolidation frontier never regresses); the retention floor
+		// watermark (INF-1571) must be lowered when reconciliation finds an
+		// undeleted row below it, which is the one legitimate backwards move.
+		ResetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error
 		PersistBlockConsolidationShadows(ctx context.Context, placements []*ConsolidationShadowPlacement) error
 		PromoteBlockConsolidationShadows(ctx context.Context, tag uint32, startHeight, endHeight uint64, limit uint64, singleBlockObjectRetention time.Duration) (*ConsolidationPromotionResult, error)
 	}
@@ -147,6 +153,13 @@ func (unfencedSingleBlockUploadGuard) Release() error {
 
 const (
 	BatchConsolidatorAutoConsolidateCursor = "batch_consolidator_auto_consolidate_processed_exclusive"
+	// SingleBlockRetentionFloorWatermarkCursor persists the retention cron's
+	// floor watermark: everything below it was found retired by a walk, so
+	// the next probe may start there instead of re-walking retired history
+	// from approved_start_height (INF-1571). Raised via
+	// SetBlockConsolidationCursor after each probe, lowered via
+	// ResetBlockConsolidationCursor when reconciliation finds a stray.
+	SingleBlockRetentionFloorWatermarkCursor = "single_block_retention_floor_watermark"
 )
 
 func WithMetaStorageFactory(params MetaStorageFactoryParams) (Result, error) {

@@ -28,7 +28,8 @@ const (
 	EventIdStartValue = model.EventIdStartValue
 	EventIdDeleted    = model.EventIdDeleted
 
-	BatchConsolidatorAutoConsolidateCursor = internal.BatchConsolidatorAutoConsolidateCursor
+	BatchConsolidatorAutoConsolidateCursor   = internal.BatchConsolidatorAutoConsolidateCursor
+	SingleBlockRetentionFloorWatermarkCursor = internal.SingleBlockRetentionFloorWatermarkCursor
 )
 
 func NewUnfencedSingleBlockUploadGuard() SingleBlockUploadGuard {

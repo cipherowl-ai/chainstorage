@@ -27,6 +27,9 @@ type fakeCohortRepository struct {
 	watermarkTagArg  uint32
 	watermarkCallCnt int
 
+	inRangeHeights []uint64
+	inRangeCalls   [][2]uint64
+
 	dueFloor        uint64
 	dueFloorFound   bool
 	dueFloorErr     error
@@ -285,4 +288,26 @@ func TestSelectorLookaheadKeysReturnsDistinctKeysBeyondWorkflowCap(t *testing.T)
 	require.Error(t, err)
 	_, err = selector.LookaheadKeys(context.Background(), selectorTestBucket, "", 2, 0, 0, time.Time{}, 10)
 	require.Error(t, err)
+}
+
+func (r *fakeCohortRepository) RetentionFloorWatermarkInRange(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (uint64, bool, error) {
+	r.inRangeCalls = append(r.inRangeCalls, [2]uint64{minHeight, endHeight})
+	found := false
+	lowest := uint64(0)
+	for _, height := range r.inRangeHeights {
+		if height < minHeight || height >= endHeight {
+			continue
+		}
+		if !found || height < lowest {
+			found = true
+			lowest = height
+		}
+	}
+	return lowest, found, nil
 }

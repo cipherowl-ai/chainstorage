@@ -39,6 +39,14 @@ type retentionCronCohortRepository struct {
 	watermarkErr       error
 	watermarkMinHeight uint64
 
+	// undeletedHeights are the undeleted rows the BOUNDED walks can find —
+	// the persisted-floor walk above the floor and the reconciliation walk
+	// below it; inRangeCalls records every [start, end) chunk either asked
+	// for, in order (INF-1571). inRangeErrAtCall fails the Nth call (1-based).
+	undeletedHeights []uint64
+	inRangeErrAtCall int
+	inRangeCalls     [][2]uint64
+
 	// The due/pending cohort fixtures are the SELECTABLE universe: what
 	// production's ListRetentionCohorts could return. rawDueHeights models due
 	// shadow rows that the due-floor candidate sees but the cohort query
@@ -118,6 +126,31 @@ func (r *retentionCronCohortRepository) RetentionFloorWatermark(
 		return 0, false, r.watermarkErr
 	}
 	return r.watermark, r.watermarkFound, nil
+}
+
+func (r *retentionCronCohortRepository) RetentionFloorWatermarkInRange(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (uint64, bool, error) {
+	r.inRangeCalls = append(r.inRangeCalls, [2]uint64{minHeight, endHeight})
+	if r.inRangeErrAtCall != 0 && len(r.inRangeCalls) == r.inRangeErrAtCall {
+		return 0, false, errors.New("statement timeout")
+	}
+	found := false
+	lowest := uint64(0)
+	for _, height := range r.undeletedHeights {
+		if height < minHeight || height >= endHeight {
+			continue
+		}
+		if !found || height < lowest {
+			found = true
+			lowest = height
+		}
+	}
+	return lowest, found, nil
 }
 
 func (r *retentionCronCohortRepository) ListRetentionCohorts(
@@ -1182,4 +1215,299 @@ func TestSingleBlockRetentionCronClearsCursorWhenSelectionExhausts(t *testing.T)
 	require.NotEmpty(t, cohortRepository.afterCursors)
 	require.True(t, cohortRepository.afterCursors[0].IsZero(),
 		"an exhausted selection must not leave a cursor that skips the window head")
+}
+
+// --- INF-1571: persisted floor watermark + bounded reconciliation ---
+
+func enablePersistedFloor(cfg *config.Config, chunk uint64) {
+	cfg.Cron.SingleBlockRetention.PersistFloorWatermark = true
+	cfg.Cron.SingleBlockRetention.FloorWalkChunkBlocks = chunk
+}
+
+func dueCohortAt(height uint64) retirement.RetentionCohort {
+	return retirement.RetentionCohort{
+		ConsolidatedObjectKey: "consolidated/a.cscb.zstd",
+		StartHeight:           height,
+		EndHeight:             height + 1_000,
+		RowCount:              1_000,
+		EligibleAt:            time.Now().UTC().Add(-2 * time.Hour),
+	}
+}
+
+const (
+	testApprovedStart = uint64(423_300_000)
+	testApprovedEnd   = uint64(437_068_000)
+)
+
+func expectFloorCursor(metaStorage *metastoragemocks.MockMetaStorage, height uint64, found bool) *gomock.Call {
+	return metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.SingleBlockRetentionFloorWatermarkCursor, uint32(2)).
+		Return(height, found, nil)
+}
+
+func expectFloorSet(metaStorage *metastoragemocks.MockMetaStorage, height uint64) *gomock.Call {
+	return metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), metastorage.SingleBlockRetentionFloorWatermarkCursor, uint32(2), height).
+		Return(nil)
+}
+
+// TestSingleBlockRetentionCronWalksFromPersistedFloor pins the point of the
+// mechanism: the floor walk starts at the persisted floor rather than at
+// approved_start_height, so its cost stops growing with retired history —
+// while the sweep's authorization envelope is untouched.
+func TestSingleBlockRetentionCronWalksFromPersistedFloor(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 0)
+	const persisted = uint64(436_500_000)
+	cohortRepository.undeletedHeights = []uint64{436_600_000}
+	cohortRepository.due = []retirement.RetentionCohort{dueCohortAt(436_600_000)}
+
+	expectFloorCursor(metaStorage, persisted, true).Times(2) // probe + reconciliation
+	expectFloorSet(metaStorage, 436_600_000)
+
+	require.NoError(t, task.Run(context.Background()))
+
+	require.Len(t, runtime.executions, 1)
+	request, ok := runtime.executions[0].request.(*workflowpkg.SingleBlockRetentionRequest)
+	require.True(t, ok)
+	require.Equal(t, testApprovedStart, request.ApprovedStartHeight,
+		"authorization still carries the operator's approved floor")
+	require.Equal(t, [][2]uint64{
+		{persisted, testApprovedEnd},                       // the walk: one chunk from the persisted floor, clipped to approvedEnd
+		{testApprovedStart, testApprovedStart + 1_000_000}, // reconciliation: first chunk below it
+	}, cohortRepository.inRangeCalls, "the walk must start at the persisted floor, not at approved_start_height")
+}
+
+// TestSingleBlockRetentionCronBootstrapsInBoundedChunks: with nothing
+// persisted the walk starts at the approval floor as before, but bounded —
+// every empty chunk raises the floor before the next runs, so the first
+// rollout from an old approval floor never runs the unbounded query.
+func TestSingleBlockRetentionCronBootstrapsInBoundedChunks(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	const chunk = uint64(5_000_000)
+	enablePersistedFloor(cfg, chunk)
+	cohortRepository.undeletedHeights = []uint64{436_000_000}
+	cohortRepository.due = []retirement.RetentionCohort{dueCohortAt(436_000_000)}
+
+	gomock.InOrder(
+		expectFloorCursor(metaStorage, 0, false),
+		expectFloorSet(metaStorage, testApprovedStart+chunk),
+		expectFloorSet(metaStorage, testApprovedStart+2*chunk),
+		expectFloorSet(metaStorage, 436_000_000),
+		expectFloorCursor(metaStorage, 436_000_000, true), // reconciliation reads the floor the walk just wrote
+	)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, [][2]uint64{
+		{testApprovedStart, testApprovedStart + chunk},
+		{testApprovedStart + chunk, testApprovedStart + 2*chunk},
+		{testApprovedStart + 2*chunk, testApprovedEnd},
+		{testApprovedStart, testApprovedStart + chunk}, // reconciliation
+	}, cohortRepository.inRangeCalls)
+}
+
+// TestSingleBlockRetentionCronBootstrapSpansTicksAtTheChunkBudget: a walk
+// that exhausts its per-tick budget launches nothing, keeps its progress, and
+// resumes from it next tick — the bootstrap cost is spread, never repeated.
+func TestSingleBlockRetentionCronBootstrapSpansTicksAtTheChunkBudget(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	const chunk = uint64(1_000_000)
+	enablePersistedFloor(cfg, chunk)
+	cohortRepository.undeletedHeights = []uint64{430_000_000}
+	cohortRepository.due = []retirement.RetentionCohort{dueCohortAt(430_000_000)}
+	budgetEnd := testApprovedStart + uint64(maxSingleBlockRetentionFloorWalkChunksPerTick)*chunk // 427.3M
+
+	gomock.InOrder(
+		// tick 1: four empty chunks, each persisted; budget exhausted
+		expectFloorCursor(metaStorage, 0, false),
+		expectFloorSet(metaStorage, testApprovedStart+chunk),
+		expectFloorSet(metaStorage, testApprovedStart+2*chunk),
+		expectFloorSet(metaStorage, testApprovedStart+3*chunk),
+		expectFloorSet(metaStorage, budgetEnd),
+		expectFloorCursor(metaStorage, budgetEnd, true), // reconciliation
+		// tick 2: resumes at the persisted progress and finds the row in its third chunk
+		expectFloorCursor(metaStorage, budgetEnd, true),
+		expectFloorSet(metaStorage, budgetEnd+chunk),
+		expectFloorSet(metaStorage, budgetEnd+2*chunk),
+		expectFloorSet(metaStorage, 430_000_000),
+		expectFloorCursor(metaStorage, 430_000_000, true), // reconciliation
+	)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions, "no sweep launches without a resolved floor")
+	require.Len(t, cohortRepository.inRangeCalls, maxSingleBlockRetentionFloorWalkChunksPerTick+1)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	walk := cohortRepository.inRangeCalls[maxSingleBlockRetentionFloorWalkChunksPerTick+1:]
+	require.Equal(t, [2]uint64{budgetEnd, budgetEnd + chunk}, walk[0], "tick 2 resumes where tick 1 stopped")
+	require.Equal(t, [2]uint64{budgetEnd + 2*chunk, budgetEnd + 3*chunk}, walk[2])
+}
+
+// TestSingleBlockRetentionCronNothingUndeletedAdvancesTheFloorToApprovedEnd:
+// when nothing undeleted remains at or above the floor the walk reaches
+// approvedEnd, proves every approved row retired, and moves the floor there,
+// so later ticks walk only what the envelope gained — not the retired tail.
+func TestSingleBlockRetentionCronNothingUndeletedAdvancesTheFloorToApprovedEnd(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 0)
+	const persisted = uint64(436_500_000)
+
+	gomock.InOrder(
+		expectFloorCursor(metaStorage, persisted, true),
+		expectFloorSet(metaStorage, testApprovedEnd),
+		expectFloorCursor(metaStorage, testApprovedEnd, true), // reconciliation
+		// next tick: the walk is empty and nothing is written
+		expectFloorCursor(metaStorage, testApprovedEnd, true),
+		expectFloorCursor(metaStorage, testApprovedEnd, true),
+	)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+	require.NoError(t, task.Run(context.Background()))
+	require.Equal(t, [][2]uint64{
+		{persisted, testApprovedEnd},
+		{testApprovedStart, testApprovedStart + 1_000_000},             // reconciliation, tick 1
+		{testApprovedStart + 1_000_000, testApprovedStart + 2_000_000}, // reconciliation, tick 2
+	}, cohortRepository.inRangeCalls, "the second tick's walk is empty: the floor already sits at approvedEnd")
+}
+
+// TestSingleBlockRetentionCronReconciliationLowersPersistedFloor is the
+// safety property the persisted floor depends on: an undeleted row below the
+// persisted floor is found by the bounded re-walk and the floor is lowered to
+// it, so the next walk starts there and the row is retired instead of being
+// stranded.
+func TestSingleBlockRetentionCronReconciliationLowersPersistedFloor(t *testing.T) {
+	task, _, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 20_000_000) // one chunk covers the whole retired range
+	const persisted = uint64(436_500_000)
+	const stray = uint64(430_000_000)
+	cohortRepository.undeletedHeights = []uint64{stray}
+
+	gomock.InOrder(
+		expectFloorCursor(metaStorage, persisted, true),
+		expectFloorSet(metaStorage, testApprovedEnd), // nothing undeleted above the floor
+		expectFloorCursor(metaStorage, testApprovedEnd, true),
+		metaStorage.EXPECT().
+			ResetBlockConsolidationCursor(gomock.Any(), metastorage.SingleBlockRetentionFloorWatermarkCursor, uint32(2), stray).
+			Return(nil),
+	)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Equal(t, [][2]uint64{{persisted, testApprovedEnd}, {testApprovedStart, testApprovedEnd}}, cohortRepository.inRangeCalls)
+}
+
+// TestSingleBlockRetentionCronReconciliationChunksAndWraps pins the per-tick
+// cost bound: each tick walks one chunk below the floor, consecutive ticks
+// continue where the last stopped, and reaching the floor wraps to the
+// approval floor so the retired range is re-inspected continuously.
+func TestSingleBlockRetentionCronReconciliationChunksAndWraps(t *testing.T) {
+	task, _, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	const chunk = uint64(5_000_000)
+	enablePersistedFloor(cfg, chunk)
+	// The floor already sits at approvedEnd, so the walk above it is empty
+	// and every inRangeCall below is reconciliation.
+	expectFloorCursor(metaStorage, testApprovedEnd, true).AnyTimes()
+
+	for i := 0; i < 4; i++ {
+		require.NoError(t, task.Run(context.Background()))
+	}
+	require.Equal(t, [][2]uint64{
+		{testApprovedStart, testApprovedStart + chunk},
+		{testApprovedStart + chunk, testApprovedStart + 2*chunk},
+		{testApprovedStart + 2*chunk, testApprovedEnd}, // clipped to the floor
+		{testApprovedStart, testApprovedStart + chunk}, // wrapped
+	}, cohortRepository.inRangeCalls)
+}
+
+// TestSingleBlockRetentionCronReconcilesOnSkippedTicks: most ticks skip because
+// a sweep is open, and those are the ticks the database is otherwise idle for
+// — reconciliation must run there too or it would starve.
+func TestSingleBlockRetentionCronReconcilesOnSkippedTicks(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 0)
+	runtime.openWorkflowID = []string{"workflow.single_block_retention/manual_run"}
+
+	expectFloorCursor(metaStorage, 436_500_000, true) // reconciliation only; the walk never ran
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+	require.Equal(t, [][2]uint64{{testApprovedStart, testApprovedStart + 1_000_000}}, cohortRepository.inRangeCalls)
+}
+
+// TestSingleBlockRetentionCronPersistFailureIsNotFatal: the walk's result is
+// valid regardless of whether the floor could be written, so a failed write
+// must not fail the tick or block the launch.
+func TestSingleBlockRetentionCronPersistFailureIsNotFatal(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 20_000_000)
+	cohortRepository.undeletedHeights = []uint64{436_000_000}
+	cohortRepository.due = []retirement.RetentionCohort{dueCohortAt(436_000_000)}
+
+	expectFloorCursor(metaStorage, 0, false).Times(2)
+	metaStorage.EXPECT().
+		SetBlockConsolidationCursor(gomock.Any(), metastorage.SingleBlockRetentionFloorWatermarkCursor, uint32(2), uint64(436_000_000)).
+		Return(errors.New("write failed"))
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+}
+
+// TestSingleBlockRetentionCronWalkChunkErrorFailsTheProbe: an error inside the
+// walk above the floor is a probe failure like the unbounded walk's was —
+// progress from earlier chunks is already persisted, so the retry is cheap.
+func TestSingleBlockRetentionCronWalkChunkErrorFailsTheProbe(t *testing.T) {
+	task, runtime, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 1_000_000)
+	cohortRepository.inRangeErrAtCall = 2
+
+	gomock.InOrder(
+		expectFloorCursor(metaStorage, 0, false),
+		expectFloorSet(metaStorage, testApprovedStart+1_000_000),
+	)
+
+	require.Error(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+	require.Len(t, cohortRepository.inRangeCalls, 2, "the tick stops at the failed chunk and reconciliation does not run")
+}
+
+// TestSingleBlockRetentionCronReconcileErrorIsNotFatal: a failed reconciliation
+// chunk is reported on its own gauge and retried next tick; it never fails
+// the tick.
+func TestSingleBlockRetentionCronReconcileErrorIsNotFatal(t *testing.T) {
+	task, _, cohortRepository, metaStorage, cfg, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	enablePersistedFloor(cfg, 0)
+	cohortRepository.inRangeErrAtCall = 1 // the walk above the floor is empty; the first call is reconciliation
+
+	expectFloorCursor(metaStorage, testApprovedEnd, true).Times(2)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, cohortRepository.inRangeCalls, 1)
+}
+
+// TestSingleBlockRetentionCronFlagOffKeepsTheUnboundedWalk: with the flag off
+// nothing touches the cursor and the walk is the pre-existing unbounded one
+// from approved_start_height.
+func TestSingleBlockRetentionCronFlagOffKeepsTheUnboundedWalk(t *testing.T) {
+	task, runtime, cohortRepository, _, _, ctrl := newSingleBlockRetentionCronTask(t)
+	defer ctrl.Finish()
+	cohortRepository.watermark = 436_000_000
+	cohortRepository.watermarkFound = true
+	cohortRepository.due = []retirement.RetentionCohort{dueCohortAt(436_000_000)}
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, testApprovedStart, cohortRepository.watermarkMinHeight)
+	require.Empty(t, cohortRepository.inRangeCalls)
 }

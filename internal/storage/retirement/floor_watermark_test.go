@@ -214,3 +214,79 @@ func TestRetentionFloorWatermarkQueryNeedsNoIndex(t *testing.T) {
 	require.NotContains(recorder.query, "single_block_delete_after")
 	require.NotContains(recorder.query, "validated_at")
 }
+
+// TestRetentionFloorWatermarkInRangeSQLIsBoundedBothEnds pins the bounded
+// form used by floor reconciliation (INF-1571): both bounds present on the
+// indexed height column, generation matched with equality, and the
+// placeholders renumbered so the generation argument still binds.
+func TestRetentionFloorWatermarkInRangeSQLIsBoundedBothEnds(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	recorder := &recordingCohortQuerier{}
+	_, _, err := retentionFloorWatermarkInRange(ctx, recorder, "v2", 2, 439_000_000, 440_000_000)
+	require.ErrorIs(err, errRecordingQuerier)
+
+	require.Contains(recorder.query, "shadow.height >= $2")
+	require.Contains(recorder.query, "shadow.height < $3")
+	require.Contains(recorder.query, "shadow.single_block_storage_generation = $4")
+	require.NotContains(recorder.query, "IS NOT DISTINCT FROM")
+	require.Equal([]any{uint32(2), uint64(439_000_000), uint64(440_000_000), "v2"}, recorder.args)
+}
+
+func TestRetentionFloorWatermarkInRangeLegacyGenerationBindsNoArgument(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	recorder := &recordingCohortQuerier{}
+	_, _, err := retentionFloorWatermarkInRange(ctx, recorder, "", 2, 10, 20)
+	require.ErrorIs(err, errRecordingQuerier)
+	require.Contains(recorder.query, "shadow.single_block_storage_generation IS NULL")
+	require.Equal([]any{uint32(2), uint64(10), uint64(20)}, recorder.args)
+}
+
+// TestRetentionFloorWatermarkInRangeEmptyRangeDoesNotQuery: an empty or
+// inverted range is a no-op rather than a query with a contradictory bound.
+func TestRetentionFloorWatermarkInRangeEmptyRangeDoesNotQuery(t *testing.T) {
+	require := require.New(t)
+	recorder := &recordingCohortQuerier{}
+	_, found, err := retentionFloorWatermarkInRange(context.Background(), recorder, "v2", 2, 20, 20)
+	require.NoError(err)
+	require.False(found)
+	require.Empty(recorder.query)
+}
+
+// TestRetentionFloorWatermarkUnboundedSQLUnchanged guards that adding the
+// bounded form did not alter the unbounded query's placeholders, which the
+// cron's main walk still relies on.
+func TestRetentionFloorWatermarkUnboundedSQLUnchanged(t *testing.T) {
+	require := require.New(t)
+	recorder := &recordingCohortQuerier{}
+	_, _, err := retentionFloorWatermark(context.Background(), recorder, "v2", 2, 439_000_000)
+	require.ErrorIs(err, errRecordingQuerier)
+	require.NotContains(recorder.query, "shadow.height < ")
+	require.Contains(recorder.query, "shadow.single_block_storage_generation = $3")
+	require.Equal([]any{uint32(2), uint64(439_000_000), "v2"}, recorder.args)
+}
+
+// TestFloorWatermarkInRangeDoesNotClamp: unlike FloorWatermark, a found row is
+// returned as-is — the caller is checking a range it believed retired, and
+// the row itself is the finding.
+func TestFloorWatermarkInRangeDoesNotClamp(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	repo := &fakeCohortRepository{inRangeHeights: []uint64{430_000_000, 435_000_000}}
+	selector := NewSelector(repo)
+
+	got, found, err := selector.FloorWatermarkInRange(ctx, "v2", 2, 423_000_000, 436_000_000)
+	require.NoError(err)
+	require.True(found)
+	require.Equal(uint64(430_000_000), got)
+	require.Equal([][2]uint64{{423_000_000, 436_000_000}}, repo.inRangeCalls)
+
+	_, found, err = selector.FloorWatermarkInRange(ctx, "v2", 2, 436_000_000, 436_000_000)
+	require.NoError(err)
+	require.False(found, "an empty range has nothing to find")
+	require.Len(repo.inRangeCalls, 1, "an empty range must not reach the repository")
+}
