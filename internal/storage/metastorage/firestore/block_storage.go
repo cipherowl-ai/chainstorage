@@ -283,6 +283,10 @@ func (b *blockStorageImpl) SetBlockConsolidationCursor(ctx context.Context, name
 	return xerrors.New("SetBlockConsolidationCursor not implemented for Firestore")
 }
 
+func (b *blockStorageImpl) ResetBlockConsolidationCursor(ctx context.Context, name string, tag uint32, height uint64) error {
+	return xerrors.New("ResetBlockConsolidationCursor not implemented for Firestore")
+}
+
 func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context, placements []*internal.ConsolidationShadowPlacement) error {
 	return xerrors.New("PersistBlockConsolidationShadows not implemented for Firestore")
 }

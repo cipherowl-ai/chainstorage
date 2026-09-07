@@ -107,6 +107,8 @@ const (
 	jsonrpcVersion = "2.0"
 
 	instrumentName = "jsonrpc.request"
+
+	rateLimitedMetric = "rate_limited"
 )
 
 func New(params ClientParams) (ClientResult, error) {
@@ -382,6 +384,9 @@ func (c *clientImpl) makeHTTPRequest(ctx context.Context, timeout time.Duration,
 		_ = json.Unmarshal(responseBody, out)
 
 		if response.StatusCode == 429 {
+			// Count every throttled attempt, including the ones absorbed by a retry, so that an endpoint
+			// approaching its quota alerts while the poller is merely slow instead of after it fails.
+			c.metrics.Tagged(map[string]string{"endpoint": endpoint.Name}).Counter(rateLimitedMetric).Inc(1)
 			return retry.RateLimit(errHTTP)
 		}
 

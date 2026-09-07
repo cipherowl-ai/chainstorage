@@ -30,6 +30,7 @@ type (
 	batchConsolidatorCronRuntime struct {
 		logger                *zap.Logger
 		openWorkflowID        []string
+		openWorkflowTaskQueue map[string]string
 		requestedWorkflowType string
 		executions            []batchConsolidatorCronExecution
 	}
@@ -73,6 +74,31 @@ func TestBatchConsolidatorCronStartsFullWindowAutoConsolidateWorkflow(t *testing
 		StartHeight: 3_000,
 		EndHeight:   4_000,
 	}, runtime.executions[0].request)
+}
+
+func TestBatchConsolidatorRoutesHistoricalWorkflowToDedicatedTaskQueue(t *testing.T) {
+	task, runtime, _, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Workflows.BatchConsolidator.TaskList = "batch_consolidator"
+	cfg.Workflows.BatchConsolidator.HistoricalTaskList = "batch_consolidator_backfill"
+
+	_, err := task.batchConsolidator.Execute(context.Background(), &workflowpkg.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		StartHeight: 100,
+		EndHeight:   200,
+	})
+	require.NoError(t, err)
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, "batch_consolidator_backfill", runtime.executions[0].options.TaskQueue)
+
+	_, err = task.batchConsolidator.Execute(context.Background(), &workflowpkg.BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeAutoConsolidate,
+		StartHeight: 200,
+		EndHeight:   300,
+	})
+	require.NoError(t, err)
+	require.Len(t, runtime.executions, 2)
+	require.Equal(t, "batch_consolidator", runtime.executions[1].options.TaskQueue)
 }
 
 func TestBatchConsolidatorCronRunsToNearestSafeFullWindow(t *testing.T) {
@@ -369,6 +395,73 @@ func TestBatchConsolidatorCronSkipsWhenBatchConsolidatorWorkflowIsAlreadyOpen(t 
 	require.Empty(t, runtime.executions)
 }
 
+func TestBatchConsolidatorCronRunsWhileHistoricalBackfillIsOnDedicatedTaskQueue(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Workflows.BatchConsolidator.TaskList = "batch_consolidator"
+	cfg.Workflows.BatchConsolidator.HistoricalTaskList = "batch_consolidator_backfill"
+	cfg.Cron.BatchConsolidator.StartHeight = 1_000
+	runtime.openWorkflowID = []string{"workflow.batch_consolidator/historical_backfill"}
+	runtime.openWorkflowTaskQueue = map[string]string{
+		"workflow.batch_consolidator/historical_backfill": "batch_consolidator_backfill",
+	}
+
+	tag := cfg.GetEffectiveBlockTag(0)
+	metaStorage.EXPECT().
+		GetBlockConsolidationCursor(gomock.Any(), metastorage.BatchConsolidatorAutoConsolidateCursor, tag).
+		Return(uint64(0), false, nil)
+	metaStorage.EXPECT().
+		GetLatestBlock(gomock.Any(), tag).
+		Return(&api.BlockMetadata{Tag: tag, Height: 5_000}, nil)
+	metaStorage.EXPECT().
+		GetFirstBlockMissingConsolidationShadow(gomock.Any(), tag, uint64(1_000), uint64(4_901)).
+		Return(uint64(3_500), true, nil)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Len(t, runtime.executions, 1)
+	require.Equal(t, "batch_consolidator", runtime.executions[0].options.TaskQueue)
+}
+
+func TestBatchConsolidatorCronBlocksHistoricalBackfillOnSharedTaskQueue(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Workflows.BatchConsolidator.TaskList = "batch_consolidator"
+	cfg.Workflows.BatchConsolidator.HistoricalTaskList = "batch_consolidator_backfill"
+	runtime.openWorkflowID = []string{"workflow.batch_consolidator/historical_backfill"}
+	runtime.openWorkflowTaskQueue = map[string]string{
+		"workflow.batch_consolidator/historical_backfill": "batch_consolidator",
+	}
+
+	metaStorage.EXPECT().GetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+}
+
+func TestBatchConsolidatorCronStillBlocksAutoWorkflowAfterIgnoringDedicatedBackfill(t *testing.T) {
+	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
+	defer ctrl.Finish()
+	cfg.Workflows.BatchConsolidator.TaskList = "batch_consolidator"
+	cfg.Workflows.BatchConsolidator.HistoricalTaskList = "batch_consolidator_backfill"
+	runtime.openWorkflowID = []string{
+		"workflow.batch_consolidator/historical_backfill",
+		"workflow.batch_consolidator/auto_consolidate",
+	}
+	runtime.openWorkflowTaskQueue = map[string]string{
+		"workflow.batch_consolidator/historical_backfill": "batch_consolidator_backfill",
+		"workflow.batch_consolidator/auto_consolidate":    "batch_consolidator",
+	}
+
+	metaStorage.EXPECT().GetBlockConsolidationCursor(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetLatestBlock(gomock.Any(), gomock.Any()).Times(0)
+	metaStorage.EXPECT().GetFirstBlockMissingConsolidationShadow(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	require.NoError(t, task.Run(context.Background()))
+	require.Empty(t, runtime.executions)
+}
+
 func TestBatchConsolidatorCronRequiresAutoConsolidateMode(t *testing.T) {
 	task, runtime, metaStorage, cfg, ctrl := newBatchConsolidatorCronTask(t)
 	defer ctrl.Finish()
@@ -491,6 +584,7 @@ func (r *batchConsolidatorCronRuntime) ListOpenWorkflows(ctx context.Context, na
 		executions = append(executions, &workflowpb.WorkflowExecutionInfo{
 			Execution: &commonpb.WorkflowExecution{WorkflowId: workflowID},
 			Type:      &commonpb.WorkflowType{Name: workflowType},
+			TaskQueue: r.openWorkflowTaskQueue[workflowID],
 		})
 	}
 	return &workflowservice.ListOpenWorkflowExecutionsResponse{Executions: executions}, nil

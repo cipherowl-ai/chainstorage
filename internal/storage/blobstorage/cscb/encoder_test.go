@@ -167,6 +167,87 @@ func TestEncodeCSCB_SpillsWhenMemoryBudgetExceeded(t *testing.T) {
 	require.True(os.IsNotExist(err))
 }
 
+func TestEncodeCSCB_AllowsOversizedSingleBlockAsDedicatedChunk(t *testing.T) {
+	require := testutil.Require(t)
+
+	maxChunkUncompressedBytes := uint64(10)
+	cfg := testEncodeConfig(api.Compression_ZSTD)
+	cfg.MaxChunkUncompressedBytes = &maxChunkUncompressedBytes
+	object, err := Encode(context.Background(), cfg, testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := ParseIndex(data)
+	require.NoError(err)
+	require.Len(index.Chunks, 3)
+	require.Equal([]uint64{5, 11, 7}, []uint64{
+		index.Chunks[0].UncompressedLength,
+		index.Chunks[1].UncompressedLength,
+		index.Chunks[2].UncompressedLength,
+	})
+	require.Equal([]uint32{1, 1, 1}, []uint32{
+		index.Chunks[0].BlockCount,
+		index.Chunks[1].BlockCount,
+		index.Chunks[2].BlockCount,
+	})
+	require.Equal([]uint32{0, 1, 2}, []uint32{
+		index.Blocks[0].ChunkIndex,
+		index.Blocks[1].ChunkIndex,
+		index.Blocks[2].ChunkIndex,
+	})
+	require.Greater(index.Chunks[1].UncompressedLength, maxChunkUncompressedBytes)
+}
+
+func TestEncodeCSCB_SplitsAtMaxChunkUncompressedBytes(t *testing.T) {
+	require := testutil.Require(t)
+
+	maxChunkUncompressedBytes := uint64(11)
+	cfg := testEncodeConfig(api.Compression_ZSTD)
+	cfg.MaxChunkUncompressedBytes = &maxChunkUncompressedBytes
+	object, err := Encode(context.Background(), cfg, testPayloads())
+	require.NoError(err)
+	defer object.Close()
+
+	data, ok := object.Bytes()
+	require.True(ok)
+	index, err := ParseIndex(data)
+	require.NoError(err)
+	require.Len(index.Chunks, 3)
+	require.Equal([]uint64{5, 11, 7}, []uint64{
+		index.Chunks[0].UncompressedLength,
+		index.Chunks[1].UncompressedLength,
+		index.Chunks[2].UncompressedLength,
+	})
+	for _, chunk := range index.Chunks {
+		require.LessOrEqual(chunk.UncompressedLength, maxChunkUncompressedBytes)
+	}
+}
+
+func TestEncodeCSCB_MaxChunkUncompressedBytesDoesNotChangeObjectsBelowCap(t *testing.T) {
+	require := testutil.Require(t)
+
+	legacyObject, err := Encode(context.Background(), testEncodeConfig(api.Compression_ZSTD), testPayloads())
+	require.NoError(err)
+	defer legacyObject.Close()
+	legacyData, ok := legacyObject.Bytes()
+	require.True(ok)
+
+	maxChunkUncompressedBytes := uint64(16)
+	cappedCfg := testEncodeConfig(api.Compression_ZSTD)
+	cappedCfg.MaxChunkUncompressedBytes = &maxChunkUncompressedBytes
+	cappedObject, err := Encode(context.Background(), cappedCfg, testPayloads())
+	require.NoError(err)
+	defer cappedObject.Close()
+	cappedData, ok := cappedObject.Bytes()
+	require.True(ok)
+
+	require.Equal(legacyData, cappedData)
+	require.Equal(legacyObject.Key, cappedObject.Key)
+	require.Equal(legacyObject.Placements, cappedObject.Placements)
+}
+
 func TestEncodeCSCB_EnforcesLocalSpillMaxBytes(t *testing.T) {
 	require := testutil.Require(t)
 

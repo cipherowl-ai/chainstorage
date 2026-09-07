@@ -826,6 +826,29 @@ func (s *bitcoinClientTestSuite) TestBitcoinClient_BatchGetBlockMetadataByRange_
 	s.Nil(metadata)
 }
 
+func (s *bitcoinClientTestSuite) TestBitcoinClient_BatchGetBlockMetadataByRange_BlockOutOfRange() {
+	heights := []uint64{uint64(101), uint64(102), uint64(103)}
+	getBlockHashesParams := make([]jsonrpc.Params, len(heights))
+
+	for i, height := range heights {
+		getBlockHashesParams[i] = jsonrpc.Params{height}
+	}
+
+	rpcErr := &jsonrpc.RPCError{
+		Code:    -8,
+		Message: "Block height out of range",
+	}
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), defaultGetBlockHash, getBlockHashesParams,
+	).Return(nil, xerrors.Errorf("received rpc error (method=%v, endpoint=%v): %w", defaultGetBlockHash, "nownodes-master", rpcErr))
+
+	metadata, err := s.client.BatchGetBlockMetadata(context.Background(), btcTag, 101, 104)
+	s.Error(err)
+	s.Nil(metadata)
+	s.True(xerrors.Is(err, internal.ErrBlockNotFound), err.Error())
+	s.Contains(err.Error(), "Block height out of range")
+}
+
 func (s *bitcoinClientTestSuite) TestBitcoinClient_BatchGetBlockMetadataByRange_GetBlocksError() {
 	heights := []uint64{uint64(101), uint64(102), uint64(103)}
 	getBlockHashesParams := make([]jsonrpc.Params, len(heights))

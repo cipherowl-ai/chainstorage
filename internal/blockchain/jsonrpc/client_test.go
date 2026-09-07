@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/uber-go/tally/v4"
 	"go.uber.org/fx"
 	"go.uber.org/mock/gomock"
 	"golang.org/x/xerrors"
@@ -338,6 +339,51 @@ func TestCall_RPCError_429_SucceededAfterRetries(t *testing.T) {
 		})
 	require.NoError(err)
 	require.NotNil(result)
+}
+
+func TestCall_HTTPError_TooManyRequests_RecordsRateLimitedMetric(t *testing.T) {
+	require := testutil.Require(t)
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	httpClient := jsonrpcmocks.NewMockHTTPClient(ctrl)
+	httpClient.EXPECT().Do(gomock.Any()).DoAndReturn(func(_ *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Body:       ioutil.NopCloser(strings.NewReader("too many requests")),
+		}, nil
+	}).Times(retry.DefaultMaxAttempts)
+
+	scope := tally.NewTestScope("", nil)
+	var params clientParams
+	app := testapp.New(
+		t,
+		withDummyEndpoints(),
+		fx.Decorate(func(tally.Scope) tally.Scope { return scope }),
+		fx.Provide(jsonrpc.New),
+		fx.Provide(func() jsonrpc.HTTPClient {
+			return httpClient
+		}),
+		fx.Populate(&params),
+	)
+	defer app.Close()
+
+	client := params.Master
+	require.NotNil(client)
+	_, err := client.Call(context.Background(),
+		&jsonrpc.RequestMethod{Name: "hello", Timeout: time.Duration(5)},
+		jsonrpc.Params{"0x1234"})
+	require.Error(err)
+
+	var errHTTP *jsonrpc.HTTPError
+	require.True(xerrors.As(err, &errHTTP))
+	require.Equal(http.StatusTooManyRequests, errHTTP.Code)
+
+	// Every throttled attempt is counted, including the ones absorbed by a retry.
+	counter, ok := scope.Snapshot().Counters()["jsonrpc.rate_limited+endpoint=node_name"]
+	require.True(ok)
+	require.Equal(int64(retry.DefaultMaxAttempts), counter.Value())
 }
 
 func TestCall_RPCError_StatusNotOK_WithCustomizedAttempts(t *testing.T) {

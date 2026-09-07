@@ -1319,6 +1319,155 @@ func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsGuardsPrimar
 	require.True(xerrors.Is(err, errors.ErrItemNotFound))
 }
 
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsRollsBackBatchOnIdentityMismatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 2, tag)
+
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blocks, nil))
+	firstMetadataID := s.getBlockMetadataID(ctx, blocks[0])
+	secondMetadataID := s.getBlockMetadataID(ctx, blocks[1])
+
+	err := s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           firstMetadataID,
+			Tag:                       blocks[0].GetTag(),
+			Height:                    blocks[0].GetHeight(),
+			Hash:                      blocks[0].GetHash(),
+			SingleBlockObjectKeyMain:  blocks[0].GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: "consolidated/valid.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                200,
+			UncompressedLength:        200,
+		},
+		{
+			BlockMetadataID:           secondMetadataID,
+			Tag:                       blocks[1].GetTag(),
+			Height:                    blocks[1].GetHeight(),
+			Hash:                      blocks[1].GetHash(),
+			SingleBlockObjectKeyMain:  "single-block/key/does/not/match",
+			ConsolidatedObjectKeyMain: "consolidated/invalid.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                200,
+			UncompressedLength:        200,
+		},
+	})
+	require.Error(err)
+	require.Contains(err.Error(), fmt.Sprintf("metadata_id=%d", secondMetadataID))
+
+	for _, block := range blocks {
+		_, err := s.accessor.GetBlockConsolidationShadow(ctx, block)
+		require.True(xerrors.Is(err, errors.ErrItemNotFound))
+	}
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsRollsBackBatchOnDeletedShadow() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 2, tag)
+
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blocks, nil))
+	firstMetadataID := s.getBlockMetadataID(ctx, blocks[0])
+	secondMetadataID := s.getBlockMetadataID(ctx, blocks[1])
+	secondPlacement := &internal.ConsolidationShadowPlacement{
+		BlockMetadataID:           secondMetadataID,
+		Tag:                       blocks[1].GetTag(),
+		Height:                    blocks[1].GetHeight(),
+		Hash:                      blocks[1].GetHash(),
+		SingleBlockObjectKeyMain:  blocks[1].GetObjectKeyMain(),
+		ConsolidatedObjectKeyMain: "consolidated/deleted.cscb.zstd",
+		ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		ByteLength:                200,
+		UncompressedLength:        200,
+	}
+	require.NoError(s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{secondPlacement}))
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE block_consolidation_shadow
+		SET single_block_object_key_main = NULL,
+			single_block_object_deleted_at = NOW()
+		WHERE block_metadata_id = $1`, secondMetadataID)
+	require.NoError(err)
+
+	err = s.accessor.PersistBlockConsolidationShadows(ctx, []*internal.ConsolidationShadowPlacement{
+		{
+			BlockMetadataID:           firstMetadataID,
+			Tag:                       blocks[0].GetTag(),
+			Height:                    blocks[0].GetHeight(),
+			Hash:                      blocks[0].GetHash(),
+			SingleBlockObjectKeyMain:  blocks[0].GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: "consolidated/valid.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteLength:                200,
+			UncompressedLength:        200,
+		},
+		secondPlacement,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), fmt.Sprintf("metadata_id=%d", secondMetadataID))
+	require.Contains(err.Error(), "existing shadow is not writable")
+
+	_, err = s.accessor.GetBlockConsolidationShadow(ctx, blocks[0])
+	require.True(xerrors.Is(err, errors.ErrItemNotFound))
+	var deletedAt sql.NullTime
+	require.NoError(s.db.QueryRowContext(
+		ctx,
+		`SELECT single_block_object_deleted_at FROM block_consolidation_shadow WHERE block_metadata_id = $1`,
+		secondMetadataID,
+	).Scan(&deletedAt))
+	require.True(deletedAt.Valid)
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockConsolidationShadowsBulkBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	const batchSize = 1000
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, batchSize, tag)
+
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blocks, nil))
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT id, height FROM block_metadata WHERE tag = $1 AND height >= $2 AND height < $3`,
+		tag,
+		startHeight,
+		startHeight+batchSize,
+	)
+	require.NoError(err)
+	defer rows.Close()
+	metadataIDs := make(map[uint64]int64, batchSize)
+	for rows.Next() {
+		var metadataID int64
+		var height uint64
+		require.NoError(rows.Scan(&metadataID, &height))
+		metadataIDs[height] = metadataID
+	}
+	require.NoError(rows.Err())
+	require.Len(metadataIDs, batchSize)
+
+	placements := make([]*internal.ConsolidationShadowPlacement, 0, batchSize)
+	for i, block := range blocks {
+		placements = append(placements, &internal.ConsolidationShadowPlacement{
+			BlockMetadataID:           metadataIDs[block.GetHeight()],
+			Tag:                       block.GetTag(),
+			Height:                    block.GetHeight(),
+			Hash:                      block.GetHash(),
+			SingleBlockObjectKeyMain:  block.GetObjectKeyMain(),
+			ConsolidatedObjectKeyMain: "consolidated/bulk.cscb.zstd",
+			ObjectFormat:              api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			ByteOffset:                uint64(i * 100),
+			ByteLength:                100,
+			UncompressedLength:        100,
+		})
+	}
+	require.NoError(s.accessor.PersistBlockConsolidationShadows(ctx, placements))
+
+	var shadowCount int
+	require.NoError(s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM block_consolidation_shadow`).Scan(&shadowCount))
+	require.Equal(batchSize, shadowCount)
+}
+
 func (s *blockStorageTestSuite) TestConsolidationShadowPromotionMovesStorageGenerationAtomically() {
 	require := testutil.Require(s.T())
 	ctx := context.Background()

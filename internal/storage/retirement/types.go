@@ -167,6 +167,11 @@ type (
 		SingleBlockWritersGuarded   bool
 		FallbackErrorCount          uint64
 		Approval                    Approval
+		// RowMemoryBudgetBytes caps the decompressed CSCB chunk working set a
+		// cohort may pin. The planner lowers row parallelism until the
+		// cohort's largest chunk fits. Zero applies the package default
+		// rather than disabling the bound.
+		RowMemoryBudgetBytes uint64
 	}
 
 	Approval struct {
@@ -190,7 +195,11 @@ type (
 		Approval    Approval    `json:"approval"`
 		SafetyGates SafetyGates `json:"safety_gates"`
 		Summary     Summary     `json:"summary"`
-		Items       []Candidate `json:"items"`
+		// QuiescenceRetryAfter is the longest remaining CSCB safety-quiescence
+		// wait observed by this pass, so a deferred run can retry when the
+		// quiescence window actually elapses instead of a full period later.
+		QuiescenceRetryAfter time.Duration `json:"quiescence_retry_after,omitempty"`
+		Items                []Candidate   `json:"items"`
 	}
 
 	SafetyGates struct {

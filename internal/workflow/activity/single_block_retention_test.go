@@ -114,6 +114,33 @@ func TestSummarizeSingleBlockRetentionReportIdentifiesFirstIncompleteHeight(t *t
 	require.Equal(t, retirement.SkipCSCBSafetyQuiescenceActive, result.RetryReason)
 }
 
+func TestSetSingleBlockRetentionRetryUsesRemainingQuiescence(t *testing.T) {
+	result := &SingleBlockRetentionRangeResult{
+		QuiescenceRetryAfter: 10 * time.Minute,
+		DeferredRows:         1,
+		Blockers: []SingleBlockRetentionReasonCount{{
+			Reason: retirement.SkipCSCBSafetyQuiescenceActive,
+			Rows:   1,
+		}},
+	}
+
+	require.True(t, setSingleBlockRetentionRetry(result))
+	require.Equal(t, 10*time.Minute+retentionQuiescenceRetryGrace, result.RetryAfter)
+	require.Equal(t, retirement.SkipCSCBSafetyQuiescenceActive, result.RetryReason)
+
+	// Without a remaining hint (or when the padded hint would exceed the full
+	// period), the retry falls back to the full quiescence period.
+	fallback := &SingleBlockRetentionRangeResult{
+		DeferredRows: 1,
+		Blockers: []SingleBlockRetentionReasonCount{{
+			Reason: retirement.SkipCSCBSafetyQuiescenceActive,
+			Rows:   1,
+		}},
+	}
+	require.True(t, setSingleBlockRetentionRetry(fallback))
+	require.Equal(t, retirement.RetentionSafetyQuiescencePeriod, fallback.RetryAfter)
+}
+
 func TestSetSingleBlockRetentionRetryDefersActiveClaim(t *testing.T) {
 	result := &SingleBlockRetentionRangeResult{
 		DeferredRows: 1,

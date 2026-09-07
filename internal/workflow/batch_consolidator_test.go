@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
+	temporalactivity "go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
@@ -35,6 +36,19 @@ type batchConsolidatorTestSuite struct {
 
 func TestBatchConsolidatorWorkflowTestSuite(t *testing.T) {
 	suite.Run(t, new(batchConsolidatorTestSuite))
+}
+
+func TestBatchConsolidatorRequestGetTags(t *testing.T) {
+	require := testutil.Require(t)
+	request := &BatchConsolidatorRequest{
+		Mode: config.ConsolidationModeHistoricalBackfill,
+		Tag:  2,
+	}
+
+	require.Equal(map[string]string{
+		tagBlockTag:          "2",
+		tagConsolidationMode: string(config.ConsolidationModeHistoricalBackfill),
+	}, request.GetTags())
 }
 
 func (s *batchConsolidatorTestSuite) SetupTest() {
@@ -300,7 +314,7 @@ func (s *batchConsolidatorTestSuite) TestBatchConsolidatorRejectsExcessiveParall
 		Parallelism: batchConsolidatorMaxParallelism + 1,
 	})
 	require.Error(err)
-	require.Contains(err.Error(), "parallelism(21) exceeds max(20)")
+	require.Contains(err.Error(), "parallelism(51) exceeds max(50)")
 }
 
 func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParallelism() {
@@ -314,7 +328,7 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 	s.cfg.Workflows.BatchConsolidator.Storage.Consolidation.ShardSize = 10000
 	var requests []*activity.BatchConsolidatorRequest
 	var requestsMu sync.Mutex
-	s.mockAutoConsolidateLatestHeight(120010)
+	s.mockAutoConsolidateLatestHeight(150010)
 	s.mockEmptyShadowStats()
 	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
 		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
@@ -334,13 +348,13 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 		Mode:        config.ConsolidationModeHistoricalBackfill,
 		Tag:         2,
 		StartHeight: 100000,
-		EndHeight:   120000,
-		BatchSize:   20000,
+		EndHeight:   150000,
+		BatchSize:   50000,
 		MaxBlocks:   1000,
-		Parallelism: 20,
+		Parallelism: 50,
 	})
 	require.NoError(err)
-	require.Len(requests, 20)
+	require.Len(requests, 50)
 	sort.Slice(requests, func(i, j int) bool {
 		return requests[i].StartHeight < requests[j].StartHeight
 	})
@@ -353,6 +367,53 @@ func (s *batchConsolidatorTestSuite) TestHistoricalBackfillAcceptsMaximumParalle
 			EndHeight:   startHeight + 1000,
 			MaxBlocks:   1000,
 		}, request)
+	}
+}
+
+func (s *batchConsolidatorTestSuite) TestHistoricalBackfillUsesDedicatedTaskQueueForEveryActivity() {
+	require := testutil.Require(s.T())
+
+	const historicalTaskList = "batch_consolidator_backfill"
+	s.cfg.Workflows.BatchConsolidator.HistoricalTaskList = historicalTaskList
+	s.cfg.Workflows.BatchConsolidator.IrreversibleDistance = 10
+
+	var taskQueues []string
+	recordTaskQueue := func(ctx context.Context) {
+		taskQueues = append(taskQueues, temporalactivity.GetInfo(ctx).TaskQueue)
+	}
+	s.env.OnActivity(activity.ActivityBatchConsolidatorLatestBlock, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorLatestBlockRequest) (*activity.BatchConsolidatorLatestBlockResponse, error) {
+			recordTaskQueue(ctx)
+			return &activity.BatchConsolidatorLatestBlockResponse{Tag: request.Tag, Height: 220}, nil
+		})
+	s.env.OnActivity(activity.ActivityBatchConsolidatorStats, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorStatsRequest) (*activity.BatchConsolidatorStatsResponse, error) {
+			recordTaskQueue(ctx)
+			return &activity.BatchConsolidatorStatsResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+	s.env.OnActivity(activity.ActivityBatchConsolidator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.BatchConsolidatorRequest) (*activity.BatchConsolidatorResponse, error) {
+			recordTaskQueue(ctx)
+			return &activity.BatchConsolidatorResponse{
+				StartHeight: request.StartHeight,
+				EndHeight:   request.EndHeight,
+			}, nil
+		})
+
+	_, err := s.batchConsolidator.Execute(context.Background(), &BatchConsolidatorRequest{
+		Mode:        config.ConsolidationModeHistoricalBackfill,
+		Tag:         2,
+		StartHeight: 100,
+		EndHeight:   200,
+		MaxBlocks:   25,
+	})
+	require.NoError(err)
+	require.NotEmpty(taskQueues)
+	for _, taskQueue := range taskQueues {
+		require.Equal(historicalTaskList, taskQueue)
 	}
 }
 

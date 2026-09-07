@@ -427,7 +427,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	}
 
 	repo := NewPostgresRepository(db)
-	cohorts, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
+	cohorts, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Len(cohorts, 1)
 	require.Equal([]RetentionCohort{{
@@ -477,19 +477,19 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 	require.NoError(err)
 	require.Empty(futureAtCutoff)
 
-	due, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
+	due, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Len(due, 1)
 	require.Equal(startHeight+1, due[0].StartHeight)
 	require.Equal(startHeight+2, due[0].EndHeight)
 	require.Equal(uint64(1), due[0].RowCount)
 
-	snapshotPending, snapshotDue, err := repo.ListRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
+	snapshotPending, snapshotDue, _, err := repo.ListRetentionCohorts(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Equal(pending, snapshotPending)
 	require.Equal(due, snapshotDue)
 
-	merged, hasMore, err := NewSelector(repo).Select(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10)
+	merged, hasMore, _, err := NewSelector(repo).Select(ctx, integrationRetentionBucket, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.False(hasMore)
 	require.Equal([]RetentionCohort{{
@@ -501,7 +501,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		Pending:               true,
 	}}, merged)
 
-	bounded, err := repo.ListDueRetentionCohorts(
+	bounded, _, err := repo.ListDueRetentionCohorts(
 		ctx,
 		"",
 		tag,
@@ -509,6 +509,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		startHeight+2,
 		now,
 		10,
+		DueCohortCursor{},
 	)
 	require.NoError(err)
 	require.Len(bounded, 1)
@@ -530,7 +531,7 @@ func TestIntegrationPostgresRepositorySelectsDueRetentionCohorts(t *testing.T) {
 		strings.Repeat("a", 64),
 	)
 	require.NoError(err)
-	cohorts, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
+	cohorts, _, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Empty(cohorts, "an object with an active CSCB repair must not be selected for retention")
 }
@@ -691,7 +692,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 	}, "v2"))
 
 	v2Bucket := "integration-v2-bucket"
-	pendingV2, dueV2, err := repo.ListRetentionCohorts(
+	pendingV2, dueV2, _, err := repo.ListRetentionCohorts(
 		ctx,
 		v2Bucket,
 		"v2",
@@ -700,6 +701,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 		0,
 		now,
 		10,
+		DueCohortCursor{},
 	)
 	require.NoError(err)
 	require.Empty(pendingV2, "an old-bucket manifest must not be selected under the v2 target")
@@ -712,7 +714,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 		EligibleAt:            dueV2[0].EligibleAt,
 	}}, dueV2, "mixed and legacy rows sharing the same object key must not merge into the v2 cohort")
 
-	pendingLegacy, dueLegacy, err := repo.ListRetentionCohorts(
+	pendingLegacy, dueLegacy, _, err := repo.ListRetentionCohorts(
 		ctx,
 		integrationRetentionBucket,
 		"",
@@ -721,6 +723,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 		0,
 		now,
 		10,
+		DueCohortCursor{},
 	)
 	require.NoError(err)
 	require.Empty(pendingLegacy, "a v2 metadata row must not be selected merely because its manifest names the old bucket")
@@ -797,7 +800,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 			single_block_object_deleted_at = NOW()
 		WHERE block_metadata_id = $1`, nativeV2ID)
 	require.NoError(err)
-	completed, hasMore, err := NewSelector(repo).Select(
+	completed, hasMore, _, err := NewSelector(repo).Select(
 		ctx,
 		v2Bucket,
 		"v2",
@@ -806,6 +809,7 @@ func TestIntegrationPostgresRepositorySelectsOnlyWriteStorageGenerationCohorts(t
 		0,
 		now,
 		10,
+		DueCohortCursor{},
 	)
 	require.NoError(err)
 	require.False(hasMore)
@@ -918,7 +922,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 	endHeight := startHeight + cohortCount
 
 	repo := NewPostgresRepository(db)
-	bounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 10)
+	bounded, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Len(bounded, cohortCount)
 	boundedHeights := make([]uint64, 0, len(bounded))
@@ -931,7 +935,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a bounded selection must be ordered by height, not by due time",
 	)
 
-	truncated, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 2)
+	truncated, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, startHeight, endHeight, now, 2, DueCohortCursor{})
 	require.NoError(err)
 	require.Len(truncated, 2)
 	require.Equal(
@@ -940,7 +944,7 @@ func TestIntegrationPostgresRepositoryOrdersBoundedSelectionByHeight(t *testing.
 		"a truncated bounded selection must keep the lowest cohorts so repeated runs advance monotonically",
 	)
 
-	unbounded, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10)
+	unbounded, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10, DueCohortCursor{})
 	require.NoError(err)
 	require.Len(unbounded, cohortCount)
 	unboundedHeights := make([]uint64, 0, len(unbounded))
@@ -969,4 +973,552 @@ func openRetirementIntegrationDB(ctx context.Context, cfg *config.PostgresConfig
 		return nil, err
 	}
 	return db, nil
+}
+
+// TestIntegrationDueCohortBoundsComeFromEnumerableRows is the regression guard
+// for the INF-1448 review finding: cohort bounds and row counts must derive
+// only from rows the sweep can enumerate — shadow rows that are canonical and
+// whose metadata still points at the cohort's consolidated object. Bounds
+// widened by an orphaned (non-canonical) or re-pointed edge row fail the
+// sweep's contiguous execution-plan validation repeatedly, and an orphaned
+// lowest row must not hide the cohort's valid remainder.
+func TestIntegrationDueCohortBoundsComeFromEnumerableRows(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_200_000_000 + unique%100_000_000)
+	startHeight := uint64(8_300_000_000 + unique%100_000_000)
+	cohortKey := fmt.Sprintf("consolidated/enumerable-%d.cscb.gzip", unique)
+	otherKey := fmt.Sprintf("consolidated/repointed-%d.cscb.gzip", unique)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, 5)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// Five heights, all with due shadow rows for cohortKey:
+	//   h+0: shadow row is NOT canonical (orphaned by a reorg)
+	//   h+1: canonical, metadata re-pointed at another object
+	//   h+2, h+3: fully enumerable
+	//   h+4: shadow row is NOT canonical (orphaned upper edge)
+	insert := func(height uint64, canonicalRow bool, metadataKey string) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, metadataKey, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		if canonicalRow {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+				VALUES ($1, $2, $3)`, height, id, tag)
+			require.NoError(err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			cohortKey,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+	}
+	insert(startHeight, false, cohortKey)   // orphaned lower edge
+	insert(startHeight+1, true, otherKey)   // canonical but re-pointed
+	insert(startHeight+2, true, cohortKey)  // enumerable
+	insert(startHeight+3, true, cohortKey)  // enumerable
+	insert(startHeight+4, false, cohortKey) // orphaned upper edge
+
+	repo := NewPostgresRepository(db)
+	cohorts, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 10, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1,
+		"orphaned and re-pointed edge rows must not hide the enumerable remainder")
+	require.Equal(startHeight+2, cohorts[0].StartHeight,
+		"bounds must start at the first ENUMERABLE row, not the first due shadow row")
+	require.Equal(startHeight+4, cohorts[0].EndHeight,
+		"bounds must end after the last ENUMERABLE row, not the orphaned upper edge")
+	require.Equal(uint64(2), cohorts[0].RowCount,
+		"row count must count only rows the sweep can enumerate")
+}
+
+// TestIntegrationCandidatePaginationSurvivesDeadPrefix is the regression guard
+// for the round-5 review finding on INF-1448: the candidate LIMIT applies to
+// RAW shadow-only candidates, so a window whose first LIMIT candidates all
+// expand to nothing (here: repair-covered cohorts) must not hide a valid
+// cohort behind them. Selection must paginate past the dead prefix within one
+// call rather than returning empty and letting the cron advance past the
+// whole window forever.
+func TestIntegrationCandidatePaginationSurvivesDeadPrefix(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_300_000_000 + unique%100_000_000)
+	baseHeight := uint64(8_500_000_000 + unique%100_000_000)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, 8)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest DISABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_manifest WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest ENABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// Four single-row cohorts in height order; the first three are covered by
+	// active repairs (dead candidates), the fourth is valid. With limit 2 the
+	// first raw page holds only dead candidates.
+	// Dead cohorts here are NON-CANONICAL, not repair-covered. Repair coverage
+	// is excluded during candidate discovery, so repair-covered fixtures never
+	// reach the expansion loop and would make this test vacuous. Orphaned rows
+	// are only detectable in the expansion, which is exactly the path under
+	// test.
+	insertCohort := func(height uint64, key string, canonical bool) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, key, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		if canonical {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+				VALUES ($1, $2, $3)`, height, id, tag)
+			require.NoError(err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			key,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+	}
+	insertCohort(baseHeight, fmt.Sprintf("consolidated/dead1-%d.cscb.gzip", unique), false)
+	insertCohort(baseHeight+1, fmt.Sprintf("consolidated/dead2-%d.cscb.gzip", unique), false)
+	insertCohort(baseHeight+2, fmt.Sprintf("consolidated/dead3-%d.cscb.gzip", unique), false)
+	validKey := fmt.Sprintf("consolidated/valid-%d.cscb.gzip", unique)
+	insertCohort(baseHeight+3, validKey, true)
+
+	repo := NewPostgresRepository(db)
+
+	// Bounded (by-height) selection with limit 2: page one is entirely dead.
+	cohorts, _, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, baseHeight+10, now, 2, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1,
+		"a dead candidate prefix wider than the limit must not hide the valid cohort")
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+
+	// Open-ended (by-due-time) selection paginates on the other cursor shape.
+	cohorts, _, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 2, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1)
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+}
+
+// TestIntegrationCandidatePaginationExhaustsHugeDeadPrefix is the round-6
+// regression guard: pagination must run to EXHAUSTION, not to a page cap. The
+// previous revision capped at 8 pages, and a cap is a silent truncation — the
+// cron reads the empty result as proof the window holds nothing selectable and
+// advances past candidates nobody examined, stranding the valid cohort.
+//
+// The fixture builds a dead prefix far wider than any fixed page budget: 60
+// repair-covered cohorts selected with limit 2 forces 30+ pages, where the old
+// cap allowed 8. The selectable cohort sits last, so only exhaustive
+// pagination can reach it.
+func TestIntegrationCandidatePaginationExhaustsHugeDeadPrefix(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	const deadCohorts = 60
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_400_000_000 + unique%100_000_000)
+	baseHeight := uint64(8_700_000_000 + unique%100_000_000)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, deadCohorts+1)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest DISABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM cscb_repair_manifest WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `ALTER TABLE cscb_repair_manifest ENABLE TRIGGER cscb_repair_manifest_delete_trigger`)
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// Dead cohorts are NON-CANONICAL: repair coverage is filtered during
+	// candidate discovery and would never reach the expansion loop this test
+	// exists to exercise.
+	insertCohort := func(height uint64, key string, canonical bool) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, key, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		if canonical {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+				VALUES ($1, $2, $3)`, height, id, tag)
+			require.NoError(err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			key,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+	}
+
+	for i := 0; i < deadCohorts; i++ {
+		insertCohort(baseHeight+uint64(i), fmt.Sprintf("consolidated/dead-%d-%04d.cscb.gzip", unique, i), false)
+	}
+	validKey := fmt.Sprintf("consolidated/valid-%d.cscb.gzip", unique)
+	insertCohort(baseHeight+uint64(deadCohorts), validKey, true)
+
+	repo := NewPostgresRepository(db)
+
+	// limit 2 => 30+ candidate pages of pure dead prefix before the valid one.
+	cohorts, resumeAfter, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, baseHeight+uint64(deadCohorts)+10, now, 2, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1,
+		"pagination must walk a dead prefix far wider than any fixed page budget")
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+	require.Equal(baseHeight+uint64(deadCohorts), cohorts[0].StartHeight)
+	require.Zero(resumeAfter,
+		"candidates were exhausted within budget, so there is no continuation to report")
+
+	// Same through the open-ended (by-due-time) cursor shape.
+	cohorts, _, err = repo.ListDueRetentionCohorts(ctx, "", tag, 0, 0, now, 2, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1)
+	require.Equal(validKey, cohorts[0].ConsolidatedObjectKey)
+}
+
+// TestIntegrationDueSelectionReportsContinuationWhenBudgetSpent is the round-7
+// regression guard: an unbounded selection call can outrun the activity
+// timeout, and a bounded one that stays silent strands work. Selection must be
+// bounded AND report where it stopped.
+//
+// It also pins the EligibleAt contract, which no other test can distinguish: a
+// cohort's EligibleAt must be the MAX single_block_delete_after over its
+// enumerable rows (the moment the cohort as a whole became retirable, which is
+// exactly what the HAVING gates on), not the MIN. Every other fixture in this
+// file gives all rows the same delete_after, so a MIN/MAX swap passes them
+// silently.
+func TestIntegrationDueSelectionReportsContinuationWhenBudgetSpent(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_500_000_000 + unique%100_000_000)
+	baseHeight := uint64(8_900_000_000 + unique%100_000_000)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, 4)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// One cohort, two enumerable rows with DIFFERENT delete_after values.
+	cohortKey := fmt.Sprintf("consolidated/eligible-%d.cscb.gzip", unique)
+	earliest := now.Add(-3 * time.Hour)
+	latest := now.Add(-time.Hour)
+	for i, deleteAfter := range []time.Time{earliest, latest} {
+		height := baseHeight + uint64(i)
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, cohortKey, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+			VALUES ($1, $2, $3)`, height, id, tag)
+		require.NoError(err)
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d.gzip", height),
+			cohortKey,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			deleteAfter,
+		)
+		require.NoError(err)
+	}
+
+	repo := NewPostgresRepository(db)
+	cohorts, resumeAfter, err := repo.ListDueRetentionCohorts(ctx, "", tag, 0, baseHeight+10, now, 10, DueCohortCursor{})
+	require.NoError(err)
+	require.Len(cohorts, 1)
+	require.Zero(resumeAfter)
+	require.WithinDuration(latest, cohorts[0].EligibleAt, time.Second,
+		"EligibleAt must be the cohort's LAST due moment (MAX), not its first (MIN)")
+	require.False(cohorts[0].EligibleAt.Equal(earliest.UTC()),
+		"a MIN/MAX swap must fail this assertion, not pass silently")
+}
+
+// TestIntegrationContinuationSurvivesOverlappingCandidates is the round-8
+// regression guard. Candidate groups are NOT height-disjoint: a reorg can leave
+// several consolidated objects covering the same or overlapping heights while
+// canonical_blocks points at only one. A continuation expressed as a height
+// watermark ("last examined end + 1") therefore filters out unexamined
+// candidates that start at or below that height, starving them permanently.
+//
+// The fixture is built so a height watermark MUST lose work: every dead
+// candidate spans the same height band as the valid one, so "resume above the
+// last dead candidate's end" skips the valid cohort entirely. Only a keyset
+// cursor — which skips exactly the candidates already examined, whatever
+// heights they overlap — finds it.
+func TestIntegrationContinuationSurvivesOverlappingCandidates(t *testing.T) {
+	require := require.New(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	if cfg.AWS.Postgres == nil {
+		t.Skip("Postgres is not configured")
+	}
+	if cfg.Env() == config.EnvProduction {
+		t.Skip("retention integration tests never write to production")
+	}
+
+	ctx := context.Background()
+	db, err := openRetirementIntegrationDB(ctx, cfg.AWS.Postgres)
+	if err != nil {
+		t.Skipf("Postgres integration database is unavailable: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	goose.SetBaseFS(metapostgres.GetEmbeddedMigrations())
+	require.NoError(goose.SetDialect("postgres"))
+	require.NoError(goose.UpContext(ctx, db, "db/migrations"))
+
+	const deadCohorts = 40
+	unique := time.Now().UTC().UnixNano()
+	tag := uint32(1_600_000_000 + unique%100_000_000)
+	baseHeight := uint64(9_100_000_000 + unique%100_000_000)
+	now := time.Now().UTC()
+	blockMetadataIDs := make([]int64, 0, deadCohorts+2)
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM block_consolidation_shadow WHERE tag = $1`, tag)
+		_, _ = db.ExecContext(ctx, `DELETE FROM canonical_blocks WHERE tag = $1`, tag)
+		for _, id := range blockMetadataIDs {
+			_, _ = db.ExecContext(ctx, `DELETE FROM block_metadata WHERE id = $1`, id)
+		}
+	}()
+
+	// insertRow puts one shadow row for `key` at `height`. canonical=false makes
+	// the row unenumerable (orphaned by a reorg) without removing it from
+	// candidate discovery, which is what forces expansion to drop it.
+	insertRow := func(height uint64, key string, canonical bool) {
+		var id int64
+		err := db.QueryRowContext(ctx, `
+			INSERT INTO block_metadata (
+				height, tag, hash, parent_height, object_key_main, timestamp, skipped,
+				object_format, byte_offset, byte_length, uncompressed_length
+			) VALUES ($1, $2, NULL, $3, $4, $5, FALSE, $6, 0, 128, 128)
+			RETURNING id`,
+			height, tag, height-1, key, now.Unix(),
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		).Scan(&id)
+		require.NoError(err)
+		blockMetadataIDs = append(blockMetadataIDs, id)
+		if canonical {
+			_, err = db.ExecContext(ctx, `
+				INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+				VALUES ($1, $2, $3)`, height, id, tag)
+			require.NoError(err)
+		}
+		_, err = db.ExecContext(ctx, `
+			INSERT INTO block_consolidation_shadow (
+				block_metadata_id, tag, height, hash, single_block_object_key_main,
+				consolidated_object_key_main, object_format, byte_offset, byte_length,
+				uncompressed_length, validated_at, single_block_retention_started_at,
+				single_block_delete_after
+			) VALUES ($1, $2, $3, NULL, $4, $5, $6, 0, 128, 128, $7, $7, $8)`,
+			id, tag, height,
+			fmt.Sprintf("single-block/%d-%s.gzip", height, key[len(key)-12:]),
+			key,
+			api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+			now.Add(-96*time.Hour),
+			now.Add(-time.Hour),
+		)
+		require.NoError(err)
+	}
+
+	// Dead candidates all START at baseHeight and END at baseHeight+100: they
+	// overlap each other and the valid cohort completely. Sorted by
+	// (MIN(height), key) they come first because their keys sort before "valid".
+	for i := 0; i < deadCohorts; i++ {
+		key := fmt.Sprintf("consolidated/dead-%04d-%d.cscb.gzip", i, unique)
+		insertRow(baseHeight, key, false)
+		insertRow(baseHeight+100, key, false)
+	}
+	// The valid cohort starts at the SAME height as every dead one, so any
+	// "resume above the last dead end height" rule discards it.
+	validKey := fmt.Sprintf("consolidated/valid-%d.cscb.gzip", unique)
+	insertRow(baseHeight, validKey, true)
+	insertRow(baseHeight+50, validKey, true)
+
+	repo := NewPostgresRepository(db)
+
+	// Walk with a tiny limit so enumeration pages repeatedly across the
+	// overlapping dead prefix, exactly as a budget-truncated cron tick does.
+	var (
+		cursor DueCohortCursor
+		found  *RetentionCohort
+	)
+	for pass := 0; pass < deadCohorts+5; pass++ {
+		cohorts, next, err := repo.ListDueRetentionCohorts(
+			ctx, "", tag, 0, baseHeight+1_000, now, 2, cursor,
+		)
+		require.NoError(err)
+		for i := range cohorts {
+			if cohorts[i].ConsolidatedObjectKey == validKey {
+				found = &cohorts[i]
+			}
+		}
+		if found != nil || next.IsZero() {
+			break
+		}
+		cursor = next
+	}
+	require.NotNil(found,
+		"a keyset continuation must reach a valid cohort that overlaps every dead candidate; a height watermark cannot")
+	require.Equal(baseHeight, found.StartHeight)
+	require.Equal(baseHeight+51, found.EndHeight)
+	require.Equal(uint64(2), found.RowCount)
 }

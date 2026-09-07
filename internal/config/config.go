@@ -349,15 +349,26 @@ type (
 	}
 
 	BatchConsolidatorWorkflowConfig struct {
-		WorkflowConfig `mapstructure:",squash"`
-		BatchSize      uint64 `mapstructure:"batch_size" validate:"required"`
-		CheckpointSize uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
-		MaxBlocks      uint64 `mapstructure:"max_blocks"`
+		WorkflowConfig     `mapstructure:",squash"`
+		BatchSize          uint64 `mapstructure:"batch_size" validate:"required"`
+		CheckpointSize     uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
+		MaxBlocks          uint64 `mapstructure:"max_blocks"`
+		HistoricalTaskList string `mapstructure:"historical_task_list"`
 	}
 
 	SingleBlockRetentionWorkflowConfig struct {
 		WorkflowConfig  `mapstructure:",squash"`
 		MaxObjectRanges int `mapstructure:"max_object_ranges" validate:"required,gt=0,lte=250"`
+		// RowParallelism bounds how many rows the retention planner processes
+		// concurrently inside one cohort activity. Zero or one is serial. The
+		// cap also bounds worker memory: each Apply worker pins up to two
+		// decompressed CSCB chunks.
+		RowParallelism int `mapstructure:"row_parallelism" validate:"omitempty,gte=0,lte=16"`
+		// RowMemoryBudgetBytes caps the decompressed CSCB chunk working set a
+		// cohort may pin. The planner lowers RowParallelism until the cohort's
+		// measured chunk size fits, so a chain with large blocks runs fewer
+		// workers instead of exhausting the pod (INF-1330).
+		RowMemoryBudgetBytes uint64 `mapstructure:"row_memory_budget_bytes"`
 	}
 
 	RosettaConfig struct {
@@ -368,12 +379,18 @@ type (
 		FromRosetta             bool    `mapstructure:"from_rosetta"`
 	}
 
+	// EndpointGroup is decoded from two different sources, so every field needs
+	// both tags: encoding/json when the group arrives as a JSON string (e.g. the
+	// CHAINSTORAGE_CHAIN_CLIENT_MASTER_ENDPOINT_GROUP env var, see UnmarshalText),
+	// and mapstructure when it arrives as a YAML mapping. mapstructure falls back
+	// to a case-insensitive field-name match, which silently drops any key with
+	// an underscore in it, so the tags are not optional.
 	EndpointGroup struct {
-		Endpoints              []Endpoint     `json:"endpoints"`
-		EndpointsFailover      []Endpoint     `json:"endpoints_failover"`
-		UseFailover            bool           `json:"use_failover"`
-		EndpointConfig         EndpointConfig `json:"endpoint_config"`
-		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover"`
+		Endpoints              []Endpoint     `json:"endpoints" mapstructure:"endpoints"`
+		EndpointsFailover      []Endpoint     `json:"endpoints_failover" mapstructure:"endpoints_failover"`
+		UseFailover            bool           `json:"use_failover" mapstructure:"use_failover"`
+		EndpointConfig         EndpointConfig `json:"endpoint_config" mapstructure:"endpoint_config"`
+		EndpointConfigFailover EndpointConfig `json:"endpoint_config_failover" mapstructure:"endpoint_config_failover"`
 	}
 
 	// endpointGroup must be in sync with EndpointGroup
@@ -386,34 +403,34 @@ type (
 	}
 
 	Endpoint struct {
-		Name       string            `json:"name"`
-		ProviderID string            `json:"provider_id"`
-		Url        string            `json:"url"`
-		User       string            `json:"user"`
-		Password   string            `json:"password"`
-		Weight     uint8             `json:"weight"`
-		ExtraUrls  map[string]string `json:"extra_urls"`
-		RPS        int               `json:"rps"`
+		Name       string            `json:"name" mapstructure:"name"`
+		ProviderID string            `json:"provider_id" mapstructure:"provider_id"`
+		Url        string            `json:"url" mapstructure:"url"`
+		User       string            `json:"user" mapstructure:"user"`
+		Password   string            `json:"password" mapstructure:"password"`
+		Weight     uint8             `json:"weight" mapstructure:"weight"`
+		ExtraUrls  map[string]string `json:"extra_urls" mapstructure:"extra_urls"`
+		RPS        int               `json:"rps" mapstructure:"rps"`
 		// RPSCountBatch makes the rate limiter charge one token per call inside
 		// a JSON-RPC batch request, for providers whose rate limit counts each
 		// batched call individually. Has no effect unless RPS is set.
-		RPSCountBatch bool `json:"rps_count_batch"`
+		RPSCountBatch bool `json:"rps_count_batch" mapstructure:"rps_count_batch"`
 	}
 
 	EndpointConfig struct {
-		StickySession StickySessionConfig `json:"sticky_session"`
-		Headers       map[string]string   `json:"headers"`
+		StickySession StickySessionConfig `json:"sticky_session" mapstructure:"sticky_session"`
+		Headers       map[string]string   `json:"headers" mapstructure:"headers"`
 	}
 
 	StickySessionConfig struct {
 		// The CookieHash method consistently maps a cookie value to a specific node.
-		CookieHash string `json:"cookie_hash"`
+		CookieHash string `json:"cookie_hash" mapstructure:"cookie_hash"`
 
 		// The CookiePassive method persists the cookie value provided by the server.
-		CookiePassive bool `json:"cookie_passive"`
+		CookiePassive bool `json:"cookie_passive" mapstructure:"cookie_passive"`
 
 		// The HeaderHash method consistently maps a header value to a specific node.
-		HeaderHash string `json:"header_hash"`
+		HeaderHash string `json:"header_hash" mapstructure:"header_hash"`
 	}
 
 	ApiConfig struct {
@@ -440,13 +457,14 @@ type (
 	}
 
 	CronConfig struct {
-		BlockRangeSize         uint64                      `mapstructure:"block_range_size" validate:"required"`
-		BatchConsolidator      BatchConsolidatorCronConfig `mapstructure:"batch_consolidator"`
-		DisableDLQProcessor    bool                        `mapstructure:"disable_dlq_processor"`
-		DisablePollingCanary   bool                        `mapstructure:"disable_polling_canary"`
-		DisableStreamingCanary bool                        `mapstructure:"disable_streaming_canary"`
-		DisableNodeCanary      bool                        `mapstructure:"disable_node_canary"`
-		DisableWorkflowStatus  bool                        `mapstructure:"disable_workflow_status"`
+		BlockRangeSize         uint64                         `mapstructure:"block_range_size" validate:"required"`
+		BatchConsolidator      BatchConsolidatorCronConfig    `mapstructure:"batch_consolidator"`
+		SingleBlockRetention   SingleBlockRetentionCronConfig `mapstructure:"single_block_retention"`
+		DisableDLQProcessor    bool                           `mapstructure:"disable_dlq_processor"`
+		DisablePollingCanary   bool                           `mapstructure:"disable_polling_canary"`
+		DisableStreamingCanary bool                           `mapstructure:"disable_streaming_canary"`
+		DisableNodeCanary      bool                           `mapstructure:"disable_node_canary"`
+		DisableWorkflowStatus  bool                           `mapstructure:"disable_workflow_status"`
 	}
 
 	BatchConsolidatorCronConfig struct {
@@ -456,6 +474,46 @@ type (
 		WorkflowParallelism int           `mapstructure:"workflow_parallelism"`
 		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
 		StartHeight         uint64        `mapstructure:"start_height"`
+	}
+
+	// SingleBlockRetentionCronConfig drives unattended single-block retention.
+	// Enabling it moves the operator's per-run deletion approval into reviewed
+	// configuration: the Approved* fields and the guard assertions are the
+	// standing operator input the cron passes through verbatim, and every
+	// in-workflow fail-closed gate still applies.
+	SingleBlockRetentionCronConfig struct {
+		Enabled             bool          `mapstructure:"enabled"`
+		Spec                string        `mapstructure:"spec"`
+		Parallelism         int64         `mapstructure:"parallelism"`
+		DelayStartDuration  time.Duration `mapstructure:"delay_start_duration"`
+		MaxObjectRanges     int           `mapstructure:"max_object_ranges" validate:"omitempty,gt=0,lte=250"`
+		WorkflowParallelism int           `mapstructure:"workflow_parallelism" validate:"omitempty,gt=0,lte=20"`
+		// WindowBlocks bounds each launched sweep so selection queries stay on
+		// the height index; the window is anchored at the oldest due work.
+		WindowBlocks uint64 `mapstructure:"window_blocks" validate:"omitempty,lte=2000000"`
+		// ApprovedEndHeight zero follows the consolidation frontier and
+		// requires AllowOpenEndedApproval as an explicit opt-in.
+		ApprovedChain               string `mapstructure:"approved_chain"`
+		ApprovedStartHeight         uint64 `mapstructure:"approved_start_height"`
+		ApprovedEndHeight           uint64 `mapstructure:"approved_end_height"`
+		AllowOpenEndedApproval      bool   `mapstructure:"allow_open_ended_approval"`
+		DirectStorageClientsGuarded bool   `mapstructure:"direct_storage_clients_guarded"`
+		SingleBlockWritersGuarded   bool   `mapstructure:"single_block_writers_guarded"`
+		FallbackReadsValidated      bool   `mapstructure:"fallback_reads_validated"`
+		ProductionDeleteEnabled     bool   `mapstructure:"production_delete_enabled"`
+		// PersistFloorWatermark starts each tick's floor walk from the floor
+		// the previous walk found (persisted as a consolidation cursor) rather
+		// than from ApprovedStartHeight, and reconciles the skipped range one
+		// bounded chunk per tick (INF-1571). Off by default: with it off the
+		// walk re-scans every retired row above ApprovedStartHeight on every
+		// tick, which grows at the retention drain rate until it crosses the
+		// statement timeout and stalls retention (INF-1569).
+		PersistFloorWatermark bool `mapstructure:"persist_floor_watermark"`
+		// FloorWalkChunkBlocks bounds every chunk of the persisted-floor walk:
+		// the walk above the floor that resolves the tick's probe start, and
+		// the reconciliation walk below it. 0 selects the default. Sized so one
+		// chunk of fully retired rows stays well inside the statement timeout.
+		FloorWalkChunkBlocks uint64 `mapstructure:"floor_walk_chunk_blocks" validate:"omitempty,lte=5000000"`
 	}
 
 	StorageConfig struct {
@@ -763,6 +821,9 @@ func New(opts ...ConfigOption) (*Config, error) {
 	v.SetDefault("aws.storage.consolidation.multipart_threshold", 134217728)
 	v.SetDefault("aws.storage.consolidation.read_shadow_first", false)
 	v.SetDefault("aws.storage.consolidation.single_block_object_retention", DefaultSingleBlockObjectRetention.String())
+	if err := v.BindEnv("aws.storage.consolidation.max_chunk_uncompressed_bytes"); err != nil {
+		return nil, xerrors.Errorf("failed to bind max_chunk_uncompressed_bytes env: %w", err)
+	}
 	if err := v.BindEnv("aws.storage.consolidation.promotion_gate_height"); err != nil {
 		return nil, xerrors.Errorf("failed to bind promotion_gate_height env: %w", err)
 	}
@@ -1014,6 +1075,9 @@ func (c *Config) validateConsolidationConfig() error {
 	}
 	if consolidation.CompressionChunkBlocks == 0 {
 		return xerrors.New("consolidation compression_chunk_blocks must be positive")
+	}
+	if consolidation.MaxChunkUncompressedBytes != nil && *consolidation.MaxChunkUncompressedBytes == 0 {
+		return xerrors.New("consolidation max_chunk_uncompressed_bytes must be positive when set")
 	}
 	if consolidation.ShardSize == 0 {
 		return xerrors.New("consolidation shard_size must be positive")

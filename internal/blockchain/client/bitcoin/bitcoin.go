@@ -221,10 +221,7 @@ func (b *bitcoinClient) GetBlockByHeight(ctx context.Context, tag uint32, height
 
 	response, err := b.client.Call(ctx, b.methods.getBlockHash, params)
 	if err != nil {
-		var rpcErr *jsonrpc.RPCError
-		if xerrors.As(err, &rpcErr) &&
-			rpcErr.Code == bitcoinErrCodeInvalidParameter &&
-			rpcErr.Message == bitcoinErrMessageBlockOutOfRange {
+		if isBlockHeightOutOfRange(err) {
 			return nil, xerrors.Errorf("block not found by height %v: %w", height, internal.ErrBlockNotFound)
 		}
 		return nil, xerrors.Errorf("failed to make a call for block %v: %w", height, err)
@@ -599,6 +596,11 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 
 	responses, err := b.client.BatchCall(ctx, b.methods.getBlockHash, params)
 	if err != nil {
+		if isBlockHeightOutOfRange(err) {
+			// The serving node's tip is below one of the requested heights. Surface ErrBlockNotFound,
+			// as GetBlockByHeight does, so that callers can decide whether that is expected.
+			return nil, xerrors.Errorf("block not found by heights [%v, %v): %v: %w", from, to, err, internal.ErrBlockNotFound)
+		}
 		return nil, xerrors.Errorf("failed to get block hashes for heights: %w", err)
 	}
 
@@ -615,4 +617,13 @@ func (b *bitcoinClient) getBlockHashesByHeights(ctx context.Context, from uint64
 		blockHashes[i] = hash.Value()
 	}
 	return blockHashes, nil
+}
+
+// isBlockHeightOutOfRange reports whether err is the bitcoind response to getblockhash for a height
+// above the serving node's current tip.
+func isBlockHeightOutOfRange(err error) bool {
+	var rpcErr *jsonrpc.RPCError
+	return xerrors.As(err, &rpcErr) &&
+		rpcErr.Code == bitcoinErrCodeInvalidParameter &&
+		rpcErr.Message == bitcoinErrMessageBlockOutOfRange
 }

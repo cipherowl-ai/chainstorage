@@ -29,4 +29,8 @@ var Module = fx.Options(
 		Group:  "task",
 		Target: NewBatchConsolidator,
 	}),
+	fx.Provide(fx.Annotated{
+		Group:  "task",
+		Target: NewSingleBlockRetention,
+	}),
 )

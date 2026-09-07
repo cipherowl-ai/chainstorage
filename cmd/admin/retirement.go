@@ -48,6 +48,7 @@ func newRetirementCommand() *cobra.Command {
 	}
 	cmd.AddCommand(newSingleBlockRetirementPlanCommand())
 	cmd.AddCommand(newSingleBlockRetirementReconcileCommand())
+	cmd.AddCommand(newFencedGenerationRehomeCommand())
 	return cmd
 }
 

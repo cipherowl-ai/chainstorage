@@ -207,3 +207,37 @@ func TestDecodeChunkFrameSupportsMaxAllowedZstdWindow(t *testing.T) {
 	require.NoError(ValidateChunkPayload(chunkPayload, chunk))
 	require.Equal(payload, chunkPayload)
 }
+
+func TestReaderSupportsExistingChunkAboveNewEncoderCap(t *testing.T) {
+	require := testutil.Require(t)
+
+	// A nil cap reproduces an object produced before max_chunk_uncompressed_bytes
+	// was configured. Its first chunk is deliberately larger than the simulated
+	// new encoder cap; readers must continue to use the persisted CSCB index.
+	legacyObject, err := Encode(context.Background(), testEncodeConfig(api.Compression_ZSTD), testPayloads())
+	require.NoError(err)
+	defer legacyObject.Close()
+	data, ok := legacyObject.Bytes()
+	require.True(ok)
+
+	index, err := ParseIndex(data)
+	require.NoError(err)
+	require.Len(index.Chunks, 2)
+	newEncoderCap := uint64(15)
+	chunk := &index.Chunks[0]
+	require.Greater(chunk.UncompressedLength, newEncoderCap)
+
+	block := &index.Blocks[1]
+	frame := data[chunk.CompressedPayloadOffset : chunk.CompressedPayloadOffset+chunk.CompressedLength]
+	stream, err := OpenBlockPayloadFromChunkFrame(
+		io.NopCloser(bytes.NewReader(frame)),
+		index.Header.Codec,
+		chunk,
+		block,
+	)
+	require.NoError(err)
+	payload, err := io.ReadAll(stream)
+	require.NoError(err)
+	require.NoError(stream.Close())
+	require.Equal([]byte("bravo-bravo"), payload)
+}

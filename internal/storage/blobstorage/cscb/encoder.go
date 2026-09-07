@@ -431,7 +431,11 @@ func shouldFlushChunk(chunk *chunkBuilder, nextPayloadLength uint64, cfg EncodeC
 	if chunk.blockCount == 0 {
 		return false
 	}
-	return chunk.uncompressedLength+nextPayloadLength > *cfg.MaxChunkUncompressedBytes
+	maxChunkUncompressedBytes := *cfg.MaxChunkUncompressedBytes
+	// A block is indivisible in CSCB v1, so an oversized block is allowed as a
+	// one-block chunk. Flush it before adding the following block.
+	return chunk.uncompressedLength > maxChunkUncompressedBytes ||
+		nextPayloadLength > maxChunkUncompressedBytes-chunk.uncompressedLength
 }
 
 func newChunkBuilder(index uint32, startHeight uint64, uncompressedOffset uint64, compressedPayloadOffset uint64, dst io.Writer, cfg EncodeConfig) (*chunkBuilder, error) {
