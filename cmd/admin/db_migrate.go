@@ -52,17 +52,27 @@ func (c *migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
 	}
 	conn, err := c.Connector.Connect(ctx)
 	if err != nil {
-		return nil, err
+		return nil, migrationConnectionError(err)
 	}
 	lockCtx, cancel := context.WithTimeout(ctx, c.waitTimeout)
 	defer cancel()
 	_, err = conn.(driver.ExecerContext).ExecContext(lockCtx, migrationLockQuery, nil)
 	if err != nil {
 		_ = conn.Close()
-		return nil, xerrors.Errorf("failed to wait for advisory lock: %w", err)
+		return nil, xerrors.Errorf("failed to wait for advisory lock: %w", migrationConnectionError(err))
 	}
 	c.connected = true
 	return conn, nil
+}
+
+func migrationConnectionError(err error) error {
+	// Connector.Connect must never return driver.ErrBadConn, even wrapped.
+	// Acquisition failures are reported to the operator instead of retried by
+	// database/sql behind the command's bounded lock-wait policy.
+	if errors.Is(err, driver.ErrBadConn) {
+		return xerrors.New("database connection failed before migration lock acquisition")
+	}
+	return err
 }
 
 func withMigrationDatabase(ctx context.Context, dsn string, waitTimeout time.Duration, run func(*sql.DB) error) error {

@@ -70,6 +70,16 @@ func TestMigrationConnectorClosesOnLockFailure(t *testing.T) {
 	require.False(t, connector.connected)
 }
 
+func TestMigrationConnectorDoesNotExposeRetryableAcquisitionError(t *testing.T) {
+	conn := &testMigrationConnection{err: driver.ErrBadConn}
+	connector := &migrationConnector{Connector: &testMigrationConnector{conn: conn}, waitTimeout: time.Second}
+	actual, err := connector.Connect(context.Background())
+	require.ErrorContains(t, err, "database connection failed before migration lock acquisition")
+	require.NotErrorIs(t, err, driver.ErrBadConn)
+	require.Nil(t, actual)
+	require.True(t, conn.closed)
+}
+
 func (e *recordingMigrationExecer) ExecContext(_ context.Context, query string, _ ...interface{}) (sql.Result, error) {
 	e.queries = append(e.queries, query)
 	if e.failAt >= 0 && len(e.queries)-1 == e.failAt {
