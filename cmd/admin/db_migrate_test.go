@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"testing"
 	"time"
@@ -16,6 +17,57 @@ import (
 type recordingMigrationExecer struct {
 	queries []string
 	failAt  int
+}
+
+type testMigrationConnection struct {
+	driver.Conn
+	query  string
+	closed bool
+	err    error
+}
+
+func (c *testMigrationConnection) ExecContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.query = query
+	if _, ok := ctx.Deadline(); !ok {
+		return nil, errors.New("lock acquisition must be bounded")
+	}
+	return driver.RowsAffected(1), c.err
+}
+
+func (c *testMigrationConnection) Close() error {
+	c.closed = true
+	return nil
+}
+
+type testMigrationConnector struct {
+	driver.Connector
+	conn *testMigrationConnection
+}
+
+func (c *testMigrationConnector) Connect(context.Context) (driver.Conn, error) {
+	return c.conn, nil
+}
+
+func TestMigrationConnectorLocksBeforePublishingAndRefusesReconnect(t *testing.T) {
+	conn := &testMigrationConnection{}
+	connector := &migrationConnector{Connector: &testMigrationConnector{conn: conn}, waitTimeout: time.Second}
+	actual, err := connector.Connect(context.Background())
+	require.NoError(t, err)
+	require.Same(t, conn, actual, "preserve the driver's optional interfaces")
+	require.Equal(t, migrationLockQuery, conn.query)
+	_, err = connector.Connect(context.Background())
+	require.ErrorIs(t, err, errMigrationSessionLost)
+	require.NotErrorIs(t, err, driver.ErrBadConn)
+}
+
+func TestMigrationConnectorClosesOnLockFailure(t *testing.T) {
+	conn := &testMigrationConnection{err: context.DeadlineExceeded}
+	connector := &migrationConnector{Connector: &testMigrationConnector{conn: conn}, waitTimeout: time.Second}
+	actual, err := connector.Connect(context.Background())
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Nil(t, actual)
+	require.True(t, conn.closed)
+	require.False(t, connector.connected)
 }
 
 func (e *recordingMigrationExecer) ExecContext(_ context.Context, query string, _ ...interface{}) (sql.Result, error) {
@@ -57,6 +109,8 @@ func TestPendingConcurrentIndexNamesOnlyIncludesPendingMigrations(t *testing.T) 
 	require.Equal(t, []string{
 		"idx_block_consolidation_shadow_object_key_reference",
 		"idx_block_consolidation_shadow_retention_due",
+		"idx_block_consolidation_shadow_retention_due_generation",
+		"idx_block_consolidation_shadow_retention_watermark",
 		"idx_block_metadata_cscb_repair_candidate",
 		"idx_block_metadata_object_key_reference",
 	}, indexNames)

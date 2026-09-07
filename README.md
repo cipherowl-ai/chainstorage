@@ -570,11 +570,16 @@ kubectl exec -it deploy/chainstorage-admin-dev-console -c chainstorage-admin -- 
 The `db-init` command:
 1. Reads master credentials from environment variables (injected by Kubernetes)
 2. Fetches network-specific credentials from AWS Secrets Manager (`chainstorage/db-creds/{env}`)
-3. Creates the database (e.g., `chainstorage_ethereum_mainnet`)
-4. Creates network-specific users with passwords from the secret
-5. Runs pending embedded migrations under a per-database advisory lock
-6. Grants the privileged migration role authority over worker-owned objects
+3. Creates network-specific users with passwords from the secret
+4. Grants the privileged migration role membership in the worker role
+5. Creates the worker-owned database (e.g., `chainstorage_ethereum_mainnet`)
+6. Runs pending embedded migrations under a per-database advisory lock
 7. Reconciles runtime permissions and fails if any grant cannot be applied
+
+Both privileged migration commands hold the advisory lock on the same physical
+connection that executes migrations and grants. A lost connection aborts the
+invocation; rerun the command to recheck migration history and recover any
+invalid concurrent indexes belonging to pending migrations.
 
 #### Database Naming Convention
 

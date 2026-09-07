@@ -190,7 +190,7 @@ func runDBInit(blockchain, network, env, awsRegion string, dryRun bool) error {
 
 	// Create database
 	logger.Info("Creating database")
-	if err := createDatabase(db, dbName, workerUsername, logger); err != nil {
+	if err := initializePrivilegedDatabase(ctx, db, dbName, masterUser, workerUsername, logger); err != nil {
 		return xerrors.Errorf("failed to create database %s: %w", dbName, err)
 	}
 	logger.Info("Created/verified database", zap.String("database", dbName))
@@ -300,6 +300,15 @@ func createUser(db *sql.DB, username, password string, canCreateDB bool, logger 
 	return nil
 }
 
+func initializePrivilegedDatabase(ctx context.Context, db *sql.DB, dbName, masterUser, workerUser string, logger *zap.Logger) error {
+	// PostgreSQL requires membership in the new owner before ALTER DATABASE
+	// OWNER TO, including the first db-init when the worker role is new.
+	if err := ensureMigrationRoleMembership(ctx, db, masterUser, workerUser); err != nil {
+		return xerrors.Errorf("failed to authorize database ownership transfer: %w", err)
+	}
+	return createDatabase(db, dbName, workerUser, logger)
+}
+
 func createDatabase(db *sql.DB, dbName, owner string, logger *zap.Logger) error {
 	// Check if database exists
 	var exists bool
@@ -363,27 +372,12 @@ func runMigrations(
 	logger *zap.Logger,
 ) error {
 	// Connect to the network database to run migrations
-	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require statement_timeout=%d",
+	migrationDSN := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=require connect_timeout=30 statement_timeout=%d",
 		host, port, dbName, masterUser, masterPassword, defaultMigrationStatementTimeout.Milliseconds())
-
-	migrationDB, err := sql.Open("postgres", migrationDSN)
-	if err != nil {
-		return xerrors.Errorf("failed to connect to database for migrations: %w", err)
-	}
-	defer func() {
-		if closeErr := migrationDB.Close(); closeErr != nil {
-			logger.Warn("Failed to close migration database connection", zap.Error(closeErr))
-		}
-	}()
-
-	// Test connection
-	if err := migrationDB.PingContext(ctx); err != nil {
-		return xerrors.Errorf("failed to ping migration database: %w", err)
-	}
 
 	if _, err := runPrivilegedMigrations(
 		ctx,
-		migrationDB,
+		migrationDSN,
 		masterUser,
 		workerUser,
 		serverUser,

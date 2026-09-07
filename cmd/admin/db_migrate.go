@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"regexp"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/lib/pq"
@@ -28,7 +30,55 @@ const defaultMigrationStatementTimeout = 2*time.Hour + 20*time.Minute
 const defaultMigrationLockWaitTimeout = 5 * time.Minute
 
 const migrationLockQuery = "SELECT pg_advisory_lock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
-const migrationUnlockQuery = "SELECT pg_advisory_unlock(hashtextextended('chainstorage-schema-migration:' || current_database(), 0))"
+
+var errMigrationSessionLost = errors.New("migration database session lost; rerun the entire migration command")
+
+// A migration run owns exactly one physical session. The advisory lock and all
+// Goose statements use that session, so losing the lock cannot leave DDL running
+// on an independent connection. Never reconnect within a run: Goose may already
+// have cached a migration list that another invocation has since applied.
+type migrationConnector struct {
+	driver.Connector
+	waitTimeout time.Duration
+	mu          sync.Mutex
+	connected   bool
+}
+
+func (c *migrationConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.connected {
+		return nil, errMigrationSessionLost
+	}
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, c.waitTimeout)
+	defer cancel()
+	_, err = conn.(driver.ExecerContext).ExecContext(lockCtx, migrationLockQuery, nil)
+	if err != nil {
+		_ = conn.Close()
+		return nil, xerrors.Errorf("failed to wait for advisory lock: %w", err)
+	}
+	c.connected = true
+	return conn, nil
+}
+
+func withMigrationDatabase(ctx context.Context, dsn string, waitTimeout time.Duration, run func(*sql.DB) error) error {
+	connector, err := pq.NewConnector(dsn)
+	if err != nil {
+		return xerrors.Errorf("failed to configure migration connection: %w", err)
+	}
+	db := sql.OpenDB(&migrationConnector{Connector: connector, waitTimeout: waitTimeout})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	defer func() { _ = db.Close() }()
+	if err := db.PingContext(ctx); err != nil {
+		return xerrors.Errorf("failed to acquire migration database session: %w", err)
+	}
+	return run(db)
+}
 
 var concurrentIndexPattern = regexp.MustCompile(`(?i)CREATE\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_$]*)`)
 
@@ -150,29 +200,15 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 		StatementTimeout: statementTimeout,
 	}
 
-	// Connect to database
+	// Connect only through a lock-owning migration session.
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s connect_timeout=%d statement_timeout=%d",
 		cfg.Host, cfg.Port, cfg.Database, cfg.User, cfg.Password, cfg.SSLMode, int(cfg.ConnectTimeout.Seconds()), cfg.StatementTimeout.Milliseconds())
-
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return xerrors.Errorf("failed to open database connection: %w", err)
-	}
-	defer func() {
-		_ = db.Close()
-	}()
-
-	if err := db.PingContext(ctx); err != nil {
-		return xerrors.Errorf("failed to ping database: %w", err)
-	}
-
-	logger.Info("Successfully connected to database")
 
 	if dryRun {
 		if err := configureEmbeddedMigrations(); err != nil {
 			return xerrors.Errorf("failed to set goose dialect: %w", err)
 		}
-		return withMigrationLock(ctx, db, lockWaitTimeout, func() error {
+		return withMigrationDatabase(ctx, dsn, lockWaitTimeout, func(db *sql.DB) error {
 			// Show pending migrations
 			logger.Info("Checking for pending migrations (dry run)")
 
@@ -213,7 +249,7 @@ func runDBMigrate(masterUser, masterPassword, workerUser, serverUser, host strin
 
 	currentVersion, err := runPrivilegedMigrations(
 		ctx,
-		db,
+		dsn,
 		masterUser,
 		workerUser,
 		serverUser,
@@ -239,7 +275,7 @@ func configureEmbeddedMigrations() error {
 
 func runPrivilegedMigrations(
 	ctx context.Context,
-	db *sql.DB,
+	dsn string,
 	masterUser string,
 	workerUser string,
 	serverUser string,
@@ -252,7 +288,7 @@ func runPrivilegedMigrations(
 	}
 
 	var currentVersion int64
-	if err := withMigrationLock(ctx, db, lockWaitTimeout, func() error {
+	if err := withMigrationDatabase(ctx, dsn, lockWaitTimeout, func(db *sql.DB) error {
 		var err error
 		currentVersion, err = runMigrationSteps(
 			ctx,
@@ -298,16 +334,6 @@ func runMigrationSteps(
 	return currentVersion, nil
 }
 
-func withMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Duration, run func() error) error {
-	releaseLock, err := acquireMigrationLock(ctx, db, waitTimeout)
-	if err != nil {
-		return xerrors.Errorf("failed to acquire database migration lock: %w", err)
-	}
-	defer releaseLock()
-
-	return run()
-}
-
 func runPendingMigrations(ctx context.Context, db *sql.DB, logger *zap.Logger) (int64, error) {
 	currentVersion, err := goose.GetDBVersion(db)
 	if err != nil {
@@ -337,27 +363,6 @@ func runPendingMigrations(ctx context.Context, db *sql.DB, logger *zap.Logger) (
 	}
 
 	return currentVersion, nil
-}
-
-func acquireMigrationLock(ctx context.Context, db *sql.DB, waitTimeout time.Duration) (func(), error) {
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to reserve lock connection: %w", err)
-	}
-
-	lockCtx, cancel := context.WithTimeout(ctx, waitTimeout)
-	defer cancel()
-	if _, err := conn.ExecContext(lockCtx, migrationLockQuery); err != nil {
-		_ = conn.Close()
-		return nil, xerrors.Errorf("failed to wait for advisory lock: %w", err)
-	}
-
-	return func() {
-		unlockCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, _ = conn.ExecContext(unlockCtx, migrationUnlockQuery)
-		_ = conn.Close()
-	}, nil
 }
 
 func pendingConcurrentIndexNames(currentVersion int64) ([]string, error) {
