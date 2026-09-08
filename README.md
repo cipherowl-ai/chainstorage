@@ -517,7 +517,7 @@ The following environment variables can be used to configure PostgreSQL:
 
 #### Database Schema
 
-ChainStorage will automatically create the necessary database schema and run migrations when it starts up. The database will contain tables for:
+ChainStorage runtime server and worker processes do not run schema migrations during startup. Apply schema changes through the privileged `db-init` or `db-migrate` admin command before starting runtime pods. The database contains tables for:
 - `block_metadata` - Block metadata and headers
 - `canonical_blocks` - Canonical chain state
 - `block_events` - Blockchain event log
@@ -570,9 +570,16 @@ kubectl exec -it deploy/chainstorage-admin-dev-console -c chainstorage-admin -- 
 The `db-init` command:
 1. Reads master credentials from environment variables (injected by Kubernetes)
 2. Fetches network-specific credentials from AWS Secrets Manager (`chainstorage/db-creds/{env}`)
-3. Creates the database (e.g., `chainstorage_ethereum_mainnet`)
-4. Creates network-specific users with passwords from the secret
-5. Grants appropriate permissions
+3. Creates network-specific users with passwords from the secret
+4. Grants the privileged migration role membership in the worker role
+5. Creates the worker-owned database (e.g., `chainstorage_ethereum_mainnet`)
+6. Runs pending embedded migrations under a per-database advisory lock
+7. Reconciles runtime permissions and fails if any grant cannot be applied
+
+Both privileged migration commands hold the advisory lock on the same physical
+connection that executes migrations and grants. A lost connection aborts the
+invocation; rerun the command to recheck migration history and recover any
+invalid concurrent indexes belonging to pending migrations.
 
 #### Database Naming Convention
 
