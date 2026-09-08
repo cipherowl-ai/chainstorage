@@ -16,7 +16,6 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
-	"go.temporal.io/sdk/workflow"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 
@@ -1629,8 +1628,8 @@ func (s *singleBlockRetentionTestSuite) TestExecuteFailsCohortAfterDeferralRetry
 // TestExecuteKeepsSingleDeferralRetryOnLegacyVersion: a run whose history
 // predates the retry budget must replay with the one retry it recorded.
 func (s *singleBlockRetentionTestSuite) TestExecuteKeepsSingleDeferralRetryOnLegacyVersion() {
-	s.env.OnGetVersion(singleBlockRetentionDeferralRetriesChangeID, workflow.DefaultVersion, singleBlockRetentionDeferralRetriesVersion).
-		Return(workflow.DefaultVersion)
+	s.env.OnGetVersion(singleBlockRetentionDeferralRetriesChangeID, temporalworkflow.DefaultVersion, singleBlockRetentionDeferralRetriesVersion).
+		Return(temporalworkflow.DefaultVersion)
 	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
 	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
 		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: []retirement.RetentionCohort{cohort}}, nil).
