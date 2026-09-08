@@ -1395,6 +1395,47 @@ func TestPlannerApply_ReleasesClaimWhenOutcomeWriteExhaustsItsDeadline(t *testin
 	require.False(released.ClaimExpiresAt.After(time.Now().UTC()), "claim must be released, got %s", released.ClaimExpiresAt)
 }
 
+// TestPlannerApply_StalledOutcomeWriteKeepsLeaseOnPlainFailure pins that the
+// release decision reads the operation's own error, not the joined cleanup
+// errors. An outcome write that times out contributes a DeadlineExceeded to
+// the returned error; if the release condition read that, an ordinary S3
+// failure whose cleanup happened to stall would give up the lease that is
+// meant to be the row's cool-down before it is retried (INF-1603).
+func TestPlannerApply_StalledOutcomeWriteKeepsLeaseOnPlainFailure(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cscbKey := "consolidated/shared.cscb.zstd"
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{row}, outcomeBlocksUntilDeadline: true}
+	store := newFakeStore()
+	store.deleteMutates = true
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[cscbKey] = cscbHead
+	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	store.deleteErrors["single-block-v1"] = errors.New("s3 delete failed")
+	planner := testPlanner(repo, store)
+	planner.claimCleanupTimeout = 50 * time.Millisecond
+
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+
+	err = planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.NotErrorIs(err, context.Canceled)
+	// The stalled outcome write's deadline error is joined into the result...
+	require.ErrorIs(err, context.DeadlineExceeded)
+	// ...but it is cleanup noise, not the operation's verdict: the row failed
+	// on S3, so the claim keeps its lease and the release never runs.
+	require.Equal(0, repo.releaseCalls)
+	require.Len(repo.cleanupContexts, 1, "only the outcome write should have run")
+	failed := repo.manifests[row.BlockMetadataID]
+	require.NotNil(failed.ClaimExpiresAt)
+	require.True(failed.ClaimExpiresAt.After(time.Now().UTC()), "claim lease must be kept, got %s", failed.ClaimExpiresAt)
+}
+
 func TestPlannerApply_KeepsClaimLeaseOnNonCancellationFailure(t *testing.T) {
 	require := require.New(t)
 	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
