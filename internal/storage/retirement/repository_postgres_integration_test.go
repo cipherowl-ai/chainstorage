@@ -231,8 +231,16 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	err = repo.RenewRetirementClaim(ctx, blockMetadataID, "competing-claim", startedAt.Add(time.Second), startedAt.Add(2*time.Hour))
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	require.NoError(repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, startedAt.Add(time.Second), startedAt.Add(2*time.Hour)))
-	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET claim_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE block_metadata_id = $1`, blockMetadataID)
-	require.NoError(err)
+	// Releasing the held claim expires it at once (INF-1603): the releaser's
+	// token can no longer renew or record, and the replacement claim below
+	// takes the row over without waiting out the lease — the same transition
+	// the manual expiry used to force here. Releasing again, or with a
+	// foreign token, is a no-op rather than an error.
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, claimToken))
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, claimToken))
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, "foreign-claim"))
+	err = repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, time.Now().UTC(), time.Now().UTC().Add(time.Hour))
+	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, ActionDeletedObjectVersion)
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	claimToken = "replacement-claim"

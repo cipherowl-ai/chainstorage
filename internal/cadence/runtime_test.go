@@ -12,6 +12,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 
 	"github.com/coinbase/chainstorage/internal/config"
+	"github.com/coinbase/chainstorage/internal/storage/retirement"
 )
 
 func TestNewConnectionOptionsLeavesTemporalKeepAliveUnsetByDefault(t *testing.T) {
@@ -118,6 +119,7 @@ func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
 
 	require.True(options.EnableSessionWorker)
 	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Equal(workerStopTimeout, options.WorkerStopTimeout)
 	require.Zero(options.MaxConcurrentActivityExecutionSize)
 }
 
@@ -131,7 +133,17 @@ func TestNewWorkerOptionsAppliesActivityConcurrencyLimit(t *testing.T) {
 
 	require.True(options.EnableSessionWorker)
 	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Equal(workerStopTimeout, options.WorkerStopTimeout)
 	require.Equal(1, options.MaxConcurrentActivityExecutionSize)
+}
+
+// TestWorkerStopTimeoutCoversRetirementClaimCleanup pins the ordering the
+// claim release depends on: both bounded cleanup writes, run in sequence on
+// their own deadlines, must be able to complete — or fail — before
+// worker.Stop gives up waiting and the process exits (INF-1603).
+func TestWorkerStopTimeoutCoversRetirementClaimCleanup(t *testing.T) {
+	require.Less(t, retirement.RetirementClaimCleanupBudget, workerStopTimeout)
+	require.Equal(t, 2*retirement.RetirementClaimCleanupTimeout, retirement.RetirementClaimCleanupBudget)
 }
 
 func TestListOpenWorkflowExecutionsPaginatesAndAppliesTypeFilter(t *testing.T) {

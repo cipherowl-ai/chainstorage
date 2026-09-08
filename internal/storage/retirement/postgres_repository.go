@@ -475,6 +475,46 @@ func (r *PostgresRepository) RenewRetirementClaim(
 	return xerrors.Errorf("%w: block_metadata_id=%d", ErrRetirementClaimUnavailable, blockMetadataID)
 }
 
+// ReleaseRetirementClaim moves the claim's expiry to now. Only the lease
+// changes: state, outcome, and attempt bookkeeping stay as the last
+// RecordRetirementOutcome left them, and the row is merely available to the
+// next attempt at once, which is what ClaimRetirement's takeover branch
+// checks. The outcome column holds one value per row, so the interrupted
+// attempt's outcome remains readable only until the next attempt claims the
+// row and records its own — the same as for any retried attempt; what
+// survives the takeover is attempt_count and last_attempt_at.
+func (r *PostgresRepository) ReleaseRetirementClaim(
+	ctx context.Context,
+	blockMetadataID int64,
+	claimToken string,
+) error {
+	if r.db == nil {
+		return xerrors.New("postgres db is required")
+	}
+	if claimToken == "" {
+		return xerrors.New("retirement claim token is required")
+	}
+	const query = `
+		UPDATE block_single_block_retention
+		SET claim_expires_at = CURRENT_TIMESTAMP,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE block_metadata_id = $1
+			AND claim_token = $2
+			AND state IN ($3, $4)
+			AND claim_expires_at > CURRENT_TIMESTAMP`
+	if _, err := r.db.ExecContext(
+		ctx,
+		query,
+		blockMetadataID,
+		claimToken,
+		RetirementStateDeleting,
+		RetirementStateDeletedPendingVerification,
+	); err != nil {
+		return xerrors.Errorf("failed to release retirement claim: %w", err)
+	}
+	return nil
+}
+
 func (r *PostgresRepository) RecordRetirementOutcome(
 	ctx context.Context,
 	blockMetadataID int64,

@@ -174,7 +174,21 @@ const (
 	singleBlockRetentionRangeSweepVersion   = 1
 	singleBlockRetentionParallelismChangeID = "single_block_retention.parallelism"
 	singleBlockRetentionParallelismVersion  = 1
-	singleBlockRetentionPartialFailureType  = "single_block_retention_partial_failure"
+	// singleBlockRetentionDeferralRetriesChangeID gates the per-cohort
+	// deferral retry budget (INF-1603). Runs started before it carry
+	// DefaultVersion and keep the single retry their history already
+	// recorded; new runs get maxSingleBlockRetentionDeferralRetries.
+	singleBlockRetentionDeferralRetriesChangeID = "single_block_retention.deferral_retries"
+	singleBlockRetentionDeferralRetriesVersion  = 1
+	// maxSingleBlockRetentionDeferralRetries bounds how many times a deferred
+	// cohort is slept-and-retried before the sweep fails. One retry was not
+	// reason-aware: a cohort deferred for the CSCB safety quiescence and then,
+	// on its retry, for a retirement claim a restarted worker left behind —
+	// two unrelated transient causes — failed the whole sweep. Three covers a
+	// quiescence wait, a claim wait, and one more, while still bounding a
+	// cohort that stays deferred to ~45 minutes of lease waits.
+	maxSingleBlockRetentionDeferralRetries = 3
+	singleBlockRetentionPartialFailureType = "single_block_retention_partial_failure"
 )
 
 func NewSingleBlockRetention(params SingleBlockRetentionParams) *SingleBlockRetention {
@@ -269,6 +283,15 @@ func (w *SingleBlockRetention) execute(
 			singleBlockRetentionParallelismVersion,
 		)
 		failureDetailsEnabled = parallelismVersion != workflow.DefaultVersion
+		deferralRetryBudget := 1
+		if workflow.GetVersion(
+			ctx,
+			singleBlockRetentionDeferralRetriesChangeID,
+			workflow.DefaultVersion,
+			singleBlockRetentionDeferralRetriesVersion,
+		) != workflow.DefaultVersion {
+			deferralRetryBudget = maxSingleBlockRetentionDeferralRetries
+		}
 		if parallelismVersion == workflow.DefaultVersion && parallelism != 1 {
 			return xerrors.Errorf(
 				"legacy single_block_retention execution requires parallelism=1, got %d",
@@ -355,6 +378,7 @@ func (w *SingleBlockRetention) execute(
 				parallelism,
 				rangeSweepEnabled,
 				failureDetailsEnabled,
+				deferralRetryBudget,
 				result,
 			)
 			cohortOutcomes = append(cohortOutcomes, outcomes...)
@@ -373,6 +397,7 @@ func (w *SingleBlockRetention) execute(
 					cohort,
 					rangeSweepEnabled,
 					failureDetailsEnabled,
+					deferralRetryBudget,
 				)
 				result.addRangeResult(rangeResult)
 				if failureDetailsEnabled {
@@ -482,6 +507,7 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohortsParallel(
 	parallelism int,
 	rangeSweepEnabled bool,
 	resultValidationEnabled bool,
+	deferralRetryBudget int,
 	result *SingleBlockRetentionResult,
 ) ([]SingleBlockRetentionCohortFailureOutcome, error) {
 	cohortOutcomes := make([]SingleBlockRetentionCohortFailureOutcome, 0, len(cohorts))
@@ -506,6 +532,7 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohortsParallel(
 					cohort,
 					rangeSweepEnabled,
 					resultValidationEnabled,
+					deferralRetryBudget,
 				)
 				settable.Set(&singleBlockRetentionCohortOutcome{
 					cohort: cohort,
@@ -567,6 +594,7 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 	cohort retirement.RetentionCohort,
 	rangeSweepEnabled bool,
 	resultValidationEnabled bool,
+	deferralRetryBudget int,
 ) (*activity.SingleBlockRetentionRangeResult, error) {
 	if err := validateSelectedSingleBlockRetentionCohort(
 		cohort,
@@ -615,7 +643,12 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 		}
 	}
 	latestValidResult := rangeResult
-	if request.Execute && rangeResult.RetryAfter > 0 {
+	// A deferred cohort is slept-and-retried up to deferralRetryBudget times.
+	// Each deferral names its own transient cause and delay (the CSCB safety
+	// quiescence, an active retirement claim), so one retry per cohort was
+	// not enough when two different causes followed each other (INF-1603);
+	// the budget bounds the total wait rather than the number of causes.
+	for retries := 0; request.Execute && rangeResult.RetryAfter > 0 && retries < deferralRetryBudget; retries++ {
 		if rangeResult.RetryAfter > maxSingleBlockRetentionRetryDelay {
 			return latestValidResult, xerrors.Errorf(
 				"retention cohort %q requested retry delay %s above maximum %s",
@@ -631,6 +664,8 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 			zap.Uint64("end_height", cohort.EndHeight),
 			zap.Duration("retry_after", rangeResult.RetryAfter),
 			zap.String("retry_reason", rangeResult.RetryReason),
+			zap.Int("retry", retries+1),
+			zap.Int("retry_budget", deferralRetryBudget),
 		)
 		if err := workflow.Sleep(ctx, rangeResult.RetryAfter); err != nil {
 			return latestValidResult, xerrors.Errorf("failed to wait before retention retry: %w", err)
@@ -651,14 +686,16 @@ func (w *SingleBlockRetention) processSingleBlockRetentionCohort(
 			}
 		}
 		rangeResult = retryResult
+		latestValidResult = retryResult
 	}
 	if !request.Execute {
 		return rangeResult, nil
 	}
 	if rangeResult.RetryAfter > 0 {
 		return rangeResult, xerrors.Errorf(
-			"retention cohort %q remained deferred after bounded retry: %s",
+			"retention cohort %q remained deferred after bounded retry (%d): %s",
 			cohort.ConsolidatedObjectKey,
+			deferralRetryBudget,
 			rangeResult.RetryReason,
 		)
 	}

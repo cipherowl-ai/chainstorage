@@ -28,6 +28,22 @@ const (
 	retirementClaimTokenBytes         = 16
 	RetirementClaimLease              = 15 * time.Minute
 	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
+	// RetirementClaimCleanupTimeout bounds EACH detached cleanup write (the
+	// outcome record, then the claim release) that follows a failed claimed
+	// operation. The writes are detached from the operation's context so a
+	// cancellation still records its trace and releases the row, but they
+	// run inside the Temporal worker's stop timeout, after which the process
+	// exits: a stalled database must fail them fast rather than hold the
+	// shutdown past the point where the release could still land. Each write
+	// gets its own deadline, started when that write starts, so an outcome
+	// write that runs to its deadline cannot leave the release with an
+	// already-expired context — that would keep the row leased for the full
+	// RetirementClaimLease, the exact outage the release exists to prevent.
+	RetirementClaimCleanupTimeout = 4 * time.Second
+	// RetirementClaimCleanupBudget is the worst-case wall time of the whole
+	// cleanup: the two writes run in sequence, each on its own timeout.
+	// internal/cadence pins it below the worker stop timeout.
+	RetirementClaimCleanupBudget = 2 * RetirementClaimCleanupTimeout
 	// retentionSafetyRevalidationInterval bounds how stale a successful
 	// bucket-safety verification may be before a destructive row re-verifies it
 	// against live S3. The preflight verifies every cohort's configuration at
@@ -63,6 +79,17 @@ type Planner struct {
 	// retentionSafetyClock feeds the safety cache's staleness checks; tests
 	// override it to exercise revalidation-interval expiry.
 	retentionSafetyClock func() time.Time
+	// claimCleanupTimeout overrides RetirementClaimCleanupTimeout per cleanup
+	// write; zero means the production constant. Tests shrink it to exercise
+	// deadline exhaustion without waiting out the real budget.
+	claimCleanupTimeout time.Duration
+}
+
+func (p *Planner) claimCleanupWriteTimeout() time.Duration {
+	if p.claimCleanupTimeout > 0 {
+		return p.claimCleanupTimeout
+	}
+	return RetirementClaimCleanupTimeout
 }
 
 type PlannerOption func(*Planner)
@@ -1147,6 +1174,7 @@ func (p *Planner) withRetirementClaim(
 		if err == nil || !claimOwned {
 			return
 		}
+		operationErr := err
 		outcome := reason
 		if outcome == "" {
 			outcome = SkipMetadataChanged
@@ -1154,8 +1182,32 @@ func (p *Planner) withRetirementClaim(
 		// Record the interruption outcome even when the failure is a
 		// cancellation, so a stopped run leaves a durable trace instead of an
 		// unexplained claim that only expires by lease.
-		if outcomeErr := p.repo.RecordRetirementOutcome(context.WithoutCancel(ctx), item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+		detached := context.WithoutCancel(ctx)
+		outcomeCtx, cancelOutcome := context.WithTimeout(detached, p.claimCleanupWriteTimeout())
+		outcomeErr := p.repo.RecordRetirementOutcome(outcomeCtx, item.BlockMetadataID, claimToken, outcome, time.Now().UTC())
+		cancelOutcome()
+		if outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
+		}
+		// A canceled run is going away — the worker is stopping, the pod is
+		// terminating — and Temporal reschedules the activity on a live
+		// worker within seconds. Left alone, this claim would hold the row
+		// against that attempt for the rest of the lease (15 minutes), and
+		// a sweep whose retry budget was already spent fails on it
+		// (INF-1603). Release it so the next attempt starts at once. Only
+		// cancellation releases: a row that failed for any other reason keeps
+		// its lease as the cool-down before it is retried.
+		// The release runs on its own deadline that starts only now, so an
+		// outcome write that consumed its whole budget above cannot hand the
+		// release an expired context; the cancellation and deadline checks
+		// below read the operation's error, not the cleanup writes', so a
+		// timed-out outcome write never blocks the release.
+		if ctx.Err() != nil || errors.Is(operationErr, context.Canceled) || errors.Is(operationErr, context.DeadlineExceeded) {
+			releaseCtx, cancelRelease := context.WithTimeout(detached, p.claimCleanupWriteTimeout())
+			defer cancelRelease()
+			if releaseErr := p.repo.ReleaseRetirementClaim(releaseCtx, item.BlockMetadataID, claimToken); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
 		}
 	}()
 
