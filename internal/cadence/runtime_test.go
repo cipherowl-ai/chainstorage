@@ -118,6 +118,7 @@ func TestNewWorkerOptionsPreservesDefaultActivityConcurrency(t *testing.T) {
 
 	require.True(options.EnableSessionWorker)
 	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Equal(workerStopTimeout, options.WorkerStopTimeout)
 	require.Zero(options.MaxConcurrentActivityExecutionSize)
 }
 
@@ -131,6 +132,7 @@ func TestNewWorkerOptionsAppliesActivityConcurrencyLimit(t *testing.T) {
 
 	require.True(options.EnableSessionWorker)
 	require.Equal(2*time.Second, options.DeadlockDetectionTimeout)
+	require.Equal(workerStopTimeout, options.WorkerStopTimeout)
 	require.Equal(1, options.MaxConcurrentActivityExecutionSize)
 }
 

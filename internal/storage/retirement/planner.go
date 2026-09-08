@@ -1154,8 +1154,22 @@ func (p *Planner) withRetirementClaim(
 		// Record the interruption outcome even when the failure is a
 		// cancellation, so a stopped run leaves a durable trace instead of an
 		// unexplained claim that only expires by lease.
-		if outcomeErr := p.repo.RecordRetirementOutcome(context.WithoutCancel(ctx), item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
+		detached := context.WithoutCancel(ctx)
+		if outcomeErr := p.repo.RecordRetirementOutcome(detached, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
+		}
+		// A canceled run is going away — the worker is stopping, the pod is
+		// terminating — and Temporal reschedules the activity on a live
+		// worker within seconds. Left alone, this claim would hold the row
+		// against that attempt for the rest of the lease (15 minutes), and
+		// a sweep whose retry budget was already spent fails on it
+		// (INF-1603). Release it so the next attempt starts at once. Only
+		// cancellation releases: a row that failed for any other reason keeps
+		// its lease as the cool-down before it is retried.
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if releaseErr := p.repo.ReleaseRetirementClaim(detached, item.BlockMetadataID, claimToken); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			}
 		}
 	}()
 

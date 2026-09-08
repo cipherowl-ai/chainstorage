@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sdkactivity "go.temporal.io/sdk/activity"
@@ -270,6 +271,39 @@ func (a *SingleBlockRetention) primeRetentionSafety(
 	)
 }
 
+// watchWorkerStop derives a context that is canceled when the Temporal
+// worker begins stopping — a pod terminating — so the planner unwinds inside
+// the worker's stop timeout and releases the row claims it holds, instead of
+// dying with them and leaving the rows leased for up to 15 minutes against
+// the attempt Temporal reschedules within seconds (INF-1603). stopped reports
+// whether that happened; the activity turns it into an error rather than a
+// result so the cohort is retried on a live worker at once instead of being
+// recorded as a failed sweep.
+func watchWorkerStop(ctx context.Context) (context.Context, func() bool, context.CancelFunc) {
+	if !sdkactivity.IsActivity(ctx) {
+		return ctx, func() bool { return false }, func() {}
+	}
+	return watchStopChannel(ctx, sdkactivity.GetWorkerStopChannel(ctx))
+}
+
+func watchStopChannel(ctx context.Context, stopCh <-chan struct{}) (context.Context, func() bool, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(ctx)
+	var stopped atomic.Bool
+	go func() {
+		select {
+		case <-stopCh:
+			stopped.Store(true)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, stopped.Load, cancel
+}
+
+func workerStopError(ctx context.Context, err error) error {
+	return xerrors.Errorf("single-block retention activity interrupted by worker stop (%v): %w", ctx.Err(), err)
+}
+
 func (a *SingleBlockRetention) executeProcess(
 	ctx context.Context,
 	request *SingleBlockRetentionProcessRequest,
@@ -280,6 +314,8 @@ func (a *SingleBlockRetention) executeProcess(
 	if err := validateSingleBlockRetentionProcessRequest(a.config, request); err != nil {
 		return nil, err
 	}
+	ctx, stopped, cancel := watchWorkerStop(ctx)
+	defer cancel()
 	_, planner, err := a.getComponents(ctx)
 	if err != nil {
 		return nil, err
@@ -307,6 +343,9 @@ func (a *SingleBlockRetention) executeProcess(
 
 	if request.Execute {
 		reconcileReport, reconcileErr := planner.Reconcile(ctx, req)
+		if reconcileErr != nil && stopped() {
+			return nil, workerStopError(ctx, reconcileErr)
+		}
 		var reconcileResult *SingleBlockRetentionRangeResult
 		if reconcileReport != nil {
 			reconcileResult, err = summarizeSingleBlockRetentionReport(request.Cohort, reconcileReport)
@@ -329,6 +368,9 @@ func (a *SingleBlockRetention) executeProcess(
 
 	report, err := planner.Plan(ctx, req)
 	if err != nil {
+		if stopped() {
+			return nil, workerStopError(ctx, err)
+		}
 		return nil, xerrors.Errorf("failed to plan retention cohort: %w", err)
 	}
 	if request.Execute {
@@ -336,6 +378,9 @@ func (a *SingleBlockRetention) executeProcess(
 			return nil, err
 		}
 		if applyErr := planner.Apply(ctx, req, report); applyErr != nil {
+			if stopped() {
+				return nil, workerStopError(ctx, applyErr)
+			}
 			result, summaryErr := summarizeSingleBlockRetentionReport(request.Cohort, report)
 			if summaryErr != nil {
 				return nil, summaryErr

@@ -159,12 +159,22 @@ func newConnectionOptions(cadenceConfig config.CadenceConfig, env config.Env) (c
 	return connectionOptions, nil
 }
 
+// workerStopTimeout is how long worker.Stop waits for running activities to
+// observe the worker-stop channel and unwind. The retention activity uses it
+// to release its row claims (INF-1603); a single claim release is one UPDATE,
+// so a few seconds suffice. It must stay inside fx's stop timeout (15s
+// default) and the pod's termination grace period (30s default) or the
+// process is killed mid-release, which is the exact failure the wait exists
+// to prevent.
+const workerStopTimeout = 10 * time.Second
+
 func newWorkerOptions(workerConfig config.WorkerConfig) worker.Options {
 	options := worker.Options{
 		// Enable this option to allow worker to process sessions. Defaults to false.
 		EnableSessionWorker: true,
 		// If set defines maximum amount of time that workflow task will be allowed to run. Defaults to 1 sec.
 		DeadlockDetectionTimeout: 2 * time.Second,
+		WorkerStopTimeout:        workerStopTimeout,
 	}
 	if workerConfig.MaxConcurrentActivityExecutionSize > 0 {
 		options.MaxConcurrentActivityExecutionSize = workerConfig.MaxConcurrentActivityExecutionSize

@@ -231,6 +231,17 @@ func TestIntegrationPostgresRepositoryRetirementStateMachine(t *testing.T) {
 	err = repo.RenewRetirementClaim(ctx, blockMetadataID, "competing-claim", startedAt.Add(time.Second), startedAt.Add(2*time.Hour))
 	require.ErrorIs(err, ErrRetirementClaimUnavailable)
 	require.NoError(repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, startedAt.Add(time.Second), startedAt.Add(2*time.Hour)))
+	// Releasing the held claim expires it at once (INF-1603): a competing
+	// claim that ClaimRetirement rejected a moment ago now succeeds, and the
+	// releaser's token no longer renews. Releasing again, or with a foreign
+	// token, is a no-op rather than an error.
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, claimToken))
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, claimToken))
+	require.NoError(repo.ReleaseRetirementClaim(ctx, blockMetadataID, "foreign-claim"))
+	err = repo.RenewRetirementClaim(ctx, blockMetadataID, claimToken, time.Now().UTC(), time.Now().UTC().Add(time.Hour))
+	require.ErrorIs(err, ErrRetirementClaimUnavailable)
+	claimToken = "takeover-after-release"
+	require.NoError(repo.ClaimRetirement(ctx, blockMetadataID, claimToken, time.Now().UTC(), time.Now().UTC().Add(2*time.Hour)))
 	_, err = db.ExecContext(ctx, `UPDATE block_single_block_retention SET claim_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE block_metadata_id = $1`, blockMetadataID)
 	require.NoError(err)
 	_, err = repo.RecordRetirementObjectDeleted(ctx, blockMetadataID, claimToken, ActionDeletedObjectVersion)

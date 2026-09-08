@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"context"
 	"math"
 	"testing"
 	"time"
@@ -366,4 +367,36 @@ func TestSingleBlockRetentionChainNamesUseOperatorCompatibleComponents(t *testin
 	require.Equal(t, "solana", blockchain)
 	require.Equal(t, "mainnet", network)
 	require.Empty(t, sidechain)
+}
+
+func TestWatchStopChannelCancelsOnWorkerStop(t *testing.T) {
+	stop := make(chan struct{})
+	ctx, stopped, cancel := watchStopChannel(context.Background(), stop)
+	defer cancel()
+	require.NoError(t, ctx.Err())
+	require.False(t, stopped())
+	close(stop)
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("context was not canceled after the worker stop channel closed")
+	}
+	require.True(t, stopped())
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
+}
+
+func TestWatchStopChannelDoesNotReportAPlainCancelAsWorkerStop(t *testing.T) {
+	stop := make(chan struct{})
+	ctx, stopped, cancel := watchStopChannel(context.Background(), stop)
+	require.NoError(t, ctx.Err())
+	cancel()
+	<-ctx.Done()
+	require.False(t, stopped())
+}
+
+func TestWatchWorkerStopOutsideAnActivityIsANoop(t *testing.T) {
+	ctx, stopped, cancel := watchWorkerStop(context.Background())
+	defer cancel()
+	require.NoError(t, ctx.Err())
+	require.False(t, stopped())
 }

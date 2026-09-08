@@ -28,6 +28,7 @@ type fakeRepo struct {
 	finalizeErr        error
 	finalizeCalls      int
 	renewCalls         int
+	releaseCalls       int
 }
 
 type fakeSafetyObservation struct {
@@ -166,6 +167,19 @@ func (r *fakeRepo) RenewRetirementClaim(
 	}
 	manifest.ClaimExpiresAt = &claimExpiresAt
 	manifest.LastAttemptAt = &renewedAt
+	r.manifests[blockMetadataID] = manifest
+	r.updateManifestRow(manifest)
+	return nil
+}
+
+func (r *fakeRepo) ReleaseRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
+	r.releaseCalls++
+	manifest, ok := r.manifests[blockMetadataID]
+	if !ok || manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
+		return nil
+	}
+	released := time.Now().UTC()
+	manifest.ClaimExpiresAt = &released
 	r.manifests[blockMetadataID] = manifest
 	r.updateManifestRow(manifest)
 	return nil
@@ -1247,6 +1261,13 @@ func TestPlannerApply_HaltsBetweenRowsOnCancellation(t *testing.T) {
 	for _, row := range repo.rows {
 		store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
 	}
+	// The first row carries a second, older version so the cancellation
+	// that fires on its first delete is observed by the next delete of the
+	// SAME row — inside its claimed operation — rather than only by the
+	// second row's pre-claim check.
+	firstTopology := store.topologies[first.SingleBlockObjectKey]
+	firstTopology.Versions = append(firstTopology.Versions, ObjectVersion{VersionID: "single-block-v0", ETag: "older-etag", Bytes: 42})
+	store.topologies[first.SingleBlockObjectKey] = firstTopology
 	cscbHead := cscbObjectHead(1024, 1024)
 	store.heads[cscbKey] = cscbHead
 	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
@@ -1271,6 +1292,45 @@ func TestPlannerApply_HaltsBetweenRowsOnCancellation(t *testing.T) {
 	require.Len(store.deleted, 1)
 	require.Equal(ActionSkip, report.Items[1].Action)
 	require.Equal(SkipNotAttemptedAfterFailure, report.Items[1].SkipReason)
+	// The interrupted row's claim is released with its outcome recorded, so
+	// the attempt Temporal reschedules can take it over immediately instead
+	// of waiting out the lease (INF-1603). The never-attempted row was never
+	// claimed, so nothing is released for it.
+	require.Equal(1, repo.releaseCalls)
+	interrupted := repo.manifests[first.BlockMetadataID]
+	require.NotNil(interrupted.ClaimExpiresAt)
+	require.False(interrupted.ClaimExpiresAt.After(time.Now().UTC()), "claim must be expired, got %s", interrupted.ClaimExpiresAt)
+	require.Equal(SkipRetentionRunCanceled, interrupted.Outcome)
+}
+
+func TestPlannerApply_KeepsClaimLeaseOnNonCancellationFailure(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cscbKey := "consolidated/shared.cscb.zstd"
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{row}}
+	store := newFakeStore()
+	store.deleteMutates = true
+	store.topologies[row.SingleBlockObjectKey] = safeTopology("single-block-v1", "single-block-etag", 42)
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[cscbKey] = cscbHead
+	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	store.deleteErrors["single-block-v1"] = errors.New("s3 delete failed")
+	planner := testPlanner(repo, store)
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+	err = planner.Apply(context.Background(), req, report)
+	require.Error(err)
+	require.NotErrorIs(err, context.Canceled)
+	// A failure that is not a cancellation keeps its lease: the claim is the
+	// cool-down before the row is retried, and only a run that is going away
+	// gives it up early.
+	require.Equal(0, repo.releaseCalls)
+	failed := repo.manifests[row.BlockMetadataID]
+	require.NotNil(failed.ClaimExpiresAt)
+	require.True(failed.ClaimExpiresAt.After(time.Now().UTC()))
 }
 
 func TestPlannerApply_RequiresProductionGateAndFinalizesMetadata(t *testing.T) {
@@ -2153,6 +2213,12 @@ func (l *lockedRepository) RenewRetirementClaim(ctx context.Context, blockMetada
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.inner.RenewRetirementClaim(ctx, blockMetadataID, claimToken, renewedAt, claimExpiresAt)
+}
+
+func (l *lockedRepository) ReleaseRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.inner.ReleaseRetirementClaim(ctx, blockMetadataID, claimToken)
 }
 
 func (l *lockedRepository) RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, claimToken string, outcome string, attemptedAt time.Time) error {

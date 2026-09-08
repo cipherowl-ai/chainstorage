@@ -16,6 +16,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 	temporalworkflow "go.temporal.io/sdk/workflow"
 	"go.uber.org/fx"
 
@@ -1538,4 +1539,111 @@ func terminalSingleBlockRetentionRangeResult(
 		VerifiedThroughExclusive: cohort.EndHeight,
 		Terminal:                 true,
 	}
+}
+
+// deferredSingleBlockRetentionRangeResult is the activity result for a cohort
+// that was scanned and wholly deferred for the given reason.
+func deferredSingleBlockRetentionRangeResult(cohort retirement.RetentionCohort, reason string) *activity.SingleBlockRetentionRangeResult {
+	firstIncompleteHeight := cohort.StartHeight
+	return &activity.SingleBlockRetentionRangeResult{
+		Cohort:                   cohort,
+		ScannedRows:              cohort.RowCount,
+		DeferredRows:             cohort.RowCount,
+		VerifiedThroughExclusive: cohort.StartHeight,
+		FirstIncompleteHeight:    &firstIncompleteHeight,
+		RetryAfter:               time.Minute,
+		RetryReason:              reason,
+	}
+}
+
+func singleCohortRetentionRequest(cohort retirement.RetentionCohort) *SingleBlockRetentionRequest {
+	return &SingleBlockRetentionRequest{
+		Tag:                         2,
+		StartHeight:                 cohort.StartHeight,
+		EndHeight:                   cohort.EndHeight,
+		EligibilityCutoff:           testSingleBlockRetentionEligibilityCutoff,
+		MaxObjectRanges:             1,
+		Parallelism:                 1,
+		Execute:                     true,
+		DirectStorageClientsGuarded: true,
+		SingleBlockWritersGuarded:   true,
+		FallbackReadsValidated:      true,
+		ApprovedChain:               "solana-mainnet",
+		ApprovedStartHeight:         cohort.StartHeight,
+		ApprovedEndHeight:           cohort.EndHeight,
+	}
+}
+
+// TestExecuteRetriesDeferredCohortAcrossReasons is the INF-1603 shape: a
+// cohort deferred for the safety quiescence and then, on its retry, for a
+// claim a restarted worker left behind — two transient causes — must still
+// complete on the next retry instead of failing the sweep.
+func (s *singleBlockRetentionTestSuite) TestExecuteRetriesDeferredCohortAcrossReasons() {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: []retirement.RetentionCohort{cohort}}, nil).
+		Once()
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{}, nil).
+		Once()
+	reasons := []string{retirement.SkipCSCBSafetyQuiescenceActive, retirement.SkipRetirementClaimActive}
+	attempt := 0
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			attempt++
+			if attempt <= len(reasons) {
+				return deferredSingleBlockRetentionRangeResult(request.Cohort, reasons[attempt-1]), nil
+			}
+			return terminalSingleBlockRetentionRangeResult(request.Cohort), nil
+		}).
+		Times(3)
+	_, err := s.workflow.Execute(context.Background(), singleCohortRetentionRequest(cohort))
+	require.NoError(s.T(), err)
+	require.Equal(s.T(), 3, attempt)
+	var result SingleBlockRetentionResult
+	require.NoError(s.T(), s.env.GetWorkflowResult(&result))
+	require.Equal(s.T(), uint64(1), result.CompletedObjectRangeCount)
+}
+
+// TestExecuteFailsCohortAfterDeferralRetryBudget pins the bound: the budget
+// is a total, not per reason, so a cohort that stays deferred fails the sweep
+// after maxSingleBlockRetentionDeferralRetries retries.
+func (s *singleBlockRetentionTestSuite) TestExecuteFailsCohortAfterDeferralRetryBudget() {
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: []retirement.RetentionCohort{cohort}}, nil).
+		Once()
+	attempt := 0
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			attempt++
+			return deferredSingleBlockRetentionRangeResult(request.Cohort, retirement.SkipRetirementClaimActive), nil
+		}).
+		Times(1 + maxSingleBlockRetentionDeferralRetries)
+	_, err := s.workflow.Execute(context.Background(), singleCohortRetentionRequest(cohort))
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "remained deferred after bounded retry (3): retirement_claim_active")
+	require.Equal(s.T(), 1+maxSingleBlockRetentionDeferralRetries, attempt)
+}
+
+// TestExecuteKeepsSingleDeferralRetryOnLegacyVersion: a run whose history
+// predates the retry budget must replay with the one retry it recorded.
+func (s *singleBlockRetentionTestSuite) TestExecuteKeepsSingleDeferralRetryOnLegacyVersion() {
+	s.env.OnGetVersion(singleBlockRetentionDeferralRetriesChangeID, workflow.DefaultVersion, singleBlockRetentionDeferralRetriesVersion).
+		Return(workflow.DefaultVersion)
+	cohort := testRetentionCohort("consolidated/100-110.cscb.zstd", 100, 110)
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionSelect, mock.Anything, mock.Anything).
+		Return(&activity.SingleBlockRetentionSelectResponse{Cohorts: []retirement.RetentionCohort{cohort}}, nil).
+		Once()
+	attempt := 0
+	s.env.OnActivity(activity.ActivitySingleBlockRetentionProcess, mock.Anything, mock.Anything).
+		Return(func(_ context.Context, request *activity.SingleBlockRetentionProcessRequest) (*activity.SingleBlockRetentionRangeResult, error) {
+			attempt++
+			return deferredSingleBlockRetentionRangeResult(request.Cohort, retirement.SkipCSCBSafetyQuiescenceActive), nil
+		}).
+		Times(2)
+	_, err := s.workflow.Execute(context.Background(), singleCohortRetentionRequest(cohort))
+	require.Error(s.T(), err)
+	require.Contains(s.T(), err.Error(), "remained deferred after bounded retry (1)")
+	require.Equal(s.T(), 2, attempt)
 }

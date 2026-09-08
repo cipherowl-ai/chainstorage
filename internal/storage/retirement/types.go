@@ -24,6 +24,11 @@ type (
 		ClaimRetirement(ctx context.Context, blockMetadataID int64, claimToken string, claimedAt time.Time, claimExpiresAt time.Time) error
 		RenewRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string, renewedAt time.Time, claimExpiresAt time.Time) error
 		RecordRetirementOutcome(ctx context.Context, blockMetadataID int64, claimToken string, outcome string, attemptedAt time.Time) error
+		// ReleaseRetirementClaim expires the claim identified by claimToken
+		// immediately, if it is still held, so the next attempt can take the
+		// row over without waiting out the lease. A claim that has already
+		// expired or belongs to another token is left untouched (no error).
+		ReleaseRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error
 		RecordRetirementObjectDeleted(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
 		FinalizeRetirement(ctx context.Context, blockMetadataID int64, claimToken string, outcome string) (time.Time, error)
 		ListPendingRetirements(
