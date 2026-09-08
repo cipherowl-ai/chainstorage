@@ -351,8 +351,12 @@ FROM pg_class WHERE oid = 'public.inf1133_migration_canary'::regclass`).Scan(&ow
 	require.Zero(t, count, "the migration must not insert probe data")
 	var id int64
 	require.NoError(t, workerDB.QueryRow("INSERT INTO public.inf1133_migration_canary DEFAULT VALUES RETURNING id").Scan(&id),
-		"worker must be able to use the new table and its identity sequence")
+		"worker must be able to insert into the new table with a generated identity")
 	require.Positive(t, id)
+	var nextID int64
+	require.NoError(t, workerDB.QueryRow("SELECT nextval($1::regclass)", sequence).Scan(&nextID),
+		"worker must also receive explicit sequence access; identity INSERT bypasses sequence ACLs")
+	require.Greater(t, nextID, id)
 	var createdAt time.Time
 	require.NoError(t, serverDB.QueryRow("SELECT created_at FROM public.inf1133_migration_canary WHERE id = $1", id).Scan(&createdAt))
 	require.False(t, createdAt.IsZero())
