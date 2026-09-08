@@ -29,6 +29,10 @@ type fakeRepo struct {
 	finalizeCalls      int
 	renewCalls         int
 	releaseCalls       int
+	// outcomeBlocksUntilDeadline makes RecordRetirementOutcome consume its
+	// context's whole deadline and fail with it, standing in for a stalled
+	// database during shutdown.
+	outcomeBlocksUntilDeadline bool
 	// cleanupContexts observes the context of every outcome and release
 	// write, in call order, so tests can pin that the cleanup is detached
 	// from the canceled operation and bounded by a deadline.
@@ -209,6 +213,10 @@ func (r *fakeRepo) RecordRetirementOutcome(
 	attemptedAt time.Time,
 ) error {
 	r.cleanupContexts = append(r.cleanupContexts, observeCleanupContext(ctx))
+	if r.outcomeBlocksUntilDeadline {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	manifest, ok := r.manifests[blockMetadataID]
 	if !ok || manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification ||
 		manifest.ClaimToken != claimToken {
@@ -1328,6 +1336,63 @@ func TestPlannerApply_HaltsBetweenRowsOnCancellation(t *testing.T) {
 		require.True(observed.hasDeadline, "cleanup write %d has no deadline", i)
 		require.False(observed.deadline.After(time.Now().Add(RetirementClaimCleanupTimeout)), "cleanup write %d deadline %s exceeds the cleanup budget", i, observed.deadline)
 	}
+}
+
+// TestPlannerApply_ReleasesClaimWhenOutcomeWriteExhaustsItsDeadline pins that
+// the release does not share the outcome write's deadline: a stalled outcome
+// write that runs to its timeout must leave the release a live, freshly
+// bounded context, or the row stays leased for the full RetirementClaimLease
+// on the worker that is going away (watch-owl on PR #212).
+func TestPlannerApply_ReleasesClaimWhenOutcomeWriteExhaustsItsDeadline(t *testing.T) {
+	require := require.New(t)
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	cscbKey := "consolidated/shared.cscb.zstd"
+	row := testRow(428058000, "hash-428058000", "single-block/428058000.zstd", cscbKey, now.Add(-8*24*time.Hour))
+	repo := &fakeRepo{rows: []MetadataRow{row}, outcomeBlocksUntilDeadline: true}
+	store := newFakeStore()
+	store.deleteMutates = true
+	topology := safeTopology("single-block-v1", "single-block-etag", 42)
+	topology.Versions = append(topology.Versions, ObjectVersion{VersionID: "single-block-v0", ETag: "older-etag", Bytes: 42})
+	store.topologies[row.SingleBlockObjectKey] = topology
+	cscbHead := cscbObjectHead(1024, 1024)
+	store.heads[cscbKey] = cscbHead
+	store.versionHeads[versionObjectKey(cscbKey, cscbHead.VersionID)] = cscbHead
+	planner := testPlanner(repo, store)
+	planner.claimCleanupTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	WithHeartbeat(func(_ context.Context, details ...any) {
+		if len(details) > 0 && details[0] == "retirement.delete.version" {
+			cancel()
+		}
+	})(planner)
+
+	req := testRequest(now, true)
+	req.ProductionDeleteEnabled = true
+	report, err := planner.Plan(context.Background(), req)
+	require.NoError(err)
+
+	started := time.Now()
+	err = planner.Apply(ctx, req, report)
+	require.ErrorIs(err, context.Canceled)
+	// The outcome write's own deadline failure is reported alongside the
+	// cancellation, not swallowed.
+	require.ErrorIs(err, context.DeadlineExceeded)
+	require.Len(repo.cleanupContexts, 2, "outcome write then release")
+	outcomeCtx, releaseCtx := repo.cleanupContexts[0], repo.cleanupContexts[1]
+	require.True(outcomeCtx.live && outcomeCtx.hasDeadline)
+	// The outcome write consumed its whole deadline...
+	require.False(outcomeCtx.deadline.After(time.Now()), "outcome deadline %s should have expired by now", outcomeCtx.deadline)
+	// ...and the release still ran live, on a deadline that started after
+	// the outcome write gave up rather than one shared with it.
+	require.True(releaseCtx.live, "release ran on an expired context")
+	require.True(releaseCtx.hasDeadline)
+	require.True(releaseCtx.deadline.After(outcomeCtx.deadline), "release deadline %s must postdate the outcome deadline %s", releaseCtx.deadline, outcomeCtx.deadline)
+	require.False(releaseCtx.deadline.After(started.Add(2*planner.claimCleanupTimeout).Add(time.Second)), "release deadline %s exceeds the cleanup budget", releaseCtx.deadline)
+	require.Equal(1, repo.releaseCalls)
+	released := repo.manifests[row.BlockMetadataID]
+	require.NotNil(released.ClaimExpiresAt)
+	require.False(released.ClaimExpiresAt.After(time.Now().UTC()), "claim must be released, got %s", released.ClaimExpiresAt)
 }
 
 func TestPlannerApply_KeepsClaimLeaseOnNonCancellationFailure(t *testing.T) {

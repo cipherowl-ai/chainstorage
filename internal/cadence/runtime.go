@@ -161,9 +161,11 @@ func newConnectionOptions(cadenceConfig config.CadenceConfig, env config.Env) (c
 
 // workerStopTimeout is how long worker.Stop waits for running activities to
 // observe the worker-stop channel and unwind. The retention activity uses it
-// to release its row claims (INF-1603); the claim cleanup is bounded by
-// retirement.RetirementClaimCleanupTimeout, which must stay below this value
-// (pinned by TestWorkerStopTimeoutCoversRetirementClaimCleanup). It must in
+// to release its row claims (INF-1603); the claim cleanup — an outcome write
+// then the release, each on its own retirement.RetirementClaimCleanupTimeout —
+// is bounded in total by retirement.RetirementClaimCleanupBudget, which must
+// stay below this value (pinned by
+// TestWorkerStopTimeoutCoversRetirementClaimCleanup). It must in
 // turn stay inside fx's stop timeout (15s default) and the pod's termination
 // grace period (30s default) or the process is killed mid-release, which is
 // the exact failure the wait exists to prevent. The SDK cancels every

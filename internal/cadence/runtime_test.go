@@ -138,11 +138,12 @@ func TestNewWorkerOptionsAppliesActivityConcurrencyLimit(t *testing.T) {
 }
 
 // TestWorkerStopTimeoutCoversRetirementClaimCleanup pins the ordering the
-// claim release depends on: the bounded cleanup writes must be able to
-// complete — or fail — before worker.Stop gives up waiting and the process
-// exits (INF-1603).
+// claim release depends on: both bounded cleanup writes, run in sequence on
+// their own deadlines, must be able to complete — or fail — before
+// worker.Stop gives up waiting and the process exits (INF-1603).
 func TestWorkerStopTimeoutCoversRetirementClaimCleanup(t *testing.T) {
-	require.Less(t, retirement.RetirementClaimCleanupTimeout, workerStopTimeout)
+	require.Less(t, retirement.RetirementClaimCleanupBudget, workerStopTimeout)
+	require.Equal(t, 2*retirement.RetirementClaimCleanupTimeout, retirement.RetirementClaimCleanupBudget)
 }
 
 func TestListOpenWorkflowExecutionsPaginatesAndAppliesTypeFilter(t *testing.T) {
