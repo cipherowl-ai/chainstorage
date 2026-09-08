@@ -255,10 +255,16 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.False(t, valid)
 	version, err := runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err)
-	require.EqualValues(t, 20260818000003, version)
+	require.EqualValues(t, 20260908000001, version)
+	assertMigrationCanary(t, migrationDB, workerDB, serverDB, migrationUser)
+	var canaryOID uint32
+	require.NoError(t, migrationDB.QueryRow("SELECT 'public.inf1133_migration_canary'::regclass::oid").Scan(&canaryOID))
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "re-running the privileged migration path must be idempotent")
-	require.EqualValues(t, 20260818000003, version)
+	require.EqualValues(t, 20260908000001, version)
+	var canaryOIDAfter uint32
+	require.NoError(t, migrationDB.QueryRow("SELECT 'public.inf1133_migration_canary'::regclass::oid").Scan(&canaryOIDAfter))
+	require.Equal(t, canaryOID, canaryOIDAfter, "rerunning migrations must preserve the canary table")
 
 	var indexPresent bool
 	require.NoError(t, migrationDB.QueryRow("SELECT to_regclass('public.idx_block_consolidation_shadow_retention_due_generation') IS NOT NULL").Scan(&indexPresent))
@@ -293,7 +299,7 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.NoError(t, err)
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "a fresh invocation must recover after session loss")
-	require.EqualValues(t, 20260818000003, version)
+	require.EqualValues(t, 20260908000001, version)
 
 	// Exercise db-init's entire empty-database migration path, not just an
 	// upgrade of a schema created by the runtime worker.
@@ -318,6 +324,9 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.NoError(t, runMigrations(context.Background(), host, port, migrationUser, migrationPassword, workerUser, serverUser, freshName, zap.NewNop()))
 	freshWorker := openIntegrationPostgres(t, host, port, freshName, workerUser, workerPassword)
 	defer func() { _ = freshWorker.Close() }()
+	freshMigration := openIntegrationPostgres(t, host, port, freshName, migrationUser, migrationPassword)
+	defer func() { _ = freshMigration.Close() }()
+	assertMigrationCanary(t, freshMigration, freshWorker, freshServer, migrationUser)
 	_, err = freshWorker.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (1,2,'fixture-hash',1)")
 	require.NoError(t, err, "worker must use admin-created tables and serial sequences")
 	var count int
@@ -325,6 +334,42 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.Equal(t, 1, count)
 	_, err = freshServer.Exec("CREATE TABLE public.server_cannot_create (id INT)")
 	require.Error(t, err, "server must not acquire schema DDL privileges")
+}
+
+func assertMigrationCanary(t *testing.T, migrationDB, workerDB, serverDB *sql.DB, migrationUser string) {
+	t.Helper()
+	var owner, sequence string
+	require.NoError(t, migrationDB.QueryRow(`
+SELECT pg_get_userbyid(relowner), pg_get_serial_sequence('public.inf1133_migration_canary', 'id')
+FROM pg_class WHERE oid = 'public.inf1133_migration_canary'::regclass`).Scan(&owner, &sequence))
+	require.Equal(t, migrationUser, owner, "the privileged migrator must own the new table")
+	require.NotEmpty(t, sequence, "the canary must exercise sequence creation as well as table creation")
+	require.NoError(t, migrationDB.QueryRow("SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = $1::regclass", sequence).Scan(&owner))
+	require.Equal(t, migrationUser, owner, "the privileged migrator must own the new sequence")
+	var count int
+	require.NoError(t, serverDB.QueryRow("SELECT count(*) FROM public.inf1133_migration_canary").Scan(&count))
+	require.Zero(t, count, "the migration must not insert probe data")
+	var id int64
+	require.NoError(t, workerDB.QueryRow("INSERT INTO public.inf1133_migration_canary DEFAULT VALUES RETURNING id").Scan(&id),
+		"worker must be able to use the new table and its identity sequence")
+	require.Positive(t, id)
+	var createdAt time.Time
+	require.NoError(t, serverDB.QueryRow("SELECT created_at FROM public.inf1133_migration_canary WHERE id = $1", id).Scan(&createdAt))
+	require.False(t, createdAt.IsZero())
+	for _, query := range []string{
+		"INSERT INTO public.inf1133_migration_canary DEFAULT VALUES",
+		"UPDATE public.inf1133_migration_canary SET created_at = CURRENT_TIMESTAMP",
+		"DELETE FROM public.inf1133_migration_canary",
+	} {
+		_, err := serverDB.Exec(query)
+		var pgErr *pq.Error
+		require.ErrorAs(t, err, &pgErr)
+		require.Equal(t, pq.ErrorCode("42501"), pgErr.Code, "server writes must fail for insufficient privilege")
+	}
+	_, err := serverDB.Exec("SELECT nextval($1::regclass)", sequence)
+	var pgErr *pq.Error
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, pq.ErrorCode("42501"), pgErr.Code, "server must not advance the canary sequence")
 }
 
 func openIntegrationPostgres(t *testing.T, host string, port int, dbName, user, password string) *sql.DB {
