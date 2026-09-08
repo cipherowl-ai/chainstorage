@@ -301,13 +301,25 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	migrationClusterDB = openIntegrationPostgres(t, host, port, "postgres", migrationUser, migrationPassword)
 	require.NoError(t, initializePrivilegedDatabase(context.Background(), migrationClusterDB, freshName, migrationUser, workerUser, zap.NewNop()))
 	require.NoError(t, migrationClusterDB.Close())
+	// PostgreSQL <15 grants CREATE on public to PUBLIC by default. Establish
+	// the same restricted fixture baseline on every version so this checks
+	// that migration grants do not add server DDL privileges, not server defaults.
+	freshMaster := openIntegrationPostgres(t, host, port, freshName, masterUser, masterPassword)
+	_, err = freshMaster.Exec("REVOKE CREATE ON SCHEMA public FROM PUBLIC")
+	require.NoError(t, err)
+	_, err = freshMaster.Exec("GRANT CREATE ON SCHEMA public TO " + pq.QuoteIdentifier(workerUser))
+	require.NoError(t, err)
+	require.NoError(t, freshMaster.Close())
+	freshServer := openIntegrationPostgres(t, host, port, freshName, serverUser, serverPassword)
+	defer func() { _ = freshServer.Close() }()
+	var serverCanCreate bool
+	require.NoError(t, freshServer.QueryRow("SELECT has_schema_privilege(current_user, 'public', 'CREATE')").Scan(&serverCanCreate))
+	require.False(t, serverCanCreate, "fixture must deny server DDL before migrations")
 	require.NoError(t, runMigrations(context.Background(), host, port, migrationUser, migrationPassword, workerUser, serverUser, freshName, zap.NewNop()))
 	freshWorker := openIntegrationPostgres(t, host, port, freshName, workerUser, workerPassword)
 	defer func() { _ = freshWorker.Close() }()
 	_, err = freshWorker.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (1,2,'fixture-hash',1)")
 	require.NoError(t, err, "worker must use admin-created tables and serial sequences")
-	freshServer := openIntegrationPostgres(t, host, port, freshName, serverUser, serverPassword)
-	defer func() { _ = freshServer.Close() }()
 	var count int
 	require.NoError(t, freshServer.QueryRow("SELECT count(*) FROM public.block_metadata").Scan(&count))
 	require.Equal(t, 1, count)
