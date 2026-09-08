@@ -28,6 +28,14 @@ const (
 	retirementClaimTokenBytes         = 16
 	RetirementClaimLease              = 15 * time.Minute
 	RetentionSafetyQuiescencePeriod   = 15 * time.Minute
+	// RetirementClaimCleanupTimeout bounds the detached outcome and release
+	// writes that follow a failed claimed operation. They are detached from
+	// the operation's context so a cancellation still records its trace and
+	// releases the row, but they run inside the Temporal worker's stop
+	// timeout (internal/cadence pins it above this value), after which the
+	// process exits: a stalled database must fail them fast rather than hold
+	// the shutdown past the point where the release could still land.
+	RetirementClaimCleanupTimeout = 5 * time.Second
 	// retentionSafetyRevalidationInterval bounds how stale a successful
 	// bucket-safety verification may be before a destructive row re-verifies it
 	// against live S3. The preflight verifies every cohort's configuration at
@@ -1154,7 +1162,8 @@ func (p *Planner) withRetirementClaim(
 		// Record the interruption outcome even when the failure is a
 		// cancellation, so a stopped run leaves a durable trace instead of an
 		// unexplained claim that only expires by lease.
-		detached := context.WithoutCancel(ctx)
+		detached, cancelDetached := context.WithTimeout(context.WithoutCancel(ctx), RetirementClaimCleanupTimeout)
+		defer cancelDetached()
 		if outcomeErr := p.repo.RecordRetirementOutcome(detached, item.BlockMetadataID, claimToken, outcome, time.Now().UTC()); outcomeErr != nil {
 			err = errors.Join(err, outcomeErr)
 		}

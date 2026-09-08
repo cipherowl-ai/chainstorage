@@ -477,9 +477,12 @@ func (r *PostgresRepository) RenewRetirementClaim(
 
 // ReleaseRetirementClaim moves the claim's expiry to now. Only the lease
 // changes: state, outcome, and attempt bookkeeping stay as the last
-// RecordRetirementOutcome left them, so the audit trail of the interrupted
-// attempt is intact — the row is merely available to the next attempt at
-// once, which is what ClaimRetirement's takeover branch checks.
+// RecordRetirementOutcome left them, and the row is merely available to the
+// next attempt at once, which is what ClaimRetirement's takeover branch
+// checks. The outcome column holds one value per row, so the interrupted
+// attempt's outcome remains readable only until the next attempt claims the
+// row and records its own — the same as for any retried attempt; what
+// survives the takeover is attempt_count and last_attempt_at.
 func (r *PostgresRepository) ReleaseRetirementClaim(
 	ctx context.Context,
 	blockMetadataID int64,

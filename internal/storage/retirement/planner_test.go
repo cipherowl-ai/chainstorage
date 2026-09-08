@@ -29,6 +29,21 @@ type fakeRepo struct {
 	finalizeCalls      int
 	renewCalls         int
 	releaseCalls       int
+	// cleanupContexts observes the context of every outcome and release
+	// write, in call order, so tests can pin that the cleanup is detached
+	// from the canceled operation and bounded by a deadline.
+	cleanupContexts []cleanupContextObservation
+}
+
+type cleanupContextObservation struct {
+	live        bool
+	hasDeadline bool
+	deadline    time.Time
+}
+
+func observeCleanupContext(ctx context.Context) cleanupContextObservation {
+	deadline, hasDeadline := ctx.Deadline()
+	return cleanupContextObservation{live: ctx.Err() == nil, hasDeadline: hasDeadline, deadline: deadline}
 }
 
 type fakeSafetyObservation struct {
@@ -174,6 +189,7 @@ func (r *fakeRepo) RenewRetirementClaim(
 
 func (r *fakeRepo) ReleaseRetirementClaim(ctx context.Context, blockMetadataID int64, claimToken string) error {
 	r.releaseCalls++
+	r.cleanupContexts = append(r.cleanupContexts, observeCleanupContext(ctx))
 	manifest, ok := r.manifests[blockMetadataID]
 	if !ok || manifest.ClaimToken != claimToken || manifest.ClaimExpiresAt == nil {
 		return nil
@@ -192,6 +208,7 @@ func (r *fakeRepo) RecordRetirementOutcome(
 	outcome string,
 	attemptedAt time.Time,
 ) error {
+	r.cleanupContexts = append(r.cleanupContexts, observeCleanupContext(ctx))
 	manifest, ok := r.manifests[blockMetadataID]
 	if !ok || manifest.State != RetirementStateDeleting && manifest.State != RetirementStateDeletedPendingVerification ||
 		manifest.ClaimToken != claimToken {
@@ -1301,6 +1318,16 @@ func TestPlannerApply_HaltsBetweenRowsOnCancellation(t *testing.T) {
 	require.NotNil(interrupted.ClaimExpiresAt)
 	require.False(interrupted.ClaimExpiresAt.After(time.Now().UTC()), "claim must be expired, got %s", interrupted.ClaimExpiresAt)
 	require.Equal(SkipRetentionRunCanceled, interrupted.Outcome)
+	// Both cleanup writes ran on a context that outlived the cancellation
+	// (otherwise a stopping worker could never record or release) but that
+	// carried a deadline inside the cleanup budget, so a stalled database
+	// cannot hold the shutdown past the worker's stop timeout.
+	require.Len(repo.cleanupContexts, 2, "outcome write then release")
+	for i, observed := range repo.cleanupContexts {
+		require.True(observed.live, "cleanup write %d ran on an already-canceled context", i)
+		require.True(observed.hasDeadline, "cleanup write %d has no deadline", i)
+		require.False(observed.deadline.After(time.Now().Add(RetirementClaimCleanupTimeout)), "cleanup write %d deadline %s exceeds the cleanup budget", i, observed.deadline)
+	}
 }
 
 func TestPlannerApply_KeepsClaimLeaseOnNonCancellationFailure(t *testing.T) {
