@@ -41,6 +41,14 @@ type (
 	// interface until the ethereum streaming walker lands.
 	EthereumNativeStream = internal.EthereumNativeStream
 
+	// SolanaNativeStream is the Solana iterator view. Exposed via
+	// NativeStreamedBlock.GetSolana().
+	SolanaNativeStream = internal.SolanaNativeStream
+
+	// TransactionFilter is the pre-decode keep/skip hook consumed by
+	// WithTransactionFilter.
+	TransactionFilter = internal.TransactionFilter
+
 	// BitcoinInputTxGroupLoader is re-exported so SDK callers can
 	// type their consumer lambdas without importing internal.
 	BitcoinInputTxGroupLoader = internal.BitcoinInputTxGroupLoader
@@ -53,9 +61,10 @@ var (
 	ErrInvalidParameters = internal.ErrInvalidParameters
 
 	// Parse options (see internal/options.go for behavior).
-	WithSkipScripts   = internal.WithSkipScripts
-	WithSkipWitnesses = internal.WithSkipWitnesses
-	WithSkipShielded  = internal.WithSkipShielded
+	WithSkipScripts       = internal.WithSkipScripts
+	WithSkipWitnesses     = internal.WithSkipWitnesses
+	WithSkipShielded      = internal.WithSkipShielded
+	WithTransactionFilter = internal.WithTransactionFilter
 )
 
 var Module = fx.Options(

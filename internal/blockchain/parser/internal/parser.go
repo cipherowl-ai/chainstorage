@@ -231,6 +231,9 @@ func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.
 		if _, ok := p.nativeParser.(BitcoinStreamer); ok {
 			wrapper.bitcoin = skippedBitcoinNativeStream{}
 		}
+		if _, ok := p.nativeParser.(SolanaStreamer); ok {
+			wrapper.solana = skippedSolanaNativeStream{}
+		}
 		return wrapper, nil
 	}
 
@@ -238,6 +241,12 @@ func (p *parserImpl) ParseStreamNative(ctx context.Context, spooled *downloader.
 	// the native parser's StreamBlockIter.
 	if streamer, ok := p.nativeParser.(BitcoinStreamer); ok {
 		return buildBitcoinNativeStreamedBlock(ctx, spooled, streamer, opts...)
+	}
+
+	// Solana: walk the envelope, stream the getBlock JSON from the
+	// spool, delegate to the native parser's StreamBlockIter.
+	if streamer, ok := p.nativeParser.(SolanaStreamer); ok {
+		return buildSolanaNativeStreamedBlock(ctx, spooled, streamer, opts...)
 	}
 
 	// No chain-specific streaming available. Return metadata-only
@@ -273,6 +282,8 @@ type nativeStreamedBlock struct {
 	// ethereum is always nil today; added when the ethereum streaming
 	// walker lands.
 	ethereum EthereumNativeStream
+	// solana is populated only for Solana streams.
+	solana SolanaNativeStream
 }
 
 func (n *nativeStreamedBlock) GetMetadata() *api.BlockMetadata { return n.metadata }
@@ -293,6 +304,12 @@ func (n *nativeStreamedBlock) GetEthereum() EthereumNativeStream {
 		return nil
 	}
 	return n.ethereum
+}
+func (n *nativeStreamedBlock) GetSolana() SolanaNativeStream {
+	if n == nil {
+		return nil
+	}
+	return n.solana
 }
 
 // skippedBitcoinNativeStream is the bitcoin inner stream returned for
@@ -367,6 +384,71 @@ func buildBitcoinNativeStreamedBlock(ctx context.Context, spooled *downloader.Sp
 		spooled:     spooled,
 		spoolHandle: handle,
 		bitcoin:     inner,
+	}, nil
+}
+
+// skippedSolanaNativeStream is the Solana inner stream returned for
+// skipped slots. Skipped slots are routine on Solana (the leader
+// produced no block), so a range walker sees an empty transaction
+// stream and an empty rewards list rather than a nil accessor; only
+// Header() reports the absence, matching the bitcoin precedent.
+type skippedSolanaNativeStream struct{}
+
+func (skippedSolanaNativeStream) Transactions() iter.Seq2[*api.SolanaTransactionV2, error] {
+	return func(yield func(*api.SolanaTransactionV2, error) bool) {}
+}
+func (skippedSolanaNativeStream) Header() (*api.SolanaHeader, error) {
+	return nil, xerrors.New("skipped block has no header")
+}
+func (skippedSolanaNativeStream) Rewards() ([]*api.SolanaReward, error) {
+	return nil, nil
+}
+
+// buildSolanaNativeStreamedBlock walks the Solana proto envelope, wires
+// a section reader over the header's byte range in the spool, and
+// delegates to the native parser's StreamBlockIter. The returned
+// NativeStreamedBlock has GetSolana() populated and the other accessors
+// nil.
+func buildSolanaNativeStreamedBlock(ctx context.Context, spooled *downloader.SpooledBlock, streamer SolanaStreamer, opts ...ParseOption) (NativeStreamedBlock, error) {
+	r, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool for walk: %w", err)
+	}
+	block, chunks, walkErr := api.WalkSolanaEnvelope(r)
+	_ = r.Close()
+	if walkErr != nil {
+		return nil, xerrors.Errorf("walk solana envelope: %w", walkErr)
+	}
+	if chunks.Header.Length == 0 && chunks.Header.Offset == 0 {
+		return nil, xerrors.Errorf("solana block at height %d has no header", spooled.BlockFile.GetHeight())
+	}
+	// ParseBlock only understands the tag-2 (jsonParsed) getBlock
+	// layout; keep the streaming path on the same contract.
+	if block.GetMetadata().GetTag() < 2 {
+		return nil, ErrNotImplemented
+	}
+
+	// One cached handle over the spool so the header section reader
+	// uses pread instead of Open+Seek+Read+Close per pass.
+	handle, err := spooled.Open()
+	if err != nil {
+		return nil, xerrors.Errorf("open spool for header reader: %w", err)
+	}
+	readerAt, ok := handle.(io.ReaderAt)
+	if !ok {
+		_ = handle.Close()
+		return nil, xerrors.Errorf("spool reader does not support ReadAt")
+	}
+	openHeader := func() (io.ReadCloser, error) {
+		return io.NopCloser(io.NewSectionReader(readerAt, chunks.Header.Offset, chunks.Header.Length)), nil
+	}
+
+	inner := streamer.StreamBlockIter(ctx, openHeader, block.GetMetadata().GetHeight(), opts...)
+	return &nativeStreamedBlock{
+		metadata:    block.GetMetadata(),
+		spooled:     spooled,
+		spoolHandle: handle,
+		solana:      inner,
 	}, nil
 }
 

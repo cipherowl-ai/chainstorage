@@ -54,6 +54,15 @@ func TestWireWalkerContract_BitcoinBlobdata(t *testing.T) {
 	)
 }
 
+// TestWireWalkerContract_SolanaBlobdata cross-references
+// api.KnownSolanaBlobFields against the SolanaBlobdata descriptor.
+func TestWireWalkerContract_SolanaBlobdata(t *testing.T) {
+	assertContractMatches(t,
+		(&api.SolanaBlobdata{}).ProtoReflect().Descriptor(),
+		api.KnownSolanaBlobFields,
+	)
+}
+
 func assertContractMatches(
 	t *testing.T,
 	d protoreflect.MessageDescriptor,

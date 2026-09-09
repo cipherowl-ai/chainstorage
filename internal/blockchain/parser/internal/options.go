@@ -1,5 +1,7 @@
 package internal
 
+import "encoding/json"
+
 // parseOptions is the internal state bag that concrete ParseOption values
 // mutate. It is unexported so only this package can implement the
 // ParseOption interface.
@@ -7,7 +9,15 @@ type parseOptions struct {
 	skipScripts   bool
 	skipWitnesses bool
 	skipShielded  bool
+	txFilter      TransactionFilter
 }
+
+// TransactionFilter decides, from one transaction's raw JSON, whether a
+// streaming parser should decode and yield it (true) or drop it (false).
+// It runs before native decoding, so a dropped transaction costs one
+// json.RawMessage copy and no conversion work. Returning an error aborts
+// the stream.
+type TransactionFilter func(rawTx json.RawMessage) (bool, error)
 
 // ParseOption configures a ParseNativeBlock / ParseBlock call. Callers
 // construct options via the With* helpers; the interface is sealed so
@@ -43,6 +53,14 @@ func WithSkipShielded() ParseOption {
 	return parseOptionFunc(func(o *parseOptions) { o.skipShielded = true })
 }
 
+// WithTransactionFilter asks a streaming parser to drop the transactions
+// the filter rejects before decoding them. Honored by
+// SolanaStreamer.StreamBlockIter; ParseBlock and the bitcoin-family
+// walker (which carries a chain-level filter of its own) ignore it.
+func WithTransactionFilter(f TransactionFilter) ParseOption {
+	return parseOptionFunc(func(o *parseOptions) { o.txFilter = f })
+}
+
 // ResolveParseOptions collapses a variadic option list into a concrete
 // view that parser implementations in sibling packages can read.
 func ResolveParseOptions(opts []ParseOption) ParseOptionsView {
@@ -60,6 +78,7 @@ type ParseOptionsView struct {
 	p parseOptions
 }
 
-func (v ParseOptionsView) SkipScripts() bool   { return v.p.skipScripts }
-func (v ParseOptionsView) SkipWitnesses() bool { return v.p.skipWitnesses }
-func (v ParseOptionsView) SkipShielded() bool  { return v.p.skipShielded }
+func (v ParseOptionsView) SkipScripts() bool                    { return v.p.skipScripts }
+func (v ParseOptionsView) SkipWitnesses() bool                  { return v.p.skipWitnesses }
+func (v ParseOptionsView) SkipShielded() bool                   { return v.p.skipShielded }
+func (v ParseOptionsView) TransactionFilter() TransactionFilter { return v.p.txFilter }
