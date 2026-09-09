@@ -65,7 +65,7 @@ func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 		if migrationDB != nil {
 			_ = migrationDB.Close()
 		}
-		for _, name := range []string{dbName, dbName + "_fresh"} {
+		for _, name := range []string{dbName, dbName + "_fresh", dbName + "_cleanup"} {
 			_, _ = masterDB.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+pq.QuoteIdentifier(name))
 		}
 		_, _ = masterDB.ExecContext(
@@ -255,16 +255,12 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.False(t, valid)
 	version, err := runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err)
-	require.EqualValues(t, 20260908000001, version)
-	assertMigrationCanary(t, migrationDB, workerDB, serverDB, migrationUser)
-	var canaryOID uint32
-	require.NoError(t, migrationDB.QueryRow("SELECT 'public.inf1133_migration_canary'::regclass::oid").Scan(&canaryOID))
+	require.EqualValues(t, 20260909000001, version)
+	assertMigrationCanaryRemoved(t, migrationDB)
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "re-running the privileged migration path must be idempotent")
-	require.EqualValues(t, 20260908000001, version)
-	var canaryOIDAfter uint32
-	require.NoError(t, migrationDB.QueryRow("SELECT 'public.inf1133_migration_canary'::regclass::oid").Scan(&canaryOIDAfter))
-	require.Equal(t, canaryOID, canaryOIDAfter, "rerunning migrations must preserve the canary table")
+	require.EqualValues(t, 20260909000001, version)
+	assertMigrationCanaryRemoved(t, migrationDB)
 
 	var indexPresent bool
 	require.NoError(t, migrationDB.QueryRow("SELECT to_regclass('public.idx_block_consolidation_shadow_retention_due_generation') IS NOT NULL").Scan(&indexPresent))
@@ -299,7 +295,76 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.NoError(t, err)
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "a fresh invocation must recover after session loss")
+	require.EqualValues(t, 20260909000001, version)
+
+	// Stage the deployed create-canary version, then apply only the pending
+	// cleanup through the real privileged path with a non-superuser admin.
+	cleanupName := dbName + "_cleanup"
+	migrationClusterDB = openIntegrationPostgres(t, host, port, "postgres", migrationUser, migrationPassword)
+	require.NoError(t, initializePrivilegedDatabase(context.Background(), migrationClusterDB, cleanupName, migrationUser, workerUser, zap.NewNop()))
+	require.NoError(t, migrationClusterDB.Close())
+	cleanupMigration := openIntegrationPostgres(t, host, port, cleanupName, migrationUser, migrationPassword)
+	defer func() { _ = cleanupMigration.Close() }()
+	cleanupWorker := openIntegrationPostgres(t, host, port, cleanupName, workerUser, workerPassword)
+	defer func() { _ = cleanupWorker.Close() }()
+	cleanupServer := openIntegrationPostgres(t, host, port, cleanupName, serverUser, serverPassword)
+	defer func() { _ = cleanupServer.Close() }()
+	require.NoError(t, goose.UpToContext(context.Background(), cleanupMigration, "db/migrations", 20260908000001))
+	require.NoError(t, grantMigrationPrivileges(context.Background(), cleanupMigration, migrationUser, workerUser, serverUser, cleanupName))
+	assertMigrationCanary(t, cleanupMigration, cleanupWorker, cleanupServer, migrationUser)
+	_, err = cleanupWorker.Exec("TRUNCATE public.inf1133_migration_canary")
+	require.NoError(t, err, "the deployed canary is empty before cleanup")
+	_, err = cleanupWorker.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (7,2,'preserved-hash',1)")
+	require.NoError(t, err)
+	relationsBefore := migrationRelationSnapshot(t, cleanupMigration)
+
+	// A dependency must fail closed, without removing either object or
+	// recording the cleanup as applied. No CASCADE belongs in this migration.
+	_, err = cleanupMigration.Exec("CREATE VIEW public.canary_dependency AS SELECT id FROM public.inf1133_migration_canary")
+	require.NoError(t, err)
+	cleanupDSN := integrationPostgresDSN(host, port, cleanupName, migrationUser, migrationPassword)
+	_, err = runPrivilegedMigrations(context.Background(), cleanupDSN, migrationUser, workerUser, serverUser, cleanupName, time.Second, zap.NewNop())
+	var dependencyErr *pq.Error
+	require.ErrorAs(t, err, &dependencyErr)
+	require.Equal(t, pq.ErrorCode("2BP01"), dependencyErr.Code)
+	version, err = goose.GetDBVersion(cleanupMigration)
+	require.NoError(t, err)
+	require.EqualValues(t, 20260908000001, version, "failed cleanup must not advance Goose")
+	var count int
+	require.NoError(t, cleanupServer.QueryRow("SELECT count(*) FROM public.inf1133_migration_canary").Scan(&count))
+	require.Zero(t, count)
+	require.NoError(t, cleanupMigration.QueryRow("SELECT count(*) FROM public.canary_dependency").Scan(&count))
+	require.Zero(t, count, "the dependent view must survive the failed cleanup")
+	_, err = cleanupMigration.Exec("DROP VIEW public.canary_dependency")
+	require.NoError(t, err)
+	for attempt := 0; attempt < 2; attempt++ {
+		version, err = runPrivilegedMigrations(context.Background(), cleanupDSN, migrationUser, workerUser, serverUser, cleanupName, time.Second, zap.NewNop())
+		require.NoError(t, err)
+		require.EqualValues(t, 20260909000001, version)
+		assertMigrationCanaryRemoved(t, cleanupMigration)
+	}
+	require.Equal(t, relationsBefore, migrationRelationSnapshot(t, cleanupMigration),
+		"cleanup must preserve all unrelated public relations, owners, and permissions")
+	var preservedHash string
+	require.NoError(t, cleanupServer.QueryRow("SELECT hash FROM public.block_metadata WHERE height=7 AND tag=2").Scan(&preservedHash))
+	require.Equal(t, "preserved-hash", preservedHash)
+	_, err = cleanupWorker.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (8,2,'worker-still-writes',1)")
+	require.NoError(t, err)
+	_, err = cleanupServer.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (9,2,'server-cannot-write',1)")
+	var permissionErr *pq.Error
+	require.ErrorAs(t, err, &permissionErr)
+	require.Equal(t, pq.ErrorCode("42501"), permissionErr.Code)
+
+	// Local rollback restores the empty schema, and a forward retry removes it.
+	require.NoError(t, goose.DownContext(context.Background(), cleanupMigration, "db/migrations"))
+	version, err = goose.GetDBVersion(cleanupMigration)
+	require.NoError(t, err)
 	require.EqualValues(t, 20260908000001, version)
+	assertMigrationCanary(t, cleanupMigration, cleanupWorker, cleanupServer, migrationUser)
+	version, err = runPrivilegedMigrations(context.Background(), cleanupDSN, migrationUser, workerUser, serverUser, cleanupName, time.Second, zap.NewNop())
+	require.NoError(t, err)
+	require.EqualValues(t, 20260909000001, version)
+	assertMigrationCanaryRemoved(t, cleanupMigration)
 
 	// Exercise db-init's entire empty-database migration path, not just an
 	// upgrade of a schema created by the runtime worker.
@@ -326,14 +391,44 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	defer func() { _ = freshWorker.Close() }()
 	freshMigration := openIntegrationPostgres(t, host, port, freshName, migrationUser, migrationPassword)
 	defer func() { _ = freshMigration.Close() }()
-	assertMigrationCanary(t, freshMigration, freshWorker, freshServer, migrationUser)
+	assertMigrationCanaryRemoved(t, freshMigration)
 	_, err = freshWorker.Exec("INSERT INTO public.block_metadata (height,tag,hash,timestamp) VALUES (1,2,'fixture-hash',1)")
 	require.NoError(t, err, "worker must use admin-created tables and serial sequences")
-	var count int
 	require.NoError(t, freshServer.QueryRow("SELECT count(*) FROM public.block_metadata").Scan(&count))
 	require.Equal(t, 1, count)
 	_, err = freshServer.Exec("CREATE TABLE public.server_cannot_create (id INT)")
 	require.Error(t, err, "server must not acquire schema DDL privileges")
+}
+
+func migrationRelationSnapshot(t *testing.T, db *sql.DB) map[string][2]string {
+	t.Helper()
+	rows, err := db.Query(`
+SELECT relname, pg_get_userbyid(relowner), COALESCE(relacl::text, '')
+FROM pg_class
+WHERE relnamespace='public'::regnamespace
+  AND relname NOT IN ('inf1133_migration_canary', 'inf1133_migration_canary_id_seq', 'inf1133_migration_canary_pkey')`)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	result := make(map[string][2]string)
+	for rows.Next() {
+		var name, owner, acl string
+		require.NoError(t, rows.Scan(&name, &owner, &acl))
+		result[name] = [2]string{owner, acl}
+	}
+	require.NoError(t, rows.Err())
+	return result
+}
+
+func assertMigrationCanaryRemoved(t *testing.T, db *sql.DB) {
+	t.Helper()
+	for _, relation := range []string{"public.inf1133_migration_canary", "public.inf1133_migration_canary_id_seq"} {
+		var present bool
+		require.NoError(t, db.QueryRow("SELECT to_regclass($1) IS NOT NULL", relation).Scan(&present))
+		require.False(t, present, "cleanup must remove %s", relation)
+	}
+	var applied int
+	require.NoError(t, db.QueryRow("SELECT count(*) FROM public.goose_db_version WHERE version_id=20260909000001 AND is_applied").Scan(&applied))
+	require.Equal(t, 1, applied, "Goose must record the cleanup exactly once")
 }
 
 func assertMigrationCanary(t *testing.T, migrationDB, workerDB, serverDB *sql.DB, migrationUser string) {
