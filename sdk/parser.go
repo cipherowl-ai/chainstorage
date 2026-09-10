@@ -40,10 +40,34 @@ type BitcoinNativeStream = parser.BitcoinNativeStream
 // returns nil today.
 type EthereumNativeStream = parser.EthereumNativeStream
 
+// SolanaNativeStream is the Solana iterator view. Obtained from
+// NativeStreamedBlock.GetSolana() when the configured chain is Solana.
+// Pair it with WithTransactionFilter to drop transactions before they
+// are decoded, and use RawTransactions() when the consumer wants the
+// getBlock JSON element itself rather than the native proto — kept
+// elements are then yielded verbatim with no decoding at all:
+//
+//	native, err := client.StreamNativeBlock(ctx, tag, slot, hash,
+//	    sdk.WithTransactionFilter(func(raw json.RawMessage) (bool, error) {
+//	        return bytes.Contains(raw, programID), nil
+//	    }))
+//	if err != nil { return err }
+//	defer native.Close()
+//	if ss := native.GetSolana(); ss != nil {
+//	    for raw, err := range ss.RawTransactions() { ... }   // or ss.Transactions()
+//	    header, _ := ss.Header()
+//	}
+type SolanaNativeStream = parser.SolanaNativeStream
+
+// TransactionFilter is the pre-decode keep/skip hook consumed by
+// WithTransactionFilter.
+type TransactionFilter = parser.TransactionFilter
+
 var (
-	WithSkipScripts   = parser.WithSkipScripts
-	WithSkipWitnesses = parser.WithSkipWitnesses
-	WithSkipShielded  = parser.WithSkipShielded
+	WithSkipScripts       = parser.WithSkipScripts
+	WithSkipWitnesses     = parser.WithSkipWitnesses
+	WithSkipShielded      = parser.WithSkipShielded
+	WithTransactionFilter = parser.WithTransactionFilter
 )
 
 // Parser is the chain-agnostic parsing surface for SDK consumers.
