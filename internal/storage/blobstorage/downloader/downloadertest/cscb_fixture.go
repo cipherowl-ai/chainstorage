@@ -7,6 +7,7 @@ package downloadertest
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -96,10 +97,27 @@ type RangeServer struct {
 	*httptest.Server
 	mu     sync.Mutex
 	ranges []string
-	// FailOnce, when set, makes the first request for that exact Range
-	// value return a truncated body (half the bytes), exercising the
-	// mid-chunk retry path. Cleared after it fires.
-	FailOnce string
+	// truncate, when set, cuts the body of requests for truncateRange to
+	// truncateKeep bytes, either once or on every request.
+	truncateRange string
+	truncateKeep  int
+	truncateLeft  int // -1 = always
+}
+
+// TruncateOnce makes the next request for exactly rangeValue return only
+// the first keep bytes of its body, exercising the mid-chunk resume path.
+func (s *RangeServer) TruncateOnce(rangeValue string, keep int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.truncateRange, s.truncateKeep, s.truncateLeft = rangeValue, keep, 1
+}
+
+// TruncateAlways truncates every request for rangeValue, so retries
+// cannot recover.
+func (s *RangeServer) TruncateAlways(rangeValue string, keep int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.truncateRange, s.truncateKeep, s.truncateLeft = rangeValue, keep, -1
 }
 
 // Serve starts a range server for the object and points every block
@@ -111,9 +129,10 @@ func (o *CSCBObject) Serve(tb testing.TB) *RangeServer {
 		rangeValue := r.Header.Get("Range")
 		server.mu.Lock()
 		server.ranges = append(server.ranges, rangeValue)
-		truncate := server.FailOnce != "" && server.FailOnce == rangeValue
-		if truncate {
-			server.FailOnce = ""
+		truncate := server.truncateRange != "" && server.truncateRange == rangeValue && server.truncateLeft != 0
+		keep := server.truncateKeep
+		if truncate && server.truncateLeft > 0 {
+			server.truncateLeft--
 		}
 		server.mu.Unlock()
 
@@ -128,8 +147,8 @@ func (o *CSCBObject) Serve(tb testing.TB) *RangeServer {
 		body := o.Data[start : end+1]
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(o.Data)))
 		w.WriteHeader(http.StatusPartialContent)
-		if truncate {
-			body = body[:len(body)/2]
+		if truncate && keep < len(body) {
+			body = body[:keep]
 		}
 		_, _ = w.Write(body)
 	}))
@@ -159,15 +178,31 @@ func (s *RangeServer) CountRange(rangeValue string) int {
 }
 
 // SyntheticBlocks builds count Solana-shaped blocks at heights
-// startHeight.. with payloadSize bytes of blob each, for size-driven
-// tests and benchmarks.
+// startHeight.. with payloadSize bytes of highly compressible blob each,
+// for size-driven tests and benchmarks.
 func SyntheticBlocks(startHeight uint64, count int, payloadSize int) []*api.Block {
+	return syntheticBlocks(startHeight, count, payloadSize, false)
+}
+
+// IncompressibleBlocks is SyntheticBlocks with pseudo-random blob bytes,
+// so the compressed chunk is about as long as the raw payloads and a
+// truncation at N compressed bytes lands roughly N raw bytes in.
+func IncompressibleBlocks(startHeight uint64, count int, payloadSize int) []*api.Block {
+	return syntheticBlocks(startHeight, count, payloadSize, true)
+}
+
+func syntheticBlocks(startHeight uint64, count int, payloadSize int, random bool) []*api.Block {
+	rng := rand.New(rand.NewSource(int64(startHeight)))
 	blocks := make([]*api.Block, count)
 	for i := range blocks {
 		height := startHeight + uint64(i)
 		payload := make([]byte, payloadSize)
-		for j := range payload {
-			payload[j] = byte('a' + (i+j)%26)
+		if random {
+			_, _ = rng.Read(payload)
+		} else {
+			for j := range payload {
+				payload[j] = byte('a' + (i+j)%26)
+			}
 		}
 		blocks[i] = &api.Block{
 			Blockchain: common.Blockchain_BLOCKCHAIN_SOLANA,

@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/testing/protocmp"
 
@@ -69,7 +70,7 @@ func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_CSCBChunkOnce() {
 		}
 	}
 	_, err = iter.Next(context.Background())
-	require.ErrorIs(err, io.EOF)
+	require.True(err == io.EOF, "end of range is exactly io.EOF: %v", err)
 
 	require.Equal(1, server.CountRange(object.ChunkRange(0)), "chunk 0 fetched once for its 3 blocks")
 	require.Equal(1, server.CountRange(object.ChunkRange(1)), "chunk 1 fetched once for its 3 blocks")
@@ -172,18 +173,27 @@ func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_MixedSkippedAndSingleBl
 	require.Equal(2, server.CountRange(object.ChunkRange(0)))
 }
 
-func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_ResumesAfterTruncatedChunk() {
+func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_ResumesMidGroupAfterTruncatedChunk() {
 	require := testutil.Require(s.T())
-	blocks := downloadertest.SyntheticBlocks(100, 4, 4096)
+	const blockSize = 256 * 1024
+	blocks := downloadertest.IncompressibleBlocks(100, 4, blockSize)
 	object := downloadertest.EncodeCSCB(s.T(), blocks, 4)
 	server := object.Serve(s.T())
-	server.FailOnce = object.ChunkRange(0)
+	// Incompressible payloads make compressed bytes ≈ raw bytes, so
+	// cutting the first response at 2.5 blocks lets blocks 100 and 101
+	// out and kills the read of 102: the retry must resume at 102 with a
+	// fresh chunk request, not restart the group (which would hand out
+	// block 100's payload again and fail the parity check below).
+	server.TruncateOnce(object.ChunkRange(0), blockSize*5/2)
 	dl := s.newDownloaderFor(server.Server)
 
 	iter, err := dl.OpenSpooledBlocks(context.Background(), object.BlockFiles)
 	require.NoError(err)
 	defer iter.Close()
 	for i := range object.BlockFiles {
+		if i == 2 {
+			require.Equal(1, server.CountRange(object.ChunkRange(0)), "blocks 100 and 101 came from the truncated response")
+		}
 		spooled, err := iter.Next(context.Background())
 		require.NoError(err, "block %d", i)
 		got := readSpooled(s.T(), spooled)
@@ -191,7 +201,36 @@ func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_ResumesAfterTruncatedCh
 			require.FailNow(diff)
 		}
 	}
-	require.Equal(2, server.CountRange(object.ChunkRange(0)), "one truncated attempt plus one successful reopen")
+	require.Equal(2, server.CountRange(object.ChunkRange(0)), "one truncated attempt plus one reopen")
+}
+
+func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_ExhaustedRetriesAreNeverEOF() {
+	require := testutil.Require(s.T())
+	// Blocks must exceed zstd's 128 KiB block size, or a truncated
+	// response may not contain one complete compressed block and even
+	// height 100 fails to decode.
+	const blockSize = 256 * 1024
+	blocks := downloadertest.IncompressibleBlocks(100, 3, blockSize)
+	object := downloadertest.EncodeCSCB(s.T(), blocks, 3)
+	server := object.Serve(s.T())
+	server.TruncateAlways(object.ChunkRange(0), blockSize*3/2)
+	dl := s.newDownloaderFor(server.Server)
+
+	iter, err := dl.OpenSpooledBlocks(context.Background(), object.BlockFiles)
+	require.NoError(err)
+	defer iter.Close()
+	got := readSpooled(s.T(), mustNext(s.T(), iter))
+	require.Equal(uint64(100), got.GetMetadata().GetHeight())
+
+	_, err = iter.Next(context.Background())
+	require.Error(err)
+	require.False(err == io.EOF, "a failed download must not look like the end of the range")
+	require.False(xerrors.Is(err, io.EOF), "nor unwrap to it: %v", err)
+	require.ErrorContains(err, "height 101")
+
+	_, again := iter.Next(context.Background())
+	require.Equal(err, again, "the error is sticky; Next cannot skip the failed block")
+	require.GreaterOrEqual(server.CountRange(object.ChunkRange(0)), 2, "retries reopened the chunk")
 }
 
 func (s *blockDownloaderTestSuite) TestOpenSpooledBlocks_CloseAndCancel() {

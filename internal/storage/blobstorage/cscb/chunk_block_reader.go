@@ -53,7 +53,11 @@ func NewChunkBlockReader(frame io.ReadCloser, codec api.Compression, chunk *Chun
 			_ = frame.Close()
 			return nil, err
 		}
-		end, _ := checkedAdd(block.ChunkRelativeOffset, block.PayloadLength)
+		end, err := BlockPayloadEnd(block)
+		if err != nil {
+			_ = frame.Close()
+			return nil, err
+		}
 		if i > 0 && block.ChunkRelativeOffset < previousEnd {
 			_ = frame.Close()
 			return nil, xerrors.Errorf("CSCB block payloads out of order at height %d: start=%d previous_end=%d", block.Height, block.ChunkRelativeOffset, previousEnd)
@@ -77,6 +81,15 @@ func NewChunkBlockReader(frame io.ReadCloser, codec api.Compression, chunk *Chun
 		reader: reader,
 		reads:  reads,
 	}, nil
+}
+
+// BlockPayloadEnd returns the chunk-relative offset one past the block's
+// payload, rejecting descriptors whose offset+length overflows.
+func BlockPayloadEnd(block *BlockDescriptor) (uint64, error) {
+	if block == nil {
+		return 0, xerrors.New("CSCB block descriptor is required")
+	}
+	return checkedAdd(block.ChunkRelativeOffset, block.PayloadLength)
 }
 
 // Next returns the next requested block and its validated payload, or
@@ -109,15 +122,11 @@ func (r *ChunkBlockReader) Next() (*BlockDescriptor, []byte, error) {
 	return read.block, payload, nil
 }
 
-// Remaining returns how many requested blocks have not been returned yet.
-func (r *ChunkBlockReader) Remaining() int {
-	return len(r.reads) - r.pos
-}
-
 // Close releases the decompressor and the underlying frame. Unread
 // chunk bytes are not drained: unlike OpenBlockPayloadFromChunkFrame,
 // per-block CRCs are checked on return, so there is no deferred
-// validation to observe.
+// validation to observe. (As with the rest of the CSCB download path,
+// an undrained HTTP body forfeits keep-alive for that connection.)
 func (r *ChunkBlockReader) Close() error {
 	if r.closed {
 		return nil

@@ -37,13 +37,11 @@ func TestChunkBlockReader_SequentialParityWithExtract(t *testing.T) {
 	require.NoError(err)
 	defer reader.Close()
 	for i, block := range blocks {
-		require.Equal(len(blocks)-i, reader.Remaining())
 		desc, payload, err := reader.Next()
 		require.NoError(err)
 		require.Equal(block.Height, desc.Height)
 		require.Equal(expected[i], payload)
 	}
-	require.Equal(0, reader.Remaining())
 	_, _, err = reader.Next()
 	require.ErrorIs(err, io.EOF)
 	require.NoError(reader.Close())

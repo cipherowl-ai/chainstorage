@@ -5,6 +5,11 @@
 //
 //	mockgen -destination sdk/mocks/mocks.go -package sdkmocks github.com/coinbase/chainstorage/sdk Client,Parser,Session
 //
+// StreamNativeBlocksByRange (INF-1635) was added in the generated style by
+// hand: newer mockgen releases resolve the sdk.ParseOption alias through to
+// parser/internal, which sdk_test cannot import. Regenerate with the same
+// mockgen that produced the rest of this file, or re-apply that method.
+//
 
 // Package sdkmocks is a generated GoMock package.
 package sdkmocks

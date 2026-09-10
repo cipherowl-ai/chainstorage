@@ -135,7 +135,7 @@ func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_ChunkOnceParity()
 		s.require.NoError(native.Close())
 	}
 	_, err = iter.Next(context.Background())
-	s.require.ErrorIs(err, io.EOF)
+	s.require.True(err == io.EOF, "end of range is exactly io.EOF: %v", err)
 
 	s.require.Equal(1, s.server.CountRange(s.object.ChunkRange(0)), "both slots came out of one chunk request")
 }
@@ -167,10 +167,19 @@ func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_FilterAppliesToEv
 			Transactions []json.RawMessage `json:"transactions"`
 		}
 		s.require.NoError(json.Unmarshal(rawBlock.GetSolana().GetHeader(), &decoded))
+		wantKept := 0
+		for _, tx := range decoded.Transactions {
+			if bytes.Contains(tx, []byte(`"Vote111111111111111111111111111111111111111"`)) {
+				wantKept++
+			}
+		}
 		s.require.Equal(len(decoded.Transactions), seen[current], "filter saw every transaction of slot %d", current)
-		s.require.LessOrEqual(kept, seen[current])
+		s.require.Equal(wantKept, kept, "slot %d yields exactly the transactions the filter kept", current)
 		s.require.NoError(native.Close())
 	}
+	// The second fixture (1,446 transactions) is mostly votes; the first
+	// has a single non-vote transaction, so both branches ran.
+	s.require.Greater(seen[1001], 1000)
 }
 
 func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_SingleBlockFallback() {
@@ -191,6 +200,24 @@ func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_SingleBlockFallba
 	s.require.NoError(native.Close())
 	_, err = iter.Next(context.Background())
 	s.require.ErrorIs(err, io.EOF)
+}
+
+// TestStreamNativeBlocksByRange_DownloadFailureIsNotEOF is the walker's
+// safety property: a chunk that cannot be read must never look like the
+// end of the range, or a checkpointing consumer would skip it.
+func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_DownloadFailureIsNotEOF() {
+	s.expectRange(api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT, s.object.BlockFiles)
+	s.server.TruncateAlways(s.object.ChunkRange(0), 64)
+
+	iter, err := s.client.StreamNativeBlocksByRange(context.Background(), 2, 1000, 1002)
+	s.require.NoError(err, "metadata succeeded; the failure is lazy")
+	defer iter.Close()
+	_, err = iter.Next(context.Background())
+	s.require.Error(err)
+	s.require.False(err == io.EOF)
+	s.require.False(xerrors.Is(err, io.EOF), "%v", err)
+	_, again := iter.Next(context.Background())
+	s.require.Equal(err, again, "terminal error is sticky")
 }
 
 func (s *streamRangeClientSuite) TestStreamNativeBlocksByRange_BothSourcesFail() {

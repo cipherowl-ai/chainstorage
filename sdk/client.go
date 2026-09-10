@@ -139,6 +139,13 @@ type (
 		// block. The range is bounded by the server's MaxNumBlockFiles;
 		// page longer walks. Callers MUST close every returned block and
 		// the iterator.
+		//
+		// Blob reads are lazy (they happen in Next), so the DEFAULT ->
+		// SINGLE_BLOCK read-source fallback here covers only the metadata
+		// lookup, unlike StreamNativeBlock, whose fallback also covers the
+		// download. A block whose consolidated object cannot be read
+		// surfaces from Next as an error (never as io.EOF) after the
+		// downloader's retries; the iterator is then finished.
 		StreamNativeBlocksByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, opts ...ParseOption) (NativeStreamedBlockIterator, error)
 	}
 
