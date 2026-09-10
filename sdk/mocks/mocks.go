@@ -5,6 +5,11 @@
 //
 //	mockgen -destination sdk/mocks/mocks.go -package sdkmocks github.com/coinbase/chainstorage/sdk Client,Parser,Session
 //
+// StreamNativeBlocksByRange (INF-1635) was added in the generated style by
+// hand: newer mockgen releases resolve the sdk.ParseOption alias through to
+// parser/internal, which sdk_test cannot import. Regenerate with the same
+// mockgen that produced the rest of this file, or re-apply that method.
+//
 
 // Package sdkmocks is a generated GoMock package.
 package sdkmocks
@@ -377,6 +382,26 @@ func (mr *MockClientMockRecorder) StreamNativeBlock(arg0, arg1, arg2, arg3 any, 
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]any{arg0, arg1, arg2, arg3}, arg4...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamNativeBlock", reflect.TypeOf((*MockClient)(nil).StreamNativeBlock), varargs...)
+}
+
+// StreamNativeBlocksByRange mocks base method.
+func (m *MockClient) StreamNativeBlocksByRange(arg0 context.Context, arg1 uint32, arg2, arg3 uint64, arg4 ...sdk.ParseOption) (sdk.NativeStreamedBlockIterator, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1, arg2, arg3}
+	for _, a := range arg4 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "StreamNativeBlocksByRange", varargs...)
+	ret0, _ := ret[0].(sdk.NativeStreamedBlockIterator)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// StreamNativeBlocksByRange indicates an expected call of StreamNativeBlocksByRange.
+func (mr *MockClientMockRecorder) StreamNativeBlocksByRange(arg0, arg1, arg2, arg3 any, arg4 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1, arg2, arg3}, arg4...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StreamNativeBlocksByRange", reflect.TypeOf((*MockClient)(nil).StreamNativeBlocksByRange), varargs...)
 }
 
 // MockParser is a mock of Parser interface.
