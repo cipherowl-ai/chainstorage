@@ -54,9 +54,11 @@ func WithSkipShielded() ParseOption {
 }
 
 // WithTransactionFilter asks a streaming parser to drop the transactions
-// the filter rejects before decoding them. Honored by
-// SolanaStreamer.StreamBlockIter; ParseBlock and the bitcoin-family
-// walker (which carries a chain-level filter of its own) ignore it.
+// the filter rejects before decoding them. Honored by the Solana and
+// bitcoin-family streaming walkers (on bitcoin it runs after the chain's
+// own filter, e.g. the Zcash shielded drop); ParseBlock ignores it. The
+// raw element carries the whole getBlock transaction — account keys,
+// instructions, meta.err, logs — so callers can filter on any of them.
 func WithTransactionFilter(f TransactionFilter) ParseOption {
 	return parseOptionFunc(func(o *parseOptions) { o.txFilter = f })
 }

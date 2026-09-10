@@ -212,6 +212,10 @@ func (b *bitcoinNativeParserImpl) decodeBlockStream(
 	opts ...internal.ParseOption,
 ) (*api.BitcoinHeader, error) {
 	optView := internal.ResolveParseOptions(opts)
+	// Caller-supplied WithTransactionFilter, applied after the chain's own
+	// txFilter (Zcash shielded drop) on the same raw element. Honored here
+	// so the option is not a silent no-op on bitcoin-family chains.
+	optFilter := optView.TransactionFilter()
 
 	dec := json.NewDecoder(r)
 	openTok, err := dec.Token()
@@ -258,14 +262,23 @@ func (b *bitcoinNativeParserImpl) decodeBlockStream(
 				// filtered txs) to preserve the source position as
 				// the tx's index, matching ParseBlock.
 				var rawTx BitcoinTransaction
-				if b.txFilter != nil {
+				if b.txFilter != nil || optFilter != nil {
 					var rawMsg json.RawMessage
 					if err := dec.Decode(&rawMsg); err != nil {
 						return nil, xerrors.Errorf("failed to decode tx[%d]: %w", txIdx, err)
 					}
-					keep, err := b.txFilter(rawMsg)
-					if err != nil {
-						return nil, xerrors.Errorf("tx filter failed at [%d]: %w", txIdx, err)
+					keep := true
+					if b.txFilter != nil {
+						var err error
+						if keep, err = b.txFilter(rawMsg); err != nil {
+							return nil, xerrors.Errorf("tx filter failed at [%d]: %w", txIdx, err)
+						}
+					}
+					if keep && optFilter != nil {
+						var err error
+						if keep, err = optFilter(rawMsg); err != nil {
+							return nil, xerrors.Errorf("transaction filter failed at [%d]: %w", txIdx, err)
+						}
 					}
 					if !keep {
 						txIdx++

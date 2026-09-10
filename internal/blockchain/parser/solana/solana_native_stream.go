@@ -93,41 +93,64 @@ func (p *solanaNativeParserImpl) StreamBlockIter(
 
 func (s *solanaBlockStream) Transactions() iter.Seq2[*api.SolanaTransactionV2, error] {
 	return func(yield func(*api.SolanaTransactionV2, error) bool) {
-		if s.openReader == nil {
-			yield(nil, xerrors.New("nil openReader"))
-			return
-		}
-
-		r, err := s.openReader()
-		if err != nil {
-			yield(nil, xerrors.Errorf("failed to open block reader: %w", err))
-			return
-		}
-		defer func() { _ = r.Close() }()
-
-		emit := func(tx *api.SolanaTransactionV2) error {
+		emitTx := func(tx *api.SolanaTransactionV2) error {
 			if !yield(tx, nil) {
 				return errIterStopped
 			}
 			return nil
 		}
-
-		tail, err := s.parser.decodeBlockStream(s.ctx, r, s.slot, emit, s.opts...)
-		switch {
-		case errors.Is(err, errIterStopped):
-			// Consumer broke the range. Nothing to report; defers clean up.
-		case err != nil:
+		if err := s.run(nil, emitTx); err != nil {
 			yield(nil, err)
-		default:
-			// Full consumption: cache the tail for free Header()/Rewards().
-			s.mu.Lock()
-			if !s.tailSet {
-				s.tail = tail
-				s.tailSet = true
-			}
-			s.mu.Unlock()
 		}
 	}
+}
+
+func (s *solanaBlockStream) RawTransactions() iter.Seq2[json.RawMessage, error] {
+	return func(yield func(json.RawMessage, error) bool) {
+		emitRaw := func(raw json.RawMessage) error {
+			if !yield(raw, nil) {
+				return errIterStopped
+			}
+			return nil
+		}
+		if err := s.run(emitRaw, nil); err != nil {
+			yield(nil, err)
+		}
+	}
+}
+
+// run opens the reader, performs one full walk with the given emitter,
+// and caches the tail on full consumption. It returns nil when the
+// consumer stopped early (nothing to report) and the walk error
+// otherwise.
+func (s *solanaBlockStream) run(emitRaw func(json.RawMessage) error, emitTx func(*api.SolanaTransactionV2) error) error {
+	if s.openReader == nil {
+		return xerrors.New("nil openReader")
+	}
+
+	r, err := s.openReader()
+	if err != nil {
+		return xerrors.Errorf("failed to open block reader: %w", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	tail, err := s.parser.walkBlockStream(s.ctx, r, s.slot, s.opts, emitRaw, emitTx)
+	switch {
+	case errors.Is(err, errIterStopped):
+		// Consumer broke the range. Nothing to report; defers clean up.
+		return nil
+	case err != nil:
+		return err
+	}
+
+	// Full consumption: cache the tail for free Header()/Rewards().
+	s.mu.Lock()
+	if !s.tailSet {
+		s.tail = tail
+		s.tailSet = true
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *solanaBlockStream) Header() (*api.SolanaHeader, error) {
@@ -186,16 +209,8 @@ func (s *solanaBlockStream) getTail() (*blockTail, error) {
 	return s.tail, s.tailErr
 }
 
-// decodeBlockStream token-walks a getBlock JSON object from r, invoking
-// emit once per transaction in source order. Only one transaction is
-// held in memory at a time (plus the small non-array header fields and
-// the raw rewards array), so peak parser memory is O(largest
-// transaction) rather than O(block).
-//
-// Parity with ParseBlock holds by construction: each yielded transaction
-// comes from the same parseTransactionV2 that ParseBlock uses, and the
-// header from the same parseHeaderV2 (enforced by
-// solana_native_stream_test).
+// decodeBlockStream is the native-decoding walk used by Transactions().
+// Kept as a named entry point for tests; see walkBlockStream.
 func (p *solanaNativeParserImpl) decodeBlockStream(
 	ctx context.Context,
 	r io.Reader,
@@ -203,7 +218,35 @@ func (p *solanaNativeParserImpl) decodeBlockStream(
 	emit func(*api.SolanaTransactionV2) error,
 	opts ...internal.ParseOption,
 ) (*blockTail, error) {
+	return p.walkBlockStream(ctx, r, slot, opts, nil, emit)
+}
+
+// walkBlockStream token-walks a getBlock JSON object from r, invoking
+// exactly one of emitRaw / emitTx once per kept transaction in source
+// order. Only one transaction is held in memory at a time (plus the
+// small non-array header fields and the raw rewards array), so peak
+// parser memory is O(largest transaction) rather than O(block).
+//
+// With emitRaw set, kept transactions are yielded as their verbatim JSON
+// element and never natively decoded. Otherwise each kept transaction
+// goes through parseTransactionV2, the same function ParseBlock uses, so
+// the two paths stay in parity (enforced by solana_native_stream_test).
+func (p *solanaNativeParserImpl) walkBlockStream(
+	ctx context.Context,
+	r io.Reader,
+	slot uint64,
+	opts []internal.ParseOption,
+	emitRaw func(json.RawMessage) error,
+	emitTx func(*api.SolanaTransactionV2) error,
+) (*blockTail, error) {
+	if (emitRaw == nil) == (emitTx == nil) {
+		return nil, xerrors.New("walkBlockStream needs exactly one emitter")
+	}
 	filter := internal.ResolveParseOptions(opts).TransactionFilter()
+	// The raw path is needed whenever the element must be inspected or
+	// yielded as bytes; the direct decode is only for the unfiltered
+	// native iteration, where it saves one copy per transaction.
+	useRaw := filter != nil || emitRaw != nil
 
 	dec := json.NewDecoder(r)
 	if err := expectDelim(dec, '{'); err != nil {
@@ -232,23 +275,32 @@ func (p *solanaNativeParserImpl) decodeBlockStream(
 				if err := ctx.Err(); err != nil {
 					return nil, err
 				}
-				// With a filter, decode the element as raw JSON first so
+				// On the raw path the element is decoded as raw JSON first so
 				// the filter can inspect any field (account keys, program
-				// ids) without paying for the native conversion; dropped
-				// transactions never reach parseTransactionV2. txIdx is
-				// always incremented so error messages name the source
+				// ids, meta.err) without paying for the native conversion;
+				// dropped transactions never reach parseTransactionV2. txIdx
+				// is always incremented so error messages name the source
 				// position, filtered or not.
 				var tx SolanaTransactionV2
-				if filter != nil {
+				if useRaw {
 					var raw json.RawMessage
 					if err := dec.Decode(&raw); err != nil {
 						return nil, xerrors.Errorf("failed to decode transaction[%d]: %w", txIdx, err)
 					}
-					keep, err := filter(raw)
-					if err != nil {
-						return nil, xerrors.Errorf("transaction filter failed at [%d]: %w", txIdx, err)
+					if filter != nil {
+						keep, err := filter(raw)
+						if err != nil {
+							return nil, xerrors.Errorf("transaction filter failed at [%d]: %w", txIdx, err)
+						}
+						if !keep {
+							txIdx++
+							continue
+						}
 					}
-					if !keep {
+					if emitRaw != nil {
+						if err := emitRaw(raw); err != nil {
+							return nil, err
+						}
 						txIdx++
 						continue
 					}
@@ -263,7 +315,7 @@ func (p *solanaNativeParserImpl) decodeBlockStream(
 				if err != nil {
 					return nil, xerrors.Errorf("failed to parse transaction[%d]: %w", txIdx, err)
 				}
-				if err := emit(apiTx); err != nil {
+				if err := emitTx(apiTx); err != nil {
 					return nil, err
 				}
 				txIdx++

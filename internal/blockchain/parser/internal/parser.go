@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"iter"
 	"os"
@@ -396,6 +397,9 @@ type skippedSolanaNativeStream struct{}
 
 func (skippedSolanaNativeStream) Transactions() iter.Seq2[*api.SolanaTransactionV2, error] {
 	return func(yield func(*api.SolanaTransactionV2, error) bool) {}
+}
+func (skippedSolanaNativeStream) RawTransactions() iter.Seq2[json.RawMessage, error] {
+	return func(yield func(json.RawMessage, error) bool) {}
 }
 func (skippedSolanaNativeStream) Header() (*api.SolanaHeader, error) {
 	return nil, xerrors.New("skipped block has no header")

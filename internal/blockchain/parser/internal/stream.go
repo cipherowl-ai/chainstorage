@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"iter"
 
@@ -68,6 +69,13 @@ type EthereumNativeStream interface {
 type SolanaNativeStream interface {
 	// Transactions yields each decoded transaction in the block.
 	Transactions() iter.Seq2[*api.SolanaTransactionV2, error]
+	// RawTransactions yields each transaction's getBlock JSON element
+	// verbatim — after WithTransactionFilter, before any native decoding.
+	// A kept transaction costs one copy and no conversion, and the bytes
+	// are exactly what a getBlock consumer (find_transaction on the block
+	// JSON) expects, so an indexer can persist them without a proto
+	// round-trip. Shares the tail-caching contract with Transactions().
+	RawTransactions() iter.Seq2[json.RawMessage, error]
 	// Header returns the block header, lazily populated.
 	Header() (*api.SolanaHeader, error)
 	// Rewards returns the block-level rewards, lazily populated.

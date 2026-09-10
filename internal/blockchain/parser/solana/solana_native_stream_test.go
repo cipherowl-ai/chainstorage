@@ -126,6 +126,77 @@ func TestSolanaStreamParseParity(t *testing.T) {
 	}
 }
 
+// TestSolanaStream_RawTransactionsVerbatim verifies RawTransactions()
+// yields each element byte-for-byte as it appears in the block JSON, in
+// order, with the same count as the native path, and still caches the
+// tail. This is the contract the bridge readers rely on: they consume
+// the getBlock element through find_transaction, not the native proto.
+func TestSolanaStream_RawTransactionsVerbatim(t *testing.T) {
+	parser, app := newStreamIterParser(t)
+	defer app.Close()
+
+	for _, fx := range solanaStreamFixtures {
+		t.Run(fx.name, func(t *testing.T) {
+			require := require.New(t)
+			header := fixtures.MustReadFile(fx.path)
+			var rawBlock struct {
+				Transactions []json.RawMessage `json:"transactions"`
+			}
+			require.NoError(json.Unmarshal(header, &rawBlock))
+
+			opener, calls := openerFor(header)
+			stream := parser.StreamBlockIter(context.Background(), opener, fx.slot)
+			var got []json.RawMessage
+			for raw, err := range stream.RawTransactions() {
+				require.NoError(err)
+				got = append(got, raw)
+			}
+			require.Equal(len(rawBlock.Transactions), len(got))
+			for i := range got {
+				require.Truef(bytes.Equal(rawBlock.Transactions[i], got[i]), "transaction[%d] not verbatim", i)
+			}
+			hdr, err := stream.Header()
+			require.NoError(err)
+			require.NotEmpty(hdr.GetBlockHash())
+			require.Equal(int32(1), atomic.LoadInt32(calls), "tail cached by the raw pass")
+		})
+	}
+}
+
+// TestSolanaStream_RawTransactionsFiltered: the filter applies to the
+// raw path and kept elements decode to the same transactions the native
+// path yields for the same filter.
+func TestSolanaStream_RawTransactionsFiltered(t *testing.T) {
+	require := require.New(t)
+	parser, app := newStreamIterParser(t)
+	defer app.Close()
+	ctx := context.Background()
+
+	header := fixtures.MustReadFile("parser/solana/block_195545749_v2.json")
+	filter := internal.WithTransactionFilter(func(raw json.RawMessage) (bool, error) {
+		keep, err := touchesAccount(raw, voteProgramID)
+		return !keep, err // non-vote transactions only
+	})
+
+	opener, _ := openerFor(header)
+	native := collectStream(t, parser.StreamBlockIter(ctx, opener, 195545750, filter))
+	require.NotEmpty(native)
+
+	var raws []json.RawMessage
+	for raw, err := range parser.StreamBlockIter(ctx, opener, 195545750, filter).RawTransactions() {
+		require.NoError(err)
+		raws = append(raws, raw)
+	}
+	require.Equal(len(native), len(raws))
+	for i, raw := range raws {
+		var tx SolanaTransactionV2
+		require.NoError(json.Unmarshal(raw, &tx))
+		decoded, err := parser.parseTransactionV2(&tx)
+		require.NoError(err)
+		require.Truef(proto.Equal(native[i], decoded), "raw[%d] decodes to a different transaction", i)
+	}
+}
+
 // TestSolanaStream_HeaderBeforeIter exercises the slow path: Header()
 // before iteration runs one dedicated pass; the following iteration
 // opens the reader again but must not re-derive the tail.
@@ -473,6 +544,31 @@ func BenchmarkSolanaStreamIterFilterProgram(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		stream := parser.StreamBlockIter(context.Background(), opener, 220114808, filter)
 		for _, err := range stream.Transactions() {
+			if err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
+
+// BenchmarkSolanaStreamRawFilterProgram is the bridge-indexer shape:
+// allowlist filter, kept elements yielded as raw bytes, no native
+// decoding at all.
+func BenchmarkSolanaStreamRawFilterProgram(b *testing.B) {
+	parser, app := newStreamIterParser(b)
+	defer app.Close()
+	header := benchHeader(b)
+	opener, _ := openerFor(header)
+	needle := []byte("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+	filter := internal.WithTransactionFilter(func(raw json.RawMessage) (bool, error) {
+		return bytes.Contains(raw, needle), nil
+	})
+	b.SetBytes(int64(len(header)))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stream := parser.StreamBlockIter(context.Background(), opener, 220114808, filter)
+		for _, err := range stream.RawTransactions() {
 			if err != nil {
 				b.Fatal(err)
 			}
