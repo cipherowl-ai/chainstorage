@@ -326,6 +326,13 @@ func (c *timeoutableClient) StreamNativeBlock(ctx context.Context, tag uint32, h
 	return c.client.StreamNativeBlock(ctx, tag, height, hash, opts...)
 }
 
+// StreamNativeBlocksByRange passes through to the wrapped client for the
+// same reason as StreamNativeBlock: the iterator's lifetime is
+// user-controlled.
+func (c *timeoutableClient) StreamNativeBlocksByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, opts ...ParseOption) (NativeStreamedBlockIterator, error) {
+	return c.client.StreamNativeBlocksByRange(ctx, tag, startHeight, endHeight, opts...)
+}
+
 func intercept[T any](ctx context.Context, logger *zap.Logger, operation retry.OperationWithResultFn[T]) (T, error) {
 	return retry.WrapWithResult(
 		ctx,

@@ -128,6 +128,18 @@ type (
 		// Close() when done. A runtime cleanup is wired as a safety
 		// net but should not be relied on.
 		StreamNativeBlock(ctx context.Context, tag uint32, height uint64, hash string, opts ...ParseOption) (NativeStreamedBlock, error)
+
+		// StreamNativeBlocksByRange returns an iterator of
+		// NativeStreamedBlocks over [startHeight, endHeight) in height
+		// order (endHeight 0 means startHeight+1). Consecutive blocks
+		// stored in the same consolidated chunk are decompressed once,
+		// which is what a walk over Solana history needs: calling
+		// StreamNativeBlock per slot re-reads each 25-block chunk for
+		// every slot. opts (e.g. WithTransactionFilter) apply to every
+		// block. The range is bounded by the server's MaxNumBlockFiles;
+		// page longer walks. Callers MUST close every returned block and
+		// the iterator.
+		StreamNativeBlocksByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, opts ...ParseOption) (NativeStreamedBlockIterator, error)
 	}
 
 	ReadSourceClient interface {
@@ -745,6 +757,58 @@ func (c *clientImpl) StreamNativeBlock(
 		return nil, xerrors.Errorf("failed to create native stream: %w", err)
 	}
 	return stream, nil
+}
+
+func (c *clientImpl) StreamNativeBlocksByRange(
+	ctx context.Context,
+	tag uint32, startHeight uint64, endHeight uint64,
+	opts ...ParseOption,
+) (NativeStreamedBlockIterator, error) {
+	if endHeight == 0 {
+		endHeight = startHeight + 1
+	}
+	sp, ok := c.parser.(streamingParser)
+	if !ok {
+		return nil, xerrors.Errorf("parser %T does not support streaming", c.parser)
+	}
+
+	inner, err := c.openSpooledBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_DEFAULT)
+	if err != nil {
+		c.logger.Warn(
+			"preferred native block range open failed; retrying single-block",
+			zap.Uint32("tag", tag),
+			zap.Uint64("start_height", startHeight),
+			zap.Uint64("end_height", endHeight),
+			zap.Error(err),
+		)
+		var fallbackErr error
+		inner, fallbackErr = c.openSpooledBlocksByRange(ctx, tag, startHeight, endHeight, api.BlockReadSource_BLOCK_READ_SOURCE_SINGLE_BLOCK)
+		if fallbackErr != nil {
+			return nil, xerrors.Errorf("failed to open preferred native block range and single-block fallback failed (originalErr=%v): %w", err, fallbackErr)
+		}
+	}
+	return &nativeStreamedBlockIterator{inner: inner, parser: sp, opts: opts}, nil
+}
+
+func (c *clientImpl) openSpooledBlocksByRange(ctx context.Context, tag uint32, startHeight uint64, endHeight uint64, readSource api.BlockReadSource) (downloader.SpooledBlockIterator, error) {
+	resp, err := c.client.GetBlockFilesByRange(ctx, &api.GetBlockFilesByRangeRequest{
+		Tag:         tag,
+		StartHeight: startHeight,
+		EndHeight:   endHeight,
+		ReadSource:  readSource,
+	})
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get block file metadata (tag=%d, startHeight=%d, endHeight=%d): %w", tag, startHeight, endHeight, err)
+	}
+	blockFiles := resp.GetFiles()
+	if len(blockFiles) == 0 {
+		return nil, xerrors.Errorf("no block file metadata found")
+	}
+	inner, err := c.blockDownloader.OpenSpooledBlocks(ctx, blockFiles)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to open spooled block iterator: %w", err)
+	}
+	return inner, nil
 }
 
 func (c *clientImpl) downloadBlockStream(ctx context.Context, tag uint32, height uint64, hash string, readSource api.BlockReadSource) (*downloader.SpooledBlock, error) {

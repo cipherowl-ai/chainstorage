@@ -61,20 +61,28 @@ type (
 		// A runtime cleanup is wired as a safety net for leaks but
 		// runs non-deterministically; do not rely on it.
 		DownloadStream(ctx context.Context, blockFile *api.BlockFile) (*SpooledBlock, error)
+
+		// OpenSpooledBlocks opens an iterator of SpooledBlocks over
+		// blockFiles in input order. Unlike calling DownloadStream per
+		// block, consecutive CSCB block files in the same chunk share one
+		// range request and one decompressor pass (chunk-once). Callers
+		// MUST close each returned SpooledBlock and the iterator.
+		OpenSpooledBlocks(ctx context.Context, blockFiles []*api.BlockFile) (SpooledBlockIterator, error)
 	}
 
 	// SpooledBlock is a chain-agnostic handle over the decompressed
-	// bytes of a block, backed by a local temp file. The parser
+	// bytes of a block, backed by a local temp file (DownloadStream)
+	// or by an in-memory payload (OpenSpooledBlocks). The parser
 	// package consumes it and produces a chain-specific
 	// StreamedBlock with lazy accessors.
 	//
 	// Open may be called multiple times; each call returns an
 	// independent io.ReadCloser positioned at byte 0 of the
-	// decompressed stream. The caller is responsible for closing
-	// every returned reader.
+	// decompressed stream that also implements io.ReaderAt. The
+	// caller is responsible for closing every returned reader.
 	//
-	// Close removes the backing temp file and is safe to call
-	// multiple times.
+	// Close releases the backing store (removes the temp file or
+	// drops the payload) and is safe to call multiple times.
 	SpooledBlock struct {
 		// BlockFile is the source descriptor (chain, tag, height,
 		// hash, compression). Parser implementations branch on
