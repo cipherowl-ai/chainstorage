@@ -720,7 +720,12 @@ const (
 	ConsolidationModePromoteFinalized          ConsolidationMode = "promote_finalized"
 	ConsolidationModeRepairExistingCSCB        ConsolidationMode = "repair_existing_cscb"
 	ConsolidationModeSyncerConsolidatedPrimary ConsolidationMode = "syncer_consolidated_primary"
-	DefaultSingleBlockObjectRetention                            = 72 * time.Hour
+	// DefaultSingleBlockObjectRetention is how long a single-block object
+	// outlives consolidation into a CSCB chunk. It is a repair window: the
+	// single-block originals are the only source a corrupt chunk can be
+	// rebuilt from, so 7 days covers a weekend plus a holiday, where 3 days
+	// let a Friday-evening problem age out before anyone looked on Monday.
+	DefaultSingleBlockObjectRetention = 168 * time.Hour
 
 	StorageGenerationLegacy            StorageGeneration = ""
 	storageGenerationLegacyConfigValue                   = "legacy"
