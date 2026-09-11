@@ -1,4 +1,43 @@
 version: 2.1
+
+orbs:
+  aws-cli: circleci/aws-cli@5.4.2
+
+executors:
+  chainstorage:
+    docker:
+      - image: ${CIPHEROWL_ECR_URL}/cipherowl/circleci:latest
+    working_directory: ~/chainstorage
+    environment:
+      # ECR registry that hosts both the docker-hub pull-through cache (base
+      # images) and the published chainstorage image.
+      ECR_REGISTRY: 471112991249.dkr.ecr.us-east-1.amazonaws.com
+      IMAGE_REPO: 471112991249.dkr.ecr.us-east-1.amazonaws.com/cipherowl/chainstorage
+
+commands:
+  build_image:
+    description: >
+      Assume the CircleCI OIDC role, log in to ECR, and build the chainstorage
+      image tagged with the short git sha. Does not push.
+    steps:
+      - aws-cli/setup:
+          role_arn: ${CIRCLECI_OIDC_ARN}
+      - run:
+          name: Log in to ECR
+          command: |
+            aws ecr get-login-password --region us-east-1 \
+              | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+      - run:
+          name: Build chainstorage image
+          # The Go build inside the Dockerfile is silent for minutes; raise the
+          # default 10m no-output timeout so it is not killed mid-build.
+          no_output_timeout: 30m
+          command: |
+            SHORT_SHA=$(git rev-parse --short=7 HEAD)
+            docker build --platform linux/amd64 \
+              --build-arg BASE_REGISTRY="${ECR_REGISTRY}/docker-hub/" \
+              -t "${IMAGE_REPO}:${SHORT_SHA}" .
+
 jobs:
   build_and_test:
     docker:
@@ -58,6 +97,34 @@ jobs:
             
             docker compose -f docker-compose-testing.yml down
 
+  # Runs on every branch: proves the Dockerfile still builds. Never pushes.
+  build-image:
+    executor: chainstorage
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - build_image
+
+  # Runs on master only, after build_and_test passes: builds and pushes the
+  # sha-pinned tag. No latest/master tags are published; the monorepo pins the
+  # short sha printed at the end of this job.
+  publish-image:
+    executor: chainstorage
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - build_image
+      - run:
+          name: Push chainstorage image
+          command: |
+            SHORT_SHA=$(git rev-parse --short=7 HEAD)
+            IMAGE="${IMAGE_REPO}:${SHORT_SHA}"
+            docker push "${IMAGE}"
+            echo
+            echo "Pushed ${IMAGE}"
+
 workflows:
   version: 2
   default:
@@ -65,3 +132,12 @@ workflows:
       - build_and_test:
           name: build_and_test
           context: cipherowl_build_context
+      - build-image:
+          context: cipherowl_build_context
+      - publish-image:
+          context: cipherowl_build_context
+          requires:
+            - build_and_test
+          filters:
+            branches:
+              only: master
