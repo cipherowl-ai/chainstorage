@@ -15,6 +15,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// headMigrationVersion is the newest embedded migration and deployedCanaryVersion
+// is the version staged by the cleanup scenario below. Adding a migration bumps
+// headMigrationVersion: the assertions here prove the privileged path migrated
+// all the way to head.
+const (
+	headMigrationVersion  = 20260914000001
+	deployedCanaryVersion = 20260908000001
+)
+
 func TestIntegrationMigrationRoleMembershipAllowsWorkerOwnedDDL(t *testing.T) {
 	if os.Getenv("TEST_TYPE") != "integration" {
 		t.Skip("integration test")
@@ -255,11 +264,11 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.False(t, valid)
 	version, err := runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err)
-	require.EqualValues(t, 20260909000001, version)
+	require.EqualValues(t, headMigrationVersion, version)
 	assertMigrationCanaryRemoved(t, migrationDB)
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "re-running the privileged migration path must be idempotent")
-	require.EqualValues(t, 20260909000001, version)
+	require.EqualValues(t, headMigrationVersion, version)
 	assertMigrationCanaryRemoved(t, migrationDB)
 
 	var indexPresent bool
@@ -295,7 +304,7 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.NoError(t, err)
 	version, err = runPrivilegedMigrations(context.Background(), migrationDSN, migrationUser, workerUser, serverUser, dbName, time.Second, zap.NewNop())
 	require.NoError(t, err, "a fresh invocation must recover after session loss")
-	require.EqualValues(t, 20260909000001, version)
+	require.EqualValues(t, headMigrationVersion, version)
 
 	// Stage the deployed create-canary version, then apply only the pending
 	// cleanup through the real privileged path with a non-superuser admin.
@@ -309,7 +318,7 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	defer func() { _ = cleanupWorker.Close() }()
 	cleanupServer := openIntegrationPostgres(t, host, port, cleanupName, serverUser, serverPassword)
 	defer func() { _ = cleanupServer.Close() }()
-	require.NoError(t, goose.UpToContext(context.Background(), cleanupMigration, "db/migrations", 20260908000001))
+	require.NoError(t, goose.UpToContext(context.Background(), cleanupMigration, "db/migrations", deployedCanaryVersion))
 	require.NoError(t, grantMigrationPrivileges(context.Background(), cleanupMigration, migrationUser, workerUser, serverUser, cleanupName))
 	assertMigrationCanary(t, cleanupMigration, cleanupWorker, cleanupServer, migrationUser)
 	_, err = cleanupWorker.Exec("TRUNCATE public.inf1133_migration_canary")
@@ -329,7 +338,7 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.Equal(t, pq.ErrorCode("2BP01"), dependencyErr.Code)
 	version, err = goose.GetDBVersion(cleanupMigration)
 	require.NoError(t, err)
-	require.EqualValues(t, 20260908000001, version, "failed cleanup must not advance Goose")
+	require.EqualValues(t, deployedCanaryVersion, version, "failed cleanup must not advance Goose")
 	var count int
 	require.NoError(t, cleanupServer.QueryRow("SELECT count(*) FROM public.inf1133_migration_canary").Scan(&count))
 	require.Zero(t, count)
@@ -340,7 +349,7 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	for attempt := 0; attempt < 2; attempt++ {
 		version, err = runPrivilegedMigrations(context.Background(), cleanupDSN, migrationUser, workerUser, serverUser, cleanupName, time.Second, zap.NewNop())
 		require.NoError(t, err)
-		require.EqualValues(t, 20260909000001, version)
+		require.EqualValues(t, headMigrationVersion, version)
 		assertMigrationCanaryRemoved(t, cleanupMigration)
 	}
 	require.Equal(t, relationsBefore, migrationRelationSnapshot(t, cleanupMigration),
@@ -355,15 +364,19 @@ $$ LANGUAGE plpgsql`, pq.QuoteIdentifier(triggerFunction)),
 	require.ErrorAs(t, err, &permissionErr)
 	require.Equal(t, pq.ErrorCode("42501"), permissionErr.Code)
 
-	// Local rollback restores the empty schema, and a forward retry removes it.
-	require.NoError(t, goose.DownContext(context.Background(), cleanupMigration, "db/migrations"))
+	// Local rollback to the staged version restores the canary schema, and a
+	// forward retry removes it again. Roll back to an explicit version rather
+	// than one step: a plain Down unwinds only whatever migration is currently
+	// head, so every migration added after the canary pair would otherwise
+	// leave the canary dropped and break the two assertions below.
+	require.NoError(t, goose.DownToContext(context.Background(), cleanupMigration, "db/migrations", deployedCanaryVersion))
 	version, err = goose.GetDBVersion(cleanupMigration)
 	require.NoError(t, err)
-	require.EqualValues(t, 20260908000001, version)
+	require.EqualValues(t, deployedCanaryVersion, version)
 	assertMigrationCanary(t, cleanupMigration, cleanupWorker, cleanupServer, migrationUser)
 	version, err = runPrivilegedMigrations(context.Background(), cleanupDSN, migrationUser, workerUser, serverUser, cleanupName, time.Second, zap.NewNop())
 	require.NoError(t, err)
-	require.EqualValues(t, 20260909000001, version)
+	require.EqualValues(t, headMigrationVersion, version)
 	assertMigrationCanaryRemoved(t, cleanupMigration)
 
 	// Exercise db-init's entire empty-database migration path, not just an
