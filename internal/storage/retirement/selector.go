@@ -122,6 +122,28 @@ type (
 			endHeight uint64,
 			eligibilityCutoff time.Time,
 		) (uint64, bool, error)
+
+		// RetentionEarliestDeadline returns the earliest
+		// single_block_delete_after among the SAME candidate rows
+		// RetentionDueFloor considers in [minHeight, endHeight), and whether
+		// any such row exists.
+		//
+		// It exists so a caller can decide "is anything due at all" without
+		// paying for the due-floor walk. Because both carry an identical
+		// predicate set, deadline > cutoff is exactly "RetentionDueFloor would
+		// report nothing due at cutoff" — not a heuristic, but MIN's defining
+		// property. The predicate sets must therefore stay in lockstep; the
+		// paired test in selector_postgres_test.go fails if they drift.
+		//
+		// No cutoff is taken deliberately: the caller compares against the
+		// cutoff it will hand to RetentionDueFloor, so one clock decides both.
+		RetentionEarliestDeadline(
+			ctx context.Context,
+			storageGeneration string,
+			tag uint32,
+			minHeight uint64,
+			endHeight uint64,
+		) (time.Time, bool, error)
 	}
 
 	Selector struct {
@@ -381,6 +403,33 @@ func (s *Selector) FloorWatermarkInRange(
 		return 0, false, xerrors.Errorf("failed to resolve bounded retention floor watermark: %w", err)
 	}
 	return height, found, nil
+}
+
+// EarliestDeadline reports when the next candidate row in
+// [minHeight, endHeight) falls due, and whether any candidate exists at all.
+// found=false means the range holds no undeleted single-block object; it is
+// never an error and never means "due now".
+func (s *Selector) EarliestDeadline(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (time.Time, bool, error) {
+	if s == nil || s.repo == nil {
+		return time.Time{}, false, xerrors.New("retention cohort repository is required")
+	}
+	if !isValidStorageGeneration(storageGeneration) {
+		return time.Time{}, false, xerrors.Errorf("unsupported retention cohort storage generation %q", storageGeneration)
+	}
+	if endHeight <= minHeight {
+		return time.Time{}, false, nil
+	}
+	deadline, found, err := s.repo.RetentionEarliestDeadline(ctx, storageGeneration, tag, minHeight, endHeight)
+	if err != nil {
+		return time.Time{}, false, xerrors.Errorf("failed to resolve retention earliest deadline: %w", err)
+	}
+	return deadline, found, nil
 }
 
 // DueFloor resolves the lowest height in [floorHeight, endHeight) that is due

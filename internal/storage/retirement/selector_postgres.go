@@ -848,6 +848,106 @@ func retentionDueFloor(
 	return uint64(height.Int64), true, nil
 }
 
+func (r *PostgresRepository) RetentionEarliestDeadline(
+	ctx context.Context,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (time.Time, bool, error) {
+	if r == nil || r.db == nil {
+		return time.Time{}, false, xerrors.New("postgres db is required")
+	}
+	return retentionEarliestDeadline(ctx, r.db, storageGeneration, tag, minHeight, endHeight)
+}
+
+// retentionEarliestDeadline answers "when does the next row in this range fall
+// due", where retentionDueFloor answers "which row is due now". The two carry
+// an IDENTICAL predicate set on purpose: with the same candidate rows,
+// MIN(single_block_delete_after) > cutoff is the definition of "no row has
+// single_block_delete_after <= cutoff", so gating the floor probe on this is an
+// algebraic equivalence rather than an approximation. Any predicate added to
+// one and not the other silently breaks that, which is what the paired test
+// asserts.
+//
+// The cost difference is the whole point. retentionDueFloor asks for
+// MIN(height), which Postgres rewrites into an ordered walk of
+// idx_block_consolidation_shadow_tag_height, so the envelope WIDTH becomes a
+// row count: measured on solana-mainnet prod over a 1.91M-height envelope,
+// 1,240,520 rows filtered, 668,980 buffers, 3.6s cold. MIN of the deadline
+// seeks on idx_block_consolidation_shadow_retention_due_generation's own key,
+// where the deadline is the third column, so width is irrelevant: same
+// envelope, 10,221 buffers, 76ms. Under a 7-day retention window roughly 165
+// of every 168 hourly ticks have nothing due, and each of those now costs the
+// seek rather than the walk.
+//
+// This deliberately takes no eligibility cutoff. It reports the deadline and
+// lets the caller compare against the cutoff IT will pass to the floor probe,
+// so the two decisions cannot straddle two different clocks (see the cron).
+func retentionEarliestDeadline(
+	ctx context.Context,
+	db retentionCohortQuerier,
+	storageGeneration string,
+	tag uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (time.Time, bool, error) {
+	if endHeight <= minHeight {
+		return time.Time{}, false, nil
+	}
+	query := `
+		SELECT MIN(shadow.single_block_delete_after)
+		FROM block_consolidation_shadow shadow
+		WHERE shadow.tag = $1
+			AND shadow.height >= $2
+			AND shadow.height < $3
+			AND shadow.validated_at IS NOT NULL
+			AND shadow.single_block_delete_after IS NOT NULL
+			AND shadow.single_block_object_deleted_at IS NULL
+			AND shadow.single_block_object_key_main IS NOT NULL
+			AND shadow.single_block_object_key_main <> ''
+			AND shadow.consolidated_object_key_main IS NOT NULL
+			AND shadow.consolidated_object_key_main <> ''
+			AND ` + storageGenerationMatch(
+		storageGeneration,
+		"$4",
+		"shadow.single_block_storage_generation",
+		"shadow.consolidated_storage_generation",
+	)
+
+	args := []any{tag, minHeight, endHeight}
+	if storageGenerationIsBound(storageGeneration) {
+		args = append(args, storageGeneration)
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return time.Time{}, false, xerrors.Errorf("failed to query retention earliest deadline: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return time.Time{}, false, xerrors.Errorf("failed to iterate retention earliest deadline: %w", err)
+		}
+		return time.Time{}, false, nil
+	}
+	var deadline sql.NullTime
+	if err := rows.Scan(&deadline); err != nil {
+		return time.Time{}, false, xerrors.Errorf("failed to scan retention earliest deadline: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return time.Time{}, false, xerrors.Errorf("failed to iterate retention earliest deadline: %w", err)
+	}
+	// MIN over an empty candidate set is NULL, not an error, and NULL compares
+	// to nothing: a caller that folded this into a boolean would get NULL and,
+	// depending on how it is written, fall through to "due". Report absence
+	// explicitly so the caller cannot express that bug.
+	if !deadline.Valid {
+		return time.Time{}, false, nil
+	}
+	return deadline.Time.UTC(), true, nil
+}
+
 func (r *PostgresRepository) RetentionFloorWatermark(
 	ctx context.Context,
 	storageGeneration string,

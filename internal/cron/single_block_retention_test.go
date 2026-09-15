@@ -58,15 +58,21 @@ type retentionCronCohortRepository struct {
 	// regardless of the requested window, so a probe searching entirely the
 	// wrong range still looked correct and the INF-1416 starvation bug was
 	// invisible to every test in this file.
-	rawDueHeights   []uint64
-	nextCursor      retirement.DueCohortCursor
-	afterCursors    []retirement.DueCohortCursor
-	selectCalls     [][2]uint64
-	dueFloorErr     error
-	dueFloorMinArg  uint64
-	dueFloorMinArgs []uint64
-	dueFloorEndArg  uint64
-	dueFloorCalls   int
+	rawDueHeights        []uint64
+	nextCursor           retirement.DueCohortCursor
+	afterCursors         []retirement.DueCohortCursor
+	selectCalls          [][2]uint64
+	dueFloorErr          error
+	dueFloorMinArg       uint64
+	dueFloorMinArgs      []uint64
+	dueFloorEndArg       uint64
+	dueFloorCalls        int
+	earliestDeadline     time.Time
+	earliestNoCandidates bool
+	earliestErr          error
+	earliestCalls        int
+	earliestMinArg       uint64
+	earliestEndArg       uint64
 }
 
 // dueFloorFixtures returns every height the production due-floor candidate
@@ -84,6 +90,30 @@ func (r *retentionCronCohortRepository) dueFloorFixtures(eligibilityCutoff time.
 		heights = append(heights, cohort.StartHeight)
 	}
 	return heights
+}
+
+// RetentionEarliestDeadline defaults to "a candidate exists and its deadline
+// is the zero time", i.e. year 1 — already past any cutoff a test will use, so
+// the cron's deadline gate opens and every pre-existing test still exercises
+// the due-floor path it was written for. A test that wants the gate CLOSED
+// sets earliestDeadline into the future, or earliestNoCandidates.
+func (r *retentionCronCohortRepository) RetentionEarliestDeadline(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (time.Time, bool, error) {
+	r.earliestCalls++
+	r.earliestMinArg = minHeight
+	r.earliestEndArg = endHeight
+	if r.earliestErr != nil {
+		return time.Time{}, false, r.earliestErr
+	}
+	if r.earliestNoCandidates {
+		return time.Time{}, false, nil
+	}
+	return r.earliestDeadline, true, nil
 }
 
 func (r *retentionCronCohortRepository) RetentionDueFloor(

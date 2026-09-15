@@ -30,15 +30,45 @@ type fakeCohortRepository struct {
 	inRangeHeights []uint64
 	inRangeCalls   [][2]uint64
 
-	dueFloor        uint64
-	dueFloorFound   bool
-	dueFloorErr     error
-	dueFloorMinArg  uint64
-	dueFloorEndArg  uint64
-	nextCursor      DueCohortCursor
-	afterCursor     DueCohortCursor
-	dueFloorCutoff  time.Time
-	dueFloorCallCnt int
+	dueFloor             uint64
+	dueFloorFound        bool
+	dueFloorErr          error
+	dueFloorMinArg       uint64
+	dueFloorEndArg       uint64
+	nextCursor           DueCohortCursor
+	afterCursor          DueCohortCursor
+	dueFloorCutoff       time.Time
+	dueFloorCallCnt      int
+	earliestDeadline     time.Time
+	earliestNoCandidates bool
+	earliestErr          error
+	earliestCalls        int
+	earliestMinArg       uint64
+	earliestEndArg       uint64
+}
+
+// RetentionEarliestDeadline defaults to "a candidate exists and its deadline
+// is the zero time", i.e. year 1 — already past any cutoff a test will use, so
+// the cron's deadline gate opens and every pre-existing test still exercises
+// the due-floor path it was written for. A test that wants the gate CLOSED
+// sets earliestDeadline into the future, or earliestNoCandidates.
+func (r *fakeCohortRepository) RetentionEarliestDeadline(
+	_ context.Context,
+	_ string,
+	_ uint32,
+	minHeight uint64,
+	endHeight uint64,
+) (time.Time, bool, error) {
+	r.earliestCalls++
+	r.earliestMinArg = minHeight
+	r.earliestEndArg = endHeight
+	if r.earliestErr != nil {
+		return time.Time{}, false, r.earliestErr
+	}
+	if r.earliestNoCandidates {
+		return time.Time{}, false, nil
+	}
+	return r.earliestDeadline, true, nil
 }
 
 func (r *fakeCohortRepository) RetentionDueFloor(

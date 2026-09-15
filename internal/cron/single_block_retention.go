@@ -393,6 +393,87 @@ func (t *singleBlockRetentionTask) runTick(ctx context.Context) error {
 	t.metrics.Gauge("floor_watermark_height").Update(float64(probeStart))
 	t.metrics.Gauge("probe_range_blocks").Update(float64(approvedEnd - probeStart))
 
+	// probe_duration_seconds covers the whole search — the deadline gate below,
+	// floor lookups, probes, and advances — so a slow tick is visible no matter
+	// which stage is slow. Declared here rather than at the walk so the gate,
+	// which is a floor lookup, is inside the measurement it belongs to.
+	probeStartedAt := time.Now()
+
+	// Gate the due-floor walk on the cheapest question that can answer it:
+	// when does the next candidate row fall due?
+	//
+	// The walk below asks for the lowest DUE height, and MIN(height) is
+	// rewritten by Postgres into an ordered scan of the tag+height index, so
+	// the envelope WIDTH becomes a row count. Under a 7-day retention window
+	// the floor legitimately stops advancing for days between tranches while
+	// approvedEnd keeps climbing with consolidation, so that width grows
+	// without bound and the walk re-derives "nothing due" from over a million
+	// rows every tick. Measured on solana-mainnet prod across a 1.91M-height
+	// envelope: 1,240,520 rows filtered, 668,980 buffers, 3.6s cold. The
+	// deadline seek covers the identical candidate set in 10,221 buffers and
+	// 76ms, because the deadline is a key column of the generation index while
+	// height is not.
+	//
+	// This is an equivalence, not a shortcut. Both queries carry the same
+	// predicate set, so "earliest deadline is after the cutoff" IS "no row is
+	// due at the cutoff" — MIN's defining property. Three things keep it that
+	// way, and each is a silent gap if dropped:
+	//
+	//   - eligibilityCutoff is passed to BOTH, so one clock decides both. The
+	//     cutoff is time.Now() in this process, not the database's: gating on
+	//     the database clock instead would let app/RDS skew hide work. The
+	//     margin is days for most of a retention window and SECONDS at the
+	//     transition, which is exactly the tick that matters.
+	//   - the answer is never cached across ticks. A deadline can be lowered
+	//     between ticks by re-consolidation restamping or by a shortened
+	//     retention window, so sleeping until it would strand work. Re-asking
+	//     costs 76ms and keeps this tick's staleness identical to before.
+	//   - the range is [probeStart, approvedEnd), the widest window this tick
+	//     can reach. The advance loop only ever raises searchStart, so gating
+	//     on the initial window is a superset of every advance and nothing can
+	//     hide above it.
+	nextDeadline, hasCandidates, err := selector.EarliestDeadline(ctx, storageGeneration, tag, probeStart, approvedEnd)
+	if err != nil {
+		t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+		return xerrors.Errorf("failed to resolve retention earliest deadline: %w", err)
+	}
+	if !hasCandidates || nextDeadline.After(eligibilityCutoff) {
+		// Absence of candidates and a future deadline are the same outcome for
+		// this tick, but they are NOT the same fact, so the gauge separates
+		// them: zero means "nothing left to retire here", positive means
+		// "work exists and is waiting". Reset every probe-only gauge for the
+		// same reason the walk's own idle path does — a gauge holding the
+		// previous tick's value would report a scan that never happened.
+		var waitSeconds float64
+		if hasCandidates {
+			waitSeconds = nextDeadline.Sub(eligibilityCutoff).Seconds()
+		}
+		t.metrics.Gauge("next_due_in_seconds").Update(waitSeconds)
+		t.metrics.Gauge("probe_duration_seconds").Update(time.Since(probeStartedAt).Seconds())
+		t.metrics.Gauge("probe_window_blocks").Update(0)
+		t.metrics.Gauge("due_floor_height").Update(0)
+		t.metrics.Gauge("probe_advance_exhausted").Update(0)
+		t.metrics.Gauge("oldest_due_age_seconds").Update(0)
+		t.metrics.Gauge("probe_backlog_truncated").Update(0)
+		t.probeResumeHeight.Store(0)
+		t.logger.Info(
+			"single_block_retention cron found nothing due",
+			zap.Uint32("tag", tag),
+			zap.String("bucket", bucket),
+			zap.String("storage_generation", storageGeneration),
+			zap.Uint64("approved_start_height", cronConfig.ApprovedStartHeight),
+			zap.Uint64("approved_end_height", approvedEnd),
+			zap.Uint64("floor_watermark_height", probeStart),
+			zap.Bool("has_candidates", hasCandidates),
+			zap.Float64("next_due_in_seconds", waitSeconds),
+			zap.String("gated_by", "earliest_deadline"),
+		)
+		return nil
+	}
+	// Something is due. The walk below still runs, and still decides WHICH
+	// height anchors the window: this gate only proves the walk is worth it.
+	t.metrics.Gauge("next_due_in_seconds").Update(0)
+
 	// Bound the PROBE by the same window that bounds the sweep.
 	//
 	// Without this the probe spans [watermark, approvedEnd] no matter how far
@@ -426,9 +507,6 @@ func (t *singleBlockRetentionTask) runTick(ctx context.Context) error {
 		windowBlocks = defaultSingleBlockRetentionWindowBlocks
 	}
 
-	// probe_duration_seconds covers the whole search — floor lookups, probes,
-	// and advances — so a slow tick is visible no matter which stage is slow.
-	probeStartedAt := time.Now()
 	var (
 		cohorts    []retirement.RetentionCohort
 		hasMore    bool
