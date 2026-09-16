@@ -66,5 +66,8 @@ var Module = fx.Options(
 	internal.NewParserBuilder("robinhood", NewRobinhoodNativeParser).
 		SetValidatorFactory(NewRobinhoodValidator).
 		Build(),
+	internal.NewParserBuilder("arc", NewArcNativeParser).
+		SetValidatorFactory(NewArcValidator).
+		Build(),
 	beacon.Module,
 )
