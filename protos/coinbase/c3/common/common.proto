@@ -34,6 +34,7 @@ enum Blockchain {
     BLOCKCHAIN_ZCASH = 68; // Zcash
     BLOCKCHAIN_TEMPO = 69; // Tempo
     BLOCKCHAIN_ROBINHOOD = 70; // Robinhood Chain
+    BLOCKCHAIN_ARC = 71; // Arc
 }
 
 // Network defines an enumeration of supported networks.
@@ -116,5 +117,8 @@ enum Network {
 
     NETWORK_ROBINHOOD_MAINNET = 154;
     NETWORK_ROBINHOOD_TESTNET = 155;
+
+    NETWORK_ARC_MAINNET = 156;
+    NETWORK_ARC_TESTNET = 157;
 
 }

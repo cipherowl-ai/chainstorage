@@ -91,6 +91,7 @@ type (
 		Zcash           ParserFactory `name:"zcash" optional:"true"`
 		Tempo           ParserFactory `name:"tempo" optional:"true"`
 		Robinhood       ParserFactory `name:"robinhood" optional:"true"`
+		Arc             ParserFactory `name:"arc" optional:"true"`
 	}
 
 	ParserParams struct {
@@ -158,6 +159,8 @@ func NewParser(params Params) (Parser, error) {
 			factory = params.Tempo
 		case common.Blockchain_BLOCKCHAIN_ROBINHOOD:
 			factory = params.Robinhood
+		case common.Blockchain_BLOCKCHAIN_ARC:
+			factory = params.Arc
 		default:
 			if params.Config.IsRosetta() {
 				factory = params.Rosetta
