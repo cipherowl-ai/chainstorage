@@ -9,10 +9,12 @@ import (
 	"math/rand/v2"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lib/pq"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
@@ -31,6 +33,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/retirement"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
+	"github.com/coinbase/chainstorage/internal/utils/utils"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
 
@@ -565,6 +568,11 @@ func (s *blockStorageTestSuite) TestPersistBlockMetasByMaxWriteSize() {
 		{totalBlocks: 4},
 		{totalBlocks: 8},
 		{totalBlocks: 64},
+		// Around the set-based insert chunk boundary, and the production backfiller batch_size.
+		{totalBlocks: persistBlockMetasChunkSize - 1},
+		{totalBlocks: persistBlockMetasChunkSize},
+		{totalBlocks: persistBlockMetasChunkSize + 1},
+		{totalBlocks: 2500},
 	}
 	for _, test := range tests {
 		s.T().Run(fmt.Sprintf("test %d blocks", test.totalBlocks), func(t *testing.T) {
@@ -1986,4 +1994,485 @@ func TestIntegrationBlockStorageTestSuite(t *testing.T) {
 	cfg, err := config.New()
 	require.NoError(err)
 	suite.Run(t, &blockStorageTestSuite{config: cfg})
+}
+
+// ---------------------------------------------------------------------------------------------
+// Set-based PersistBlockMetas (INF-1675)
+// ---------------------------------------------------------------------------------------------
+
+func (s *blockStorageTestSuite) cloneBlocks(blocks []*api.BlockMetadata) []*api.BlockMetadata {
+	cloned := make([]*api.BlockMetadata, len(blocks))
+	for i, block := range blocks {
+		cloned[i] = proto.Clone(block).(*api.BlockMetadata)
+	}
+	return cloned
+}
+
+func (s *blockStorageTestSuite) countBlockMetadataAtHeight(ctx context.Context, blockTag uint32, height uint64) int {
+	require := testutil.Require(s.T())
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM block_metadata WHERE tag = $1 AND height = $2`, blockTag, height).Scan(&count)
+	require.NoError(err)
+	return count
+}
+
+func (s *blockStorageTestSuite) canonicalIDsByHeight(ctx context.Context, blockTag uint32) map[uint64]int64 {
+	require := testutil.Require(s.T())
+	rows, err := s.db.QueryContext(ctx, `SELECT height, block_metadata_id FROM canonical_blocks WHERE tag = $1`, blockTag)
+	require.NoError(err)
+	defer rows.Close()
+	ids := make(map[uint64]int64)
+	for rows.Next() {
+		var height uint64
+		var id int64
+		require.NoError(rows.Scan(&height, &id))
+		ids[height] = id
+	}
+	require.NoError(rows.Err())
+	return ids
+}
+
+func (s *blockStorageTestSuite) countBlockMetadata(ctx context.Context, blockTag uint32) int {
+	require := testutil.Require(s.T())
+	var count int
+	require.NoError(s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM block_metadata WHERE tag = $1`, blockTag).Scan(&count))
+	return count
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasSkippedAcrossChunkBoundaries() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	boundary := persistBlockMetasChunkSize
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, boundary+5, tag)
+	// Skipped rows straddle the first chunk boundary: last row of chunk 1, first two of chunk 2.
+	for _, i := range []int{boundary - 1, boundary, boundary + 1} {
+		blocks[i] = &api.BlockMetadata{Tag: tag, Height: startHeight + uint64(i), Skipped: true}
+	}
+	blocks[boundary+2].ParentHeight = blocks[boundary-2].Height
+	blocks[boundary+2].ParentHash = blocks[boundary-2].Hash
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+
+	fetched, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+uint64(len(blocks)))
+	require.NoError(err)
+	require.Len(fetched, len(blocks))
+	for i := range blocks {
+		s.equalProto(blocks[i], fetched[i])
+	}
+	latest, err := s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	s.equalProto(blocks[len(blocks)-1], latest)
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasAllSkippedBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := make([]*api.BlockMetadata, 0, 3)
+	for i := uint64(0); i < 3; i++ {
+		blocks = append(blocks, &api.BlockMetadata{Tag: tag, Height: startHeight + i, Skipped: true})
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+
+	fetched, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+3)
+	require.NoError(err)
+	require.Len(fetched, 3)
+	for i := range blocks {
+		s.equalProto(blocks[i], fetched[i])
+	}
+	latest, err := s.accessor.GetLatestBlock(ctx, tag)
+	require.NoError(err)
+	s.equalProto(blocks[2], latest)
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasSameHeightRegularAndSkippedLastWins() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	chain := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+	skippedAt2 := &api.BlockMetadata{Tag: tag, Height: startHeight + 2, Skipped: true}
+	skippedAt3 := &api.BlockMetadata{Tag: tag, Height: startHeight + 3, Skipped: true}
+	// Caller order decides: the skipped row comes after the regular one at height 2 and before it
+	// at height 3. Chain validation ignores skipped rows, so the regular chain stays continuous.
+	batch := []*api.BlockMetadata{chain[0], chain[1], chain[2], skippedAt2, skippedAt3, chain[3], chain[4]}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(batch), nil))
+
+	at2, err := s.accessor.GetBlockByHeight(ctx, tag, startHeight+2)
+	require.NoError(err)
+	s.equalProto(skippedAt2, at2)
+	at3, err := s.accessor.GetBlockByHeight(ctx, tag, startHeight+3)
+	require.NoError(err)
+	s.equalProto(chain[3], at3)
+	// Both rows are kept in block_metadata and the regular ones stay retrievable by hash.
+	require.Equal(2, s.countBlockMetadataAtHeight(ctx, tag, startHeight+2))
+	require.Equal(2, s.countBlockMetadataAtHeight(ctx, tag, startHeight+3))
+	s.equalProto(chain[2], mustGetBlockByHash(s.T(), s.accessor, chain[2]))
+	s.equalProto(chain[3], mustGetBlockByHash(s.T(), s.accessor, chain[3]))
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasSameHeightReorgPairLastWins() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	chain := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 10, tag)
+	top := chain[9]
+	altA := proto.Clone(top).(*api.BlockMetadata)
+	altA.Hash = "0xalt-a"
+	altA.ParentHash = ""
+	altA.ParentHeight = 0
+	altA.ObjectKeyMain = "alt-a"
+	altB := proto.Clone(altA).(*api.BlockMetadata)
+	altB.Hash = "0xalt-b"
+	altB.ObjectKeyMain = "alt-b"
+
+	batch := append(s.cloneBlocks(chain), proto.Clone(altA).(*api.BlockMetadata), proto.Clone(altB).(*api.BlockMetadata))
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, batch, nil))
+	canonical, err := s.accessor.GetBlockByHeight(ctx, tag, top.Height)
+	require.NoError(err)
+	s.equalProto(altB, canonical)
+	s.equalProto(top, mustGetBlockByHash(s.T(), s.accessor, top))
+	s.equalProto(altA, mustGetBlockByHash(s.T(), s.accessor, altA))
+	require.Equal(3, s.countBlockMetadataAtHeight(ctx, tag, top.Height))
+
+	// Reversed caller order among the same-height blocks flips the winner.
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks([]*api.BlockMetadata{altB, altA}), nil))
+	canonical, err = s.accessor.GetBlockByHeight(ctx, tag, top.Height)
+	require.NoError(err)
+	s.equalProto(altA, canonical)
+	require.Equal(3, s.countBlockMetadataAtHeight(ctx, tag, top.Height))
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasDuplicateEntriesInBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	chain := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+	duplicate := proto.Clone(chain[2]).(*api.BlockMetadata)
+	duplicate.ParentHash = ""
+	duplicate.ParentHeight = 0
+	duplicate.ObjectKeyMain = "duplicate"
+	skippedA := &api.BlockMetadata{Tag: tag, Height: startHeight + 5, Skipped: true}
+	skippedB := &api.BlockMetadata{Tag: tag, Height: startHeight + 5, Skipped: true}
+	// The same conflict key twice in one batch must not trip "cannot affect row a second time".
+	batch := []*api.BlockMetadata{chain[0], chain[1], chain[2], duplicate, chain[3], chain[4], skippedA, skippedB}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(batch), nil))
+
+	require.Equal(1, s.countBlockMetadataAtHeight(ctx, tag, startHeight+2))
+	at2, err := s.accessor.GetBlockByHeight(ctx, tag, startHeight+2)
+	require.NoError(err)
+	require.Equal("duplicate", at2.ObjectKeyMain, "the later duplicate updates the row")
+	require.Equal(1, s.countBlockMetadataAtHeight(ctx, tag, startHeight+5))
+	at5, err := s.accessor.GetBlockByHeight(ctx, tag, startHeight+5)
+	require.NoError(err)
+	require.True(at5.Skipped)
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasIdempotentReplay() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	size := persistBlockMetasChunkSize + 1
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, size, tag)
+	mid := size / 2
+	blocks[mid] = &api.BlockMetadata{Tag: tag, Height: startHeight + uint64(mid), Skipped: true}
+	blocks[mid+1].ParentHeight = blocks[mid-1].Height
+	blocks[mid+1].ParentHash = blocks[mid-1].Hash
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+	ids := s.canonicalIDsByHeight(ctx, tag)
+	count := s.countBlockMetadata(ctx, tag)
+	require.Len(ids, size)
+	require.Equal(size, count)
+
+	// An identical replay changes nothing.
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+	require.Equal(ids, s.canonicalIDsByHeight(ctx, tag))
+	require.Equal(count, s.countBlockMetadata(ctx, tag))
+
+	// A replay with new placements updates the rows in place and keeps every id.
+	replayed := s.cloneBlocks(blocks)
+	for _, block := range replayed {
+		if block.Skipped {
+			continue
+		}
+		block.ObjectKeyMain += ".replayed"
+		block.Timestamp = utils.ToTimestamp(block.GetTimestamp().GetSeconds() + 1)
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, s.cloneBlocks(replayed), nil))
+	require.Equal(ids, s.canonicalIDsByHeight(ctx, tag))
+	require.Equal(count, s.countBlockMetadata(ctx, tag))
+	fetched, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+uint64(size))
+	require.NoError(err)
+	require.Len(fetched, size)
+	for i := range replayed {
+		s.equalProto(replayed[i], fetched[i])
+	}
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasMultiTagBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	const otherTag = tag + 1
+	// Chain validation ignores tags, so the two tags must occupy disjoint height ranges within one
+	// batch; the second tag's first block has no parent hash so the check does not cross tags.
+	first := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 5, tag)
+	second := testutil.MakeBlockMetadatasFromStartHeight(startHeight+5, 5, otherTag)
+	second[0].ParentHash = ""
+	second[0].ParentHeight = 0
+	batch := append(s.cloneBlocks(first), s.cloneBlocks(second)...)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, batch, nil))
+
+	for _, expected := range [][]*api.BlockMetadata{first, second} {
+		fetched, err := s.accessor.GetBlocksByHeightRange(ctx, expected[0].Tag, expected[0].Height, expected[0].Height+5)
+		require.NoError(err)
+		require.Len(fetched, 5)
+		for i := range expected {
+			s.equalProto(expected[i], fetched[i])
+		}
+		// Nothing leaked into the other tag's canonical chain.
+		_, err = s.accessor.GetBlockByHeight(ctx, expected[0].Tag, expected[0].Height+5)
+		require.Error(err)
+		require.True(xerrors.Is(err, errors.ErrItemNotFound))
+	}
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasMixedObjectFormatsBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 40, tag)
+	for i, block := range blocks {
+		if i%2 == 0 {
+			block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
+			continue
+		}
+		block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH
+		block.ObjectKeyMain = fmt.Sprintf("consolidated/batch-%d.cscb.gzip", i/10)
+		block.ByteOffset = uint64(i) * 100
+		block.ByteLength = 100
+		block.UncompressedLength = 250
+		block.StorageGeneration = "v2"
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+
+	fetched, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+40)
+	require.NoError(err)
+	require.Len(fetched, 40)
+	for i := range blocks {
+		s.equalProto(blocks[i], fetched[i])
+	}
+}
+
+// fenceBlockForRetirement moves an already persisted single-block row to a CSCB placement, records
+// its shadow, and prepares its retirement, which fences the row. It returns the row id and the
+// consolidated object key the row must keep from then on.
+func (s *blockStorageTestSuite) fenceBlockForRetirement(ctx context.Context, block *api.BlockMetadata) (int64, string) {
+	require := testutil.Require(s.T())
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
+	require.True(ok)
+
+	cscbKey := fmt.Sprintf("consolidated/fenced-%d.cscb.gzip", block.Height)
+	var blockMetadataID int64
+	err := s.db.QueryRowContext(ctx, `
+		UPDATE block_metadata
+		SET object_key_main = $1,
+			object_format = $2,
+			byte_offset = $3,
+			byte_length = $4,
+			uncompressed_length = $5
+		WHERE tag = $6 AND hash = $7
+		RETURNING id`,
+		cscbKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+		block.Tag,
+		block.Hash,
+	).Scan(&blockMetadataID)
+	require.NoError(err)
+
+	validatedAt := time.Now().UTC().Add(-96 * time.Hour)
+	retireAfter := validatedAt.Add(72 * time.Hour)
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO block_consolidation_shadow (
+			block_metadata_id, tag, height, hash, single_block_object_key_main,
+			consolidated_object_key_main, object_format, byte_offset, byte_length,
+			uncompressed_length, validated_at, single_block_retention_started_at, single_block_delete_after
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11, $12)`,
+		blockMetadataID,
+		block.Tag,
+		block.Height,
+		block.Hash,
+		block.ObjectKeyMain,
+		cscbKey,
+		api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH,
+		64,
+		128,
+		256,
+		validatedAt,
+		retireAfter,
+	)
+	require.NoError(err)
+
+	repo := retirement.NewPostgresRepository(s.db)
+	manifest := retirement.RetirementManifest{
+		BlockMetadataID:                blockMetadataID,
+		Tag:                            block.Tag,
+		Height:                         block.Height,
+		Hash:                           block.Hash,
+		State:                          retirement.RetirementStateEligible,
+		Bucket:                         "integration-bucket",
+		SingleBlockObjectKey:           block.ObjectKeyMain,
+		SingleBlockObjectKeySHA256:     sha256Hex(block.ObjectKeyMain),
+		SingleBlockObjectVersionIDs:    []string{"single-block-v1"},
+		SingleBlockObjectETag:          "single-block-etag",
+		SingleBlockObjectBytes:         512,
+		ConsolidatedObjectKey:          cscbKey,
+		ConsolidatedObjectVersionID:    "cscb-v1",
+		ConsolidatedObjectETag:         "cscb-etag",
+		ConsolidatedByteOffset:         64,
+		ConsolidatedByteLength:         128,
+		ConsolidatedUncompressedLength: 256,
+		PayloadSHA256:                  strings.Repeat("a", 64),
+		PreparedAt:                     time.Now().UTC(),
+	}
+	require.NoError(repo.PrepareRetirement(ctx, manifest, ""))
+
+	fencedGuard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, block.Tag, block.Height, block.Hash)
+	require.NoError(err)
+	require.True(fencedGuard.RetirementFenced())
+	require.NoError(fencedGuard.Release())
+	return blockMetadataID, cscbKey
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasPreservesRetirementFencedCSCBPlacementInBatch() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
+	for _, block := range blocks {
+		block.ObjectFormat = api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_SINGLE_BLOCK
+		block.ObjectKeyMain = fmt.Sprintf("single-block/%d.gzip", block.Height)
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+	fencedID, cscbKey := s.fenceBlockForRetirement(ctx, blocks[1])
+	idsBefore := s.canonicalIDsByHeight(ctx, tag)
+
+	// Replay all three rows with new single-block placements in one set-based statement.
+	replayed := s.cloneBlocks(blocks)
+	for _, block := range replayed {
+		block.ObjectKeyMain = fmt.Sprintf("single-block/replayed-%d.gzip", block.Height)
+		block.StorageGeneration = "v2"
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, s.cloneBlocks(replayed), nil))
+
+	for _, fetched := range []*api.BlockMetadata{
+		mustGetBlockByHash(s.T(), s.accessor, blocks[1]),
+		mustGetBlockByHeight(s.T(), s.accessor, blocks[1]),
+	} {
+		require.Equal(cscbKey, fetched.ObjectKeyMain)
+		require.Equal(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH, fetched.ObjectFormat)
+		require.Equal(uint64(64), fetched.ByteOffset)
+		require.Equal(uint64(128), fetched.ByteLength)
+		require.Equal(uint64(256), fetched.UncompressedLength)
+		require.Equal("", fetched.GetStorageGeneration())
+	}
+	for _, i := range []int{0, 2} {
+		fetched := mustGetBlockByHeight(s.T(), s.accessor, blocks[i])
+		s.equalProto(replayed[i], fetched)
+	}
+	idsAfter := s.canonicalIDsByHeight(ctx, tag)
+	require.Equal(idsBefore, idsAfter)
+	require.Equal(fencedID, idsAfter[blocks[1].Height])
+}
+
+func isPostgresDeadlock(err error) bool {
+	var pqErr *pq.Error
+	return xerrors.As(err, &pqErr) && pqErr.Code == "40P01"
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasConcurrentOverlappingWriters() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	chain := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 450, tag)
+	// Two writers on overlapping ranges, the shape of a poller and a backfiller sharing a tag.
+	ranges := [][2]int{{0, 300}, {150, 450}}
+	const rounds = 5
+	var wg sync.WaitGroup
+	errs := make(chan error, len(ranges)*rounds)
+	deadlocks := make(chan struct{}, len(ranges)*rounds*10)
+	for _, r := range ranges {
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			for round := 0; round < rounds; round++ {
+				var err error
+				for attempt := 0; attempt < 10; attempt++ {
+					err = s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(chain[lo:hi]), nil)
+					if err == nil || !isPostgresDeadlock(err) {
+						break
+					}
+					deadlocks <- struct{}{}
+				}
+				if err != nil {
+					errs <- err
+				}
+			}
+		}(r[0], r[1])
+	}
+	wg.Wait()
+	close(errs)
+	close(deadlocks)
+	for err := range errs {
+		require.NoError(err)
+	}
+	s.T().Logf("detected deadlocks retried: %d", len(deadlocks))
+
+	fetched, err := s.accessor.GetBlocksByHeightRange(ctx, tag, startHeight, startHeight+450)
+	require.NoError(err)
+	require.Len(fetched, 450)
+	for i := range chain {
+		s.equalProto(chain[i], fetched[i])
+	}
+	require.Equal(450, s.countBlockMetadata(ctx, tag))
+}
+
+func (s *blockStorageTestSuite) TestPersistBlockMetasWaitsForSingleBlockUploadGuard() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 3, tag)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, s.cloneBlocks(blocks), nil))
+
+	guardStorage, ok := s.accessor.(internal.SingleBlockUploadGuardStorage)
+	require.True(ok)
+	guard, err := guardStorage.AcquireSingleBlockUploadGuard(ctx, blocks[1].Tag, blocks[1].Height, blocks[1].Hash)
+	require.NoError(err)
+	require.False(guard.RetirementFenced())
+	defer func() { _ = guard.Release() }()
+
+	replayed := s.cloneBlocks(blocks)
+	for _, block := range replayed {
+		block.ObjectKeyMain += ".replayed"
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- s.accessor.PersistBlockMetas(ctx, false, s.cloneBlocks(replayed), nil)
+	}()
+	select {
+	case err := <-done:
+		require.Failf("persist bypassed the single-block upload guard", "unexpected result: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	require.NoError(guard.Release())
+	select {
+	case err := <-done:
+		require.NoError(err)
+	case <-time.After(10 * time.Second):
+		require.Fail("persist did not complete after the upload guard was released")
+	}
+	fetched := mustGetBlockByHeight(s.T(), s.accessor, blocks[1])
+	s.equalProto(replayed[1], fetched)
 }
