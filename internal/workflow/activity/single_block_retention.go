@@ -401,11 +401,22 @@ func (a *SingleBlockRetention) executeProcess(
 	if request.Execute && setSingleBlockRetentionRetry(result) {
 		return result, nil
 	}
+	// Every bucket the row accounting classifies into, in the order
+	// validateSingleBlockRetentionResult subtracts them, so the line reconciles
+	// by eye: scanned_rows == planned + deleted_verified + already_retired +
+	// skipped_slots + deferred + failed. Omitting planned_rows and skipped_slots
+	// made a correct cohort look broken: a solana sweep logging
+	// scanned_rows=1000 deleted_verified_rows=996 with every other logged bucket
+	// at zero reads as four silently undeleted rows, when they are skipped slots
+	// that never had a block to delete; and a dry run (execute=false) logs
+	// deleted_verified_rows=0 with its whole result parked in planned_rows.
 	logger.Info(
 		"processed single-block retention cohort",
 		zap.Uint64("scanned_rows", result.ScannedRows),
+		zap.Uint64("planned_rows", result.PlannedRows),
 		zap.Uint64("deleted_verified_rows", result.DeletedVerifiedRows),
 		zap.Uint64("already_retired_rows", result.AlreadyRetiredRows),
+		zap.Uint64("skipped_slots", result.SkippedSlots),
 		zap.Uint64("deferred_rows", result.DeferredRows),
 		zap.Uint64("failed_rows", result.FailedRows),
 		zap.Bool("terminal", result.Terminal),

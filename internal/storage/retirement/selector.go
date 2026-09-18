@@ -132,8 +132,9 @@ type (
 		// paying for the due-floor walk. Because both carry an identical
 		// predicate set, deadline > cutoff is exactly "RetentionDueFloor would
 		// report nothing due at cutoff" — not a heuristic, but MIN's defining
-		// property. The predicate sets must therefore stay in lockstep; the
-		// paired test in selector_postgres_test.go fails if they drift.
+		// property. The predicate sets must therefore stay in lockstep;
+		// TestEarliestDeadlineAndDueFloorShareACandidateSet in
+		// earliest_deadline_test.go fails if they drift.
 		//
 		// No cutoff is taken deliberately: the caller compares against the
 		// cutoff it will hand to RetentionDueFloor, so one clock decides both.
