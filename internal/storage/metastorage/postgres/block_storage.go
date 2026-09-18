@@ -197,21 +197,20 @@ func (b *blockStorageImpl) PersistBlockMetas(
 		}
 
 		// Sort blocks by height for chain validation.
-		// IMPORTANT: When multiple blocks have the same height (e.g., during a reorg), their relative
-		// order after sorting is not guaranteed to be stable. However, this implementation follows the
-		// "last block wins" principle - the last block processed for a given height will become the
-		// canonical block for that height. This behavior is consistent with the DynamoDB implementation
-		// where the last block overwrites the canonical entry.
+		// IMPORTANT: When multiple blocks have the same height (e.g., during a reorg), this
+		// implementation follows the "last block wins" principle - the last block for a given height,
+		// in caller order, becomes the canonical block for that height. The sort is stable so that
+		// caller order among equal heights is preserved. This behavior is consistent with the DynamoDB
+		// implementation where the last block overwrites the canonical entry.
 		//
 		// The canonical_blocks table uses "ON CONFLICT (height, tag) DO UPDATE" which means:
-		// - If multiple blocks in the input have the same height, the last one processed will
-		//   overwrite previous entries in canonical_blocks
+		// - If multiple blocks in the input have the same height, the last one wins in canonical_blocks
 		// - All blocks are still stored in block_metadata (allowing retrieval by specific hash)
 		// - Only the last block for each height becomes the canonical one
 		//
 		// Callers should ensure that when multiple blocks exist for the same height, the desired
 		// canonical block is placed last in the blocks array for that height.
-		sort.Slice(blocks, func(i, j int) bool {
+		sort.SliceStable(blocks, func(i, j int) bool {
 			return blocks[i].Height < blocks[j].Height
 		})
 		if err := parser.ValidateChain(blocks, lastBlock); err != nil {
@@ -249,151 +248,35 @@ func (b *blockStorageImpl) PersistBlockMetas(
 			return err
 		}
 
-		// Different queries for skipped vs non-skipped blocks due to different conflict resolution
-		blockMetadataSkippedQuery := `
-			INSERT INTO block_metadata (
-				height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
-				object_format, byte_offset, byte_length, uncompressed_length, storage_generation
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
-				hash = EXCLUDED.hash,
-				parent_hash = EXCLUDED.parent_hash,
-				parent_height = EXCLUDED.parent_height,
-				object_key_main = EXCLUDED.object_key_main,
-				timestamp = EXCLUDED.timestamp,
-				skipped = EXCLUDED.skipped,
-				object_format = EXCLUDED.object_format,
-				byte_offset = EXCLUDED.byte_offset,
-				byte_length = EXCLUDED.byte_length,
-				uncompressed_length = EXCLUDED.uncompressed_length,
-				storage_generation = EXCLUDED.storage_generation
-			RETURNING id`
-
-		blockMetadataRegularQuery := `
-			INSERT INTO block_metadata (
-				height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
-				object_format, byte_offset, byte_length, uncompressed_length, storage_generation
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-			ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
-				parent_hash = EXCLUDED.parent_hash,
-				parent_height = EXCLUDED.parent_height,
-				object_key_main = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.object_key_main
-					ELSE EXCLUDED.object_key_main
-				END,
-				timestamp = EXCLUDED.timestamp,
-				skipped = EXCLUDED.skipped,
-				object_format = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.object_format
-					ELSE EXCLUDED.object_format
-				END,
-				byte_offset = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.byte_offset
-					ELSE EXCLUDED.byte_offset
-				END,
-				byte_length = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.byte_length
-					ELSE EXCLUDED.byte_length
-				END,
-				uncompressed_length = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.uncompressed_length
-					ELSE EXCLUDED.uncompressed_length
-				END,
-				storage_generation = CASE
-					WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
-						OR EXISTS (
-							SELECT 1 FROM cscb_repair_block repair_block
-							WHERE repair_block.block_metadata_id = block_metadata.id
-						) THEN block_metadata.storage_generation
-					ELSE EXCLUDED.storage_generation
-				END
-			RETURNING id`
-
-		// Simply insert or update canonical blocks like DynamoDB does
-		// The "last write wins" behavior matches DynamoDB's TransactWriteItems
-		// Chain validation happens in update_watermark activity, not here
-		canonicalQuery := `
-			INSERT INTO canonical_blocks (height, block_metadata_id, tag)
-			VALUES ($1, $2, $3)
-			ON CONFLICT (height, tag) DO UPDATE
-			SET block_metadata_id = EXCLUDED.block_metadata_id`
-
-		for _, block := range blocks {
-			tsProto := block.GetTimestamp()
-			var unixTimestamp int64
-			if tsProto == nil { // special case for genesis block
-				unixTimestamp = 0
-			} else {
-				unixTimestamp = tsProto.GetSeconds() // directly get seconds from protobuf timestamp
+		// Persist in height-ordered chunks with set-based statements instead of two round trips per
+		// block. Within a chunk, block_metadata rows are upserted first (regular, then skipped, both
+		// ascending by height) and canonical_blocks rows last, which keeps the row-lock order of the
+		// per-block implementation at chunk granularity for concurrent writers.
+		ids := newPersistedBlockIDs(len(blocks))
+		for _, chunk := range chunkSlice(blocks, persistBlockMetasChunkSize) {
+			regular, skipped := partitionBlocksForPersist(chunk)
+			// Postgres rejects a multi-row ON CONFLICT DO UPDATE that touches the same row twice
+			// ("cannot affect row a second time"), so collapse duplicates on each conflict key,
+			// keeping the last occurrence. This matches the per-row implementation, where a later
+			// duplicate simply updated the row inserted by an earlier one.
+			regular = dedupeBlocksKeepLast(regular, regularBlockKey)
+			skipped = dedupeBlocksKeepLast(skipped, skippedBlockKey)
+			if err := upsertBlockMetadataChunk(txCtx, tx, regular, false, ids); err != nil {
+				return err
+			}
+			if err := upsertBlockMetadataChunk(txCtx, tx, skipped, true, ids); err != nil {
+				return err
 			}
 
-			var parentHeight uint64
-			if block.Height == 0 {
-				// Genesis block has no parent, set parent height to 0
-				parentHeight = 0
-			} else {
-				parentHeight = block.ParentHeight
-			}
-
-			var blockId int64
-			var query string
-			if block.Skipped {
-				query = blockMetadataSkippedQuery
-			} else {
-				query = blockMetadataRegularQuery
-			}
-
-			byteOffset, byteLength, uncompressedLength := blockObjectByteFields(block)
-			err = tx.QueryRowContext(txCtx, query,
-				block.Height,
-				block.Tag,
-				block.Hash,
-				block.ParentHash,
-				parentHeight,
-				block.ObjectKeyMain,
-				unixTimestamp,
-				block.Skipped,
-				int32(block.GetObjectFormat()),
-				byteOffset,
-				byteLength,
-				uncompressedLength,
-				nullableStorageGeneration(block.GetStorageGeneration()),
-			).Scan(&blockId)
+			// Simply insert or update canonical blocks like DynamoDB does
+			// The "last write wins" behavior matches DynamoDB's TransactWriteItems
+			// Chain validation happens in update_watermark activity, not here
+			canonical, err := resolveCanonicalRows(chunk, ids)
 			if err != nil {
-				return xerrors.Errorf("failed to insert block metadata for height %d: %w", block.Height, err)
+				return err
 			}
-
-			// Insert into canonical_blocks
-			// Always insert/update canonical blocks like DynamoDB does
-			_, err = tx.ExecContext(txCtx, canonicalQuery,
-				block.Height,
-				blockId,
-				block.Tag,
-			)
-			if err != nil {
-				return xerrors.Errorf("failed to insert canonical block for height %d: %w", block.Height, err)
+			if err := upsertCanonicalRows(txCtx, tx, canonical); err != nil {
+				return err
 			}
 		}
 
@@ -1600,6 +1483,364 @@ func nullableStorageGeneration(generation string) interface{} {
 		return nil
 	}
 	return generation
+}
+
+// persistBlockMetasChunkSize bounds the number of rows in one set-based statement issued by
+// PersistBlockMetas. It is a variable so benchmarks can sweep it.
+var persistBlockMetasChunkSize = 1000
+
+type (
+	blockHashKey struct {
+		tag  uint32
+		hash string
+	}
+
+	blockHeightKey struct {
+		tag    uint32
+		height uint64
+	}
+
+	canonicalRow struct {
+		height          uint64
+		blockMetadataID int64
+		tag             uint32
+	}
+
+	// persistedBlockIDs maps each upserted block_metadata row back to its id using the
+	// conflict key of the partial unique index the row was upserted under.
+	persistedBlockIDs struct {
+		regular map[blockHashKey]int64
+		skipped map[blockHeightKey]int64
+	}
+)
+
+func newPersistedBlockIDs(capacity int) *persistedBlockIDs {
+	return &persistedBlockIDs{
+		regular: make(map[blockHashKey]int64, capacity),
+		skipped: make(map[blockHeightKey]int64, capacity),
+	}
+}
+
+func (p *persistedBlockIDs) lookup(block *api.BlockMetadata) (int64, bool) {
+	if block.Skipped {
+		id, ok := p.skipped[skippedBlockKey(block)]
+		return id, ok
+	}
+	id, ok := p.regular[regularBlockKey(block)]
+	return id, ok
+}
+
+// regularBlockKey is the conflict key of unique_tag_hash_regular.
+func regularBlockKey(block *api.BlockMetadata) blockHashKey {
+	return blockHashKey{tag: block.Tag, hash: block.Hash}
+}
+
+// skippedBlockKey is the conflict key of unique_tag_height_skipped.
+func skippedBlockKey(block *api.BlockMetadata) blockHeightKey {
+	return blockHeightKey{tag: block.Tag, height: block.Height}
+}
+
+func chunkSlice[T any](items []T, size int) [][]T {
+	if size <= 0 {
+		size = len(items)
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	chunks := make([][]T, 0, (len(items)+size-1)/size)
+	for start := 0; start < len(items); start += size {
+		end := start + size
+		if end > len(items) {
+			end = len(items)
+		}
+		chunks = append(chunks, items[start:end])
+	}
+	return chunks
+}
+
+// partitionBlocksForPersist splits blocks into regular and skipped groups, preserving order.
+func partitionBlocksForPersist(blocks []*api.BlockMetadata) (regular []*api.BlockMetadata, skipped []*api.BlockMetadata) {
+	regular = make([]*api.BlockMetadata, 0, len(blocks))
+	for _, block := range blocks {
+		if block.Skipped {
+			skipped = append(skipped, block)
+		} else {
+			regular = append(regular, block)
+		}
+	}
+	return regular, skipped
+}
+
+// dedupeBlocksKeepLast drops every block whose key reappears later in the slice. The order of the
+// surviving blocks follows the position of their last occurrence.
+func dedupeBlocksKeepLast[K comparable](blocks []*api.BlockMetadata, key func(*api.BlockMetadata) K) []*api.BlockMetadata {
+	last := make(map[K]int, len(blocks))
+	for i, block := range blocks {
+		last[key(block)] = i
+	}
+	if len(last) == len(blocks) {
+		return blocks
+	}
+	deduped := make([]*api.BlockMetadata, 0, len(last))
+	for i, block := range blocks {
+		if last[key(block)] == i {
+			deduped = append(deduped, block)
+		}
+	}
+	return deduped
+}
+
+const blockMetadataUpsertSource = `
+		INSERT INTO block_metadata (
+			height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
+			object_format, byte_offset, byte_length, uncompressed_length, storage_generation
+		)
+		SELECT
+			input.height, input.tag, input.hash, input.parent_hash, input.parent_height, input.object_key_main,
+			input.timestamp, input.skipped, input.object_format, input.byte_offset, input.byte_length,
+			input.uncompressed_length, NULLIF(input.storage_generation, '')
+		FROM UNNEST(
+			$1::BIGINT[], $2::INTEGER[], $3::TEXT[], $4::TEXT[], $5::BIGINT[], $6::TEXT[], $7::BIGINT[],
+			$8::BOOLEAN[], $9::SMALLINT[], $10::BIGINT[], $11::BIGINT[], $12::BIGINT[], $13::TEXT[]
+		) WITH ORDINALITY AS input(
+			height, tag, hash, parent_hash, parent_height, object_key_main, timestamp, skipped,
+			object_format, byte_offset, byte_length, uncompressed_length, storage_generation, ordinal
+		)
+		ORDER BY input.ordinal`
+
+// blockMetadataUpsertQuery returns the set-based upsert for one group of blocks. The two groups use
+// different partial unique indexes and therefore different conflict resolution. Every input array
+// must have the same length; rows are processed in array order.
+func blockMetadataUpsertQuery(skipped bool) string {
+	if skipped {
+		return blockMetadataUpsertSource + `
+		ON CONFLICT (tag, height) WHERE skipped = true DO UPDATE SET
+			hash = EXCLUDED.hash,
+			parent_hash = EXCLUDED.parent_hash,
+			parent_height = EXCLUDED.parent_height,
+			object_key_main = EXCLUDED.object_key_main,
+			timestamp = EXCLUDED.timestamp,
+			skipped = EXCLUDED.skipped,
+			object_format = EXCLUDED.object_format,
+			byte_offset = EXCLUDED.byte_offset,
+			byte_length = EXCLUDED.byte_length,
+			uncompressed_length = EXCLUDED.uncompressed_length,
+			storage_generation = EXCLUDED.storage_generation
+		RETURNING id, tag, height`
+	}
+	// A block whose single-block object has been fenced for retirement, or that is pinned by a CSCB
+	// repair, keeps its current placement. The fence and repair triggers enforce the same invariant.
+	return blockMetadataUpsertSource + `
+		ON CONFLICT (tag, hash) WHERE hash IS NOT NULL AND NOT skipped DO UPDATE SET
+			parent_hash = EXCLUDED.parent_hash,
+			parent_height = EXCLUDED.parent_height,
+			object_key_main = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.object_key_main
+				ELSE EXCLUDED.object_key_main
+			END,
+			timestamp = EXCLUDED.timestamp,
+			skipped = EXCLUDED.skipped,
+			object_format = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.object_format
+				ELSE EXCLUDED.object_format
+			END,
+			byte_offset = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.byte_offset
+				ELSE EXCLUDED.byte_offset
+			END,
+			byte_length = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.byte_length
+				ELSE EXCLUDED.byte_length
+			END,
+			uncompressed_length = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.uncompressed_length
+				ELSE EXCLUDED.uncompressed_length
+			END,
+			storage_generation = CASE
+				WHEN block_metadata.single_block_retention_fenced_at IS NOT NULL
+					OR EXISTS (
+						SELECT 1 FROM cscb_repair_block repair_block
+						WHERE repair_block.block_metadata_id = block_metadata.id
+					) THEN block_metadata.storage_generation
+				ELSE EXCLUDED.storage_generation
+			END
+		RETURNING id, tag, hash`
+}
+
+const canonicalBlocksUpsertQuery = `
+		INSERT INTO canonical_blocks (height, block_metadata_id, tag)
+		SELECT input.height, input.block_metadata_id, input.tag
+		FROM UNNEST($1::BIGINT[], $2::BIGINT[], $3::INTEGER[]) WITH ORDINALITY
+			AS input(height, block_metadata_id, tag, ordinal)
+		ORDER BY input.ordinal
+		ON CONFLICT (height, tag) DO UPDATE
+		SET block_metadata_id = EXCLUDED.block_metadata_id`
+
+// blockMetadataColumnArrays builds the 13 array parameters of blockMetadataUpsertQuery.
+func blockMetadataColumnArrays(blocks []*api.BlockMetadata) []interface{} {
+	n := len(blocks)
+	heights := make([]int64, 0, n)
+	tags := make([]int64, 0, n)
+	hashes := make([]string, 0, n)
+	parentHashes := make([]string, 0, n)
+	parentHeights := make([]int64, 0, n)
+	objectKeys := make([]string, 0, n)
+	timestamps := make([]int64, 0, n)
+	skipped := make([]bool, 0, n)
+	objectFormats := make([]int64, 0, n)
+	byteOffsets := make([]sql.NullInt64, 0, n)
+	byteLengths := make([]sql.NullInt64, 0, n)
+	uncompressedLengths := make([]sql.NullInt64, 0, n)
+	storageGenerations := make([]string, 0, n)
+	for _, block := range blocks {
+		// The genesis block has neither a timestamp nor a parent.
+		var unixTimestamp int64
+		if ts := block.GetTimestamp(); ts != nil {
+			unixTimestamp = ts.GetSeconds()
+		}
+		var parentHeight uint64
+		if block.Height != 0 {
+			parentHeight = block.ParentHeight
+		}
+		byteOffset, byteLength, uncompressedLength := blockObjectByteFields(block)
+
+		heights = append(heights, int64(block.Height))
+		tags = append(tags, int64(block.Tag))
+		hashes = append(hashes, block.Hash)
+		parentHashes = append(parentHashes, block.ParentHash)
+		parentHeights = append(parentHeights, int64(parentHeight))
+		objectKeys = append(objectKeys, block.ObjectKeyMain)
+		timestamps = append(timestamps, unixTimestamp)
+		skipped = append(skipped, block.Skipped)
+		objectFormats = append(objectFormats, int64(block.GetObjectFormat()))
+		byteOffsets = append(byteOffsets, byteOffset)
+		byteLengths = append(byteLengths, byteLength)
+		uncompressedLengths = append(uncompressedLengths, uncompressedLength)
+		storageGenerations = append(storageGenerations, block.GetStorageGeneration())
+	}
+	return []interface{}{
+		pq.Array(heights),
+		pq.Array(tags),
+		pq.Array(hashes),
+		pq.Array(parentHashes),
+		pq.Array(parentHeights),
+		pq.Array(objectKeys),
+		pq.Array(timestamps),
+		pq.Array(skipped),
+		pq.Array(objectFormats),
+		pq.Array(byteOffsets),
+		pq.Array(byteLengths),
+		pq.Array(uncompressedLengths),
+		pq.Array(storageGenerations),
+	}
+}
+
+// upsertBlockMetadataChunk upserts one deduplicated group of blocks and records their ids.
+// Ids are matched by conflict key rather than by RETURNING row order, which Postgres does not
+// guarantee.
+func upsertBlockMetadataChunk(ctx context.Context, tx *sql.Tx, blocks []*api.BlockMetadata, skipped bool, ids *persistedBlockIDs) (err error) {
+	if len(blocks) == 0 {
+		return nil
+	}
+	group := "regular"
+	if skipped {
+		group = "skipped"
+	}
+	firstHeight, lastHeight := blocks[0].Height, blocks[len(blocks)-1].Height
+	rows, err := tx.QueryContext(ctx, blockMetadataUpsertQuery(skipped), blockMetadataColumnArrays(blocks)...)
+	if err != nil {
+		return xerrors.Errorf("failed to insert %s block metadata for heights [%d, %d]: %w", group, firstHeight, lastHeight, err)
+	}
+	// The rows must be fully drained and closed before the next statement on this transaction.
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil && err == nil {
+			err = xerrors.Errorf("failed to close %s block metadata rows: %w", group, closeErr)
+		}
+	}()
+	returned := 0
+	for rows.Next() {
+		var id, tag int64
+		if skipped {
+			var height int64
+			if err := rows.Scan(&id, &tag, &height); err != nil {
+				return xerrors.Errorf("failed to scan %s block metadata id: %w", group, err)
+			}
+			ids.skipped[blockHeightKey{tag: uint32(tag), height: uint64(height)}] = id
+		} else {
+			var hash sql.NullString
+			if err := rows.Scan(&id, &tag, &hash); err != nil {
+				return xerrors.Errorf("failed to scan %s block metadata id: %w", group, err)
+			}
+			ids.regular[blockHashKey{tag: uint32(tag), hash: hash.String}] = id
+		}
+		returned++
+	}
+	if err := rows.Err(); err != nil {
+		return xerrors.Errorf("failed to read %s block metadata ids for heights [%d, %d]: %w", group, firstHeight, lastHeight, err)
+	}
+	if returned != len(blocks) {
+		return xerrors.Errorf("%s block metadata upsert for heights [%d, %d] returned %d ids for %d blocks", group, firstHeight, lastHeight, returned, len(blocks))
+	}
+	return nil
+}
+
+// resolveCanonicalRows picks the canonical block_metadata id for every height in the chunk. When
+// several blocks share a height, the last one in the (stable-sorted) chunk wins.
+func resolveCanonicalRows(chunk []*api.BlockMetadata, ids *persistedBlockIDs) ([]canonicalRow, error) {
+	last := make(map[blockHeightKey]int, len(chunk))
+	for i, block := range chunk {
+		last[blockHeightKey{tag: block.Tag, height: block.Height}] = i
+	}
+	rows := make([]canonicalRow, 0, len(last))
+	for i, block := range chunk {
+		if last[blockHeightKey{tag: block.Tag, height: block.Height}] != i {
+			continue
+		}
+		id, ok := ids.lookup(block)
+		if !ok {
+			return nil, xerrors.Errorf("missing block metadata id for tag %d height %d hash %q skipped %v", block.Tag, block.Height, block.Hash, block.Skipped)
+		}
+		rows = append(rows, canonicalRow{height: block.Height, blockMetadataID: id, tag: block.Tag})
+	}
+	return rows, nil
+}
+
+func upsertCanonicalRows(ctx context.Context, tx *sql.Tx, rows []canonicalRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	heights := make([]int64, 0, len(rows))
+	blockMetadataIDs := make([]int64, 0, len(rows))
+	tags := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		heights = append(heights, int64(row.height))
+		blockMetadataIDs = append(blockMetadataIDs, row.blockMetadataID)
+		tags = append(tags, int64(row.tag))
+	}
+	if _, err := tx.ExecContext(ctx, canonicalBlocksUpsertQuery, pq.Array(heights), pq.Array(blockMetadataIDs), pq.Array(tags)); err != nil {
+		return xerrors.Errorf("failed to insert canonical blocks for heights [%d, %d]: %w", rows[0].height, rows[len(rows)-1].height, err)
+	}
+	return nil
 }
 
 func blockObjectByteFields(block *api.BlockMetadata) (sql.NullInt64, sql.NullInt64, sql.NullInt64) {
