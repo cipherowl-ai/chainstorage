@@ -122,8 +122,9 @@ type (
 		// The EIP-2718 type of the transaction
 		Type EthereumQuantity `json:"type"`
 		// The EIP-1559 related fields
-		MaxFeePerGas         *EthereumQuantity             `json:"maxFeePerGas"`
-		MaxPriorityFeePerGas *EthereumQuantity             `json:"maxPriorityFeePerGas"`
+		// EIP-1559 fee caps are uint256 and user-signed (INF-1990).
+		MaxFeePerGas         *EthereumBigQuantity          `json:"maxFeePerGas"`
+		MaxPriorityFeePerGas *EthereumBigQuantity          `json:"maxPriorityFeePerGas"`
 		AccessList           *[]*EthereumTransactionAccess `json:"accessList"`
 		Mint                 *EthereumBigQuantity          `json:"mint"`
 		// The EIP-4844 related fields
@@ -278,6 +279,7 @@ type (
 
 	ethereumNativeParserMetrics struct {
 		gasPriceOutOfRangeCounter tally.Counter
+		feeCapOutOfRangeCounter   tally.Counter
 	}
 )
 
@@ -303,6 +305,7 @@ const (
 
 	parserMetricsReasonKey    = "reason"
 	gasPriceOutOfRangeFailure = "gas_price_out_of_range"
+	feeCapOutOfRangeFailure   = "fee_cap_out_of_range"
 	parseFailure              = "parse_failure"
 
 	arbitrumNITROUpgradeBlockNumber = 22_207_818
@@ -399,6 +402,24 @@ func (v EthereumBigQuantity) Value() string {
 	return i.String()
 }
 
+// saturatingFeeCap converts an EIP-1559 fee cap to the uint64 proto
+// field, clamping a value above 64 bits to math.MaxUint64 rather than
+// failing the block: the cap is user-signed and valid up to uint256
+// (INF-1990). Mirrors the gasPrice out-of-range handling.
+func (p *ethereumNativeParserImpl) saturatingFeeCap(v *EthereumBigQuantity, field string, txHash string) uint64 {
+	n, err := v.Uint64()
+	if err == nil {
+		return n
+	}
+	p.metrics.feeCapOutOfRangeCounter.Inc(1)
+	p.Logger.Warn("fee cap is out of uint64 range; saturating",
+		zap.String("field", field),
+		zap.String("value", v.Value()),
+		zap.String("transaction hash", txHash),
+	)
+	return math.MaxUint64
+}
+
 func (v EthereumBigQuantity) Uint64() (uint64, error) {
 	i := big.Int(v)
 	if !i.IsUint64() {
@@ -484,6 +505,7 @@ func newEthereumNativeParserMetrics(scope tally.Scope) *ethereumNativeParserMetr
 	scope = scope.SubScope("ethereum_native_parser")
 	return &ethereumNativeParserMetrics{
 		gasPriceOutOfRangeCounter: newEthereumNativeParserCounter(scope, gasPriceOutOfRangeFailure),
+		feeCapOutOfRangeCounter:   newEthereumNativeParserCounter(scope, feeCapOutOfRangeFailure),
 	}
 }
 
@@ -804,14 +826,17 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 		}
 		outTransaction.GasPrice = gasPrice
 
+		var maxFeePerGas, maxPriorityFeePerGas uint64
 		if transaction.MaxFeePerGas != nil {
+			maxFeePerGas = p.saturatingFeeCap(transaction.MaxFeePerGas, "maxFeePerGas", transaction.Hash.Value())
 			outTransaction.OptionalMaxFeePerGas = &api.EthereumTransaction_MaxFeePerGas{
-				MaxFeePerGas: transaction.MaxFeePerGas.Value(),
+				MaxFeePerGas: maxFeePerGas,
 			}
 		}
 		if transaction.MaxPriorityFeePerGas != nil {
+			maxPriorityFeePerGas = p.saturatingFeeCap(transaction.MaxPriorityFeePerGas, "maxPriorityFeePerGas", transaction.Hash.Value())
 			outTransaction.OptionalMaxPriorityFeePerGas = &api.EthereumTransaction_MaxPriorityFeePerGas{
-				MaxPriorityFeePerGas: transaction.MaxPriorityFeePerGas.Value(),
+				MaxPriorityFeePerGas: maxPriorityFeePerGas,
 			}
 		}
 
@@ -827,8 +852,7 @@ func (p *ethereumNativeParserImpl) parseHeader(data []byte) (*api.EthereumHeader
 			var priorityFeePerGas uint64
 			if transaction.MaxFeePerGas != nil && transaction.MaxPriorityFeePerGas != nil {
 				// EIP-1559 transaction
-				priorityFeePerGas = transaction.MaxFeePerGas.Value() - block.BaseFeePerGas.Value()
-				maxPriorityFeePerGas := transaction.MaxPriorityFeePerGas.Value()
+				priorityFeePerGas = maxFeePerGas - block.BaseFeePerGas.Value()
 				if priorityFeePerGas > maxPriorityFeePerGas {
 					priorityFeePerGas = maxPriorityFeePerGas
 				}
