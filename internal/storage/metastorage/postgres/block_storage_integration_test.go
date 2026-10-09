@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"sort"
@@ -1728,6 +1729,113 @@ func (s *blockStorageTestSuite) TestGetFirstPromotableBlockConsolidationShadowFi
 	require.NoError(err)
 	require.False(found)
 	require.Zero(height)
+}
+
+// TestPromotionPlansBoundTheUnconsolidatedIndexByHeight reproduces the
+// statistics robinhood-mainnet had on 2026-10-08: the planner believes no
+// block_metadata row is unpromoted (null_frac(byte_length) = 0) while many are.
+// Under them every promotion statement must still read
+// idx_block_metadata_unconsolidated by height. An unbounded scan of that index
+// timed out every promotion once a backlog formed, and each failure made the
+// backlog larger.
+func (s *blockStorageTestSuite) TestPromotionPlansBoundTheUnconsolidatedIndexByHeight() {
+	require := testutil.Require(s.T())
+	ctx := context.Background()
+	startHeight := s.config.Chain.BlockStartHeight
+	blocks := testutil.MakeBlockMetadatasFromStartHeight(startHeight, 200, tag)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blocks, nil))
+	windowStart, windowEnd := startHeight+100, startHeight+110
+	// Validated shadows for the window, as production holds one per row.
+	for _, block := range blocks[100:110] {
+		s.insertConsolidationShadow(ctx, block, "consolidated/window.cscb.zstd", 10, 20, 20, true, "")
+	}
+
+	_, err := s.db.ExecContext(ctx, `ALTER TABLE block_metadata SET (autovacuum_enabled = false)`)
+	require.NoError(err)
+	defer func() {
+		_, err := s.db.ExecContext(ctx, `ALTER TABLE block_metadata RESET (autovacuum_enabled)`)
+		require.NoError(err)
+	}()
+	// Analyze while every row looks promoted, then make every row unpromoted
+	// again without re-analyzing. VACUUM first so page counts do not depend on
+	// rows earlier tests deleted.
+	for _, statement := range []string{
+		`UPDATE block_metadata SET byte_length = 1 WHERE tag = 1`,
+		`VACUUM block_metadata`,
+		`VACUUM canonical_blocks`,
+		`VACUUM block_consolidation_shadow`,
+		`ANALYZE block_metadata`,
+		`ANALYZE canonical_blocks`,
+		`ANALYZE block_consolidation_shadow`,
+		`UPDATE block_metadata SET byte_length = NULL WHERE tag = 1`,
+	} {
+		_, err := s.db.ExecContext(ctx, statement)
+		require.NoError(err, statement)
+	}
+
+	cscb := int32(api.BlockObjectFormat_BLOCK_OBJECT_FORMAT_CSCB_BATCH)
+	statements := []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"promotionInvalidShadowQuery", promotionInvalidShadowQuery, []any{tag, windowStart, windowEnd, cscb}},
+		{"promotionQuery", promotionQuery, []any{tag, windowStart, windowEnd, 10, cscb, config.DefaultSingleBlockObjectRetention.Microseconds()}},
+	}
+	for _, statement := range statements {
+		for _, node := range s.explainPlanNodes(ctx, statement.query, statement.args...) {
+			nodeType, _ := node["Node Type"].(string)
+			if node["Relation Name"] != "block_metadata" || !strings.Contains(nodeType, "Scan") {
+				continue
+			}
+			// The wedge's signature is a scan of block_metadata with filters
+			// only: the partial index read without its (tag, height) key, or
+			// the UPDATE driven from it against the candidates CTE. Any index
+			// condition is a bounded lookup (the window on the partial index,
+			// or a candidate's primary key or unique (tag, hash)).
+			condition, _ := node["Index Cond"].(string)
+			if node["Index Name"] == "idx_block_metadata_unconsolidated" {
+				require.Contains(condition, "height", "%s reads idx_block_metadata_unconsolidated without a height bound: %v", statement.name, node)
+				continue
+			}
+			require.NotEmpty(condition, "%s scans block_metadata with no index condition: %v", statement.name, node)
+		}
+	}
+}
+
+// explainPlanNodes returns every node of the statement's plan. Sequential and
+// bitmap scans are disabled for the explain: a production-sized table is read
+// by plain index scans here, and the small test tables would otherwise plan
+// unlike one.
+func (s *blockStorageTestSuite) explainPlanNodes(ctx context.Context, query string, args ...any) []map[string]any {
+	require := testutil.Require(s.T())
+	tx, err := s.db.BeginTx(ctx, nil)
+	require.NoError(err)
+	defer func() { _ = tx.Rollback() }()
+	for _, setting := range []string{`SET LOCAL enable_seqscan = off`, `SET LOCAL enable_bitmapscan = off`} {
+		_, err = tx.ExecContext(ctx, setting)
+		require.NoError(err)
+	}
+	var raw []byte
+	require.NoError(tx.QueryRowContext(ctx, "EXPLAIN (FORMAT JSON) "+query, args...).Scan(&raw))
+	var plans []map[string]any
+	require.NoError(json.Unmarshal(raw, &plans))
+	require.NotEmpty(plans)
+	var nodes []map[string]any
+	var walk func(node map[string]any)
+	walk = func(node map[string]any) {
+		nodes = append(nodes, node)
+		children, _ := node["Plans"].([]any)
+		for _, child := range children {
+			if childNode, ok := child.(map[string]any); ok {
+				walk(childNode)
+			}
+		}
+	}
+	root, ok := plans[0]["Plan"].(map[string]any)
+	require.True(ok, "EXPLAIN returned no plan")
+	walk(root)
+	return nodes
 }
 
 func (s *blockStorageTestSuite) TestPromoteBlockConsolidationShadowsMissingShadowNoOps() {

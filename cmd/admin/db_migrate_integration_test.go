@@ -20,7 +20,7 @@ import (
 // headMigrationVersion: the assertions here prove the privileged path migrated
 // all the way to head.
 const (
-	headMigrationVersion  = 20260914000001
+	headMigrationVersion  = 20261009000001
 	deployedCanaryVersion = 20260908000001
 )
 
