@@ -1261,6 +1261,147 @@ func (b *blockStorageImpl) PersistBlockConsolidationShadows(ctx context.Context,
 	return nil
 }
 
+// promotionInvalidShadowQuery and promotionQuery repeat the canonical range on
+// block_metadata (bm.tag, bm.height). Their byte_length IS NULL and
+// skipped = false predicates match idx_block_metadata_unconsolidated
+// (tag, height), and unpromoted rows are a thin sliver clustered at the end of
+// the table, so ANALYZE can sample none of them and record
+// null_frac(byte_length) = 0, as robinhood-mainnet's 02:03Z autoanalyze did on
+// 2026-10-08. The planner then estimates that index at one row and, without
+// bm.height, drives the join from it with no index condition, so the scan
+// covers every unpromoted row: a backlog makes each attempt slower than the
+// last, and every promotion hit the 60s statement_timeout with 821,921 rows
+// behind it a day later. Bounded, the same selection reads only the window
+// (10,000 rows in 50ms on robinhood). Bound block_metadata only: the same range
+// on block_consolidation_shadow becomes its index condition and turns the
+// shadow lookup into a nested range scan (15.7s for the same window).
+//
+// The updated CTE in promotionQuery deliberately has no byte_length IS NULL
+// re-check: that predicate let the same unbounded index drive a nested loop
+// against the candidates CTE. Candidates are already selected with it and
+// locked FOR UPDATE, which re-evaluates it against the latest row version, so
+// the update reaches each row by primary key instead, and
+// PromoteBlockConsolidationShadows still requires every candidate to be
+// promoted and marked for retirement exactly once.
+const promotionInvalidShadowQuery = `
+		SELECT shadow.block_metadata_id, shadow.height
+		FROM canonical_blocks cb
+		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+			AND shadow.tag = bm.tag
+			AND shadow.height = bm.height
+			AND shadow.hash = bm.hash
+			AND shadow.single_block_object_key_main = bm.object_key_main
+			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
+		WHERE cb.tag = $1
+			AND cb.height >= $2
+			AND cb.height < $3
+			AND bm.tag = $1
+			AND bm.height >= $2
+			AND bm.height < $3
+			AND bm.skipped = false
+			AND bm.byte_length IS NULL
+			AND bm.object_key_main IS NOT NULL
+			AND bm.object_key_main <> ''
+			AND shadow.validated_at IS NOT NULL
+			AND (
+				shadow.consolidated_object_key_main IS NULL
+				OR shadow.consolidated_object_key_main = ''
+				OR shadow.object_format <> $4
+				OR shadow.byte_offset < 0
+				OR shadow.byte_length <= 0
+				OR shadow.uncompressed_length IS NULL
+				OR shadow.uncompressed_length <= 0
+			)
+		ORDER BY cb.height ASC
+		LIMIT 1`
+
+// promotionQuery: see promotionInvalidShadowQuery.
+const promotionQuery = `
+		WITH database_clock AS (
+			SELECT clock_timestamp() AS retention_started_at
+		), candidates AS (
+			SELECT
+				bm.id AS block_metadata_id,
+				bm.tag,
+				bm.height,
+				bm.hash,
+				bm.object_key_main AS single_block_object_key_main,
+				bm.storage_generation AS single_block_storage_generation,
+				shadow.consolidated_object_key_main,
+				shadow.consolidated_storage_generation,
+				shadow.object_format,
+				shadow.byte_offset,
+				shadow.byte_length,
+				shadow.uncompressed_length
+			FROM canonical_blocks cb
+			JOIN block_metadata bm ON bm.id = cb.block_metadata_id
+			JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
+				AND shadow.tag = bm.tag
+				AND shadow.height = bm.height
+				AND shadow.hash = bm.hash
+				AND shadow.single_block_object_key_main = bm.object_key_main
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
+			WHERE cb.tag = $1
+				AND cb.height >= $2
+				AND cb.height < $3
+				AND bm.tag = $1
+				AND bm.height >= $2
+				AND bm.height < $3
+				AND bm.skipped = false
+				AND bm.byte_length IS NULL
+				AND bm.object_key_main IS NOT NULL
+				AND bm.object_key_main <> ''
+				AND shadow.validated_at IS NOT NULL
+				AND shadow.consolidated_object_key_main IS NOT NULL
+				AND shadow.consolidated_object_key_main <> ''
+				AND shadow.object_format = $5
+				AND shadow.byte_offset >= 0
+				AND shadow.byte_length > 0
+				AND shadow.uncompressed_length IS NOT NULL
+				AND shadow.uncompressed_length > 0
+			ORDER BY cb.height ASC
+			LIMIT $4
+			FOR UPDATE OF cb, bm, shadow
+		),
+		updated AS (
+			UPDATE block_metadata bm
+			SET
+				object_key_main = candidates.consolidated_object_key_main,
+				storage_generation = candidates.consolidated_storage_generation,
+				object_format = candidates.object_format,
+				byte_offset = candidates.byte_offset,
+				byte_length = candidates.byte_length,
+				uncompressed_length = candidates.uncompressed_length
+			FROM candidates
+			WHERE bm.id = candidates.block_metadata_id
+				AND bm.tag = candidates.tag
+				AND bm.height = candidates.height
+				AND bm.hash = candidates.hash
+				AND bm.object_key_main = candidates.single_block_object_key_main
+				AND bm.storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
+				AND bm.skipped = false
+			RETURNING bm.id
+		),
+		retired AS (
+			UPDATE block_consolidation_shadow shadow
+			SET
+				single_block_retention_started_at = database_clock.retention_started_at,
+				single_block_delete_after = database_clock.retention_started_at + ($6 * INTERVAL '1 microsecond')
+			FROM candidates, database_clock
+			WHERE shadow.block_metadata_id = candidates.block_metadata_id
+				AND shadow.tag = candidates.tag
+				AND shadow.height = candidates.height
+				AND shadow.hash = candidates.hash
+				AND shadow.single_block_object_key_main = candidates.single_block_object_key_main
+				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
+			RETURNING shadow.block_metadata_id
+		)
+		SELECT
+			(SELECT COUNT(*) FROM candidates),
+			(SELECT COUNT(*) FROM updated),
+			(SELECT COUNT(*) FROM retired)`
+
 func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 	ctx context.Context,
 	tag uint32,
@@ -1295,40 +1436,11 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		return nil, err
 	}
 
-	const invalidShadowQuery = `
-		SELECT shadow.block_metadata_id, shadow.height
-		FROM canonical_blocks cb
-		JOIN block_metadata bm ON bm.id = cb.block_metadata_id
-		JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-			AND shadow.tag = bm.tag
-			AND shadow.height = bm.height
-			AND shadow.hash = bm.hash
-			AND shadow.single_block_object_key_main = bm.object_key_main
-			AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
-		WHERE cb.tag = $1
-			AND cb.height >= $2
-			AND cb.height < $3
-			AND bm.skipped = false
-			AND bm.byte_length IS NULL
-			AND bm.object_key_main IS NOT NULL
-			AND bm.object_key_main <> ''
-			AND shadow.validated_at IS NOT NULL
-			AND (
-				shadow.consolidated_object_key_main IS NULL
-				OR shadow.consolidated_object_key_main = ''
-				OR shadow.object_format <> $4
-				OR shadow.byte_offset < 0
-				OR shadow.byte_length <= 0
-				OR shadow.uncompressed_length IS NULL
-				OR shadow.uncompressed_length <= 0
-			)
-		ORDER BY cb.height ASC
-		LIMIT 1`
 	var invalidMetadataID int64
 	var invalidHeight uint64
 	err = tx.QueryRowContext(
 		ctx,
-		invalidShadowQuery,
+		promotionInvalidShadowQuery,
 		tag,
 		startHeight,
 		endHeight,
@@ -1341,93 +1453,10 @@ func (b *blockStorageImpl) PromoteBlockConsolidationShadows(
 		return nil, xerrors.Errorf("invalid consolidation shadow metadata for metadata_id=%d height=%d", invalidMetadataID, invalidHeight)
 	}
 
-	const promoteQuery = `
-		WITH database_clock AS (
-			SELECT clock_timestamp() AS retention_started_at
-		), candidates AS (
-			SELECT
-				bm.id AS block_metadata_id,
-				bm.tag,
-				bm.height,
-				bm.hash,
-				bm.object_key_main AS single_block_object_key_main,
-				bm.storage_generation AS single_block_storage_generation,
-				shadow.consolidated_object_key_main,
-				shadow.consolidated_storage_generation,
-				shadow.object_format,
-				shadow.byte_offset,
-				shadow.byte_length,
-				shadow.uncompressed_length
-			FROM canonical_blocks cb
-			JOIN block_metadata bm ON bm.id = cb.block_metadata_id
-			JOIN block_consolidation_shadow shadow ON shadow.block_metadata_id = bm.id
-				AND shadow.tag = bm.tag
-				AND shadow.height = bm.height
-				AND shadow.hash = bm.hash
-				AND shadow.single_block_object_key_main = bm.object_key_main
-				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM bm.storage_generation
-			WHERE cb.tag = $1
-				AND cb.height >= $2
-				AND cb.height < $3
-				AND bm.skipped = false
-				AND bm.byte_length IS NULL
-				AND bm.object_key_main IS NOT NULL
-				AND bm.object_key_main <> ''
-				AND shadow.validated_at IS NOT NULL
-				AND shadow.consolidated_object_key_main IS NOT NULL
-				AND shadow.consolidated_object_key_main <> ''
-				AND shadow.object_format = $5
-				AND shadow.byte_offset >= 0
-				AND shadow.byte_length > 0
-				AND shadow.uncompressed_length IS NOT NULL
-				AND shadow.uncompressed_length > 0
-			ORDER BY cb.height ASC
-			LIMIT $4
-			FOR UPDATE OF cb, bm, shadow
-		),
-		updated AS (
-			UPDATE block_metadata bm
-			SET
-				object_key_main = candidates.consolidated_object_key_main,
-				storage_generation = candidates.consolidated_storage_generation,
-				object_format = candidates.object_format,
-				byte_offset = candidates.byte_offset,
-				byte_length = candidates.byte_length,
-				uncompressed_length = candidates.uncompressed_length
-			FROM candidates
-			WHERE bm.id = candidates.block_metadata_id
-				AND bm.tag = candidates.tag
-				AND bm.height = candidates.height
-				AND bm.hash = candidates.hash
-				AND bm.object_key_main = candidates.single_block_object_key_main
-				AND bm.storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
-				AND bm.skipped = false
-				AND bm.byte_length IS NULL
-			RETURNING bm.id
-		),
-		retired AS (
-			UPDATE block_consolidation_shadow shadow
-			SET
-				single_block_retention_started_at = database_clock.retention_started_at,
-				single_block_delete_after = database_clock.retention_started_at + ($6 * INTERVAL '1 microsecond')
-			FROM candidates, database_clock
-			WHERE shadow.block_metadata_id = candidates.block_metadata_id
-				AND shadow.tag = candidates.tag
-				AND shadow.height = candidates.height
-				AND shadow.hash = candidates.hash
-				AND shadow.single_block_object_key_main = candidates.single_block_object_key_main
-				AND shadow.single_block_storage_generation IS NOT DISTINCT FROM candidates.single_block_storage_generation
-			RETURNING shadow.block_metadata_id
-		)
-		SELECT
-			(SELECT COUNT(*) FROM candidates),
-			(SELECT COUNT(*) FROM updated),
-			(SELECT COUNT(*) FROM retired)`
-
 	var candidates, promoted, retired uint64
 	if err := tx.QueryRowContext(
 		ctx,
-		promoteQuery,
+		promotionQuery,
 		tag,
 		startHeight,
 		endHeight,
