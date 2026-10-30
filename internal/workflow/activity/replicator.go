@@ -25,6 +25,7 @@ import (
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/finalizer"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
+	"github.com/coinbase/chainstorage/internal/utils/httputil"
 	"github.com/coinbase/chainstorage/internal/utils/retry"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
@@ -76,13 +77,24 @@ type (
 	}
 )
 
-func NewReplicator(params ReplicatorParams) *Replicator {
+// newReplicatorHTTPClient builds the client the replicator uses to pull blobs
+// from the replication source. The transport is left nil unless the pool is
+// configured, which keeps sharing http.DefaultTransport as before.
+func newReplicatorHTTPClient(pool config.HttpPoolConfig) *http.Client {
 	httpClient := &http.Client{
 		Timeout: timeout,
 	}
-	httpClient = tracehttp.WrapClient(httpClient, tracehttp.RTWithResourceNamer(func(req *http.Request) string {
+	if pool.MaxConns > 0 {
+		httpClient.Transport = httputil.NewPooledTransport(pool.MaxConns, pool.IdleConnTimeout)
+	}
+
+	return tracehttp.WrapClient(httpClient, tracehttp.RTWithResourceNamer(func(req *http.Request) string {
 		return "/workflow/activity/replicator"
 	}))
+}
+
+func NewReplicator(params ReplicatorParams) *Replicator {
+	httpClient := newReplicatorHTTPClient(params.Config.Workflows.Replicator.Http)
 	a := &Replicator{
 		baseActivity:        newBaseActivity(ActivityReplicator, params.Runtime),
 		config:              params.Config,

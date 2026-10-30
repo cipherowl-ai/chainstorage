@@ -23,6 +23,8 @@ import (
 	blobstorageinternal "github.com/coinbase/chainstorage/internal/storage/blobstorage/internal"
 	"github.com/coinbase/chainstorage/internal/storage/internal/errors"
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
+	"github.com/coinbase/chainstorage/internal/utils/fxparams"
+	"github.com/coinbase/chainstorage/internal/utils/httputil"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -1054,4 +1056,44 @@ func (t *rangeConcurrencyTracker) peakActive() int {
 
 func rangeHeader(offset uint64, length uint64) string {
 	return fmt.Sprintf("bytes=%d-%d", offset, offset+length-1)
+}
+
+// unwrapTracedTransport strips the round tripper installed by
+// tracehttp.WrapClient to reach the transport the client was built with.
+func unwrapTracedTransport(t *testing.T, client HTTPClient) http.RoundTripper {
+	require := testutil.Require(t)
+
+	httpClient, ok := client.(*http.Client)
+	require.True(ok)
+	unwrapper, ok := httpClient.Transport.(interface{ Unwrap() http.RoundTripper })
+	require.True(ok)
+	return unwrapper.Unwrap()
+}
+
+// Without configuration the downloader must keep sharing
+// http.DefaultTransport, exactly as it did before the pool knob existed.
+func TestNewHTTPClient_UnconfiguredKeepsDefaultTransport(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+	require.Equal(0, cfg.BlobDownloader.Http.MaxConns)
+
+	client := NewHTTPClient(HTTPClientParams{Params: fxparams.Params{Config: cfg}})
+	require.True(unwrapTracedTransport(t, client) == http.DefaultTransport)
+}
+
+func TestNewHTTPClient_ConfiguredPool(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.BlobDownloader.Http.MaxConns = 24
+
+	client := NewHTTPClient(HTTPClientParams{Params: fxparams.Params{Config: cfg}})
+	transport, ok := unwrapTracedTransport(t, client).(*http.Transport)
+	require.True(ok)
+	require.Equal(24, transport.MaxIdleConns)
+	require.Equal(24, transport.MaxIdleConnsPerHost)
+	require.Equal(httputil.DefaultIdleConnTimeout, transport.IdleConnTimeout)
 }

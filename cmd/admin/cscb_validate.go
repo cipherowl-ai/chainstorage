@@ -257,19 +257,29 @@ func runCSCBValidate(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	counter := newCSCBCountingHTTPClient(downloader.NewHTTPClient())
 	var deps struct {
 		fx.In
 		Client     gateway.Client
 		Downloader downloader.BlockDownloader
 	}
+	// The real client is built inside the app so that it picks up the
+	// configured connection pool; the counter decorates it in place.
+	var counter *cscbCountingHTTPClient
 	app := startApp(
-		fx.Provide(func() downloader.HTTPClient { return counter }),
+		fx.Provide(downloader.NewHTTPClient),
+		fx.Decorate(func(client downloader.HTTPClient) downloader.HTTPClient {
+			counter = newCSCBCountingHTTPClient(client)
+			return counter
+		}),
 		fx.Provide(downloader.NewBlockDownloader),
 		gateway.WithClientID(cscbFlags.clientID),
 		fx.Populate(&deps),
 	)
 	defer app.Close()
+
+	if counter == nil {
+		return xerrors.New("failed to install the counting http client")
+	}
 
 	tag := app.Config().GetEffectiveBlockTag(cscbFlags.tag)
 	validator := &cscbValidator{

@@ -24,6 +24,7 @@ import (
 	storage_utils "github.com/coinbase/chainstorage/internal/storage/utils"
 	"github.com/coinbase/chainstorage/internal/utils/finalizer"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
+	"github.com/coinbase/chainstorage/internal/utils/httputil"
 	"github.com/coinbase/chainstorage/internal/utils/log"
 	"github.com/coinbase/chainstorage/internal/utils/retry"
 	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
@@ -105,6 +106,11 @@ type (
 		HttpClient HTTPClient
 	}
 
+	HTTPClientParams struct {
+		fx.In
+		fxparams.Params
+	}
+
 	HTTPClient interface {
 		Do(req *http.Request) (*http.Response, error)
 	}
@@ -166,9 +172,14 @@ func NewBlockDownloader(params BlockDownloaderParams) BlockDownloader {
 	}
 }
 
-func NewHTTPClient() HTTPClient {
+func NewHTTPClient(params HTTPClientParams) HTTPClient {
 	httpClient := &http.Client{
 		Timeout: timeout,
+	}
+	// Left on http.DefaultTransport unless configured, which keeps the
+	// pre-existing behavior for anyone who has not sized the pool.
+	if pool := params.Config.BlobDownloader.Http; pool.MaxConns > 0 {
+		httpClient.Transport = httputil.NewPooledTransport(pool.MaxConns, pool.IdleConnTimeout)
 	}
 	httpClient = tracehttp.WrapClient(httpClient, tracehttp.RTWithResourceNamer(func(req *http.Request) string {
 		return "/chainstorage/blobstorage/downloader"

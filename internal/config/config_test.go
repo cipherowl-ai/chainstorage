@@ -1514,6 +1514,42 @@ func TestDefaultHttpTimeout(t *testing.T) {
 	require.Equal(0*time.Second, cfg.Chain.Client.HttpTimeout)
 }
 
+// The connection pool knobs are unset by default. Each client decides what a
+// zero value means for itself, so that adding them changes no behavior until
+// somebody configures one.
+func TestDefaultHttpPools(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+
+	require.Equal(0, cfg.Chain.Client.MaxConns)
+	require.Equal(0*time.Second, cfg.Chain.Client.IdleConnTimeout)
+	require.Equal(config.HttpPoolConfig{}, cfg.Workflows.Replicator.Http)
+	require.Equal(config.HttpPoolConfig{}, cfg.BlobDownloader.Http)
+}
+
+func TestHttpPoolOverridingByEnvSettings(t *testing.T) {
+	require := testutil.Require(t)
+
+	require.NoError(os.Setenv("CHAINSTORAGE_CHAIN_CLIENT_MAX_CONNS", "64"))
+	defer os.Unsetenv("CHAINSTORAGE_CHAIN_CLIENT_MAX_CONNS")
+	require.NoError(os.Setenv("CHAINSTORAGE_CHAIN_CLIENT_IDLE_CONN_TIMEOUT", "45s"))
+	defer os.Unsetenv("CHAINSTORAGE_CHAIN_CLIENT_IDLE_CONN_TIMEOUT")
+	require.NoError(os.Setenv("CHAINSTORAGE_BLOB_DOWNLOADER_HTTP_MAX_CONNS", "32"))
+	defer os.Unsetenv("CHAINSTORAGE_BLOB_DOWNLOADER_HTTP_MAX_CONNS")
+	require.NoError(os.Setenv("CHAINSTORAGE_WORKFLOWS_REPLICATOR_HTTP_MAX_CONNS", "16"))
+	defer os.Unsetenv("CHAINSTORAGE_WORKFLOWS_REPLICATOR_HTTP_MAX_CONNS")
+
+	cfg, err := config.New()
+	require.NoError(err)
+
+	require.Equal(64, cfg.Chain.Client.MaxConns)
+	require.Equal(45*time.Second, cfg.Chain.Client.IdleConnTimeout)
+	require.Equal(32, cfg.BlobDownloader.Http.MaxConns)
+	require.Equal(16, cfg.Workflows.Replicator.Http.MaxConns)
+}
+
 func TestDefaultTxBatchSize(t *testing.T) {
 	require := testutil.Require(t)
 
