@@ -284,6 +284,7 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 			To:    "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
 			Index: 0,
 			Type:  1,
+			Memo:  "68656c6c6f",
 			Receipt: &api.EthereumTransactionReceipt{
 				TransactionHash:   "d581afa9158fbed69fb10d6a2245ad45d912a3da03ff24d59f3d2f6df6fd9529",
 				BlockHash:         "0000000004034f5cd8946001c721db6457608ad887b3734c825d55826c3c3c87",
@@ -460,6 +461,7 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 		require.Equal(expected_tx.To, tx.To)
 		require.Equal(expected_tx.Index, tx.Index)
 		require.Equal(expected_tx.Type, tx.Type)
+		require.Equal(expected_tx.Memo, tx.Memo)
 		require.Equal(expected_tx.Receipt.From, tx.Receipt.From)
 		require.Equal(expected_tx.Receipt.To, tx.Receipt.To)
 		require.Equal(expected_tx.Receipt.TransactionHash, tx.Receipt.TransactionHash)
@@ -521,6 +523,44 @@ func (s *tronParserTestSuite) TestParseTronBlock() {
 			require.Nil(tx.Receipt.GetOptionalNetUsage())
 		}
 	}
+}
+
+func (s *tronParserTestSuite) TestParseTronBlock_MemoFollowsTransactionHash() {
+	require := testutil.Require(s.T())
+
+	rawReceipts, err := s.fixtureParsingHelper("parser/tron/raw_block_tx_receipt.json")
+	require.NoError(err)
+	rawTraces, err := s.fixtureParsingHelper("parser/tron/raw_block_trace_tx_info.json")
+	require.NoError(err)
+	// Each trace now sits at the other transaction's position; the first one carries a memo.
+	rawTraces[0], rawTraces[1] = rawTraces[1], rawTraces[0]
+
+	block := &api.Block{
+		Blockchain: common.Blockchain_BLOCKCHAIN_TRON,
+		Network:    common.Network_NETWORK_TRON_MAINNET,
+		Metadata: &api.BlockMetadata{
+			Tag:        2,
+			Hash:       "0x0000000004034f5cd8946001c721db6457608ad887b3734c825d55826c3c3c87",
+			ParentHash: "0x0000000004034f5b43c5934257b3d1f1a313bba4af0a4dd2f778fda9e641b615",
+			Height:     0x4034f5c,
+		},
+		Blobdata: &api.Block_Ethereum{
+			Ethereum: &api.EthereumBlobdata{
+				Header:              fixtures.MustReadFile("parser/tron/raw_block_header.json"),
+				TransactionReceipts: rawReceipts,
+				TransactionTraces:   rawTraces,
+			},
+		},
+	}
+
+	nativeBlock, err := s.parser.ParseNativeBlock(context.Background(), block)
+	require.NoError(err)
+	transactions := nativeBlock.GetEthereum().Transactions
+	require.Equal(2, len(transactions))
+	require.Equal("d581afa9158fbed69fb10d6a2245ad45d912a3da03ff24d59f3d2f6df6fd9529", transactions[0].Hash)
+	require.Equal("", transactions[0].Memo)
+	require.Equal("e14935e6144007163609bb49292897ba81bf7ee93bf28ba4cc5ebd0d6b95f4b9", transactions[1].Hash)
+	require.Equal("", transactions[1].Memo)
 }
 
 func (s *tronParserTestSuite) fixtureParsingHelper(filePath string) ([][]byte, error) {

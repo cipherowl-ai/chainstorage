@@ -85,6 +85,7 @@ type TronTransactionInfo struct {
 	Fee                  uint64                    `json:"fee"`
 	Receipt              TronReceipt               `json:"receipt"`
 	Type                 string                    `json:"type"`
+	Memo                 string                    `json:"memo"`
 }
 
 type TronReceipt struct {
@@ -259,6 +260,12 @@ func parseTronTxInfo(
 		} else {
 			// If type is not found in map, set to 999 as default or log warning
 			tx.Type = TronContractTypeUnknown
+		}
+
+		// add memo (raw_data.data) to transaction. Consumers join on it, so attach it only to the
+		// transaction the trace names: traces pair with transactions by position.
+		if strings.EqualFold(toTronHash(tx.Hash), txInfo.Id) {
+			tx.Memo = txInfo.Memo
 		}
 	}
 	return nil

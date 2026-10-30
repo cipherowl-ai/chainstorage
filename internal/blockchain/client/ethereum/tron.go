@@ -2,6 +2,7 @@ package ethereum
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"time"
@@ -176,7 +177,7 @@ func (c *TronClient) getBlockTxInfoByNum(ctx context.Context, blockNumber uint64
 func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethereum.EthereumBlockLit) ([][]byte, error) {
 	blockNumber := block.Number.Value()
 
-	// Get block transactions to extract types
+	// Get block transactions to extract types and memos
 	blockTxData, err := c.getBlockTxByNum(ctx, blockNumber)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get block transactions: %w", err)
@@ -188,14 +189,14 @@ func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethe
 		return nil, xerrors.Errorf("failed to get transaction info: %w", err)
 	}
 
-	// Parse block data to extract transaction types by txID
-	txTypeMap, err := c.extractTransactionTypes(blockTxData)
+	// Parse block data to extract transaction types and memos by txID
+	txTypeMap, txMemoMap, err := c.extractTransactionTypes(blockTxData)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to extract transaction types: %w", err)
 	}
 
-	// Merge txInfo with transaction types
-	results, err := c.mergeTxInfoWithTypes(txInfoResponse, txTypeMap)
+	// Merge txInfo with transaction types and memos
+	results, err := c.mergeTxInfoWithTypes(txInfoResponse, txTypeMap, txMemoMap)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to merge txInfo with types: %w", err)
 	}
@@ -203,8 +204,8 @@ func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethe
 	return results, nil
 }
 
-// mergeTxInfoWithTypes parses txInfo response and adds transaction types based on txID matching
-func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[string]string) ([][]byte, error) {
+// mergeTxInfoWithTypes parses txInfo response and adds transaction types and memos based on txID matching
+func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[string]string, txMemoMap map[string]string) ([][]byte, error) {
 	// Parse txInfo response as array
 	var txInfoArray []json.RawMessage
 	if err := json.Unmarshal(txInfoResponse, &txInfoArray); err != nil {
@@ -229,6 +230,10 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 		if txType, exists := txTypeMap[txID]; exists {
 			txInfo["type"] = txType
 		}
+		// Add the memo (raw_data.data) if the transaction carries one
+		if memo, exists := txMemoMap[txID]; exists {
+			txInfo["memo"] = memo
+		}
 
 		// Re-serialize the modified txInfo
 		modifiedBytes, err := json.Marshal(txInfo)
@@ -242,35 +247,39 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 	return results, nil
 }
 
-// extractTransactionTypes extracts transaction types from block data, indexed by txID
-func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]string, error) {
+// extractTransactionTypes extracts transaction types and memos from block data, indexed by txID.
+// The memo is the transaction's raw_data.data as the node returns it: hex without a 0x prefix.
+// Only transactions that carry a memo get an entry in the memo map; a memo that is not a hex
+// string fails the block.
+func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]string, map[string]string, error) {
 	if len(blockTxData) == 0 {
-		return make(map[string]string), nil
+		return make(map[string]string), make(map[string]string), nil
 	}
 
 	// Parse the block data
 	var blockData map[string]interface{}
 	if err := json.Unmarshal(blockTxData, &blockData); err != nil {
-		return nil, xerrors.Errorf("failed to unmarshal block data: %w", err)
+		return nil, nil, xerrors.Errorf("failed to unmarshal block data: %w", err)
 	}
 
 	txTypeMap := make(map[string]string)
+	txMemoMap := make(map[string]string)
 
 	// Extract transactions array
 	transactions, ok := blockData["transactions"].([]any)
 	if !ok {
-		return txTypeMap, nil // No transactions in block
+		return txTypeMap, txMemoMap, nil // No transactions in block
 	}
 	// Extract txID (every transaction must have txID)
 	for _, tx := range transactions {
 		txMap, ok := tx.(map[string]any)
 		if !ok {
-			return nil, xerrors.Errorf("failed to assert transaction as map[string]interface{}: %+v", tx)
+			return nil, nil, xerrors.Errorf("failed to assert transaction as map[string]interface{}: %+v", tx)
 		}
 
 		txID, ok := txMap["txID"].(string)
 		if !ok {
-			return nil, xerrors.Errorf("transaction is missing txID or it's not a string: %+v", txMap)
+			return nil, nil, xerrors.Errorf("transaction is missing txID or it's not a string: %+v", txMap)
 		}
 
 		rawDataVal, ok := txMap["raw_data"]
@@ -279,7 +288,21 @@ func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]str
 		}
 		rawData, ok := rawDataVal.(map[string]any)
 		if !ok {
-			return nil, xerrors.Errorf("raw_data is not a map: %+v", rawDataVal)
+			return nil, nil, xerrors.Errorf("raw_data is not a map: %+v", rawDataVal)
+		}
+
+		// raw_data.data is the optional memo; read it before the contract checks below can skip the transaction
+		if dataVal, ok := rawData["data"]; ok && dataVal != nil {
+			memo, ok := dataVal.(string)
+			if !ok {
+				return nil, nil, xerrors.Errorf("raw_data.data is not a string: %+v", dataVal)
+			}
+			if _, err := hex.DecodeString(memo); err != nil {
+				return nil, nil, xerrors.Errorf("raw_data.data of transaction %v is not hex (%.80q): %w", txID, memo, err)
+			}
+			if memo != "" {
+				txMemoMap[txID] = memo
+			}
 		}
 
 		contractsVal, ok := rawData["contract"]
@@ -293,16 +316,16 @@ func (c *TronClient) extractTransactionTypes(blockTxData []byte) (map[string]str
 
 		contract, ok := contracts[0].(map[string]any)
 		if !ok {
-			return nil, xerrors.Errorf("contract is not a map: %+v", contracts[0])
+			return nil, nil, xerrors.Errorf("contract is not a map: %+v", contracts[0])
 		}
 
 		txType, ok := contract["type"].(string)
 		if !ok {
-			return nil, xerrors.Errorf("contract type is not a string: %+v", contract["type"])
+			return nil, nil, xerrors.Errorf("contract type is not a string: %+v", contract["type"])
 		}
 
 		txTypeMap[txID] = txType
 	}
 
-	return txTypeMap, nil
+	return txTypeMap, txMemoMap, nil
 }
