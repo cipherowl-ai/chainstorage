@@ -1,6 +1,7 @@
 [
     {   
         "type": "TransferContract",
+        "memo": "68656c6c6f",
         "log": [
             {
                 "address": "a614f803b6fd780986a42c78ec9c7f77e6ded13c",

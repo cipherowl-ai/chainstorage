@@ -126,6 +126,9 @@ message EthereumTransaction {
     string max_fee_per_blob_gas = 29;
   }
   repeated string blob_versioned_hashes = 30;
+  // Tron only: the transaction's raw_data.data (the memo), as hex without a 0x prefix.
+  // A fork-only field, numbered apart from upstream's sequence so a port of upstream's next field cannot collide with it.
+  string memo = 1000;
 }
 
 message EthereumTransactionReceipt {

@@ -159,6 +159,105 @@ const (
 		]
 	}
 	`
+	// Two TransferContract transactions of block 87573393: the first carries a memo (raw_data.data), the second doesn't.
+	fixtureBlockTxInfoWithMemoResponse = `
+	[
+		{
+			"id": "4b1345bbc3610321d041619b80e52f16ddfde9108b814ac5af0b7c1ea9240446",
+			"fee": 1000000,
+			"blockNumber": 87573393,
+			"blockTimeStamp": 1793393586000,
+			"contractResult": [
+				""
+			],
+			"receipt": {
+				"net_usage": 302
+			}
+		},
+		{
+			"id": "61cba69bd9b6fb70692aca4f7cdfc45ccc95822da2c00e9b88c5101c6a603ed3",
+			"fee": 268000,
+			"blockNumber": 87573393,
+			"blockTimeStamp": 1793393586000,
+			"contractResult": [
+				""
+			],
+			"receipt": {
+				"net_fee": 268000
+			}
+		}
+	]
+	`
+	fixtureBlockTxWithMemoResponse = `
+	{
+		"blockID": "000000000538439184c6ad65ee294d0dac4651041c8c76c3764b28db9008058a",
+		"transactions": [
+			{
+				"raw_data": {
+					"ref_block_bytes": "4390",
+					"ref_block_hash": "1bc6674ccdf3c01c",
+					"expiration": 1793393643000,
+					"data": "6be029c1fa65e2b3a98e23b325b5d4da1c1ee32b39c7ddf2a20ed685776e280b",
+					"contract": [
+						{
+							"parameter": {
+								"value": {
+									"owner_address": "41f70da97812cb96acdf810712aa562db8dfa3dbef",
+									"to_address": "4176f171569726e59d53d0eda4b6650d495c14f10d",
+									"amount": 12023410
+								},
+								"type_url": "type.googleapis.com/protocol.TransferContract"
+							},
+							"type": "TransferContract"
+						}
+					],
+					"timestamp": 1793393583000
+				},
+				"signature": [
+					"e6d57305dc56d73845a178f57722b2ab55fb49223be22ac89be77b5425bff03c20a8248e284d53c612dbbc1740cc7b9217885929722d00ebe58b22a6b03070641b"
+				],
+				"ret": [
+					{
+						"contractRet": "SUCCESS"
+					}
+				],
+				"raw_data_hex": "0a02439022081bc6674ccdf3c01c40f89bddf4983452206be029c1fa65e2b3a98e23b325b5d4da1c1ee32b39c7ddf2a20ed685776e280b5a68080112640a2d747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e5472616e73666572436f6e747261637412330a1541f70da97812cb96acdf810712aa562db8dfa3dbef12154176f171569726e59d53d0eda4b6650d495c14f10d18f2ecdd057098c7d9f49834",
+				"txID": "4b1345bbc3610321d041619b80e52f16ddfde9108b814ac5af0b7c1ea9240446"
+			},
+			{
+				"raw_data": {
+					"ref_block_bytes": "4390",
+					"ref_block_hash": "1bc6674ccdf3c01c",
+					"expiration": 1793429583000,
+					"contract": [
+						{
+							"parameter": {
+								"value": {
+									"owner_address": "4191a048c65200d96bffec3ac903c92155f085a32b",
+									"to_address": "4129228e5d382b7a2c2a0dbc05e6d6507f4dbb3bbe",
+									"amount": 5072200
+								},
+								"type_url": "type.googleapis.com/protocol.TransferContract"
+							},
+							"type": "TransferContract"
+						}
+					],
+					"timestamp": 1793393583000
+				},
+				"signature": [
+					"ca219de01b3013ee3d144305058063340174f80114948322b29a16bf6ecfcbb5406c99d7f62964b0a81bb403e8d835c64957449b6093df90e9087b4271d58dc900"
+				],
+				"ret": [
+					{
+						"contractRet": "SUCCESS"
+					}
+				],
+				"raw_data_hex": "0a02439022081bc6674ccdf3c01c4098e9ee8599345a68080112640a2d747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e5472616e73666572436f6e747261637412330a154191a048c65200d96bffec3ac903c92155f085a32b12154129228e5d382b7a2c2a0dbc05e6d6507f4dbb3bbe18c8cab5027098c7d9f49834",
+				"txID": "61cba69bd9b6fb70692aca4f7cdfc45ccc95822da2c00e9b88c5101c6a603ed3"
+			}
+		]
+	}
+	`
 )
 
 func TestTronClientTestSuite(t *testing.T) {
@@ -302,4 +401,71 @@ func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight() {
 	require.Nil(blobdata.Uncles)
 }
 
-// TODO: add test case for TronClient.getBlockTraces
+func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_Memo() {
+	require := testutil.Require(s.T())
+	blockResponse := &jsonrpc.Response{
+		Result: json.RawMessage(fixtureBlock),
+	}
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), ethGetBlockByNumberMethod, jsonrpc.Params{
+			"0xacc290",
+			true,
+		},
+	).Return(blockResponse, nil)
+	receiptResponse := []*jsonrpc.Response{
+		{Result: json.RawMessage(fixtureReceipt)},
+		{Result: json.RawMessage(fixtureReceipt)},
+	}
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), ethGetTransactionReceiptMethod, gomock.Any(),
+	).Return(receiptResponse, nil)
+
+	postData, _ := json.Marshal(tronBlockNumRequestData{Num: ethereumHeight})
+	s.restClient.EXPECT().Call(gomock.Any(), tronTxInfoMethod, postData).Return(json.RawMessage(fixtureBlockTxInfoWithMemoResponse), nil)
+	s.restClient.EXPECT().Call(gomock.Any(), tronBlockTxMethod, postData).Return(json.RawMessage(fixtureBlockTxWithMemoResponse), nil)
+
+	block, err := s.client.GetBlockByHeight(context.Background(), tronTestTag, tronTestHeight)
+	require.NoError(err)
+
+	traces := block.GetEthereum().TransactionTraces
+	require.Equal(2, len(traces))
+
+	var withMemo map[string]any
+	require.NoError(json.Unmarshal(traces[0], &withMemo))
+	require.Equal("4b1345bbc3610321d041619b80e52f16ddfde9108b814ac5af0b7c1ea9240446", withMemo["id"])
+	require.Equal("TransferContract", withMemo["type"])
+	require.Equal("6be029c1fa65e2b3a98e23b325b5d4da1c1ee32b39c7ddf2a20ed685776e280b", withMemo["memo"])
+
+	var withoutMemo map[string]any
+	require.NoError(json.Unmarshal(traces[1], &withoutMemo))
+	require.Equal("61cba69bd9b6fb70692aca4f7cdfc45ccc95822da2c00e9b88c5101c6a603ed3", withoutMemo["id"])
+	require.Equal("TransferContract", withoutMemo["type"])
+	require.NotContains(withoutMemo, "memo")
+}
+
+func (s *tronClientTestSuite) TestTronClient_ExtractTransactionTypes_Memo() {
+	require := testutil.Require(s.T())
+	client := &TronClient{}
+
+	txTypeMap, txMemoMap, err := client.extractTransactionTypes([]byte(`{"transactions": [
+		{"txID": "aa", "raw_data": {"data": "68656c6c6f", "contract": [{"type": "TransferContract"}]}},
+		{"txID": "bb", "raw_data": {"data": "", "contract": [{"type": "TransferContract"}]}},
+		{"txID": "cc", "raw_data": {"contract": [{"type": "TriggerSmartContract"}]}},
+		{"txID": "dd", "raw_data": {"data": null, "contract": [{"type": "TransferContract"}]}}
+	]}`))
+	require.NoError(err)
+	require.Equal(map[string]string{"aa": "TransferContract", "bb": "TransferContract", "cc": "TriggerSmartContract", "dd": "TransferContract"}, txTypeMap)
+	require.Equal(map[string]string{"aa": "68656c6c6f"}, txMemoMap)
+
+	_, _, err = client.extractTransactionTypes([]byte(`{"transactions": [
+		{"txID": "aa", "raw_data": {"data": 1, "contract": [{"type": "TransferContract"}]}}
+	]}`))
+	require.Error(err)
+	require.Contains(err.Error(), "raw_data.data is not a string")
+
+	_, _, err = client.extractTransactionTypes([]byte(`{"transactions": [
+		{"txID": "aa", "raw_data": {"data": "hello", "contract": [{"type": "TransferContract"}]}}
+	]}`))
+	require.Error(err)
+	require.Contains(err.Error(), "raw_data.data of transaction aa is not hex")
+}
