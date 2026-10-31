@@ -1643,3 +1643,12 @@ func TestValidateAWSstorageConfig(t *testing.T) {
 	err = validate.Struct(&cfg.AWS)
 	require.Error(err, "Validation should fail when both configs are nil - at least one storage backend is required")
 }
+
+func TestHttpPoolConfigEnabled(t *testing.T) {
+	require := testutil.Require(t)
+
+	require.False(config.HttpPoolConfig{}.Enabled())
+	require.True(config.HttpPoolConfig{MaxConns: 8}.Enabled())
+	// Either knob on its own is enough to opt into a pooled transport.
+	require.True(config.HttpPoolConfig{IdleConnTimeout: time.Second}.Enabled())
+}

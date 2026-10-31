@@ -37,3 +37,14 @@ func TestNewPooledTransport_DefaultIdleConnTimeout(t *testing.T) {
 	transport := NewPooledTransport(8, 0)
 	require.Equal(DefaultIdleConnTimeout, transport.IdleConnTimeout)
 }
+
+func TestNewPooledTransport_DefaultMaxConns(t *testing.T) {
+	require := testutil.Require(t)
+
+	// A caller that configures only the idle timeout must still get a pool:
+	// MaxIdleConnsPerHost = 0 would mean DefaultMaxIdleConnsPerHost = 2.
+	transport := NewPooledTransport(0, 10*time.Second)
+	require.Equal(DefaultMaxConns, transport.MaxIdleConns)
+	require.Equal(DefaultMaxConns, transport.MaxIdleConnsPerHost)
+	require.Equal(10*time.Second, transport.IdleConnTimeout)
+}

@@ -84,7 +84,7 @@ func newReplicatorHTTPClient(pool config.HttpPoolConfig) *http.Client {
 	httpClient := &http.Client{
 		Timeout: timeout,
 	}
-	if pool.MaxConns > 0 {
+	if pool.Enabled() {
 		httpClient.Transport = httputil.NewPooledTransport(pool.MaxConns, pool.IdleConnTimeout)
 	}
 

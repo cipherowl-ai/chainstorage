@@ -10,16 +10,28 @@ import (
 	"time"
 )
 
-// DefaultIdleConnTimeout is applied when a caller does not configure one.
-const DefaultIdleConnTimeout = 30 * time.Second
+const (
+	// DefaultMaxConns and DefaultIdleConnTimeout are applied when a caller
+	// leaves the corresponding setting at zero.
+	DefaultMaxConns        = 120
+	DefaultIdleConnTimeout = 30 * time.Second
+)
 
 // NewPooledTransport clones http.DefaultTransport and overrides its connection
-// pool. A non-positive idleConnTimeout falls back to DefaultIdleConnTimeout.
+// pool. A non-positive maxConns or idleConnTimeout falls back to
+// DefaultMaxConns or DefaultIdleConnTimeout, so a partially configured pool is
+// still a pool. In particular maxConns must never reach the transport as 0:
+// MaxIdleConnsPerHost = 0 means DefaultMaxIdleConnsPerHost = 2, which is the
+// behavior this package exists to avoid.
 //
 // MaxConnsPerHost is deliberately left at 0 (unlimited): it is a hard limiter
 // with blocking acquisition semantics, so a non-zero value would trade
 // connection churn for requests timing out while queued.
 func NewPooledTransport(maxConns int, idleConnTimeout time.Duration) *http.Transport {
+	if maxConns <= 0 {
+		maxConns = DefaultMaxConns
+	}
+
 	if idleConnTimeout <= 0 {
 		idleConnTimeout = DefaultIdleConnTimeout
 	}

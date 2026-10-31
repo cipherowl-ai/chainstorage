@@ -3,6 +3,7 @@ package activity
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/httputil"
@@ -38,4 +39,17 @@ func TestReplicatorHTTPClient_ConfiguredPool(t *testing.T) {
 	require.Equal(16, transport.MaxIdleConns)
 	require.Equal(16, transport.MaxIdleConnsPerHost)
 	require.Equal(httputil.DefaultIdleConnTimeout, transport.IdleConnTimeout)
+}
+
+// Configuring only the idle timeout must still pool, rather than being
+// silently dropped on the floor.
+func TestReplicatorHTTPClient_IdleConnTimeoutOnly(t *testing.T) {
+	require := testutil.Require(t)
+
+	client := newReplicatorHTTPClient(config.HttpPoolConfig{IdleConnTimeout: 90 * time.Second})
+	transport, ok := unwrapTracedTransport(t, client).(*http.Transport)
+	require.True(ok)
+	require.Equal(90*time.Second, transport.IdleConnTimeout)
+	require.Equal(httputil.DefaultMaxConns, transport.MaxIdleConns)
+	require.Equal(httputil.DefaultMaxConns, transport.MaxIdleConnsPerHost)
 }

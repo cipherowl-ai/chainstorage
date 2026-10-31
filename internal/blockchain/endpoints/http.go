@@ -57,8 +57,8 @@ type (
 
 const (
 	defaultTimeout         = 120 * time.Second
-	defaultIdleConnTimeout = 30 * time.Second
-	defaultMaxConns        = 120
+	defaultIdleConnTimeout = httputil.DefaultIdleConnTimeout
+	defaultMaxConns        = httputil.DefaultMaxConns
 )
 
 var _ http.CookieJar = (*stickySessionJar)(nil)

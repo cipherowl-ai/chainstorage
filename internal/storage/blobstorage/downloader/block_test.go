@@ -1097,3 +1097,20 @@ func TestNewHTTPClient_ConfiguredPool(t *testing.T) {
 	require.Equal(24, transport.MaxIdleConnsPerHost)
 	require.Equal(httputil.DefaultIdleConnTimeout, transport.IdleConnTimeout)
 }
+
+// Configuring only the idle timeout must still pool, rather than being
+// silently dropped on the floor.
+func TestNewHTTPClient_IdleConnTimeoutOnly(t *testing.T) {
+	require := testutil.Require(t)
+
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.BlobDownloader.Http.IdleConnTimeout = 90 * time.Second
+
+	client := NewHTTPClient(HTTPClientParams{Params: fxparams.Params{Config: cfg}})
+	transport, ok := unwrapTracedTransport(t, client).(*http.Transport)
+	require.True(ok)
+	require.Equal(90*time.Second, transport.IdleConnTimeout)
+	require.Equal(httputil.DefaultMaxConns, transport.MaxIdleConns)
+	require.Equal(httputil.DefaultMaxConns, transport.MaxIdleConnsPerHost)
+}

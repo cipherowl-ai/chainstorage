@@ -1199,6 +1199,13 @@ func mergeInConfig(v *viper.Viper, configOpts *configOptions, env Env) error {
 	return nil
 }
 
+// Enabled reports whether the operator configured this pool at all. Any single
+// knob is enough: NewPooledTransport defaults the rest, so setting only
+// idle_conn_timeout still pools rather than being silently ignored.
+func (c HttpPoolConfig) Enabled() bool {
+	return c.MaxConns > 0 || c.IdleConnTimeout > 0
+}
+
 func (c *Config) Namespace() string {
 	return c.namespace
 }

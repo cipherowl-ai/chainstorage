@@ -178,7 +178,7 @@ func NewHTTPClient(params HTTPClientParams) HTTPClient {
 	}
 	// Left on http.DefaultTransport unless configured, which keeps the
 	// pre-existing behavior for anyone who has not sized the pool.
-	if pool := params.Config.BlobDownloader.Http; pool.MaxConns > 0 {
+	if pool := params.Config.BlobDownloader.Http; pool.Enabled() {
 		httpClient.Transport = httputil.NewPooledTransport(pool.MaxConns, pool.IdleConnTimeout)
 	}
 	httpClient = tracehttp.WrapClient(httpClient, tracehttp.RTWithResourceNamer(func(req *http.Request) string {
