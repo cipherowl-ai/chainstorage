@@ -316,6 +316,14 @@ func newEndpoint(
 		opts = append(opts, withOverrideRequestTimeout(cfg.Chain.Client.HttpTimeout))
 	}
 
+	if cfg.Chain.Client.MaxConns > 0 {
+		opts = append(opts, withMaxConns(cfg.Chain.Client.MaxConns))
+	}
+
+	if cfg.Chain.Client.IdleConnTimeout > 0 {
+		opts = append(opts, withIdleConnTimeout(cfg.Chain.Client.IdleConnTimeout))
+	}
+
 	if endpoint.RPS > 0 {
 		opts = append(opts, withRPS(endpoint.RPS))
 	}

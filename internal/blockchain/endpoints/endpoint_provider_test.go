@@ -365,6 +365,60 @@ func TestEndpointProvider_DefaultTimeout(t *testing.T) {
 	require.Equal(120.0, client.Timeout.Seconds())
 }
 
+func TestEndpointProvider_ConnectionPool(t *testing.T) {
+	require := testutil.Require(t)
+
+	logger := zaptest.NewLogger(t)
+	cfg, err := config.New()
+	require.NoError(err)
+	cfg.Chain.Client.MaxConns = 42
+	cfg.Chain.Client.IdleConnTimeout = 15 * time.Second
+
+	endpointGroup := &config.EndpointGroup{
+		Endpoints: []config.Endpoint{
+			{
+				Url:    "https://www.coinbase.com",
+				Weight: 1,
+			},
+		},
+	}
+	provider, err := newEndpointProvider(logger, cfg, tally.NoopScope, endpointGroup, "master")
+	require.NoError(err)
+	endpoint, err := provider.GetEndpoint(context.Background())
+	require.NoError(err)
+
+	transport := transportOf(t, endpoint.Client)
+	require.Equal(42, transport.MaxIdleConns)
+	require.Equal(42, transport.MaxIdleConnsPerHost)
+	require.Equal(15*time.Second, transport.IdleConnTimeout)
+}
+
+func TestEndpointProvider_DefaultConnectionPool(t *testing.T) {
+	require := testutil.Require(t)
+
+	logger := zaptest.NewLogger(t)
+	cfg, err := config.New()
+	require.NoError(err)
+
+	endpointGroup := &config.EndpointGroup{
+		Endpoints: []config.Endpoint{
+			{
+				Url:    "https://www.coinbase.com",
+				Weight: 1,
+			},
+		},
+	}
+	provider, err := newEndpointProvider(logger, cfg, tally.NoopScope, endpointGroup, "master")
+	require.NoError(err)
+	endpoint, err := provider.GetEndpoint(context.Background())
+	require.NoError(err)
+
+	// An unconfigured chain must still get a pooled client.
+	transport := transportOf(t, endpoint.Client)
+	require.Equal(defaultMaxConns, transport.MaxIdleConnsPerHost)
+	require.Equal(defaultIdleConnTimeout, transport.IdleConnTimeout)
+}
+
 func TestEndpointProvider_StickySessionCookiePassive(t *testing.T) {
 	require := testutil.Require(t)
 

@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/publicsuffix"
 	tracehttp "gopkg.in/DataDog/dd-trace-go.v1/contrib/net/http"
 
+	"github.com/coinbase/chainstorage/internal/utils/httputil"
 	"github.com/coinbase/chainstorage/internal/utils/ratelimiter"
 )
 
@@ -56,8 +57,8 @@ type (
 
 const (
 	defaultTimeout         = 120 * time.Second
-	defaultIdleConnTimeout = 30 * time.Second
-	defaultMaxConns        = 120
+	defaultIdleConnTimeout = httputil.DefaultIdleConnTimeout
+	defaultMaxConns        = httputil.DefaultMaxConns
 )
 
 var _ http.CookieJar = (*stickySessionJar)(nil)
@@ -90,34 +91,31 @@ func newHTTPClient(opts ...ClientOption) (*http.Client, error) {
 	return tracehttp.WrapClient(httpClient), nil
 }
 
-func newDefaultClient(options *clientOptions) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+// newTransport builds the transport shared by every endpoint http client.
+// Both the default and the sticky session paths must go through it so their
+// connection pool settings cannot drift apart.
+func newTransport(options *clientOptions) *http.Transport {
+	transport := httputil.NewPooledTransport(options.maxConns, options.idleConnTimeout)
 	if options.rootCAs != nil {
 		transport.TLSClientConfig.RootCAs = options.rootCAs
 	}
 
+	return transport
+}
+
+func newDefaultClient(options *clientOptions) (*http.Client, error) {
 	client := &http.Client{
 		Timeout:   options.timeout,
-		Transport: transport,
+		Transport: newTransport(options),
 	}
 	wrapClient := WrapHTTPClient(client, options.headers, options.rps, options.rpsCountBatch)
 	return wrapClient, nil
 }
 
 func newStickyClient(options *clientOptions) (*http.Client, error) {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-
-	// Override connection pool options.
-	transport.IdleConnTimeout = options.idleConnTimeout
-	transport.MaxIdleConns = options.maxConns
-	transport.MaxIdleConnsPerHost = options.maxConns
-	if options.rootCAs != nil {
-		transport.TLSClientConfig.RootCAs = options.rootCAs
-	}
-
 	client := &http.Client{
 		Timeout:   options.timeout,
-		Transport: transport,
+		Transport: newTransport(options),
 		Jar:       options.jar,
 	}
 
@@ -191,6 +189,20 @@ func (j *stickySessionJar) Cookies(u *url.URL) []*http.Cookie {
 func withOverrideRequestTimeout(timeout time.Duration) ClientOption {
 	return func(opts *clientOptions) {
 		opts.timeout = timeout
+	}
+}
+
+// withMaxConns overrides the size of the idle connection pool, both in total
+// and per host.
+func withMaxConns(maxConns int) ClientOption {
+	return func(opts *clientOptions) {
+		opts.maxConns = maxConns
+	}
+}
+
+func withIdleConnTimeout(timeout time.Duration) ClientOption {
+	return func(opts *clientOptions) {
+		opts.idleConnTimeout = timeout
 	}
 }
 

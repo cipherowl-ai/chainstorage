@@ -42,9 +42,26 @@ type (
 		FunctionalTest FunctionalTestConfig `mapstructure:"functional_test"`
 		StatsD         *StatsDConfig        `mapstructure:"statsd"`
 		Prometheus     *PrometheusConfig    `mapstructure:"prometheus"`
+		BlobDownloader BlobDownloaderConfig `mapstructure:"blob_downloader"`
 
 		namespace string
 		env       Env
+	}
+
+	// BlobDownloaderConfig configures the http client that downloads block
+	// blobs from presigned storage urls. It is storage-neutral: the same
+	// client serves S3 and GCS.
+	BlobDownloaderConfig struct {
+		Http HttpPoolConfig `mapstructure:"http"`
+	}
+
+	// HttpPoolConfig sizes an http.Transport connection pool. Each client that
+	// embeds it is configured separately, since they target different hosts.
+	// The zero value leaves the client on http.DefaultTransport, preserving
+	// whatever behavior it had before the knob existed.
+	HttpPoolConfig struct {
+		MaxConns        int           `mapstructure:"max_conns"`
+		IdleConnTimeout time.Duration `mapstructure:"idle_conn_timeout"`
 	}
 
 	StorageType struct {
@@ -106,6 +123,12 @@ type (
 		RpcTimeoutGetBlock     time.Duration     `mapstructure:"rpc_timeout_get_block"`
 		RpcTimeoutGetRawTx     time.Duration     `mapstructure:"rpc_timeout_get_raw_tx"`
 		RpcTimeoutGetBlockHash time.Duration     `mapstructure:"rpc_timeout_get_block_hash"`
+		// MaxConns and IdleConnTimeout size the idle connection pool of every
+		// endpoint client. Unlike the other clients, zero here keeps the
+		// package defaults (defaultMaxConns, defaultIdleConnTimeout), which
+		// are already pooled.
+		MaxConns        int           `mapstructure:"max_conns"`
+		IdleConnTimeout time.Duration `mapstructure:"idle_conn_timeout"`
 	}
 
 	JSONRPCConfig struct {
@@ -275,6 +298,9 @@ type (
 		MiniBatchSize  uint64 `mapstructure:"mini_batch_size" validate:"required"`
 		CheckpointSize uint64 `mapstructure:"checkpoint_size" validate:"required,gtfield=BatchSize"`
 		Parallelism    int    `mapstructure:"parallelism" validate:"required"`
+		// Http sizes the connection pool of the replicator's own http client,
+		// which talks to the replication source rather than to a chain node.
+		Http HttpPoolConfig `mapstructure:"http"`
 	}
 
 	EventBackfillerWorkflowConfig struct {
@@ -835,6 +861,21 @@ func New(opts ...ConfigOption) (*Config, error) {
 	if err := v.BindEnv("aws.storage.consolidation.safe_promotion_lag"); err != nil {
 		return nil, xerrors.Errorf("failed to bind safe_promotion_lag env: %w", err)
 	}
+	// The connection pool knobs are absent from the config templates on
+	// purpose: a missing key means "keep the client's own default". They
+	// therefore need an explicit binding to be settable from the environment.
+	for _, key := range []string{
+		"chain.client.max_conns",
+		"chain.client.idle_conn_timeout",
+		"blob_downloader.http.max_conns",
+		"blob_downloader.http.idle_conn_timeout",
+		"workflows.replicator.http.max_conns",
+		"workflows.replicator.http.idle_conn_timeout",
+	} {
+		if err := v.BindEnv(key); err != nil {
+			return nil, xerrors.Errorf("failed to bind %v env: %w", key, err)
+		}
+	}
 
 	// Read the data in base.yml
 	if err := v.ReadConfig(configReader); err != nil {
@@ -1156,6 +1197,13 @@ func mergeInConfig(v *viper.Viper, configOpts *configOptions, env Env) error {
 		}
 	}
 	return nil
+}
+
+// Enabled reports whether the operator configured this pool at all. Any single
+// knob is enough: NewPooledTransport defaults the rest, so setting only
+// idle_conn_timeout still pools rather than being silently ignored.
+func (c HttpPoolConfig) Enabled() bool {
+	return c.MaxConns > 0 || c.IdleConnTimeout > 0
 }
 
 func (c *Config) Namespace() string {
