@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"strconv"
 	"time"
 
@@ -52,7 +53,10 @@ type (
 		rawJson json.RawMessage          // Store the raw message in blob storage.
 	}
 
-	// parsedInputTx holds a parsed input transaction with an O(1) vout lookup map.
+	// parsedInputTx holds a parsed input transaction with an O(1) lookup map of
+	// the vouts the block spends. tx.Vout is cleared: the other outputs of a
+	// fan-out transaction are never needed, and a dust sweep spends thousands
+	// of those transactions in one block.
 	parsedInputTx struct {
 		tx      *bitcoin.BitcoinInputTransactionLit
 		voutMap map[uint64]*bitcoin.BitcoinTransactionOutput
@@ -326,7 +330,7 @@ func (b *bitcoinClient) getBlockFromHeader(
 ) (*api.Block, error) {
 	blockHash := headerResult.header.Hash.Value()
 
-	inputTransactionsData, rawInputTransactionsMap, err := b.getInputTransactions(ctx, headerResult.header)
+	inputTransactionsData, rawInputTransactions, err := b.getInputTransactions(ctx, headerResult.header)
 	if err != nil {
 		return nil, xerrors.Errorf("failed to get previous transactions for block %s: %w", blockHash, err)
 	}
@@ -337,11 +341,9 @@ func (b *bitcoinClient) getBlockFromHeader(
 	}
 
 	blobdata := &api.BitcoinBlobdata{
-		Header:            headerResult.rawJson,
-		InputTransactions: inputTransactions,
-	}
-	if b.preserveRawInputTransactions {
-		blobdata.RawInputTransactions = rawInputTransactionsMap
+		Header:               headerResult.rawJson,
+		InputTransactions:    inputTransactions,
+		RawInputTransactions: rawInputTransactions,
 	}
 
 	block := &api.Block{
@@ -364,7 +366,8 @@ func (b *bitcoinClient) getBlockFromHeader(
 }
 
 // getInputTransactions fetches and processes input transactions for a block.
-// Returns per-transaction filtered input data and the raw transaction map.
+// Returns per-transaction filtered input data and, when the client preserves
+// it, the raw transaction map.
 //
 // For a block with transactions A (inputs: A1, A2), B (inputs: B1, B2), C (inputs: C1),
 // the results will be:
@@ -377,14 +380,9 @@ func (b *bitcoinClient) getInputTransactions(
 	transactions := header.Transactions
 	blockHash := header.Hash.Value()
 
-	inputTransactionIDs := collectInputTransactionIDs(transactions)
+	inputTransactionIDs, spentVouts := collectInputTransactionIDs(transactions)
 
-	inputTransactionsMap, err := b.fetchInputTransactions(ctx, inputTransactionIDs, blockHash)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	parsedCache, err := parseInputTransactions(inputTransactionsMap)
+	parsedCache, rawInputTransactions, err := b.fetchInputTransactions(ctx, inputTransactionIDs, spentVouts, blockHash)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -394,34 +392,43 @@ func (b *bitcoinClient) getInputTransactions(
 		return nil, nil, err
 	}
 
-	return results, inputTransactionsMap, nil
+	return results, rawInputTransactions, nil
 }
 
-// collectInputTransactionIDs extracts deduplicated input transaction IDs
-// from all block transactions, preserving first-seen order.
-func collectInputTransactionIDs(transactions []*bitcoin.BitcoinTransactionLit) []string {
-	seen := make(map[string]bool)
+// collectInputTransactionIDs extracts deduplicated input transaction IDs from
+// all block transactions, preserving first-seen order, and the vouts the block
+// spends from each of them.
+func collectInputTransactionIDs(transactions []*bitcoin.BitcoinTransactionLit) ([]string, map[string]map[uint64]bool) {
+	spentVouts := make(map[string]map[uint64]bool)
 	var ids []string
 	for _, tx := range transactions {
 		for _, input := range tx.Inputs {
 			txID := input.Identifier.Value()
 			// coinbase transaction does not have txid
-			if txID != "" && !seen[txID] {
-				seen[txID] = true
+			if txID == "" {
+				continue
+			}
+			if spentVouts[txID] == nil {
+				spentVouts[txID] = make(map[uint64]bool)
 				ids = append(ids, txID)
 			}
+			spentVouts[txID][input.Vout.Value()] = true
 		}
 	}
-	return ids
+	return ids, spentVouts
 }
 
-// fetchInputTransactions fetches raw transaction data for the given IDs via
-// concurrent batched getrawtransaction RPC calls. Returns a map of txid -> raw JSON.
+// fetchInputTransactions fetches the given IDs via concurrent batched
+// getrawtransaction RPC calls and parses each batch as it arrives, so that the
+// outputs the block does not spend never outlive their batch. Returns the
+// parsed transactions and, when the client preserves it, a map of txid -> raw
+// JSON.
 func (b *bitcoinClient) fetchInputTransactions(
 	ctx context.Context,
 	inputTransactionIDs []string,
+	spentVouts map[string]map[uint64]bool,
 	blockHash string,
-) (map[string][]byte, error) {
+) (map[string]*parsedInputTx, map[string][]byte, error) {
 	opts := internal.OptionsFromContext(ctx)
 	txBatchSize := b.config.Chain.Client.TxBatchSize
 	numTransactions := len(inputTransactionIDs)
@@ -435,7 +442,8 @@ func (b *bitcoinClient) fetchInputTransactions(
 
 	// Calculate number of batches and pre-allocate per-batch result slices.
 	numBatches := (numTransactions + txBatchSize - 1) / txBatchSize
-	batchResults := make([][]*jsonrpc.Response, numBatches)
+	batchParsed := make([]map[string]*parsedInputTx, numBatches)
+	batchRaw := make([]map[string][]byte, numBatches)
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(fetchInputTxConcurrency)
@@ -473,34 +481,50 @@ func (b *bitcoinClient) fetchInputTransactions(
 					err,
 				)
 			}
-			batchResults[idx] = responses
+
+			raw := make(map[string][]byte, len(responses))
+			for i, resp := range responses {
+				raw[inputTransactionIDs[batchStart+i]] = resp.Result
+			}
+			parsed, err := parseInputTransactions(raw, spentVouts)
+			if err != nil {
+				return err
+			}
+			batchParsed[idx] = parsed
+			if b.preserveRawInputTransactions {
+				batchRaw[idx] = raw
+			}
 			opts.RecordHeartbeat(ctx, "fetchInputTx.batch.done", idx)
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	opts.RecordHeartbeat(ctx, "fetchInputTx.done", numBatches)
 
 	// Merge batch results into a single map.
-	result := make(map[string][]byte, numTransactions)
-	for batchIdx, responses := range batchResults {
-		batchStart := batchIdx * txBatchSize
-		for respIdx, resp := range responses {
-			result[inputTransactionIDs[batchStart+respIdx]] = resp.Result
-		}
+	parsedCache := make(map[string]*parsedInputTx, numTransactions)
+	for _, parsed := range batchParsed {
+		maps.Copy(parsedCache, parsed)
+	}
+	if !b.preserveRawInputTransactions {
+		return parsedCache, nil, nil
+	}
+	rawInputTransactions := make(map[string][]byte, numTransactions)
+	for _, raw := range batchRaw {
+		maps.Copy(rawInputTransactions, raw)
 	}
 
-	return result, nil
+	return parsedCache, rawInputTransactions, nil
 }
 
 // parseInputTransactions unmarshals, validates, and indexes raw input
-// transactions. Each unique txid is parsed once and its vouts are indexed
-// by N for O(1) lookup. Replaces reflection-based validator.Struct with
-// direct checks to avoid per-call reflection overhead.
-func parseInputTransactions(rawMap map[string][]byte) (map[string]*parsedInputTx, error) {
+// transactions. Each unique txid is parsed once and the vouts in spentVouts
+// are indexed by N for O(1) lookup. Replaces reflection-based validator.Struct
+// with direct checks to avoid per-call reflection overhead.
+func parseInputTransactions(rawMap map[string][]byte, spentVouts map[string]map[uint64]bool) (map[string]*parsedInputTx, error) {
 	parsed := make(map[string]*parsedInputTx, len(rawMap))
 	for txID, rawData := range rawMap {
 		var tx bitcoin.BitcoinInputTransactionLit
@@ -513,10 +537,14 @@ func parseInputTransactions(rawMap map[string][]byte) (map[string]*parsedInputTx
 		if len(tx.Vout) == 0 {
 			return nil, xerrors.Errorf("failed to validate input transaction %s: vout must have at least 1 element", txID)
 		}
-		vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(tx.Vout))
+		spent := spentVouts[txID]
+		vm := make(map[uint64]*bitcoin.BitcoinTransactionOutput, len(spent))
 		for _, o := range tx.Vout {
-			vm[o.N.Value()] = o
+			if n := o.N.Value(); spent[n] {
+				vm[n] = o
+			}
 		}
+		tx.Vout = nil
 		parsed[txID] = &parsedInputTx{tx: &tx, voutMap: vm}
 	}
 	return parsed, nil

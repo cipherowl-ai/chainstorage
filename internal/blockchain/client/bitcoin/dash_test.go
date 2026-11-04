@@ -3,6 +3,7 @@ package bitcoin
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -12,6 +13,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/blockchain/client/internal"
 	"github.com/coinbase/chainstorage/internal/blockchain/jsonrpc"
 	jsonrpcmocks "github.com/coinbase/chainstorage/internal/blockchain/jsonrpc/mocks"
+	"github.com/coinbase/chainstorage/internal/config"
 	"github.com/coinbase/chainstorage/internal/utils/fixtures"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
@@ -29,6 +31,56 @@ type dashClientTestSuite struct {
 
 func TestDashClientTestSuite(t *testing.T) {
 	suite.Run(t, new(dashClientTestSuite))
+}
+
+// TestDashClient_GetBlockByHash_RawInputTransactionsAcrossBatches verifies that
+// raw transactions are preserved when they arrive in more than one batch.
+func TestDashClient_GetBlockByHash_RawInputTransactionsAcrossBatches(t *testing.T) {
+	require := testutil.Require(t)
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+	rpcClient := jsonrpcmocks.NewMockClient(ctrl)
+
+	cfg, err := config.New(
+		config.WithBlockchain(common.Blockchain_BLOCKCHAIN_DASH),
+		config.WithNetwork(common.Network_NETWORK_DASH_MAINNET),
+	)
+	require.NoError(err)
+	cfg.Chain.Client.TxBatchSize = 2
+
+	var result internal.ClientParams
+	app := testapp.New(t, Module, testModule(rpcClient), testapp.WithConfig(cfg), fx.Populate(&result))
+	defer app.Close()
+
+	blockResponse, err := fixtures.ReadFile("client/bitcoin/btc_getblockresponse.json")
+	require.NoError(err)
+	rpcClient.EXPECT().Call(
+		gomock.Any(), defaultGetBlockByHash, jsonrpc.Params{btcFixtureBlockHash, bitcoinBlockVerbosity},
+	).Return(&jsonrpc.Response{Result: blockResponse}, nil)
+
+	inputResponses := make(map[string][]byte, len(btcFixtureInputTransactionIDs))
+	for i, id := range btcFixtureInputTransactionIDs {
+		inputResponses[id], err = fixtures.ReadFile(fmt.Sprintf("client/bitcoin/btc_getinputtx%d_resp.json", i+1))
+		require.NoError(err)
+	}
+	rpcClient.EXPECT().BatchCall(gomock.Any(), defaultGetRawTransaction, gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ *jsonrpc.RequestMethod, batchParams []jsonrpc.Params, _ ...jsonrpc.Option) ([]*jsonrpc.Response, error) {
+			responses := make([]*jsonrpc.Response, len(batchParams))
+			for i, params := range batchParams {
+				responses[i] = &jsonrpc.Response{Result: inputResponses[params[0].(string)]}
+			}
+			return responses, nil
+		},
+	).Times(2)
+
+	block, err := result.Master.GetBlockByHash(context.Background(), btcTag, btcFixtureBlockHeight, btcFixtureBlockHash)
+	require.NoError(err)
+
+	rawInputTransactions := block.GetBitcoin().RawInputTransactions
+	require.Len(rawInputTransactions, len(inputResponses))
+	for id, response := range inputResponses {
+		require.JSONEq(string(response), string(rawInputTransactions[id]))
+	}
 }
 
 func (s *dashClientTestSuite) SetupTest() {
