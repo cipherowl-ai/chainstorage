@@ -26,6 +26,7 @@ type (
 		getLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		getLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
 		getMaxEventId              *activity.GetMaxEventIdActivity
+		setPostgresWatermark       *activity.SetPostgresWatermarkActivity
 	}
 
 	MigratorParams struct {
@@ -37,11 +38,12 @@ type (
 		GetLatestBlockFromPostgres *activity.GetLatestBlockFromPostgresActivity
 		GetLatestEventFromPostgres *activity.GetLatestEventFromPostgresActivity
 		GetMaxEventId              *activity.GetMaxEventIdActivity
+		SetPostgresWatermark       *activity.SetPostgresWatermarkActivity
 	}
 
 	MigratorRequest struct {
 		StartEventSequence int64 // Start event sequence
-		EndEventSequence   int64 // End event sequence (0 = auto-detect)
+		EndEventSequence   int64 // End event sequence, exclusive (0 = through the last event in DynamoDB)
 		EventTag           uint32
 		Tag                uint32
 		BatchSize          uint64 // Optional. If not specified, it is read from the workflow config.
@@ -74,6 +76,7 @@ func NewMigrator(params MigratorParams) *Migrator {
 		getLatestBlockFromPostgres: params.GetLatestBlockFromPostgres,
 		getLatestEventFromPostgres: params.GetLatestEventFromPostgres,
 		getMaxEventId:              params.GetMaxEventId,
+		setPostgresWatermark:       params.SetPostgresWatermark,
 	}
 	w.registerWorkflow(w.execute)
 	return w
@@ -198,7 +201,8 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 		}
 
 		// Handle end event sequence auto-detection if not provided
-		if request.EndEventSequence == 0 {
+		endAutoDetected := request.EndEventSequence == 0
+		if endAutoDetected {
 			logger.Info("No end event sequence provided, fetching max event ID from DynamoDB...")
 
 			// Query DynamoDB for the actual max event ID
@@ -226,14 +230,16 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 				return xerrors.New("No events found in DynamoDB to migrate")
 			}
 
-			request.EndEventSequence = maxEventResp.MaxEventId
+			request.EndEventSequence = maxEventResp.MaxEventId + 1
 			logger.Info("Found max event ID in DynamoDB",
 				zap.Int64("maxEventId", maxEventResp.MaxEventId),
 				zap.Int64("startEventSequence", request.StartEventSequence))
 		}
 
-		// Validate end sequence after auto-detection and auto-resume
-		if !continuousSync && request.StartEventSequence >= request.EndEventSequence {
+		// Validate end sequence after auto-detection and auto-resume. A run that finds nothing left
+		// to copy still has to finish, because the watermark is set at the end of the run.
+		caughtUp := endAutoDetected && request.StartEventSequence == request.EndEventSequence
+		if !continuousSync && !caughtUp && request.StartEventSequence >= request.EndEventSequence {
 			return xerrors.Errorf("startEventSequence (%d) must be less than endEventSequence (%d)",
 				request.StartEventSequence, request.EndEventSequence)
 		}
@@ -263,14 +269,6 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			logger.Info("starting next continuous sync cycle after catch-up",
 				zap.Int64("nextStartEventSequence", newRequest.StartEventSequence))
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
-		}
-
-		// Special case: if auto-resume found we're already caught up
-		if request.AutoResume && request.StartEventSequence >= request.EndEventSequence {
-			logger.Info("Auto-resume detected: already caught up, no migration needed",
-				zap.Int64("startEventSequence", request.StartEventSequence),
-				zap.Int64("endEventSequence", request.EndEventSequence))
-			return nil // Successfully completed with no work to do
 		}
 
 		// Log migration mode
@@ -374,9 +372,20 @@ func (w *Migrator) execute(ctx workflow.Context, request *MigratorRequest) error
 			return workflow.NewContinueAsNewError(ctx, w.name, &newRequest)
 		}
 
+		// The migrator copies without a watermark, and nothing reads a Postgres chain without one.
+		watermark, err := w.setPostgresWatermark.Execute(ctx, &activity.SetPostgresWatermarkRequest{
+			Tag:      tag,
+			EventTag: eventTag,
+		})
+		if err != nil {
+			return xerrors.Errorf("failed to set postgres watermark: %w", err)
+		}
+
 		logger.Info("migrator workflow finished",
 			zap.Int64("totalEvents", totalEventRange),
-			zap.Int64("processedEvents", processedEvents))
+			zap.Int64("processedEvents", processedEvents),
+			zap.Uint64("watermarkHeight", watermark.Height),
+			zap.String("watermarkHash", watermark.Hash))
 
 		return nil
 	})

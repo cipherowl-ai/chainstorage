@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -26,8 +25,11 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	postgres_storage "github.com/coinbase/chainstorage/internal/storage/metastorage/postgres"
 	"github.com/coinbase/chainstorage/internal/utils/fxparams"
+	"github.com/coinbase/chainstorage/internal/utils/syncgroup"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
+
+const migratorHeartbeatInterval = 10 * time.Second
 
 type (
 	Migrator struct {
@@ -73,6 +75,12 @@ type (
 		config    *config.Config
 		awsConfig aws.Config
 		metrics   tally.Scope
+	}
+
+	SetPostgresWatermarkActivity struct {
+		baseActivity
+		config  *config.Config
+		metrics tally.Scope
 	}
 
 	MigratorParams struct {
@@ -163,6 +171,16 @@ func NewGetMaxEventIdActivity(params MigratorParams) *GetMaxEventIdActivity {
 	return a
 }
 
+func NewSetPostgresWatermarkActivity(params MigratorParams) *SetPostgresWatermarkActivity {
+	a := &SetPostgresWatermarkActivity{
+		baseActivity: newBaseActivity(ActivitySetPostgresWatermark, params.Runtime),
+		config:       params.Config,
+		metrics:      params.Metrics,
+	}
+	a.register(a.execute)
+	return a
+}
+
 func (a *Migrator) Execute(ctx workflow.Context, request *MigratorRequest) (*MigratorResponse, error) {
 	var response MigratorResponse
 	err := a.executeActivity(ctx, request, &response)
@@ -186,20 +204,11 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 	}
 
 	// Add heartbeat mechanism - send heartbeat every 10 seconds to avoid timeout
-	heartbeatTicker := time.NewTicker(10 * time.Second)
-	defer heartbeatTicker.Stop()
-
-	go func() {
-		for range heartbeatTicker.C {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				activity.RecordHeartbeat(ctx, fmt.Sprintf("Processing events [%d, %d), elapsed: %v",
-					request.StartEventSequence, request.EndEventSequence, time.Since(startTime)))
-			}
-		}
-	}()
+	stopHeartbeat := startHeartbeat(ctx, migratorHeartbeatInterval, func() {
+		activity.RecordHeartbeat(ctx, fmt.Sprintf("Processing events [%d, %d), elapsed: %v",
+			request.StartEventSequence, request.EndEventSequence, time.Since(startTime)))
+	})
+	defer stopHeartbeat()
 
 	// Create storage instances
 	migrationData, err := a.createStorageInstances(ctx)
@@ -221,19 +230,9 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		}, nil
 	}
 
-	// Step 2: Split events into segments and migrate blocks
-	blocksMigrated, err := a.migrateExtractedBlocks(ctx, logger, migrationData, request, events)
+	blocksMigrated, eventsMigrated, err := a.migrateBatch(ctx, logger, migrationData, request, events)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to migrate blocks: %w", err)
-	}
-
-	// Step 3: Migrate events
-	eventsMigrated := 0
-	if len(events) > 0 {
-		eventsMigrated, err = a.persistEvents(ctx, logger, migrationData, request, events)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to migrate events: %w", err)
-		}
+		return nil, err
 	}
 
 	duration := time.Since(startTime)
@@ -249,6 +248,71 @@ func (a *Migrator) execute(ctx context.Context, request *MigratorRequest) (*Migr
 		Message: fmt.Sprintf("Migrated %d blocks and %d events in %v",
 			blocksMigrated, eventsMigrated, duration),
 	}, nil
+}
+
+func (a *Migrator) migrateBatch(ctx context.Context, logger *zap.Logger,
+	data *MigrationData, request *MigratorRequest,
+	events []*model.EventEntry) (int, int, error) {
+
+	// Blocks land before their events, and a batch's events land together. So when a retry finds the
+	// batch's events in the destination, its blocks are there too, and writing them again could leave
+	// a fork that lost on the canonical rows.
+	batchCopied, err := isBatchCopied(ctx, data.DestStorage, request)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	// Step 2: Split events into segments and migrate blocks
+	blocksMigrated := 0
+	if !batchCopied {
+		blocksMigrated, err = a.migrateExtractedBlocks(ctx, logger, data, request, events)
+		if err != nil {
+			return 0, 0, xerrors.Errorf("failed to migrate blocks: %w", err)
+		}
+	}
+
+	// Step 3: Migrate events
+	eventsMigrated, err := a.persistEvents(ctx, logger, data, request, events)
+	if err != nil {
+		return 0, 0, xerrors.Errorf("failed to migrate events: %w", err)
+	}
+
+	return blocksMigrated, eventsMigrated, nil
+}
+
+func isBatchCopied(ctx context.Context, dest metastorage.MetaStorage, request *MigratorRequest) (bool, error) {
+	maxEventId, err := dest.GetMaxEventId(ctx, request.EventTag)
+	if errors.Is(err, storage.ErrNoEventHistory) {
+		return false, nil
+	}
+	if err != nil {
+		return false, xerrors.Errorf("failed to get max event id: %w", err)
+	}
+	return maxEventId >= request.EndEventSequence-1, nil
+}
+
+// startHeartbeat calls record every interval until ctx ends or the returned function is called.
+// The returned function waits for the heartbeat goroutine to exit.
+func startHeartbeat(ctx context.Context, interval time.Duration, record func()) func() {
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				record()
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
 }
 
 func (a *Migrator) createStorageInstances(ctx context.Context) (*MigrationData, error) {
@@ -389,14 +453,9 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 		// Get parent block for validation if not genesis
 		var lastBlock *api.BlockMetadata
 		if len(segmentBlocks) > 0 && segmentBlocks[0].Height > 0 {
-			parentHeight := segmentBlocks[0].Height - 1
-			parentBlock, err := data.DestStorage.GetBlockByHeight(ctx, request.Tag, parentHeight)
-			if err == nil {
-				lastBlock = parentBlock
-			} else if !errors.Is(err, storage.ErrItemNotFound) {
-				logger.Warn("Could not fetch parent block",
-					zap.Uint64("parentHeight", parentHeight),
-					zap.Error(err))
+			lastBlock, err = getSegmentParent(ctx, data.DestStorage, request.Tag, segmentBlocks[0])
+			if err != nil {
+				return totalBlocksPersistedCount, err
 			}
 		}
 
@@ -424,6 +483,38 @@ func (a *Migrator) migrateExtractedBlocks(ctx context.Context, logger *zap.Logge
 		zap.Int("totalBlocksPersisted", totalBlocksPersistedCount))
 
 	return totalBlocksPersistedCount, nil
+}
+
+// getSegmentParent returns the block to validate a segment against, or nil if the destination has
+// none. It is the canonical block below the segment, unless the destination holds the block the
+// segment names as its parent: when a batch holding a reorg is retried, the winning fork is already
+// canonical there, while the segment extends the fork that lost.
+func getSegmentParent(ctx context.Context, dest metastorage.MetaStorage, tag uint32, first *api.BlockMetadata) (*api.BlockMetadata, error) {
+	parentHeight := first.Height - 1
+	parent, err := dest.GetBlockByHeight(ctx, tag, parentHeight)
+	if errors.Is(err, storage.ErrItemNotFound) || errors.Is(err, storage.ErrInvalidHeight) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, xerrors.Errorf("failed to fetch parent block at height %d: %w", parentHeight, err)
+	}
+	if first.ParentHash == "" || first.ParentHash == parent.Hash {
+		return parent, nil
+	}
+
+	// The parent sits lower than parentHeight when the height in between is skipped.
+	forkParentHeight := parentHeight
+	if first.ParentHeight != 0 {
+		forkParentHeight = first.ParentHeight
+	}
+	forkParent, err := dest.GetBlockByHash(ctx, tag, forkParentHeight, first.ParentHash)
+	if errors.Is(err, storage.ErrItemNotFound) {
+		return parent, nil
+	}
+	if err != nil {
+		return nil, xerrors.Errorf("failed to fetch parent block (height=%d, hash=%s): %w", forkParentHeight, first.ParentHash, err)
+	}
+	return forkParent, nil
 }
 
 // BlockSegment represents a continuous segment of blocks to persist together
@@ -525,11 +616,9 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 	close(workChan)
 
 	// Worker function - fetches block and writes directly to results[index]
-	var wg sync.WaitGroup
+	group, _ := syncgroup.New(ctx)
 	for i := 0; i < parallelism; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		group.Go(func() error {
 			for item := range workChan {
 				var blockMeta *api.BlockMetadata
 
@@ -549,11 +638,9 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 					var err error
 					blockMeta, err = data.SourceStorage.GetBlockByHash(ctx, request.Tag, item.Block.Height, item.Block.Hash)
 					if err != nil {
-						logger.Warn("Failed to fetch block by hash",
-							zap.Uint64("height", item.Block.Height),
-							zap.String("hash", item.Block.Hash),
-							zap.Error(err))
-						continue // Skip this block
+						// The block's event cannot land without it, so the batch has to fail.
+						return xerrors.Errorf("failed to fetch block (height=%d, hash=%s): %w",
+							item.Block.Height, item.Block.Hash, err)
 					}
 				}
 
@@ -565,30 +652,27 @@ func (a *Migrator) fetchBlockData(ctx context.Context, logger *zap.Logger,
 					EventSeq:      item.Block.EventSeq,
 				}
 			}
-		}()
+			return nil
+		})
 	}
 
 	// Wait for all workers to complete
-	wg.Wait()
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
 
-	// Filter out nils (from failed fetches) and count skipped
-	var validResults []*BlockWithInfo
 	skippedCount := 0
 	for _, blockInfo := range results {
-		if blockInfo != nil {
-			validResults = append(validResults, blockInfo)
-			if blockInfo.BlockMetadata != nil && blockInfo.BlockMetadata.Skipped {
-				skippedCount++
-			}
+		if blockInfo.BlockMetadata != nil && blockInfo.BlockMetadata.Skipped {
+			skippedCount++
 		}
 	}
 
 	logger.Debug("Completed parallel block data fetch",
-		zap.Int("requested", len(blocksToMigrate)),
-		zap.Int("fetched", len(validResults)),
+		zap.Int("fetched", len(results)),
 		zap.Int("skippedBlocks", skippedCount))
 
-	return validResults, nil
+	return results, nil
 }
 
 func (a *Migrator) persistEvents(ctx context.Context, logger *zap.Logger,
@@ -672,6 +756,16 @@ type GetMaxEventIdRequest struct {
 type GetMaxEventIdResponse struct {
 	MaxEventId int64 // Maximum event ID in DynamoDB
 	Found      bool  // true if events were found
+}
+
+type SetPostgresWatermarkRequest struct {
+	Tag      uint32 `validate:"required"`
+	EventTag uint32
+}
+
+type SetPostgresWatermarkResponse struct {
+	Height uint64
+	Hash   string
 }
 
 func (a *Migrator) GetLatestBlockHeight(ctx context.Context, req *GetLatestBlockHeightRequest) (*GetLatestBlockHeightResponse, error) {
@@ -865,6 +959,90 @@ func (a *GetMaxEventIdActivity) execute(ctx context.Context, request *GetMaxEven
 	}, nil
 }
 
+func (a *SetPostgresWatermarkActivity) Execute(ctx workflow.Context, request *SetPostgresWatermarkRequest) (*SetPostgresWatermarkResponse, error) {
+	var response SetPostgresWatermarkResponse
+	err := a.executeActivity(ctx, request, &response)
+	return &response, err
+}
+
+func (a *SetPostgresWatermarkActivity) execute(ctx context.Context, request *SetPostgresWatermarkRequest) (*SetPostgresWatermarkResponse, error) {
+	if err := a.validateRequest(request); err != nil {
+		return nil, err
+	}
+
+	logger := a.getLogger(ctx).With(zap.Reflect("request", request))
+
+	// Create PostgreSQL storage using shared connection pool to query destination
+	postgresParams := postgres_storage.Params{
+		Params: fxparams.Params{
+			Config:  a.config,
+			Logger:  logger,
+			Metrics: a.metrics,
+		},
+	}
+	destResult, err := postgres_storage.NewMetaStorage(postgresParams)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create PostgreSQL storage: %w", err)
+	}
+
+	response, err := setWatermarkAtEventTip(ctx, destResult.MetaStorage, a.config.Chain.BlockStartHeight, request)
+	if err != nil {
+		return nil, err
+	}
+
+	logger.Info("Set PostgreSQL watermark",
+		zap.Uint64("height", response.Height),
+		zap.String("hash", response.Hash))
+	return response, nil
+}
+
+// setWatermarkAtEventTip points GetLatestBlock at the tip of the destination's event stream. The
+// migrator writes no watermark while it copies, and without one GetLatestBlock finds nothing, so
+// the streamer and the poller cannot start on the destination.
+func setWatermarkAtEventTip(ctx context.Context, dest metastorage.MetaStorage, blockStartHeight uint64,
+	request *SetPostgresWatermarkRequest) (*SetPostgresWatermarkResponse, error) {
+
+	maxEventId, err := dest.GetMaxEventId(ctx, request.EventTag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get max event id: %w", err)
+	}
+	tip, err := metastorage.GetTipEvent(ctx, dest, request.EventTag, maxEventId)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get tip event: %w", err)
+	}
+
+	// Reading the parent too proves that the tip is linked to the chain below it.
+	startHeight := tip.BlockHeight
+	if startHeight > blockStartHeight {
+		startHeight--
+	}
+	blocks, err := dest.GetBlocksByHeightRange(ctx, request.Tag, startHeight, tip.BlockHeight+1)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get blocks [%d, %d]: %w", startHeight, tip.BlockHeight, err)
+	}
+	tipBlock := blocks[len(blocks)-1]
+	if tipBlock.Hash != tip.BlockHash {
+		return nil, xerrors.Errorf("canonical block at height %d has hash %s, but event %d has %s",
+			tip.BlockHeight, tipBlock.Hash, tip.EventId, tip.BlockHash)
+	}
+
+	if err := dest.PersistBlockMetas(ctx, true, []*api.BlockMetadata{tipBlock}, nil); err != nil {
+		return nil, xerrors.Errorf("failed to set watermark at height %d: %w", tip.BlockHeight, err)
+	}
+
+	// A watermark from an earlier run stays in place when a rollback has since shortened the chain.
+	latest, err := dest.GetLatestBlock(ctx, request.Tag)
+	if err != nil {
+		return nil, xerrors.Errorf("failed to get latest block: %w", err)
+	}
+	if latest.Height != tipBlock.Height || latest.Hash != tipBlock.Hash {
+		return nil, xerrors.Errorf("latest block is (height=%d, hash=%s), but the event tip is (height=%d, hash=%s)",
+			latest.Height, latest.Hash, tipBlock.Height, tipBlock.Hash)
+	}
+
+	return &SetPostgresWatermarkResponse{Height: tipBlock.Height, Hash: tipBlock.Hash}, nil
+}
+
 func (a *GetLatestBlockHeightActivity) createStorageInstances(ctx context.Context) (*MigrationData, error) {
 	logger := a.getLogger(ctx)
 
@@ -910,4 +1088,5 @@ const (
 	ActivityGetLatestBlockFromPostgres = "activity.migrator.GetLatestBlockFromPostgres"
 	ActivityGetLatestEventFromPostgres = "activity.migrator.GetLatestEventFromPostgres"
 	ActivityGetMaxEventId              = "activity.migrator.GetMaxEventId"
+	ActivitySetPostgresWatermark       = "activity.migrator.SetPostgresWatermark"
 )

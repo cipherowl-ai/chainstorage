@@ -2,6 +2,7 @@ package internal
 
 import (
 	"container/list"
+	"context"
 
 	"golang.org/x/xerrors"
 
@@ -9,6 +10,8 @@ import (
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/model"
 	api "github.com/coinbase/chainstorage/protos/coinbase/chainstorage"
 )
+
+const tipEventBatchSize = int64(100)
 
 type (
 	EventsToChainAdaptor struct {
@@ -109,4 +112,31 @@ func ValidateEvents(events []*model.EventEntry) error {
 	// check if we can prepend events to an event-chain adaptor to make sure it can construct a continuous chain
 	eventsToChainAdaptor := NewEventsToChainAdaptor()
 	return eventsToChainAdaptor.AppendEvents(events)
+}
+
+// GetTipEvent returns the BLOCK_ADDED event of the block at the tip of the event stream ending at
+// maxEventId. It can be older than the last BLOCK_ADDED, because the stream can end in a rollback.
+func GetTipEvent(ctx context.Context, storage EventStorage, eventTag uint32, maxEventId int64) (*model.EventEntry, error) {
+	eventsToChainAdaptor := NewEventsToChainAdaptor()
+	for end := maxEventId + 1; end > model.EventIdStartValue; end -= tipEventBatchSize {
+		start := end - tipEventBatchSize
+		if start < model.EventIdStartValue {
+			start = model.EventIdStartValue
+		}
+		events, err := storage.GetEventsByEventIdRange(ctx, eventTag, start, end)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to get events [%d, %d): %w", start, end, err)
+		}
+		if err := eventsToChainAdaptor.AppendEvents(events); err != nil {
+			return nil, xerrors.Errorf("failed to append events [%d, %d): %w", start, end, err)
+		}
+		tipEvent, err := eventsToChainAdaptor.PopEventForTailBlock()
+		if err == nil {
+			return tipEvent, nil
+		}
+		if !xerrors.Is(err, errors.ErrNoEventAvailable) {
+			return nil, xerrors.Errorf("failed to get event for tail block: %w", err)
+		}
+	}
+	return nil, xerrors.Errorf("event stream ending at %d has no block left: %w", maxEventId, errors.ErrItemNotFound)
 }

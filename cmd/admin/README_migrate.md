@@ -15,6 +15,46 @@ The migration tool performs a comprehensive transfer of blockchain data:
 2. Migration preserves complete blockchain history including all reorg blocks
 3. Canonical block identification is maintained through migration ordering
 
+## Migrating a Live Chain
+
+`admin migrate` copies a fixed height range once. A chain that keeps ingesting moves with `workflow.migrator` instead. It replays the DynamoDB event stream, so event ids and reorg history carry over.
+
+```bash
+# Copy everything, then keep following the chain
+go run ./cmd/admin workflow start --workflow=migrator \
+  --env=production --blockchain=base --network=mainnet \
+  --input='{"AutoResume": true, "ContinuousSync": true}'
+
+# With the writers stopped: copy what is left and set the watermark
+go run ./cmd/admin workflow start --workflow=migrator \
+  --env=production --blockchain=base --network=mainnet \
+  --input='{"AutoResume": true}'
+```
+
+- Without `EndEventSequence`, a run goes through the last event in DynamoDB.
+- A run without `ContinuousSync` ends by setting the PostgreSQL watermark at the tip of the event stream, even when nothing was left to copy. Until then `GetLatestBlock` finds nothing on PostgreSQL, so neither the streamer nor the poller can start there. A continuous run writes no watermark.
+- A batch fails if a block read fails, or if PostgreSQL cannot store an event as DynamoDB has it. No event of that batch lands, so restarting with `AutoResume` picks up at the same batch.
+- A failed run does not restart by itself.
+- A bounded run fails if a rollback has taken the tip below a watermark left by an earlier bounded run. `GetLatestBlock` would return the stale block, and clearing it takes a manual write.
+
+### Checking Parity
+
+`admin migrate-parity` compares the two stores and changes neither. It walks every canonical height and event in PostgreSQL, then samples heights and event ids against DynamoDB. See `--help` for what it compares.
+
+```bash
+# While the migrator copies. The walk loads the database, so point it at the reader.
+CHAINSTORAGE_AWS_POSTGRES_HOST=<reader endpoint> go run ./cmd/admin migrate-parity \
+  --env=production --blockchain=base --network=mainnet
+
+# With the writers stopped and the last bounded run finished: compare the tips
+CHAINSTORAGE_AWS_POSTGRES_HOST=<reader endpoint> go run ./cmd/admin migrate-parity \
+  --env=production --blockchain=base --network=mainnet \
+  --walk=false --block-samples=0 --event-samples=0 \
+  --block-tail=10000 --event-tail=10000 --require-caught-up
+```
+
+It exits non-zero on any problem, and `--report-json` writes the full report.
+
 ## Architecture
 
 ### Advanced Migration Strategy

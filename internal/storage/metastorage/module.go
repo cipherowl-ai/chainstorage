@@ -1,6 +1,8 @@
 package metastorage
 
 import (
+	"context"
+
 	"go.uber.org/fx"
 
 	"github.com/coinbase/chainstorage/internal/storage/metastorage/dynamodb"
@@ -38,6 +40,14 @@ func NewUnfencedSingleBlockUploadGuard() SingleBlockUploadGuard {
 
 func NewEventsToChainAdaptor() *EventsToChainAdaptor {
 	return internal.NewEventsToChainAdaptor()
+}
+
+func GetTipEvent(ctx context.Context, storage EventStorage, eventTag uint32, maxEventId int64) (*model.EventEntry, error) {
+	return internal.GetTipEvent(ctx, storage, eventTag, maxEventId)
+}
+
+func ValidateEvents(events []*model.EventEntry) error {
+	return internal.ValidateEvents(events)
 }
 
 var Module = fx.Options(

@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"go.temporal.io/sdk/testsuite"
 	"go.uber.org/fx"
+	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/cadence"
 	"github.com/coinbase/chainstorage/internal/config"
@@ -29,6 +30,9 @@ type migratorTestSuite struct {
 	migrator *Migrator
 	app      testapp.TestApp
 	cfg      *config.Config
+
+	watermarkRequests []*activity.SetPostgresWatermarkRequest
+	watermarkErr      error
 }
 
 func TestMigratorTestSuite(t *testing.T) {
@@ -55,6 +59,18 @@ func (s *migratorTestSuite) SetupTest() {
 		cadence.WithTestEnv(s.env),
 		fx.Populate(&s.migrator),
 	)
+
+	s.watermarkRequests = nil
+	s.watermarkErr = nil
+	s.env.OnActivity(activity.ActivitySetPostgresWatermark, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.SetPostgresWatermarkRequest) (*activity.SetPostgresWatermarkResponse, error) {
+			s.watermarkRequests = append(s.watermarkRequests, request)
+			if s.watermarkErr != nil {
+				return nil, s.watermarkErr
+			}
+			return &activity.SetPostgresWatermarkResponse{Height: 600, Hash: "0x600"}, nil
+		}).
+		Maybe()
 }
 
 func (s *migratorTestSuite) TearDownTest() {
@@ -121,6 +137,7 @@ func (s *migratorTestSuite) TestMigrator_WithCheckpoint() {
 	})
 	require.Error(err)
 	require.True(IsContinueAsNewError(err))
+	require.Empty(s.watermarkRequests, "the watermark belongs to the end of the run, not to a checkpoint")
 }
 
 func (s *migratorTestSuite) TestMigrator_CustomBatchSize() {
@@ -242,6 +259,187 @@ func (s *migratorTestSuite) TestMigrator_ContinuousSync() {
 	if err != nil {
 		require.True(IsContinueAsNewError(err) || s.env.IsWorkflowCompleted())
 	}
+}
+
+func (s *migratorTestSuite) TestMigrator_ContinuousSync_CopiesLastEventWithoutWatermark() {
+	require := testutil.Require(s.T())
+
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 6000,
+		Tag:                1,
+		ContinuousSync:     true,
+		SyncInterval:       "1s",
+	})
+	require.True(IsContinueAsNewError(err))
+	require.Len(requests, 1)
+	require.Equal(int64(6000), requests[0].StartEventSequence)
+	require.Equal(int64(6001), requests[0].EndEventSequence)
+	require.Empty(s.watermarkRequests)
+}
+
+func (s *migratorTestSuite) TestMigrator_ContinuousSync_CaughtUp() {
+	require := testutil.Require(s.T())
+
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 6001,
+		Tag:                1,
+		ContinuousSync:     true,
+		SyncInterval:       "1s",
+	})
+	require.True(IsContinueAsNewError(err))
+	require.Empty(requests)
+	require.Empty(s.watermarkRequests)
+}
+
+func (s *migratorTestSuite) TestMigrator_BoundedRunSetsWatermark() {
+	require := testutil.Require(s.T())
+
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 1000,
+		EndEventSequence:   2000,
+		Tag:                2,
+		EventTag:           3,
+	})
+	require.NoError(err)
+	require.Len(requests, 1)
+	require.Equal([]*activity.SetPostgresWatermarkRequest{{Tag: 2, EventTag: 3}}, s.watermarkRequests)
+}
+
+func (s *migratorTestSuite) TestMigrator_BoundedRunFailsWhenWatermarkFails() {
+	require := testutil.Require(s.T())
+
+	s.watermarkErr = xerrors.New("no canonical block at the tip")
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 1000,
+		EndEventSequence:   2000,
+		Tag:                1,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), "no canonical block at the tip")
+}
+
+func (s *migratorTestSuite) TestMigrator_AutoDetectedEndIncludesLastEvent() {
+	require := testutil.Require(s.T())
+
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 5000,
+		Tag:                1,
+	})
+	require.NoError(err)
+	require.Len(requests, 1)
+	require.Equal(int64(5000), requests[0].StartEventSequence)
+	require.Equal(int64(6001), requests[0].EndEventSequence)
+	require.Len(s.watermarkRequests, 1)
+}
+
+func (s *migratorTestSuite) TestMigrator_AutoResumeCopiesLastEvent() {
+	require := testutil.Require(s.T())
+
+	s.mockLatestEventInPostgres(5999)
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		Tag:        1,
+		AutoResume: true,
+	})
+	require.NoError(err)
+	require.Len(requests, 1)
+	require.Equal(int64(6000), requests[0].StartEventSequence)
+	require.Equal(int64(6001), requests[0].EndEventSequence)
+	require.Len(s.watermarkRequests, 1)
+}
+
+func (s *migratorTestSuite) TestMigrator_CaughtUpBoundedRunSetsWatermark() {
+	require := testutil.Require(s.T())
+
+	s.mockLatestEventInPostgres(6000)
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		Tag:        1,
+		AutoResume: true,
+	})
+	require.NoError(err)
+	require.Empty(requests)
+	require.Len(s.watermarkRequests, 1)
+}
+
+func (s *migratorTestSuite) TestMigrator_DestinationAheadOfSourceFails() {
+	require := testutil.Require(s.T())
+
+	s.mockLatestEventInPostgres(6001)
+	s.mockMaxEventId(6000)
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		Tag:        1,
+		AutoResume: true,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), "must be less than")
+	require.Empty(requests)
+	require.Empty(s.watermarkRequests)
+}
+
+func (s *migratorTestSuite) TestMigrator_ExplicitEmptyRangeFails() {
+	require := testutil.Require(s.T())
+
+	var requests []*activity.MigratorRequest
+	s.mockMigrator(&requests)
+
+	_, err := s.migrator.Execute(context.Background(), &MigratorRequest{
+		StartEventSequence: 1000,
+		EndEventSequence:   1000,
+		Tag:                1,
+	})
+	require.Error(err)
+	require.Contains(err.Error(), "must be less than")
+	require.Empty(requests)
+	require.Empty(s.watermarkRequests)
+}
+
+func (s *migratorTestSuite) mockMaxEventId(maxEventId int64) {
+	s.env.OnActivity(activity.ActivityGetMaxEventId, mock.Anything, mock.Anything).
+		Return(&activity.GetMaxEventIdResponse{MaxEventId: maxEventId, Found: true}, nil).
+		Maybe()
+}
+
+func (s *migratorTestSuite) mockLatestEventInPostgres(sequence int64) {
+	s.env.OnActivity(activity.ActivityGetLatestEventFromPostgres, mock.Anything, mock.Anything).
+		Return(&activity.GetLatestEventFromPostgresResponse{Sequence: sequence, Found: true}, nil).
+		Once()
+}
+
+func (s *migratorTestSuite) mockMigrator(requests *[]*activity.MigratorRequest) {
+	s.env.OnActivity(activity.ActivityMigrator, mock.Anything, mock.Anything).
+		Return(func(ctx context.Context, request *activity.MigratorRequest) (*activity.MigratorResponse, error) {
+			*requests = append(*requests, request)
+			return &activity.MigratorResponse{Success: true}, nil
+		}).
+		Maybe()
 }
 
 func (s *migratorTestSuite) TestMigrator_Parallelism() {

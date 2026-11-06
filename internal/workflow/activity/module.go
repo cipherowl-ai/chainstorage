@@ -27,4 +27,5 @@ var Module = fx.Options(
 	fx.Provide(NewGetLatestBlockFromPostgresActivity),
 	fx.Provide(NewGetLatestEventFromPostgresActivity),
 	fx.Provide(NewGetMaxEventIdActivity),
+	fx.Provide(NewSetPostgresWatermarkActivity),
 )
