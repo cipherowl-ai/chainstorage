@@ -208,6 +208,29 @@ func (e *eventStorageImpl) AddEventEntries(ctx context.Context, eventTag uint32,
 			return xerrors.Errorf("failed to insert skipped events: %w", err)
 		}
 
+		// The inserts above can leave an event out without an error: the JOIN drops an event whose
+		// block is missing, and ON CONFLICT keeps whatever already holds the sequence. Committing the
+		// rest would move the max event id past the hole, and nothing reads below it again.
+		var missingEvents int
+		var firstMissingEvent sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*), MIN(e.event_sequence)
+			FROM temp_events e
+			LEFT JOIN block_events be
+			  ON be.event_tag = e.event_tag
+			  AND be.event_sequence = e.event_sequence
+			  AND be.event_type = e.event_type::event_type_enum
+			  AND be.height = e.height
+			  AND COALESCE(be.hash, '') = COALESCE(e.hash, '')
+			WHERE be.event_sequence IS NULL
+		`).Scan(&missingEvents, &firstMissingEvent); err != nil {
+			return xerrors.Errorf("failed to verify inserted events: %w", err)
+		}
+		if missingEvents > 0 {
+			return xerrors.Errorf("%d of %d events were not stored as given, starting at event %d",
+				missingEvents, len(eventEntries), firstMissingEvent.Int64)
+		}
+
 		if err := tx.Commit(); err != nil {
 			return xerrors.Errorf("failed to commit transaction: %w", err)
 		}

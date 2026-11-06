@@ -273,6 +273,121 @@ func (s *eventStorageTestSuite) TestAddEventsMultipleTimesNonDefaultEventTag() {
 
 ////////////////////////////////////////////////////////////
 
+func (s *eventStorageTestSuite) TestAddEventEntriesAgainSucceeds() {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	s.addEvents(s.eventTag, 0, 3, s.tag)
+	events, err := s.accessor.GetEventsByEventIdRange(ctx, s.eventTag, model.EventIdStartValue, model.EventIdStartValue+3)
+	require.NoError(err)
+
+	require.NoError(s.accessor.AddEventEntries(ctx, s.eventTag, events))
+}
+
+func (s *eventStorageTestSuite) TestAddEventEntriesRollsBackWhenAnEventHasNoBlock() {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	s.addEvents(s.eventTag, 0, 3, s.tag)
+	blockMetas := testutil.MakeBlockMetadatasFromStartHeight(3, 4, s.tag)
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blockMetas[:2], nil))
+	require.NoError(s.accessor.PersistBlockMetas(ctx, true, blockMetas[3:], nil))
+
+	// Height 5 has no block, and height 6 after it does. Committing the rest would leave a hole
+	// below the new max event id.
+	events := testutil.MakeBlockEventEntries(api.BlockchainEvent_BLOCK_ADDED, s.eventTag, 7, 3, 7, s.tag)
+	err := s.accessor.AddEventEntries(ctx, s.eventTag, events)
+	require.Error(err)
+	require.Contains(err.Error(), "1 of 4 events were not stored as given, starting at event 6")
+
+	maxEventId, err := s.accessor.GetMaxEventId(ctx, s.eventTag)
+	require.NoError(err)
+	require.Equal(int64(3), maxEventId)
+}
+
+func (s *eventStorageTestSuite) TestAddEventEntriesRollsBackWhenASequenceHoldsADifferentEvent() {
+	require := testutil.Require(s.T())
+	ctx := context.TODO()
+
+	s.addEvents(s.eventTag, 0, 3, s.tag)
+	blockMetas := []*api.BlockMetadata{
+		{Tag: s.tag, Height: 2, Hash: "0xfork2", ParentHash: "0x1", ParentHeight: 1},
+		{Tag: s.tag, Height: 3, Hash: "0xfork3", ParentHash: "0xfork2", ParentHeight: 2},
+	}
+	require.NoError(s.accessor.PersistBlockMetas(ctx, false, blockMetas, nil))
+
+	// Event 3 already holds the block at height 2 on the other fork.
+	events := []*model.EventEntry{
+		model.NewEventEntry(s.eventTag, 3, model.NewBlockEventWithBlockMeta(api.BlockchainEvent_BLOCK_ADDED, blockMetas[0])),
+		model.NewEventEntry(s.eventTag, 4, model.NewBlockEventWithBlockMeta(api.BlockchainEvent_BLOCK_ADDED, blockMetas[1])),
+	}
+	err := s.accessor.AddEventEntries(ctx, s.eventTag, events)
+	require.Error(err)
+	require.Contains(err.Error(), "1 of 2 events were not stored as given, starting at event 3")
+
+	maxEventId, err := s.accessor.GetMaxEventId(ctx, s.eventTag)
+	require.NoError(err)
+	require.Equal(int64(3), maxEventId)
+}
+
+func (s *eventStorageTestSuite) TestAddEventEntriesComparesTheEventAlreadyStored() {
+	const (
+		height = uint64(3)
+		hash   = "0x3"
+		added  = "BLOCK_ADDED"
+	)
+	emptyHash := ""
+	otherHash := "0xother"
+	storedHash := hash
+
+	for i, testCase := range []struct {
+		name          string
+		storedType    string
+		storedHeight  uint64
+		storedHash    *string
+		skipped       bool
+		expectedError bool
+	}{
+		{name: "same event", storedType: added, storedHeight: height, storedHash: &storedHash},
+		{name: "opposite type", storedType: "BLOCK_REMOVED", storedHeight: height, storedHash: &storedHash, expectedError: true},
+		{name: "other height", storedType: added, storedHeight: height + 1, storedHash: &storedHash, expectedError: true},
+		{name: "other hash", storedType: added, storedHeight: height, storedHash: &otherHash, expectedError: true},
+		{name: "skipped with an empty hash", storedType: added, storedHeight: height, storedHash: &emptyHash, skipped: true},
+		{name: "skipped with a null hash", storedType: added, storedHeight: height, skipped: true},
+	} {
+		s.Run(testCase.name, func() {
+			require := testutil.Require(s.T())
+			ctx := context.TODO()
+			eventTag := uint32(10 + i)
+
+			var opts []testutil.Option
+			if testCase.skipped {
+				opts = append(opts, testutil.WithBlockSkipped())
+			}
+			s.addEvents(eventTag, 0, 3, s.tag)
+			blockMetas := testutil.MakeBlockMetadatasFromStartHeight(height, 1, s.tag, opts...)
+			require.NoError(s.accessor.PersistBlockMetas(ctx, false, blockMetas, nil))
+			_, err := s.db.ExecContext(ctx, `
+				INSERT INTO block_events (event_tag, event_sequence, event_type, block_metadata_id, height, hash)
+				SELECT $1, 4, $2::event_type_enum, cb.block_metadata_id, $3, $4
+				FROM canonical_blocks cb
+				WHERE cb.tag = $5 AND cb.height = $6`,
+				eventTag, testCase.storedType, testCase.storedHeight, testCase.storedHash, s.tag, height)
+			require.NoError(err)
+
+			events := testutil.MakeBlockEventEntries(api.BlockchainEvent_BLOCK_ADDED, eventTag, 4, height, height+1, s.tag, opts...)
+			err = s.accessor.AddEventEntries(ctx, eventTag, events)
+
+			if testCase.expectedError {
+				require.Error(err)
+				require.Contains(err.Error(), "1 of 1 events were not stored as given, starting at event 4")
+			} else {
+				require.NoError(err)
+			}
+		})
+	}
+}
+
 func (s *eventStorageTestSuite) TestAddEventsDiscontinuousChain_NotSkipped() {
 	require := testutil.Require(s.T())
 	numEvents := uint64(100)
