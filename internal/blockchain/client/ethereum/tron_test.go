@@ -16,6 +16,7 @@ import (
 	"github.com/coinbase/chainstorage/internal/blockchain/restapi"
 	restapimocks "github.com/coinbase/chainstorage/internal/blockchain/restapi/mocks"
 	"github.com/coinbase/chainstorage/internal/dlq"
+	"github.com/coinbase/chainstorage/internal/utils/retry"
 	"github.com/coinbase/chainstorage/internal/utils/testapp"
 	"github.com/coinbase/chainstorage/internal/utils/testutil"
 	"github.com/coinbase/chainstorage/protos/coinbase/c3/common"
@@ -102,7 +103,7 @@ const (
 				"signature": [
 					"e93160d1df484382923db34f02ca196a7dbbd7342948214a739fdf4b96896cfc2ca4d9b706c2393c3f83d269f31901aee43ae8e50a04579b6636c03c321da8e000"
 				],
-				"txID": "0xbaa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b",
+				"txID": "baa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b",
 				"raw_data": {
 					"contract": [
 						{
@@ -396,9 +397,79 @@ func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight() {
 	require.Equal(2, len(blobdata.TransactionReceipts))
 	require.NotNil(blobdata.TransactionTraces)
 	require.Equal(2, len(blobdata.TransactionTraces))
-	require.NotNil(blobdata.TransactionTraces[0])
-	require.NotNil(blobdata.TransactionTraces[1])
+	for _, trace := range blobdata.TransactionTraces {
+		var txInfo map[string]any
+		require.NoError(json.Unmarshal(trace, &txInfo))
+		require.NotEmpty(txInfo["type"])
+	}
 	require.Nil(blobdata.Uncles)
+}
+
+// A block is refused, after both node calls are repeated, when the transaction
+// details do not cover every transaction or one of them has no contract type.
+func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_IncompleteTraces() {
+	const oneTxInfo = `[{"id": "baa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b", "blockNumber": 11322000}]`
+	tests := []struct {
+		name     string
+		txInfo   string
+		blockTx  string
+		expected string
+	}{
+		{"empty tx info", `[]`, fixtureBlockTxResponse, "got 0 txInfo entries for 2 transactions"},
+		{"partial tx info", oneTxInfo, fixtureBlockTxResponse, "got 1 txInfo entries for 2 transactions"},
+		{"block without transactions", fixtureBlockTxInfoResponse, `{"blockID": "00"}`, "no contract type for txInfo id"},
+	}
+	for _, test := range tests {
+		s.Run(test.name, func() {
+			require := testutil.Require(s.T())
+			s.rpcClient.EXPECT().Call(
+				gomock.Any(), ethGetBlockByNumberMethod, jsonrpc.Params{"0xacc290", true},
+			).Return(&jsonrpc.Response{Result: json.RawMessage(fixtureBlock)}, nil)
+			s.rpcClient.EXPECT().BatchCall(
+				gomock.Any(), ethGetTransactionReceiptMethod, gomock.Any(),
+			).Return([]*jsonrpc.Response{
+				{Result: json.RawMessage(fixtureReceipt)},
+				{Result: json.RawMessage(fixtureReceipt)},
+			}, nil).AnyTimes()
+
+			postData, _ := json.Marshal(tronBlockNumRequestData{Num: ethereumHeight})
+			s.restClient.EXPECT().Call(gomock.Any(), tronTxInfoMethod, postData).
+				Return(json.RawMessage(test.txInfo), nil).Times(retry.DefaultMaxAttempts)
+			s.restClient.EXPECT().Call(gomock.Any(), tronBlockTxMethod, postData).
+				Return(json.RawMessage(test.blockTx), nil).Times(retry.DefaultMaxAttempts)
+
+			_, err := s.client.GetBlockByHeight(context.Background(), tronTestTag, tronTestHeight)
+			require.Error(err)
+			require.Contains(err.Error(), test.expected)
+		})
+	}
+}
+
+// A partial answer from the node is repeated, and the block is stored once
+// the node returns all of it.
+func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_RetriesPartialTraces() {
+	require := testutil.Require(s.T())
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), ethGetBlockByNumberMethod, jsonrpc.Params{"0xacc290", true},
+	).Return(&jsonrpc.Response{Result: json.RawMessage(fixtureBlock)}, nil)
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), ethGetTransactionReceiptMethod, gomock.Any(),
+	).Return([]*jsonrpc.Response{
+		{Result: json.RawMessage(fixtureReceipt)},
+		{Result: json.RawMessage(fixtureReceipt)},
+	}, nil)
+
+	postData, _ := json.Marshal(tronBlockNumRequestData{Num: ethereumHeight})
+	gomock.InOrder(
+		s.restClient.EXPECT().Call(gomock.Any(), tronTxInfoMethod, postData).Return(json.RawMessage(`[]`), nil),
+		s.restClient.EXPECT().Call(gomock.Any(), tronTxInfoMethod, postData).Return(json.RawMessage(fixtureBlockTxInfoResponse), nil),
+	)
+	s.restClient.EXPECT().Call(gomock.Any(), tronBlockTxMethod, postData).
+		Return(json.RawMessage(fixtureBlockTxResponse), nil).Times(2)
+
+	block, err := s.client.GetBlockByHeight(context.Background(), tronTestTag, tronTestHeight)
+	require.NoError(err)
+	require.Equal(2, len(block.GetEthereum().TransactionTraces))
 }
 
 func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_Memo() {
