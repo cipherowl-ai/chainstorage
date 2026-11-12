@@ -3,6 +3,7 @@ package ethereum
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/suite"
@@ -419,6 +420,7 @@ func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_IncompleteTraces()
 		{"partial tx info", oneTxInfo, fixtureBlockTxResponse, "got 1 txInfo entries for 2 transactions"},
 		{"duplicate tx info", `[` + oneTxInfo[1:len(oneTxInfo)-1] + `,` + oneTxInfo[1:], fixtureBlockTxResponse, "duplicate txInfo id"},
 		{"block without transactions", fixtureBlockTxInfoResponse, `{"blockID": "00"}`, "no contract type for txInfo id"},
+		{"tx info of other transactions", fixtureBlockTxInfoWithMemoResponse, fixtureBlockTxWithMemoResponse, "no txInfo for transaction"},
 	}
 	for _, test := range tests {
 		s.Run(test.name, func() {
@@ -473,10 +475,55 @@ func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_RetriesPartialTrac
 	require.Equal(2, len(block.GetEthereum().TransactionTraces))
 }
 
+// Traces come back in the order of the block's transactions, whatever order
+// the node listed the transaction details in.
+func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_ReorderedTraces() {
+	require := testutil.Require(s.T())
+	s.rpcClient.EXPECT().Call(
+		gomock.Any(), ethGetBlockByNumberMethod, jsonrpc.Params{"0xacc290", true},
+	).Return(&jsonrpc.Response{Result: json.RawMessage(fixtureBlock)}, nil)
+	s.rpcClient.EXPECT().BatchCall(
+		gomock.Any(), ethGetTransactionReceiptMethod, gomock.Any(),
+	).Return([]*jsonrpc.Response{
+		{Result: json.RawMessage(fixtureReceipt)},
+		{Result: json.RawMessage(fixtureReceipt)},
+	}, nil)
+
+	var txInfos []json.RawMessage
+	require.NoError(json.Unmarshal([]byte(fixtureBlockTxInfoResponse), &txInfos))
+	require.Equal(2, len(txInfos))
+	reversed, err := json.Marshal([]json.RawMessage{txInfos[1], txInfos[0]})
+	require.NoError(err)
+
+	postData, _ := json.Marshal(tronBlockNumRequestData{Num: ethereumHeight})
+	s.restClient.EXPECT().Call(gomock.Any(), tronTxInfoMethod, postData).Return(json.RawMessage(reversed), nil)
+	s.restClient.EXPECT().Call(gomock.Any(), tronBlockTxMethod, postData).Return(json.RawMessage(fixtureBlockTxResponse), nil)
+
+	block, err := s.client.GetBlockByHeight(context.Background(), tronTestTag, tronTestHeight)
+	require.NoError(err)
+
+	traces := block.GetEthereum().TransactionTraces
+	require.Equal(2, len(traces))
+	for i, expected := range []string{
+		"baa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b",
+		"f5365847bff6e48d0c6bc23eee276343d2987efd9876c3c1bf597225e3d69991",
+	} {
+		var txInfo map[string]any
+		require.NoError(json.Unmarshal(traces[i], &txInfo))
+		require.Equal(expected, txInfo["id"])
+	}
+}
+
 func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_Memo() {
 	require := testutil.Require(s.T())
+	// The block lists the transactions the memo fixtures describe.
 	blockResponse := &jsonrpc.Response{
-		Result: json.RawMessage(fixtureBlock),
+		Result: json.RawMessage(strings.NewReplacer(
+			`{"hash": "0xbaa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b"}`,
+			`{"hash": "0x4b1345bbc3610321d041619b80e52f16ddfde9108b814ac5af0b7c1ea9240446"}`,
+			`{"hash": "0xf5365847bff6e48d0c6bc23eee276343d2987efd9876c3c1bf597225e3d69991"}`,
+			`{"hash": "0x61cba69bd9b6fb70692aca4f7cdfc45ccc95822da2c00e9b88c5101c6a603ed3"}`,
+		).Replace(fixtureBlock)),
 	}
 	s.rpcClient.EXPECT().Call(
 		gomock.Any(), ethGetBlockByNumberMethod, jsonrpc.Params{
