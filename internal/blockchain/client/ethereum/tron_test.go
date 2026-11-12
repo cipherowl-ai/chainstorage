@@ -417,6 +417,7 @@ func (s *tronClientTestSuite) TestTronClient_GetBlockByHeight_IncompleteTraces()
 	}{
 		{"empty tx info", `[]`, fixtureBlockTxResponse, "got 0 txInfo entries for 2 transactions"},
 		{"partial tx info", oneTxInfo, fixtureBlockTxResponse, "got 1 txInfo entries for 2 transactions"},
+		{"duplicate tx info", `[` + oneTxInfo[1:len(oneTxInfo)-1] + `,` + oneTxInfo[1:], fixtureBlockTxResponse, "duplicate txInfo id"},
 		{"block without transactions", fixtureBlockTxInfoResponse, `{"blockID": "00"}`, "no contract type for txInfo id"},
 	}
 	for _, test := range tests {

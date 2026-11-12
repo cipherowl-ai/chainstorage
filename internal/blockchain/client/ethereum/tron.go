@@ -231,6 +231,7 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 
 	// Merge each txInfo with its corresponding type
 	results := make([][]byte, 0, len(txInfoArray))
+	seen := make(map[string]struct{}, len(txInfoArray))
 	for _, txInfoBytes := range txInfoArray {
 		// Parse txInfo as map to allow dynamic field addition
 		var txInfo map[string]interface{}
@@ -243,6 +244,12 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 		if !ok {
 			return nil, xerrors.Errorf("txInfo id is not a string or is missing: %+v", txInfo)
 		}
+		// A repeated entry would stand in for a transaction the node left out
+		// and still satisfy the caller's count check.
+		if _, dup := seen[txID]; dup {
+			return nil, retry.Retryable(xerrors.Errorf("duplicate txInfo id %v", txID))
+		}
+		seen[txID] = struct{}{}
 		// Every transaction has a contract type; a missing one means the block
 		// call did not return this transaction.
 		txType, exists := txTypeMap[txID]
