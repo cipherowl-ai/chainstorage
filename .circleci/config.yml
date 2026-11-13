@@ -97,6 +97,39 @@ jobs:
             
             docker compose -f docker-compose-testing.yml down
 
+  # Lints and tests the Python SDK (sdk/python) and checks that its generated
+  # classes match protos/. Uses a public image and no context: it needs no
+  # credentials.
+  python_sdk:
+    parameters:
+      python-version:
+        type: string
+    docker:
+      - image: cimg/python:<< parameters.python-version >>
+    working_directory: ~/chainstorage
+    steps:
+      - checkout
+      - run:
+          name: Install the SDK with its dev tools
+          command: pip install -e 'sdk/python[dev]'
+      - run:
+          name: Lint and test
+          command: make test-py
+      - when:
+          condition:
+            equal: ["3.12", << parameters.python-version >>]
+          steps:
+            - run:
+                name: Generated classes match the protos
+                command: make proto-py && git add -N . && git diff --exit-code
+      - run:
+          name: Test on protobuf 6
+          # The generator pins protobuf 5 for the steps above. Consumers may
+          # run the generated classes on protobuf 6, so test that last.
+          command: |
+            pip install 'protobuf>=6,<7'
+            cd sdk/python && pytest
+
   # Runs on every branch: proves the Dockerfile still builds. Never pushes.
   build-image:
     executor: chainstorage
@@ -132,6 +165,11 @@ workflows:
       - build_and_test:
           name: build_and_test
           context: cipherowl_build_context
+      - python_sdk:
+          name: python_sdk-<< matrix.python-version >>
+          matrix:
+            parameters:
+              python-version: ["3.10", "3.12"]
       - build-image:
           context: cipherowl_build_context
       - publish-image:

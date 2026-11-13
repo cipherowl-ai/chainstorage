@@ -836,6 +836,8 @@ grpcurl --plaintext -d '{"initial_position_in_stream": "13222054"}' localhost:90
 Chainstorage also provides SDK, and you can find supported
 methods [here](https://github.com/coinbase/chainstorage/blob/master/sdk/client.go)
 
+A Python SDK lives in [`sdk/python`](sdk/python/README.md).
+
 Note:
 - `GetBlocksByRangeWithTag` is not equivalent to the batch version of `GetBlockWithTag` since you don't have a way to
   specify the block hash.

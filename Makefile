@@ -95,6 +95,17 @@ proto:
 	@echo "--- proto"
 	./scripts/protogen.sh
 
+# Python SDK (sdk/python). Both need: pip install -e 'sdk/python[dev]'
+.PHONY: proto-py
+proto-py:
+	@echo "--- proto-py"
+	./scripts/protogen-py.sh
+
+.PHONY: test-py
+test-py:
+	@echo "--- test-py"
+	cd sdk/python && ruff check . && ruff format --check . && pytest
+
 .PHONY: codegen
 codegen: proto
 	@echo "--- codegen"
