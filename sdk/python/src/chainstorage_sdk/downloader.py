@@ -48,6 +48,9 @@ _IN_FLIGHT_BYTES = 256 * 1024 * 1024
 # long its block is.
 _UNKNOWN_BLOCK_BYTES = 8 * 1024 * 1024
 
+# Responses are read in pieces of this size, and never past what is needed.
+_RESPONSE_PIECE = 1024 * 1024
+
 # Parsed indexes and decompressed chunks kept for the next read. The chunk
 # cache is capped in bytes (Config.chunk_cache_bytes), and a chunk larger
 # than the cap is not kept.
@@ -203,10 +206,21 @@ class BlockDownloader:
         return units
 
     def _download_single(self, block_file: api_pb2.BlockFile) -> list[bytes]:
-        body = self._request(block_file.file_url, None)
-        # The server does not always say how long the block is.
+        # No block is larger than the largest chunk. The server does not
+        # always say how long the block is; when it does not, the output may
+        # still not grow past that.
+        cap = cscb.MAX_CHUNK_BYTES
         declared = block_file.uncompressed_length or None
-        payload = bytes(cscb.decompress(body, block_file.compression, max_size=declared))
+        if declared is not None and declared > cap:
+            raise BlockFormatError(
+                f"block {block_file.height} declares {declared} bytes, more than the {cap} allowed"
+            )
+        body = self._request(block_file.file_url, None, limit=cap)
+        if declared is not None:
+            payload = cscb.decompress(body, block_file.compression, max_size=declared)
+        else:
+            payload = cscb.decompress(body, block_file.compression, limit=cap)
+        payload = bytes(payload)
         if declared is not None and len(payload) != declared:
             raise BlockFormatError(
                 f"block {block_file.height} is {len(payload)} bytes long, not the {declared} "
@@ -267,33 +281,51 @@ class BlockDownloader:
                 )
             return body
 
-        return self._request(url, {"Range": f"bytes={start}-{end}"}, check)
+        # One byte more than wanted shows a store that sent too much.
+        return self._request(url, {"Range": f"bytes={start}-{end}"}, check, limit=expected)
 
     def _request(
         self,
         url: str,
         headers: dict[str, str] | None,
         check: Callable[[int, bytes], bytes] | None = None,
+        *,
+        limit: int,
     ) -> bytes:
+        """Gets ``url`` and returns its body, read up to ``limit`` + 1 bytes.
+
+        Reading stops there, so a store that ignores a range or sends a huge
+        object never makes us hold more. Without ``check``, a longer body is
+        refused.
+        """
         timeout = self._config.http_timeout
 
         def attempt() -> bytes:
             try:
-                response = self._session.get(url, headers=headers, timeout=timeout)
-                status, body = response.status_code, response.content
+                with self._session.get(
+                    url, headers=headers, timeout=timeout, stream=True
+                ) as response:
+                    status = response.status_code
+                    if status not in (200, 206):
+                        raise DownloadError(
+                            f"received status {status} for {_redact(url)}",
+                            status_code=status,
+                            retryable=status in (408, 429) or status >= 500,
+                        )
+                    body = _read_at_most(response, limit + 1)
             except requests.RequestException as exc:
                 # The exception text can hold the signed link, so only its
                 # type is reported, and it is not chained.
                 raise DownloadError(
                     f"failed to download {_redact(url)}: {type(exc).__name__}", retryable=True
                 ) from None
-            if status not in (200, 206):
+            if check is not None:
+                return check(status, body)
+            if len(body) > limit:
                 raise DownloadError(
-                    f"received status {status} for {_redact(url)}",
-                    status_code=status,
-                    retryable=status in (408, 429) or status >= 500,
+                    f"{_redact(url)} is longer than the {limit} bytes allowed", status_code=status
                 )
-            return body if check is None else check(status, body)
+            return body
 
         return call_with_retry(
             attempt,
@@ -301,6 +333,19 @@ class BlockDownloader:
             policy=self._config.retry,
             sleep=self._sleep,
         )
+
+
+def _read_at_most(response: requests.Response, size: int) -> bytes:
+    """Reads the body of a streamed response, stopping after ``size`` bytes."""
+    pieces: list[bytes] = []
+    read = 0
+    for piece in response.iter_content(chunk_size=_RESPONSE_PIECE):
+        pieces.append(piece)
+        read += len(piece)
+        if read >= size:
+            break
+    body = b"".join(pieces)
+    return body if len(body) <= size else body[:size]
 
 
 def is_consolidated(block_file: api_pb2.BlockFile) -> bool:

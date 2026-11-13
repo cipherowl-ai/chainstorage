@@ -297,13 +297,41 @@ def test_a_chunk_that_declares_an_absurd_length_is_refused_before_it_is_read():
     [gzip.compress, zstandard.ZstdCompressor().compress, zstd_without_a_declared_size],
     ids=["gzip", "zstd", "zstd without a declared size"],
 )
-@pytest.mark.parametrize("max_size", [None, 100_000], ids=["unbounded", "bounded"])
-def test_cut_off_or_empty_data_is_never_a_block(compress, max_size):
+@pytest.mark.parametrize(
+    "bound",
+    [{}, {"max_size": 100_000}, {"limit": 100_000}],
+    ids=["unbounded", "bounded", "limited"],
+)
+def test_cut_off_or_empty_data_is_never_a_block(compress, bound):
     compression = api_pb2.GZIP if compress is gzip.compress else api_pb2.ZSTD
     data = compress(bytes(range(256)) * 390)
     for damaged in (b"", data[:-1], data[: len(data) // 2]):
         with pytest.raises(BlockFormatError):
-            cscb.decompress(damaged, compression, max_size=max_size)
+            cscb.decompress(damaged, compression, **bound)
+
+
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [
+        (api_pb2.NONE, lambda data: data),
+        (api_pb2.GZIP, gzip.compress),
+        (api_pb2.ZSTD, zstandard.ZstdCompressor().compress),
+        (api_pb2.ZSTD, zstd_without_a_declared_size),
+    ],
+    ids=["none", "gzip", "zstd", "zstd without a declared size"],
+)
+def test_decompress_refuses_output_past_its_limit(compression, compress):
+    # Several pieces of every reader, so the limit is checked as output grows.
+    payload = bytes(range(256)) * 12_000
+    data = compress(payload)
+    assert bytes(cscb.decompress(data, compression, limit=len(payload))) == payload
+    with pytest.raises(BlockFormatError, match=f"longer than the {len(payload) - 1} bytes allowed"):
+        cscb.decompress(data, compression, limit=len(payload) - 1)
+
+
+def test_decompress_takes_a_size_or_a_limit_not_both():
+    with pytest.raises(ValueError, match="not both"):
+        cscb.decompress(b"data", api_pb2.NONE, max_size=4, limit=4)
 
 
 def test_decompress_refuses_an_unknown_compression():

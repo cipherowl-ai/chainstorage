@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import struct
 
 import grpc
 import pytest
+import zstandard
 from conftest import TAG, block_hash, block_time, make_block
 
 from chainstorage_sdk import (
@@ -407,6 +409,118 @@ def test_a_single_block_of_the_wrong_length_is_refused(deployment):
         assert downloader.download(file) == make_block(5).SerializeToString()
     finally:
         downloader.close()
+
+
+def zstd_without_a_declared_size(data: bytes) -> bytes:
+    return zstandard.ZstdCompressor(write_content_size=False).compress(data)
+
+
+def single_block_file(deployment, name: str, compression: int, length: int = 0):
+    return api_pb2.BlockFile(
+        height=5,
+        file_url=deployment.storage.url(name),
+        compression=compression,
+        uncompressed_length=length,
+    )
+
+
+def test_a_single_block_declaring_too_many_bytes_is_refused_before_it_is_read(
+    deployment, monkeypatch
+):
+    deployment.server.add_block(5)
+    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(BlockFormatError, match="declares 1001 bytes, more than the 1000"):
+            downloader.download(single_block_file(deployment, "blocks/5", api_pb2.GZIP, 1001))
+    finally:
+        downloader.close()
+    assert deployment.storage.requests_for("blocks/5") == []
+
+
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [(api_pb2.GZIP, gzip.compress), (api_pb2.ZSTD, zstd_without_a_declared_size)],
+    ids=["gzip", "zstd without a declared size"],
+)
+def test_a_single_block_of_unknown_length_may_not_grow_past_the_cap(
+    deployment, monkeypatch, compression, compress
+):
+    payload = make_block(5, 4096).SerializeToString()
+    deployment.storage.objects["unsized"] = compress(payload)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        file = single_block_file(deployment, "unsized", compression)
+        assert downloader.download(file) == payload
+        monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", len(payload) - 1)
+        with pytest.raises(BlockFormatError, match="bytes allowed"):
+            downloader.download(file)
+    finally:
+        downloader.close()
+
+
+def test_a_single_block_object_larger_than_the_cap_is_not_read_whole(deployment, monkeypatch):
+    deployment.storage.objects["huge"] = b"x" * 10_000
+    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(DownloadError, match="longer than the 1000 bytes allowed"):
+            downloader.download(single_block_file(deployment, "huge", api_pb2.NONE))
+    finally:
+        downloader.close()
+
+
+class _EndlessResponse:
+    """A streamed response whose body never ends; counts what is read."""
+
+    def __init__(self) -> None:
+        self.pieces_read = 0
+
+    def iter_content(self, chunk_size: int):
+        while True:
+            self.pieces_read += 1
+            yield b"x" * chunk_size
+
+
+def test_a_response_is_read_no_further_than_needed(monkeypatch):
+    monkeypatch.setattr(downloader_module, "_RESPONSE_PIECE", 10)
+    response = _EndlessResponse()
+
+    assert downloader_module._read_at_most(response, 25) == b"x" * 25
+    assert response.pieces_read == 3
+
+
+def test_a_store_that_ignores_ranges_is_read_only_as_far_as_the_range(deployment, monkeypatch):
+    entries = deployment.server.add_consolidated("zstd")
+    deployment.storage.ignore_ranges = True
+    monkeypatch.setattr(downloader_module, "_RESPONSE_PIECE", 1024)
+    read: list[int] = []
+    real = downloader_module._read_at_most
+
+    def recording(response, size):
+        body = real(response, size)
+        read.append(len(body))
+        return body
+
+    monkeypatch.setattr(downloader_module, "_read_at_most", recording)
+    whole = len(deployment.storage.objects[CONSOLIDATED_OBJECT])
+    monkeypatch.setattr(cscb, "INITIAL_INDEX_READ_SIZE", 128)
+    downloader = BlockDownloader(deployment.config())
+    file = api_pb2.BlockFile()
+    file.CopyFrom(deployment.server.consolidated[entries[0]["height"]])
+    file.file_url = deployment.storage.url(file.file_url)
+
+    try:
+        with pytest.raises(DownloadError, match="range request was not honoured"):
+            downloader.download(file)
+    finally:
+        downloader.close()
+    # The index read starts at 0, so the whole object would be accepted, but
+    # only what the range asked for (and one byte more) was read.
+    assert read[0] == 129 < whole
 
 
 def test_a_long_index_is_read_in_a_second_request(deployment, monkeypatch):

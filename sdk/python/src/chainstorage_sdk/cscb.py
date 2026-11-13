@@ -54,6 +54,12 @@ MAX_CHUNK_BYTES = 2**30
 # reader uses the same limit.
 ZSTD_MAX_WINDOW_SIZE = 2**29
 
+# Pieces in which output of unknown length is produced under a limit. A zstd
+# block holds at most 128 KiB and takes at least 3 bytes, so one 1 KiB slice of
+# input can produce at most ~43 MiB beyond the limit before it is refused.
+_READ_PIECE = 1024 * 1024
+_ZSTD_INPUT_SLICE = 1024
+
 
 @dataclass(frozen=True)
 class Header:
@@ -324,26 +330,49 @@ def read_block(data: bytes, block_file: api_pb2.BlockFile) -> bytes:
     return extract_blocks(decode_chunk(frame, index.header.codec, chunk), chunk, [block])[0]
 
 
-def decompress(data: bytes, compression: int, *, max_size: int | None = None) -> bytes | bytearray:
+def decompress(
+    data: bytes,
+    compression: int,
+    *,
+    max_size: int | None = None,
+    limit: int | None = None,
+) -> bytes | bytearray:
     """Decompresses ``data`` according to an ``api_pb2.Compression`` value.
 
     With ``max_size``, output that would be longer is refused, and the result
-    is written straight into one buffer of that size.
+    is written straight into one buffer of that size. Use it when the length
+    is known. When it is not, ``limit`` refuses output longer than ``limit``
+    without setting any memory aside for it: the output grows as it is made.
     """
+    if max_size is not None and limit is not None:
+        raise ValueError("pass max_size or limit, not both")
     if compression in (api_pb2.GZIP, api_pb2.ZSTD) and not data:
         # Neither library complains about empty input; it is never a block.
         raise BlockFormatError("failed to decompress block data: it is empty")
     try:
         if compression == api_pb2.NONE:
             payload: bytes | bytearray = data
-            if max_size is not None and len(payload) > max_size:
+            bound = max_size if max_size is not None else limit
+            if bound is not None and len(payload) > bound:
                 raise _TooLong
         elif compression == api_pb2.GZIP:
             with gzip.GzipFile(fileobj=io.BytesIO(data)) as reader:
-                payload = _read(reader, max_size)
+                if limit is not None:
+                    payload = _read_limited(reader, limit)
+                else:
+                    payload = _read(reader, max_size)
         elif compression == api_pb2.ZSTD:
             decompressor = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW_SIZE)
-            if max_size is None:
+            if limit is not None:
+                declared = zstandard.frame_content_size(data)
+                if declared > limit:
+                    raise _TooLong
+                if declared >= 0:
+                    # A frame that declares its size is read in one pass.
+                    max_size, limit = declared, None
+            if limit is not None:
+                payload = _decompress_zstd_limited(decompressor, data, limit)
+            elif max_size is None:
                 stream = decompressor.decompressobj()
                 payload = stream.decompress(data)
                 if not stream.eof:
@@ -363,9 +392,11 @@ def decompress(data: bytes, compression: int, *, max_size: int | None = None) ->
         else:
             raise BlockFormatError(f"unsupported compression: {compression}")
     except _TooLong:
-        raise BlockFormatError(
-            f"decompressed data is longer than the declared {max_size} bytes"
-        ) from None
+        if limit is not None:
+            message = f"decompressed data is longer than the {limit} bytes allowed"
+        else:
+            message = f"decompressed data is longer than the declared {max_size} bytes"
+        raise BlockFormatError(message) from None
     except (OSError, EOFError, zlib.error, zstandard.ZstdError) as exc:
         raise BlockFormatError(f"failed to decompress block data: {exc}") from exc
     return payload
@@ -395,6 +426,39 @@ def _read(reader: io.BufferedIOBase, max_size: int | None) -> bytes | bytearray:
     if reader.read(1):
         raise _TooLong
     return buffer
+
+
+def _read_limited(reader: io.BufferedIOBase, limit: int) -> bytearray:
+    """Reads a gzip stream in pieces; ``_TooLong`` past ``limit`` bytes."""
+    payload = bytearray()
+    while piece := reader.read(_READ_PIECE):
+        payload += piece
+        if len(payload) > limit:
+            raise _TooLong
+    return payload
+
+
+def _decompress_zstd_limited(
+    decompressor: zstandard.ZstdDecompressor, data: bytes, limit: int
+) -> bytearray:
+    """Decompresses a zstd frame of unknown size; ``_TooLong`` past ``limit``.
+
+    The input goes in in small slices, so the output is checked as it grows.
+    """
+    stream = decompressor.decompressobj()
+    view = memoryview(data)
+    payload = bytearray()
+    for start in range(0, len(view), _ZSTD_INPUT_SLICE):
+        payload += stream.decompress(view[start : start + _ZSTD_INPUT_SLICE])
+        if len(payload) > limit:
+            raise _TooLong
+        if stream.eof:
+            break
+    if not stream.eof:
+        # A stream that was cut off decompresses without an error, to
+        # whatever it held up to the cut.
+        raise BlockFormatError("failed to decompress block data: it is cut off")
+    return payload
 
 
 def _parse_block_record(envelope: bytes, offset: int) -> BlockRecord:
