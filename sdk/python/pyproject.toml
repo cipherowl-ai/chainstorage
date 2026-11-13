@@ -16,6 +16,8 @@ dependencies = [
     # the protobuf 5 and 6 runtimes only.
     "grpcio>=1.71.0",
     "protobuf>=5.29.0,<7",
+    "requests>=2.31",
+    "zstandard>=0.22",
 ]
 
 [project.optional-dependencies]
