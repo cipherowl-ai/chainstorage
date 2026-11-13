@@ -114,6 +114,11 @@ class ChainStorageStub(object):
                 request_serializer=coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateRequest.SerializeToString,
                 response_deserializer=coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateResponse.FromString,
                 _registered_method=True)
+        self.GetBlockByTimestamp = channel.unary_unary(
+                '/coinbase.chainstorage.ChainStorage/GetBlockByTimestamp',
+                request_serializer=coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampRequest.SerializeToString,
+                response_deserializer=coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampResponse.FromString,
+                _registered_method=True)
 
 
 class ChainStorageServicer(object):
@@ -215,6 +220,12 @@ class ChainStorageServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetBlockByTimestamp(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ChainStorageServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -297,6 +308,11 @@ def add_ChainStorageServicer_to_server(servicer, server):
                     servicer.GetVerifiedAccountState,
                     request_deserializer=coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateRequest.FromString,
                     response_serializer=coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateResponse.SerializeToString,
+            ),
+            'GetBlockByTimestamp': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetBlockByTimestamp,
+                    request_deserializer=coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampRequest.FromString,
+                    response_serializer=coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -731,6 +747,33 @@ class ChainStorage(object):
             '/coinbase.chainstorage.ChainStorage/GetVerifiedAccountState',
             coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateRequest.SerializeToString,
             coinbase_dot_chainstorage_dot_api__pb2.GetVerifiedAccountStateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetBlockByTimestamp(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/coinbase.chainstorage.ChainStorage/GetBlockByTimestamp',
+            coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampRequest.SerializeToString,
+            coinbase_dot_chainstorage_dot_api__pb2.GetBlockByTimestampResponse.FromString,
             options,
             channel_credentials,
             insecure,

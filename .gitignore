@@ -33,3 +33,12 @@ dev-data/
 
 # ignore binaries
 /scripts/bin
+
+# Python SDK
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+/sdk/python/build/
+/sdk/python/dist/
