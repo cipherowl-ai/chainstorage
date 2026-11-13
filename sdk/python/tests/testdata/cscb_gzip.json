@@ -1,0 +1,73 @@
+{
+  "file": "cscb_gzip.bin",
+  "codec": "GZIP",
+  "chunk_blocks": 3,
+  "blocks": [
+    {
+      "tag": 2,
+      "hash": "hash-1000",
+      "parent_hash": "hash-999",
+      "height": 1000,
+      "parent_height": 999,
+      "byte_offset": 0,
+      "byte_length": 342,
+      "uncompressed_length": 342,
+      "payload_sha256": "df52c75324df5b84af8fb2a1484500f722837b3af6b1835654b4c629d6510b6f"
+    },
+    {
+      "tag": 2,
+      "hash": "hash-1001",
+      "parent_hash": "hash-1000",
+      "height": 1001,
+      "parent_height": 1000,
+      "byte_offset": 342,
+      "byte_length": 360,
+      "uncompressed_length": 360,
+      "payload_sha256": "e13121b9987f80a3e21f380380c42c5e211516c6abccf0a37031bae813fdfca5"
+    },
+    {
+      "tag": 2,
+      "hash": "hash-1002",
+      "parent_hash": "hash-1001",
+      "height": 1002,
+      "parent_height": 1001,
+      "byte_offset": 702,
+      "byte_length": 377,
+      "uncompressed_length": 377,
+      "payload_sha256": "b8b97be3750c36ead83a0d64a5a3a0aa41229d4640fb59c6bc9ecead5bef47b5"
+    },
+    {
+      "tag": 2,
+      "hash": "hash-1003",
+      "parent_hash": "hash-1002",
+      "height": 1003,
+      "parent_height": 1002,
+      "byte_offset": 1079,
+      "byte_length": 394,
+      "uncompressed_length": 394,
+      "payload_sha256": "3776cfefbef2701c3479687467ccf6d2fe5113ae7fef198fb7997a7a10349ca6"
+    },
+    {
+      "tag": 2,
+      "hash": "hash-1004",
+      "parent_hash": "hash-1003",
+      "height": 1004,
+      "parent_height": 1003,
+      "byte_offset": 1473,
+      "byte_length": 411,
+      "uncompressed_length": 411,
+      "payload_sha256": "91fc737fde49dd976fdb9b0c69d2a8761b24d062b40eb49e26c9ee674af46dfa"
+    },
+    {
+      "tag": 2,
+      "hash": "hash-1005",
+      "parent_hash": "hash-1004",
+      "height": 1005,
+      "parent_height": 1004,
+      "byte_offset": 1884,
+      "byte_length": 428,
+      "uncompressed_length": 428,
+      "payload_sha256": "7bae390a580069355f4630a4314a987a9585147db7ff1b7b24f3932e7794b2b7"
+    }
+  ]
+}
