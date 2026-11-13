@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
@@ -175,6 +176,15 @@ func (c *TronClient) getBlockTxInfoByNum(ctx context.Context, blockNumber uint64
 }
 
 func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethereum.EthereumBlockLit) ([][]byte, error) {
+	// The node can answer either call below with an empty or partial body while it
+	// is still catching up on the block. Both calls are repeated together, so that
+	// the block is refused rather than stored with missing or untyped traces.
+	return retry.WrapWithResult(ctx, func(ctx context.Context) ([][]byte, error) {
+		return c.fetchBlockTraces(ctx, block)
+	})
+}
+
+func (c *TronClient) fetchBlockTraces(ctx context.Context, block *ethereum.EthereumBlockLit) ([][]byte, error) {
 	blockNumber := block.Number.Value()
 
 	// Get block transactions to extract types and memos
@@ -196,16 +206,39 @@ func (c *TronClient) getBlockTraces(ctx context.Context, tag uint32, block *ethe
 	}
 
 	// Merge txInfo with transaction types and memos
-	results, err := c.mergeTxInfoWithTypes(txInfoResponse, txTypeMap, txMemoMap)
+	txInfoByID, err := c.mergeTxInfoWithTypes(txInfoResponse, txTypeMap, txMemoMap)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to merge txInfo with types: %w", err)
+		return nil, xerrors.Errorf("failed to merge txInfo with types (height=%v): %w", blockNumber, err)
+	}
+
+	// Every transaction in the block has exactly one txInfo entry.
+	if len(txInfoByID) != len(block.Transactions) {
+		return nil, retry.Retryable(xerrors.Errorf(
+			"got %v txInfo entries for %v transactions (height=%v)",
+			len(txInfoByID), len(block.Transactions), blockNumber,
+		))
+	}
+
+	// The parser pairs traces with the block's transactions by position, so
+	// return them in the block's order, whatever order the node answered in.
+	results := make([][]byte, len(block.Transactions))
+	for i, tx := range block.Transactions {
+		txID := strings.TrimPrefix(tx.Hash.Value(), "0x")
+		txInfo, ok := txInfoByID[txID]
+		if !ok {
+			return nil, retry.Retryable(xerrors.Errorf(
+				"no txInfo for transaction %v (height=%v)", txID, blockNumber,
+			))
+		}
+		results[i] = txInfo
 	}
 
 	return results, nil
 }
 
-// mergeTxInfoWithTypes parses txInfo response and adds transaction types and memos based on txID matching
-func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[string]string, txMemoMap map[string]string) ([][]byte, error) {
+// mergeTxInfoWithTypes parses txInfo response and adds transaction types and memos based on txID matching.
+// The result is keyed by the lower-case txID.
+func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[string]string, txMemoMap map[string]string) (map[string][]byte, error) {
 	// Parse txInfo response as array
 	var txInfoArray []json.RawMessage
 	if err := json.Unmarshal(txInfoResponse, &txInfoArray); err != nil {
@@ -213,7 +246,7 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 	}
 
 	// Merge each txInfo with its corresponding type
-	results := make([][]byte, 0, len(txInfoArray))
+	results := make(map[string][]byte, len(txInfoArray))
 	for _, txInfoBytes := range txInfoArray {
 		// Parse txInfo as map to allow dynamic field addition
 		var txInfo map[string]interface{}
@@ -226,10 +259,19 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 		if !ok {
 			return nil, xerrors.Errorf("txInfo id is not a string or is missing: %+v", txInfo)
 		}
-		// Add transaction type if found
-		if txType, exists := txTypeMap[txID]; exists {
-			txInfo["type"] = txType
+		// A repeated entry would stand in for a transaction the node left out
+		// and still satisfy the caller's count check.
+		key := strings.ToLower(txID)
+		if _, dup := results[key]; dup {
+			return nil, retry.Retryable(xerrors.Errorf("duplicate txInfo id %v", txID))
 		}
+		// Every transaction has a contract type; a missing one means the block
+		// call did not return this transaction.
+		txType, exists := txTypeMap[txID]
+		if !exists {
+			return nil, retry.Retryable(xerrors.Errorf("no contract type for txInfo id %v", txID))
+		}
+		txInfo["type"] = txType
 		// Add the memo (raw_data.data) if the transaction carries one
 		if memo, exists := txMemoMap[txID]; exists {
 			txInfo["memo"] = memo
@@ -241,7 +283,7 @@ func (c *TronClient) mergeTxInfoWithTypes(txInfoResponse []byte, txTypeMap map[s
 			return nil, xerrors.Errorf("failed to marshal modified txInfo: %w", err)
 		}
 
-		results = append(results, modifiedBytes)
+		results[key] = modifiedBytes
 	}
 
 	return results, nil
