@@ -64,6 +64,7 @@ var (
 	WithSkipScripts       = internal.WithSkipScripts
 	WithSkipWitnesses     = internal.WithSkipWitnesses
 	WithSkipShielded      = internal.WithSkipShielded
+	WithHeaderOnly        = internal.WithHeaderOnly
 	WithTransactionFilter = internal.WithTransactionFilter
 )
 

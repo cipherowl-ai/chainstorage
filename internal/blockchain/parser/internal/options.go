@@ -10,6 +10,7 @@ type parseOptions struct {
 	skipWitnesses bool
 	skipShielded  bool
 	txFilter      TransactionFilter
+	headerOnly    bool
 }
 
 // TransactionFilter decides, from one transaction's raw JSON, whether a
@@ -63,6 +64,13 @@ func WithTransactionFilter(f TransactionFilter) ParseOption {
 	return parseOptionFunc(func(o *parseOptions) { o.txFilter = f })
 }
 
+// WithHeaderOnly asks the ethereum-family ParseBlock to skip receipts,
+// traces and token transfers, so the returned transactions carry none
+// of them. Ignored on Tron, whose header is rewritten from receipt data.
+func WithHeaderOnly() ParseOption {
+	return parseOptionFunc(func(o *parseOptions) { o.headerOnly = true })
+}
+
 // ResolveParseOptions collapses a variadic option list into a concrete
 // view that parser implementations in sibling packages can read.
 func ResolveParseOptions(opts []ParseOption) ParseOptionsView {
@@ -84,3 +92,4 @@ func (v ParseOptionsView) SkipScripts() bool                    { return v.p.ski
 func (v ParseOptionsView) SkipWitnesses() bool                  { return v.p.skipWitnesses }
 func (v ParseOptionsView) SkipShielded() bool                   { return v.p.skipShielded }
 func (v ParseOptionsView) TransactionFilter() TransactionFilter { return v.p.txFilter }
+func (v ParseOptionsView) HeaderOnly() bool                     { return v.p.headerOnly }

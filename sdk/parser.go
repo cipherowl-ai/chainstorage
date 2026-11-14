@@ -67,6 +67,7 @@ var (
 	WithSkipScripts       = parser.WithSkipScripts
 	WithSkipWitnesses     = parser.WithSkipWitnesses
 	WithSkipShielded      = parser.WithSkipShielded
+	WithHeaderOnly        = parser.WithHeaderOnly
 	WithTransactionFilter = parser.WithTransactionFilter
 )
 

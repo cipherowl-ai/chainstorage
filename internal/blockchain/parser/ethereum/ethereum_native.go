@@ -587,131 +587,135 @@ func (p *ethereumNativeParserImpl) ParseBlock(ctx context.Context, rawBlock *api
 		return nil, xerrors.Errorf("unexpected number of transactions: expected=%v actual=%v", numTransactions, len(transactions))
 	}
 
-	var transactionReceipts []*api.EthereumTransactionReceipt
-	if p.nodeType.ReceiptsEnabled() {
-		transactionReceipts, err = p.parseTransactionReceipts(blobdata, transactions)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to parse transaction receipts: %w", err)
-		}
-		if numTransactions != len(transactionReceipts) {
-			return nil, xerrors.Errorf("unexpected number of transaction receipts: expected=%v actual=%v", numTransactions, len(transactionReceipts))
-		}
-
-		// txHashCounts is only needed by a chain-specific tolerator (see
-		// WithReceiptIndexMismatchTolerator); the default strict path skips the allocation.
-		var txHashCounts map[string]int
-		if p.receiptIndexMismatchTolerator != nil {
-			txHashCounts = make(map[string]int, len(transactions))
-			for _, t := range transactions {
-				txHashCounts[t.Hash]++
+	headerOnly := internal.ResolveParseOptions(opts).HeaderOnly() &&
+		p.config.Blockchain() != common.Blockchain_BLOCKCHAIN_TRON
+	if !headerOnly {
+		var transactionReceipts []*api.EthereumTransactionReceipt
+		if p.nodeType.ReceiptsEnabled() {
+			transactionReceipts, err = p.parseTransactionReceipts(blobdata, transactions)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to parse transaction receipts: %w", err)
 			}
-		}
-
-		for i, transactionReceipt := range transactionReceipts {
-			transaction := transactions[i]
-
-			hashOrBlockMismatch := transactionReceipt.TransactionHash != transaction.Hash ||
-				transactionReceipt.BlockHash != header.Hash ||
-				transactionReceipt.BlockNumber != header.Number
-			indexMismatch := transactionReceipt.TransactionIndex != transaction.Index
-
-			tolerable := indexMismatch && !hashOrBlockMismatch &&
-				p.receiptIndexMismatchTolerator != nil &&
-				p.receiptIndexMismatchTolerator(transaction, transactionReceipt, transactions, txHashCounts)
-
-			if hashOrBlockMismatch || (indexMismatch && !tolerable) {
-				return nil, xerrors.Errorf("unexpected transaction receipt: transactionReceipt={%+v} transaction={%+v} block={%+v}", transactionReceipt, transaction, header)
+			if numTransactions != len(transactionReceipts) {
+				return nil, xerrors.Errorf("unexpected number of transaction receipts: expected=%v actual=%v", numTransactions, len(transactionReceipts))
 			}
 
-			if tolerable {
-				receiptPointsToHash := ""
-				if transactionReceipt.TransactionIndex < uint64(len(transactions)) {
-					receiptPointsToHash = transactions[transactionReceipt.TransactionIndex].Hash
+			// txHashCounts is only needed by a chain-specific tolerator (see
+			// WithReceiptIndexMismatchTolerator); the default strict path skips the allocation.
+			var txHashCounts map[string]int
+			if p.receiptIndexMismatchTolerator != nil {
+				txHashCounts = make(map[string]int, len(transactions))
+				for _, t := range transactions {
+					txHashCounts[t.Hash]++
 				}
-				p.Logger.Warn("tolerating receipt/tx index mismatch by chain-specific policy",
-					zap.String("blockchain", p.config.Chain.Blockchain.String()),
-					zap.String("transaction_hash", transaction.Hash),
-					zap.Uint64("block_number", header.Number),
-					zap.Uint64("expected_transaction_index", transaction.Index),
-					zap.Uint64("receipt_transaction_index", transactionReceipt.TransactionIndex),
-					zap.String("receipt_points_to_transaction_hash", receiptPointsToHash),
-				)
+			}
+
+			for i, transactionReceipt := range transactionReceipts {
+				transaction := transactions[i]
+
+				hashOrBlockMismatch := transactionReceipt.TransactionHash != transaction.Hash ||
+					transactionReceipt.BlockHash != header.Hash ||
+					transactionReceipt.BlockNumber != header.Number
+				indexMismatch := transactionReceipt.TransactionIndex != transaction.Index
+
+				tolerable := indexMismatch && !hashOrBlockMismatch &&
+					p.receiptIndexMismatchTolerator != nil &&
+					p.receiptIndexMismatchTolerator(transaction, transactionReceipt, transactions, txHashCounts)
+
+				if hashOrBlockMismatch || (indexMismatch && !tolerable) {
+					return nil, xerrors.Errorf("unexpected transaction receipt: transactionReceipt={%+v} transaction={%+v} block={%+v}", transactionReceipt, transaction, header)
+				}
+
+				if tolerable {
+					receiptPointsToHash := ""
+					if transactionReceipt.TransactionIndex < uint64(len(transactions)) {
+						receiptPointsToHash = transactions[transactionReceipt.TransactionIndex].Hash
+					}
+					p.Logger.Warn("tolerating receipt/tx index mismatch by chain-specific policy",
+						zap.String("blockchain", p.config.Chain.Blockchain.String()),
+						zap.String("transaction_hash", transaction.Hash),
+						zap.Uint64("block_number", header.Number),
+						zap.Uint64("expected_transaction_index", transaction.Index),
+						zap.Uint64("receipt_transaction_index", transactionReceipt.TransactionIndex),
+						zap.String("receipt_points_to_transaction_hash", receiptPointsToHash),
+					)
+				}
+			}
+		} else {
+			transactionReceipts = make([]*api.EthereumTransactionReceipt, numTransactions)
+		}
+
+		isParityTrace := p.traceType.ParityTraceEnabled()
+		if p.config.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_ARBITRUM {
+			// All arb_trace methods on the Arbitrum One chain should be called on blocks prior to 22207818 due to NITRO upgrade.
+			// Reference - arbitrum NITRO: https://github.com/OffchainLabs/nitro
+			// QuickNode arb endpoint guide: https://www.quicknode.com/docs/arbitrum/arbtrace_block and https://www.quicknode.com/docs/arbitrum/debug_traceBlockByNumber
+			if header.Number < arbitrumNITROUpgradeBlockNumber {
+				isParityTrace = true
+			} else {
+				isParityTrace = false
 			}
 		}
-	} else {
-		transactionReceipts = make([]*api.EthereumTransactionReceipt, numTransactions)
-	}
 
-	isParityTrace := p.traceType.ParityTraceEnabled()
-	if p.config.Chain.Blockchain == common.Blockchain_BLOCKCHAIN_ARBITRUM {
-		// All arb_trace methods on the Arbitrum One chain should be called on blocks prior to 22207818 due to NITRO upgrade.
-		// Reference - arbitrum NITRO: https://github.com/OffchainLabs/nitro
-		// QuickNode arb endpoint guide: https://www.quicknode.com/docs/arbitrum/arbtrace_block and https://www.quicknode.com/docs/arbitrum/debug_traceBlockByNumber
-		if header.Number < arbitrumNITROUpgradeBlockNumber {
-			isParityTrace = true
+		var transactionTraces []*api.EthereumTransactionTrace
+		if p.nodeType.TracesEnabled() && !isParityTrace {
+			transactionTraces, err = p.parseTransactionTraces(blobdata, transactions)
+			if err != nil {
+				return nil, xerrors.Errorf("failed to parse transaction traces: %w", err)
+			}
 		} else {
-			isParityTrace = false
+			transactionTraces = make([]*api.EthereumTransactionTrace, numTransactions)
 		}
-	}
 
-	var transactionTraces []*api.EthereumTransactionTrace
-	if p.nodeType.TracesEnabled() && !isParityTrace {
-		transactionTraces, err = p.parseTransactionTraces(blobdata, transactions)
+		if numTransactions != len(transactionTraces) {
+			return nil, xerrors.Errorf("unexpected number of transaction traces: expected=%v actual=%v", numTransactions, len(transactionTraces))
+		}
+
+		tokenTransfers, err := p.parseTokenTransfers(transactionReceipts)
 		if err != nil {
-			return nil, xerrors.Errorf("failed to parse transaction traces: %w", err)
+			return nil, xerrors.Errorf("failed to parse token transfer: %w", err)
 		}
-	} else {
-		transactionTraces = make([]*api.EthereumTransactionTrace, numTransactions)
-	}
-
-	if numTransactions != len(transactionTraces) {
-		return nil, xerrors.Errorf("unexpected number of transaction traces: expected=%v actual=%v", numTransactions, len(transactionTraces))
-	}
-
-	tokenTransfers, err := p.parseTokenTransfers(transactionReceipts)
-	if err != nil {
-		return nil, xerrors.Errorf("failed to parse token transfer: %w", err)
-	}
-	if numTransactions != len(tokenTransfers) {
-		return nil, xerrors.Errorf("unexpected number of token transfers: expected=%v actual=%v", numTransactions, len(tokenTransfers))
-	}
-	transactionToFlattenedTracesMap := make(map[string][]*api.EthereumTransactionFlattenedTrace, 0)
-	if isParityTrace {
-		if p.config.Blockchain() != common.Blockchain_BLOCKCHAIN_TRON {
-			if err := p.parseTransactionFlattenedParityTraces(blobdata, transactionToFlattenedTracesMap); err != nil {
-				return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
-			}
+		if numTransactions != len(tokenTransfers) {
+			return nil, xerrors.Errorf("unexpected number of token transfers: expected=%v actual=%v", numTransactions, len(tokenTransfers))
 		}
-	}
-	// post process block data for Tron data, convert hash and account address, and set flattened traces
-	if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
-		if err := postProcessTronBlock(
-			blobdata,
-			header,
-			transactions,
-			transactionReceipts,
-			tokenTransfers,
-			transactionToFlattenedTracesMap); err != nil {
-			return nil, xerrors.Errorf("failed to post process tron block: %w", err)
-		}
-	}
-	for i, transaction := range transactions {
-		transaction.Receipt = transactionReceipts[i]
-		transaction.TokenTransfers = tokenTransfers[i]
-
-		transactionTrace := transactionTraces[i]
-
-		// Parse transaction flattened traces
-		var transactionFlattenedTraces []*api.EthereumTransactionFlattenedTrace
+		transactionToFlattenedTracesMap := make(map[string][]*api.EthereumTransactionFlattenedTrace, 0)
 		if isParityTrace {
-			if _, ok := transactionToFlattenedTracesMap[transaction.Hash]; !ok {
-				continue
+			if p.config.Blockchain() != common.Blockchain_BLOCKCHAIN_TRON {
+				if err := p.parseTransactionFlattenedParityTraces(blobdata, transactionToFlattenedTracesMap); err != nil {
+					return nil, xerrors.Errorf("failed to parse transaction parity traces: %w", err)
+				}
 			}
-			transactionFlattenedTraces = transactionToFlattenedTracesMap[transaction.Hash]
-		} else {
-			transactionFlattenedTraces = p.parseTransactionFlattenedTraces(transactionTrace, transaction, "", []uint64{})
 		}
-		transaction.FlattenedTraces = transactionFlattenedTraces
+		// post process block data for Tron data, convert hash and account address, and set flattened traces
+		if p.config.Blockchain() == common.Blockchain_BLOCKCHAIN_TRON {
+			if err := postProcessTronBlock(
+				blobdata,
+				header,
+				transactions,
+				transactionReceipts,
+				tokenTransfers,
+				transactionToFlattenedTracesMap); err != nil {
+				return nil, xerrors.Errorf("failed to post process tron block: %w", err)
+			}
+		}
+		for i, transaction := range transactions {
+			transaction.Receipt = transactionReceipts[i]
+			transaction.TokenTransfers = tokenTransfers[i]
+
+			transactionTrace := transactionTraces[i]
+
+			// Parse transaction flattened traces
+			var transactionFlattenedTraces []*api.EthereumTransactionFlattenedTrace
+			if isParityTrace {
+				if _, ok := transactionToFlattenedTracesMap[transaction.Hash]; !ok {
+					continue
+				}
+				transactionFlattenedTraces = transactionToFlattenedTracesMap[transaction.Hash]
+			} else {
+				transactionFlattenedTraces = p.parseTransactionFlattenedTraces(transactionTrace, transaction, "", []uint64{})
+			}
+			transaction.FlattenedTraces = transactionFlattenedTraces
+		}
 	}
 
 	uncles, err := p.parseUncles(blobdata)
