@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import struct
+import time
 
 import grpc
 import pytest
@@ -13,6 +14,7 @@ from conftest import TAG, block_hash, block_time, make_block
 
 from chainstorage_sdk import (
     BlockFormatError,
+    CallTimeoutError,
     Client,
     Config,
     ConfigError,
@@ -1422,3 +1424,329 @@ def test_consolidated_fixture_layout_is_what_these_tests_assume(deployment):
     deployment.server.add_consolidated("zstd")
     data = deployment.storage.objects[CONSOLIDATED_OBJECT]
     assert struct.unpack_from("<II", data, 8) == (6, 2)
+
+
+# -- block files, without a download --------------------------------------
+
+
+class DeadlineTransport(StubTransport):
+    """A transport that takes a deadline, and records the one of each call."""
+
+    def __init__(self, answer=None) -> None:
+        super().__init__(answer)
+        self.deadlines: list[float | None] = []
+
+    def call(self, method, request, *, timeout, deadline=None):
+        self.deadlines.append(deadline)
+        return super().call(method, request, timeout=timeout)
+
+
+def range_answer(method, request):
+    return api_pb2.GetBlockFilesByRangeResponse(
+        files=chain_files(request.start_height, request.end_height)
+    )
+
+
+def stub_client(transport) -> Client:
+    return Client(
+        Config(server_address="unused:1"), transport=transport, downloader=StubDownloader()
+    )
+
+
+def test_the_latest_block_comes_with_its_tag_hashes_and_time(deployment):
+    deployment.server.add_block(8)
+    deployment.server.add_block(9)
+
+    latest = deployment.client().get_latest_block_info()
+
+    assert (latest.tag, latest.height) == (TAG, 9)
+    assert (latest.hash, latest.parent_hash) == (block_hash(9), block_hash(8))
+    assert latest.timestamp.seconds == block_time(9)
+    assert deployment.server.calls_to("GetLatestBlock")[0].tag == TAG
+
+
+def test_a_block_file_is_returned_without_a_download(deployment):
+    deployment.server.add_block(5)
+
+    file = deployment.client().get_block_file(5, read_source=SINGLE_BLOCK)
+
+    assert (file.tag, file.height, file.hash, file.skipped) == (TAG, 5, block_hash(5), False)
+    assert file.file_url
+    assert deployment.storage.requests == []
+    request = deployment.server.calls_to("GetBlockFile")[0]
+    assert (request.tag, request.height, request.hash) == (TAG, 5, "")
+    assert request.read_source == SINGLE_BLOCK
+
+
+def test_a_block_file_is_found_by_hash(deployment):
+    deployment.server.add_block(5)
+    deployment.server.add_orphan(5, "replaced")
+
+    file = deployment.client().get_block_file(5, "replaced", tag=TAG)
+
+    assert (file.height, file.hash) == (5, "replaced")
+    assert deployment.server.calls_to("GetBlockFile")[0].hash == "replaced"
+
+
+def test_the_block_file_of_a_skipped_block_says_so(deployment):
+    deployment.server.skipped.add(6)
+
+    file = deployment.client().get_block_file(6)
+
+    assert (file.height, file.skipped, file.file_url) == (6, True, "")
+
+
+@pytest.mark.parametrize("read_source", [DEFAULT, CONSOLIDATED])
+def test_a_block_file_is_not_looked_for_in_another_source(deployment, read_source):
+    # get_block would read the block from single-block objects instead.
+    with pytest.raises(NotFoundError):
+        deployment.client().get_block_file(5, read_source=read_source)
+
+    assert [request.read_source for request in deployment.server.calls_to("GetBlockFile")] == [
+        read_source
+    ]
+
+
+def test_the_block_files_of_a_range_come_in_height_order(deployment):
+    for height in (10, 11, 13):
+        deployment.server.add_block(height)
+    deployment.server.skipped.add(12)
+
+    files = deployment.client().get_block_files_by_range(10, 14, read_source=SINGLE_BLOCK)
+
+    assert [file.height for file in files] == [10, 11, 12, 13]
+    assert [file.skipped for file in files] == [False, False, True, False]
+    assert [file.hash for file in files] == [block_hash(10), block_hash(11), "", block_hash(13)]
+    assert deployment.storage.requests == []
+    request = deployment.server.calls_to("GetBlockFilesByRange")[0]
+    assert (request.tag, request.start_height, request.end_height) == (TAG, 10, 14)
+    assert request.read_source == SINGLE_BLOCK
+
+
+def test_a_range_of_block_files_without_an_end_is_one_block(deployment):
+    deployment.server.add_block(10)
+    deployment.server.add_block(11)
+
+    files = deployment.client().get_block_files_by_range(10)
+
+    assert [file.height for file in files] == [10]
+
+
+@pytest.mark.parametrize("end_height", [5, 4])
+def test_an_empty_range_of_block_files_is_refused(deployment, end_height):
+    with pytest.raises(ConfigError):
+        deployment.client().get_block_files_by_range(5, end_height)
+
+    assert deployment.server.calls == []
+
+
+def test_a_long_range_of_block_files_is_asked_for_in_requests_of_a_thousand():
+    transport = StubTransport(range_answer)
+
+    files = stub_client(transport).get_block_files_by_range(100, 2600)
+
+    assert [file.height for file in files] == list(range(100, 2600))
+    assert [(request.start_height, request.end_height) for _, request, _ in transport.calls] == [
+        (100, 1100),
+        (1100, 2100),
+        (2100, 2600),
+    ]
+
+
+def test_block_files_of_two_requests_that_do_not_connect_are_refused():
+    def answer(method, request):
+        fork = "a" if request.start_height == 0 else "b"
+        return api_pb2.GetBlockFilesByRangeResponse(
+            files=chain_files(request.start_height, request.end_height, fork=fork)
+        )
+
+    with pytest.raises(RequestError, match="block 1000 does not follow block 999"):
+        stub_client(StubTransport(answer)).get_block_files_by_range(0, 1500)
+
+
+def test_a_range_of_block_files_that_misses_a_height_is_refused():
+    def answer(method, request):
+        return api_pb2.GetBlockFilesByRangeResponse(files=chain_files(10, 13))
+
+    with pytest.raises(RequestError, match="expected 4 block files"):
+        stub_client(StubTransport(answer)).get_block_files_by_range(10, 14)
+
+
+@pytest.mark.parametrize("read_source", [DEFAULT, CONSOLIDATED])
+def test_a_range_of_block_files_is_not_looked_for_in_another_source(read_source):
+    # iter_raw_block_payloads would read the range from single-block objects.
+    def answer(method, request):
+        raise RequestError("GetBlockFilesByRange failed", code="FAILED_PRECONDITION")
+
+    transport = StubTransport(answer)
+
+    with pytest.raises(RequestError):
+        stub_client(transport).get_block_files_by_range(10, 14, read_source=read_source)
+
+    assert [request.read_source for _, request, _ in transport.calls] == [read_source]
+
+
+# -- a time limit for a whole call ----------------------------------------
+
+
+def test_a_call_within_its_timeout_is_retried_as_usual(deployment):
+    deployment.server.add_block(4)
+    unavailable = grpc.StatusCode.UNAVAILABLE
+    deployment.server.failures["GetLatestBlock"].extend([unavailable, unavailable])
+
+    assert deployment.client().get_latest_block(timeout=30) == 4
+    assert len(deployment.server.calls_to("GetLatestBlock")) == 3
+    assert len(deployment.sleeps) == 2
+
+
+def test_a_timeout_cuts_an_attempt_short(deployment):
+    deployment.server.add_block(4)
+    deployment.server.delays["GetLatestBlock"] = 0.6
+    client = deployment.client(client_timeout=30)
+    started = time.monotonic()
+
+    with pytest.raises(CallTimeoutError, match="DEADLINE_EXCEEDED") as raised:
+        client.get_latest_block(timeout=0.1)
+
+    assert time.monotonic() - started < 0.5
+    # Both, so that code written for either kind of error handles it.
+    assert isinstance(raised.value, RequestError)
+    assert isinstance(raised.value, TimeoutError)
+    assert not raised.value.retryable
+    assert len(deployment.server.calls_to("GetLatestBlock")) == 1
+    assert deployment.sleeps == []
+
+
+def test_a_timeout_stops_a_retry_that_could_not_start_in_time(deployment):
+    deployment.server.add_block(4)
+    deployment.server.failures["GetLatestBlock"].append(grpc.StatusCode.UNAVAILABLE)
+    client = deployment.client(retry=RetryPolicy(initial_interval=60, jitter=0, max_interval=60))
+
+    with pytest.raises(CallTimeoutError, match="the last attempt failed with UNAVAILABLE"):
+        client.get_latest_block(timeout=5)
+
+    assert len(deployment.server.calls_to("GetLatestBlock")) == 1
+    assert deployment.sleeps == []
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_a_timeout_that_has_run_out_fails_before_the_server_is_asked(deployment, timeout):
+    deployment.server.add_block(4)
+
+    with pytest.raises(CallTimeoutError):
+        deployment.client().get_latest_block(timeout=timeout)
+
+    assert deployment.server.calls == []
+
+
+def test_every_call_that_does_not_download_takes_a_timeout(deployment):
+    deployment.server.add_block(4)
+    deployment.server.add_event(4)
+    client = deployment.client()
+    events = api_pb2.GetChainEventsRequest(max_num_events=1)
+
+    assert client.get_latest_block(timeout=30) == 4
+    assert client.get_latest_block_info(timeout=30).height == 4
+    assert client.get_block_file(4, timeout=30).height == 4
+    assert len(client.get_block_files_by_range(4, 5, timeout=30)) == 1
+    assert len(client.get_chain_events(events, timeout=30)) == 1
+    assert client.get_chain_metadata(timeout=30).latest_block_tag == TAG
+
+    for call in (
+        lambda: client.get_latest_block(timeout=0),
+        lambda: client.get_latest_block_info(timeout=0),
+        lambda: client.get_block_file(4, timeout=0),
+        lambda: client.get_block_files_by_range(4, 5, timeout=0),
+        lambda: client.get_chain_events(events, timeout=0),
+        lambda: client.get_chain_metadata(timeout=0),
+    ):
+        with pytest.raises(CallTimeoutError):
+            call()
+
+
+def test_the_requests_of_a_long_range_share_one_timeout():
+    transport = DeadlineTransport(range_answer)
+    before = time.monotonic()
+
+    stub_client(transport).get_block_files_by_range(0, 2500, timeout=20)
+
+    assert len(transport.deadlines) == 3
+    assert len(set(transport.deadlines)) == 1
+    assert before + 20 <= transport.deadlines[0] <= time.monotonic() + 20
+
+
+def test_a_call_without_a_timeout_has_no_deadline():
+    transport = DeadlineTransport(range_answer)
+
+    stub_client(transport).get_block_files_by_range(0, 5)
+
+    assert transport.deadlines == [None]
+
+
+# -- a connection that was reset, and the log of retries ------------------
+
+
+@pytest.mark.parametrize("details", ["Stream removed", "Received RST_STREAM with error code 2"])
+def test_a_call_is_retried_when_its_connection_was_reset(deployment, details):
+    deployment.server.add_block(4)
+    reset = (grpc.StatusCode.UNKNOWN, details)
+    deployment.server.failures["GetLatestBlock"].extend([reset, reset])
+
+    assert deployment.client().get_latest_block() == 4
+    assert len(deployment.server.calls_to("GetLatestBlock")) == 3
+
+
+def test_a_call_is_not_retried_on_another_unknown_failure(deployment):
+    deployment.server.add_block(4)
+    deployment.server.failures["GetLatestBlock"].append(
+        (grpc.StatusCode.UNKNOWN, "the handler raised an exception")
+    )
+
+    with pytest.raises(RequestError) as raised:
+        deployment.client().get_latest_block()
+
+    assert raised.value.code == "UNKNOWN"
+    assert not raised.value.retryable
+    assert len(deployment.server.calls_to("GetLatestBlock")) == 1
+
+
+def test_a_retried_call_is_logged(deployment, caplog):
+    deployment.server.add_block(4)
+    failures = [grpc.StatusCode.UNAVAILABLE, (grpc.StatusCode.UNKNOWN, "Stream removed")]
+    deployment.server.failures["GetLatestBlock"].extend(failures)
+    client = deployment.client(retry=RetryPolicy(jitter=0))
+
+    with caplog.at_level("WARNING", logger="chainstorage_sdk.retry"):
+        assert client.get_latest_block() == 4
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "GetLatestBlock failed with UNAVAILABLE on attempt 1 of 4; trying again in 0.2 s",
+        "GetLatestBlock failed with UNKNOWN on attempt 2 of 4; trying again in 0.4 s",
+    ]
+
+
+def test_a_call_that_succeeds_at_once_logs_nothing(deployment, caplog):
+    deployment.server.add_block(5)
+
+    with caplog.at_level("WARNING", logger="chainstorage_sdk"):
+        deployment.client().get_block(5)
+
+    assert caplog.records == []
+
+
+def test_a_retried_download_is_logged_without_its_link(deployment, caplog):
+    deployment.server.add_block(5)
+    deployment.storage.signature = "secret"
+    deployment.storage.failures["blocks/5"].append(503)
+    deployment.storage.error_body = STORE_REFUSAL
+    client = deployment.client(retry=RetryPolicy(jitter=0))
+
+    with caplog.at_level("WARNING", logger="chainstorage_sdk.retry"):
+        client.get_block(5, read_source=SINGLE_BLOCK)
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "a block file download failed with status 503 ExpiredToken on attempt 1 of 4; "
+        "trying again in 0.2 s"
+    ]
+    assert "secret" not in caplog.text
+    assert "blocks/5" not in caplog.text

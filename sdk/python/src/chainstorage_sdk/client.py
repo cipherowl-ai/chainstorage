@@ -93,6 +93,11 @@ class Client:
 
     A client holds a connection and a download pool. Close it when done, or
     use it as a context manager. It may be shared between threads.
+
+    The methods that only ask the server, and download nothing, take
+    ``timeout``: a limit in seconds for the whole call, retries included.
+    When it runs out the call raises ``CallTimeoutError``. Without it, each
+    attempt is limited by ``client_timeout`` and the retries by ``retry``.
     """
 
     def __init__(
@@ -124,10 +129,73 @@ class Client:
 
     # -- blocks -----------------------------------------------------------
 
-    def get_latest_block(self, *, tag: int | None = None) -> int:
+    def get_latest_block(self, *, tag: int | None = None, timeout: float | None = None) -> int:
         """Returns the height of the latest block."""
+        return self.get_latest_block_info(tag=tag, timeout=timeout).height
+
+    def get_latest_block_info(
+        self, *, tag: int | None = None, timeout: float | None = None
+    ) -> api_pb2.GetLatestBlockResponse:
+        """Returns the latest block's tag, hash, parent hash, height and
+        timestamp."""
         request = api_pb2.GetLatestBlockRequest(tag=self._tag(tag))
-        return self._call("GetLatestBlock", request, self._short_timeout).height
+        return self._call("GetLatestBlock", request, self._short_timeout, _deadline(timeout))
+
+    def get_block_file(
+        self,
+        height: int,
+        hash: str = "",
+        *,
+        tag: int | None = None,
+        read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+    ) -> api_pb2.BlockFile:
+        """Returns where one block is stored, without downloading it.
+
+        The answer is for ``read_source`` as asked: unlike ``get_block``, this
+        does not try single-block objects when the wanted source fails.
+
+        A block file holds a signed link (``file_url``). Do not log it.
+        """
+        request = api_pb2.GetBlockFileRequest(
+            tag=self._tag(tag), height=height, hash=hash, read_source=read_source
+        )
+        return self._call("GetBlockFile", request, self._short_timeout, _deadline(timeout)).file
+
+    def get_block_files_by_range(
+        self,
+        start_height: int,
+        end_height: int = 0,
+        *,
+        tag: int | None = None,
+        read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+    ) -> list[api_pb2.BlockFile]:
+        """Returns where the blocks in ``[start_height, end_height)`` are
+        stored, in height order, without downloading them. ``end_height == 0``
+        means one block. A skipped block has a file with ``skipped`` set.
+
+        A range of any length is accepted, requested from the server 1,000
+        blocks at a time and checked as ``iter_raw_block_payloads`` checks it:
+        every height is present, and consecutive requests connect.
+
+        The answer is for ``read_source`` as asked: unlike
+        ``iter_raw_block_payloads``, this does not try single-block objects
+        when the wanted source fails.
+
+        A block file holds a signed link (``file_url``). Do not log it.
+        """
+        start_height, end_height = _range(start_height, end_height)
+        resolved_tag = self._tag(tag)
+        deadline = _deadline(timeout)
+        files: list[api_pb2.BlockFile] = []
+        previous: api_pb2.BlockFile | None = None
+        for first in range(start_height, end_height, MAX_BLOCK_FILES_PER_REQUEST):
+            last = min(first + MAX_BLOCK_FILES_PER_REQUEST, end_height)
+            page = self._block_files(resolved_tag, first, last, read_source, deadline)
+            previous = _check_connects(previous, page)
+            files.extend(page)
+        return files
 
     def get_block(
         self,
@@ -212,10 +280,7 @@ class Client:
         1,000 blocks at a time; each such request describes one consistent
         chain, and the client checks that consecutive requests connect.
         """
-        if end_height == 0:
-            end_height = start_height + 1
-        if end_height <= start_height:
-            raise ConfigError(f"invalid range: start_height={start_height} end_height={end_height}")
+        start_height, end_height = _range(start_height, end_height)
         return self._iter_raw_block_payloads(start_height, end_height, self._tag(tag), read_source)
 
     def _iter_raw_block_payloads(
@@ -225,20 +290,7 @@ class Client:
         for first in range(start_height, end_height, MAX_BLOCK_FILES_PER_REQUEST):
             last = min(first + MAX_BLOCK_FILES_PER_REQUEST, end_height)
             source, files = self._page(tag, first, last, read_source)
-            # The server checks the chain within one request. Between two
-            # requests the chain can change, so check that they connect.
-            stored = [block_file for block_file in files if not block_file.skipped]
-            if stored:
-                if (
-                    previous is not None
-                    and stored[0].parent_hash
-                    and stored[0].parent_hash != previous.hash
-                ):
-                    raise RequestError(
-                        f"the chain changed while reading: block {stored[0].height} does "
-                        f"not follow block {previous.height}; read the range again"
-                    )
-                previous = stored[-1]
+            previous = _check_connects(previous, files)
             yield from self._download_page(tag, files, source)
 
     def _page(
@@ -341,11 +393,14 @@ class Client:
     # -- chain events -----------------------------------------------------
 
     def get_chain_events(
-        self, request: api_pb2.GetChainEventsRequest
+        self, request: api_pb2.GetChainEventsRequest, *, timeout: float | None = None
     ) -> list[api_pb2.BlockchainEvent]:
         """Returns up to ``request.max_num_events`` events after a position."""
-        timeout = self._medium_timeout if request.max_num_events > 10 else self._short_timeout
-        return list(self._call("GetChainEvents", request, timeout).events)
+        attempt_timeout = (
+            self._medium_timeout if request.max_num_events > 10 else self._short_timeout
+        )
+        response = self._call("GetChainEvents", request, attempt_timeout, _deadline(timeout))
+        return list(response.events)
 
     def stream_chain_events(self, config: StreamingConfiguration) -> Iterator[ChainEventResult]:
         """Yields chain events as the server reports them, each with its block.
@@ -428,11 +483,12 @@ class Client:
 
     # -- metadata ---------------------------------------------------------
 
-    def get_chain_metadata(self) -> api_pb2.GetChainMetadataResponse:
+    def get_chain_metadata(
+        self, *, timeout: float | None = None
+    ) -> api_pb2.GetChainMetadataResponse:
         """Returns what the server reports about its chain and its tags."""
-        return self._call(
-            "GetChainMetadata", api_pb2.GetChainMetadataRequest(), self._short_timeout
-        )
+        request = api_pb2.GetChainMetadataRequest()
+        return self._call("GetChainMetadata", request, self._short_timeout, _deadline(timeout))
 
     # -- internals --------------------------------------------------------
 
@@ -451,18 +507,30 @@ class Client:
     def _long_timeout(self) -> float:
         return self._config.client_timeout * 4 + 3
 
-    def _call(self, method: str, request: Any, timeout: float) -> Any:
-        return self._transport.call(method, request, timeout=timeout)
+    def _call(
+        self, method: str, request: Any, timeout: float, deadline: float | None = None
+    ) -> Any:
+        """Sends one call. ``timeout`` limits each attempt; ``deadline``, a
+        ``time.monotonic()`` value, limits the call as a whole."""
+        if deadline is None:
+            # A transport written before deadlines existed still works.
+            return self._transport.call(method, request, timeout=timeout)
+        return self._transport.call(method, request, timeout=timeout, deadline=deadline)
 
     def _block_files(
-        self, tag: int, start_height: int, end_height: int, read_source: int
+        self,
+        tag: int,
+        start_height: int,
+        end_height: int,
+        read_source: int,
+        deadline: float | None = None,
     ) -> list[api_pb2.BlockFile]:
         count = end_height - start_height
         request = api_pb2.GetBlockFilesByRangeRequest(
             tag=tag, start_height=start_height, end_height=end_height, read_source=read_source
         )
         timeout = self._long_timeout if count > 2 else self._medium_timeout
-        files = list(self._call("GetBlockFilesByRange", request, timeout).files)
+        files = list(self._call("GetBlockFilesByRange", request, timeout, deadline).files)
         if len(files) != count:
             raise RequestError(
                 f"expected {count} block files for [{start_height}, {end_height}), got {len(files)}"
@@ -488,6 +556,41 @@ class Client:
                 return read(api_pb2.BLOCK_READ_SOURCE_SINGLE_BLOCK)
             except ChainStorageError as fallback_exc:
                 raise fallback_exc from exc
+
+
+def _range(start_height: int, end_height: int) -> tuple[int, int]:
+    """Returns the range a caller asked for; ``end_height == 0`` is one block."""
+    if end_height == 0:
+        end_height = start_height + 1
+    if end_height <= start_height:
+        raise ConfigError(f"invalid range: start_height={start_height} end_height={end_height}")
+    return start_height, end_height
+
+
+def _deadline(timeout: float | None) -> float | None:
+    """Turns a caller's ``timeout`` into the moment the call must be done by."""
+    return None if timeout is None else time.monotonic() + timeout
+
+
+def _check_connects(
+    previous: api_pb2.BlockFile | None, files: Sequence[api_pb2.BlockFile]
+) -> api_pb2.BlockFile | None:
+    """Checks that one request's block files follow ``previous``, the last
+    stored block of the request before it, and returns the block the next
+    request has to follow.
+
+    The server checks the chain within one request. Between two requests the
+    chain can change.
+    """
+    stored = [block_file for block_file in files if not block_file.skipped]
+    if not stored:
+        return previous
+    if previous is not None and stored[0].parent_hash and stored[0].parent_hash != previous.hash:
+        raise RequestError(
+            f"the chain changed while reading: block {stored[0].height} does "
+            f"not follow block {previous.height}; read the range again"
+        )
+    return stored[-1]
 
 
 def _is_expired_link(exc: DownloadError) -> bool:

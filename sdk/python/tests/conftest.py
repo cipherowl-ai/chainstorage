@@ -142,7 +142,9 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
         self.transactions: dict[str, list[int]] = {}
         self.calls: list[tuple[str, object]] = []
         self.metadata: list[tuple[str, dict[str, str]]] = []
-        self.failures: dict[str, deque[grpc.StatusCode]] = defaultdict(deque)
+        # Per method: the failures to answer with before serving it. An entry
+        # is a status code, or a (status code, details) pair.
+        self.failures: dict[str, deque] = defaultdict(deque)
         self.delays: dict[str, float] = {}
         # One entry per stream the server will open: how many events to send
         # before it fails with the given code. Streams beyond the plan send
@@ -232,7 +234,9 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
         if method in self.delays:
             time.sleep(self.delays[method])
         if self.failures[method]:
-            context.abort(self.failures[method].popleft(), "injected failure")
+            failure = self.failures[method].popleft()
+            code, details = failure if isinstance(failure, tuple) else (failure, "injected failure")
+            context.abort(code, details)
 
     def _block_file(self, height: int, hash: str, read_source: int, context) -> api_pb2.BlockFile:
         if hash and hash != block_hash(height):
@@ -267,7 +271,11 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
     def GetLatestBlock(self, request, context):
         self._enter("GetLatestBlock", request, context)
         height = max([*self.blocks, *self.skipped, *self.consolidated])
-        return api_pb2.GetLatestBlockResponse(tag=TAG, height=height, hash=block_hash(height))
+        response = api_pb2.GetLatestBlockResponse(
+            tag=TAG, height=height, hash=block_hash(height), parent_hash=block_hash(height - 1)
+        )
+        response.timestamp.seconds = block_time(height)
+        return response
 
     def GetBlockFile(self, request, context):
         self._enter("GetBlockFile", request, context)

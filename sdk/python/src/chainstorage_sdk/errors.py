@@ -29,6 +29,15 @@ class NotFoundError(RequestError):
     """The server has no such block, transaction or event."""
 
 
+class CallTimeoutError(RequestError, TimeoutError):
+    """A call did not finish within the ``timeout`` the caller gave it.
+
+    The limit covers the whole call, its retries included. This is not the
+    error of one attempt that ran past ``client_timeout``: that one is a
+    ``RequestError`` with the code ``DEADLINE_EXCEEDED``, and it is retried.
+    """
+
+
 class DownloadError(ChainStorageError):
     """Fetching a block file from storage failed.
 

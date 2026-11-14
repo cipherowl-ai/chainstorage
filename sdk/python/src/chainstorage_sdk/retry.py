@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import TypeVar
+
+from chainstorage_sdk.errors import CallTimeoutError
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -40,16 +45,34 @@ class RetryPolicy:
             interval = min(self.max_interval, interval * self.multiplier)
 
 
+def time_left(deadline: float | None) -> float | None:
+    """Returns the seconds until ``deadline``, a ``time.monotonic()`` value,
+    or ``None`` when there is no deadline."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
 def call_with_retry(
     fn: Callable[[], T],
     *,
     retryable: Callable[[Exception], bool],
     policy: RetryPolicy,
     sleep: Callable[[float], None] = time.sleep,
+    what: str = "call",
+    reason: Callable[[Exception], str] = lambda exc: type(exc).__name__,
+    deadline: float | None = None,
 ) -> T:
     """Calls ``fn`` until it returns, raises an error that is not retryable,
-    or the policy's attempts are used up. The last error is raised as is."""
+    or the policy's attempts are used up. The last error is raised as is.
+
+    Every retry is logged as a warning: ``what`` names the call, and
+    ``reason`` turns the error into the few words that are logged. The error
+    itself is not logged, because its text may hold a signed link.
+
+    ``deadline`` is a ``time.monotonic()`` value. A retry that could not
+    start before it is not made: ``CallTimeoutError`` is raised instead.
+    """
     waits = policy.waits()
+    attempt = 1
     while True:
         try:
             return fn()
@@ -57,4 +80,19 @@ def call_with_retry(
             wait = next(waits, None)
             if wait is None or not retryable(exc):
                 raise
+            left = time_left(deadline)
+            if left is not None and wait >= left:
+                raise CallTimeoutError(
+                    f"{what} did not finish in time; the last attempt failed with {reason(exc)}",
+                    code="DEADLINE_EXCEEDED",
+                ) from exc
+            logger.warning(
+                "%s failed with %s on attempt %d of %d; trying again in %.1f s",
+                what,
+                reason(exc),
+                attempt,
+                policy.attempts,
+                wait,
+            )
             sleep(wait)
+            attempt += 1

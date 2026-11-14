@@ -3,7 +3,9 @@
 Both transports expose the same two operations, so the client does not know
 which one it is using:
 
-- ``call(method, request, timeout=...)`` for a unary call;
+- ``call(method, request, timeout=..., deadline=...)`` for a unary call.
+  ``timeout`` is for one attempt. ``deadline`` is a ``time.monotonic()``
+  value for the whole call, retries included; ``None`` means no limit;
 - ``stream_chain_events(request)`` for the event stream (gRPC only).
 
 Every failure is raised as ``RequestError``; a transport never leaks a gRPC
@@ -23,8 +25,8 @@ from google.protobuf import json_format, message_factory
 from google.protobuf.message import Message
 
 from chainstorage_sdk.config import TRANSPORT_REST, Config
-from chainstorage_sdk.errors import NotFoundError, RequestError
-from chainstorage_sdk.retry import call_with_retry
+from chainstorage_sdk.errors import CallTimeoutError, NotFoundError, RequestError
+from chainstorage_sdk.retry import RetryPolicy, call_with_retry, time_left
 from coinbase.chainstorage import api_pb2, api_pb2_grpc
 
 logger = logging.getLogger(__name__)
@@ -46,11 +48,17 @@ _RETRYABLE_GRPC_CODES = frozenset(
     }
 )
 
+# grpc reports a connection that was reset in the middle of a call as UNKNOWN
+# with one of these texts. Every call of the SDK is a read, so it is repeated.
+_RETRYABLE_UNKNOWN_DETAILS = ("Stream removed", "RST_STREAM")
+
 _SERVICE = api_pb2.DESCRIPTOR.services_by_name["ChainStorage"]
 
 
 class Transport(Protocol):
-    def call(self, method: str, request: Message, *, timeout: float) -> Any: ...
+    def call(
+        self, method: str, request: Message, *, timeout: float, deadline: float | None = None
+    ) -> Any: ...
 
     def stream_chain_events(self, request: api_pb2.ChainEventsRequest) -> EventStream: ...
 
@@ -96,18 +104,19 @@ class GrpcTransport:
             self._channel = grpc.insecure_channel(target, options)
         self._stub = api_pb2_grpc.ChainStorageStub(self._channel)
 
-    def call(self, method: str, request: Message, *, timeout: float) -> Any:
+    def call(
+        self, method: str, request: Message, *, timeout: float, deadline: float | None = None
+    ) -> Any:
         rpc = getattr(self._stub, method)
 
         def attempt() -> Any:
+            attempt_timeout = _attempt_timeout(method, timeout, deadline)
             try:
-                return rpc(request, timeout=timeout, metadata=self._metadata)
+                return rpc(request, timeout=attempt_timeout, metadata=self._metadata)
             except grpc.RpcError as exc:
                 raise _from_grpc_error(method, exc) from exc
 
-        return call_with_retry(
-            attempt, retryable=_is_retryable_request, policy=self._policy, sleep=self._sleep
-        )
+        return _call_with_retry(method, attempt, self._policy, self._sleep, deadline)
 
     def stream_chain_events(self, request: api_pb2.ChainEventsRequest) -> EventStream:
         return _GrpcEventStream(self._stub.StreamChainEvents(request, metadata=self._metadata))
@@ -155,7 +164,9 @@ class RestTransport:
             # The Go SDK's REST client sends the token under this name as well.
             self._headers["cb-nft-api-token"] = config.auth_token
 
-    def call(self, method: str, request: Message, *, timeout: float) -> Any:
+    def call(
+        self, method: str, request: Message, *, timeout: float, deadline: float | None = None
+    ) -> Any:
         response_type = message_factory.GetMessageClass(
             _SERVICE.methods_by_name[method].output_type
         )
@@ -163,9 +174,10 @@ class RestTransport:
         body = json_format.MessageToJson(request)
 
         def attempt() -> Any:
+            attempt_timeout = _attempt_timeout(method, timeout, deadline)
             try:
                 response = self._session.post(
-                    url, data=body, headers=self._headers, timeout=timeout
+                    url, data=body, headers=self._headers, timeout=attempt_timeout
                 )
             except requests.RequestException as exc:
                 raise RequestError(
@@ -186,9 +198,7 @@ class RestTransport:
             except (json_format.ParseError, ValueError) as exc:
                 raise RequestError(f"{method} returned an invalid body", retryable=True) from exc
 
-        return call_with_retry(
-            attempt, retryable=_is_retryable_request, policy=self._policy, sleep=self._sleep
-        )
+        return _call_with_retry(method, attempt, self._policy, self._sleep, deadline)
 
     def stream_chain_events(self, request: api_pb2.ChainEventsRequest) -> EventStream:
         raise RequestError("StreamChainEvents is not available over REST; use gRPC")
@@ -221,8 +231,42 @@ def _is_grpc_not_found(response: requests.Response) -> bool:
     return isinstance(body, dict) and body.get("code") == grpc.StatusCode.NOT_FOUND.value[0]
 
 
+def _call_with_retry(
+    method: str,
+    attempt: Callable[[], Any],
+    policy: RetryPolicy,
+    sleep: Callable[[float], None],
+    deadline: float | None,
+) -> Any:
+    return call_with_retry(
+        attempt,
+        retryable=_is_retryable_request,
+        policy=policy,
+        sleep=sleep,
+        what=method,
+        reason=_reason,
+        deadline=deadline,
+    )
+
+
+def _attempt_timeout(method: str, timeout: float, deadline: float | None) -> float:
+    """Returns how long one attempt may take: ``timeout``, or the time left
+    until ``deadline`` when that is less."""
+    left = time_left(deadline)
+    if left is None:
+        return timeout
+    if left <= 0:
+        raise CallTimeoutError(f"{method} did not finish in time", code="DEADLINE_EXCEEDED")
+    return min(timeout, left)
+
+
 def _is_retryable_request(exc: Exception) -> bool:
     return isinstance(exc, RequestError) and exc.retryable
+
+
+def _reason(exc: Exception) -> str:
+    """The few words about a failed attempt that go into the retry log line."""
+    return getattr(exc, "code", "") or "no valid response"
 
 
 def _from_grpc_error(method: str, exc: grpc.RpcError) -> RequestError:
@@ -232,4 +276,8 @@ def _from_grpc_error(method: str, exc: grpc.RpcError) -> RequestError:
     message = f"{method} failed with {name}: {details}"
     if code == grpc.StatusCode.NOT_FOUND:
         return NotFoundError(message, code=name)
-    return RequestError(message, code=name, retryable=code in _RETRYABLE_GRPC_CODES)
+    retryable = code in _RETRYABLE_GRPC_CODES or (
+        code == grpc.StatusCode.UNKNOWN
+        and any(text in (details or "") for text in _RETRYABLE_UNKNOWN_DETAILS)
+    )
+    return RequestError(message, code=name, retryable=retryable)

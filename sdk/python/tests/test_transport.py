@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from chainstorage_sdk import Client, Config, ConfigError, NotFoundError, RequestError, RetryPolicy
+from chainstorage_sdk import (
+    CallTimeoutError,
+    Client,
+    Config,
+    ConfigError,
+    NotFoundError,
+    RequestError,
+    RetryPolicy,
+)
 from chainstorage_sdk.retry import call_with_retry
 from chainstorage_sdk.transport import grpc_target
 from coinbase.chainstorage import api_pb2
@@ -123,6 +132,100 @@ def test_an_error_that_is_not_retryable_is_raised_at_once():
             call, retryable=lambda exc: False, policy=RetryPolicy(), sleep=lambda _: None
         )
     assert len(calls) == 1
+
+
+def failing_call():
+    raise KeyError("the text of the error")
+
+
+def test_a_retry_is_logged_with_what_failed_and_why(caplog):
+    outcomes = [KeyError("the text of the error"), "done"]
+
+    def call():
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    with caplog.at_level("WARNING", logger="chainstorage_sdk.retry"):
+        call_with_retry(
+            call,
+            retryable=lambda exc: True,
+            policy=RetryPolicy(jitter=0),
+            sleep=lambda _: None,
+            what="a lookup",
+            reason=lambda exc: "a reason",
+        )
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "a lookup failed with a reason on attempt 1 of 4; trying again in 0.2 s"
+    ]
+    # The error itself is not logged: its text could hold a signed link.
+    assert "the text of the error" not in caplog.text
+
+
+def test_a_retry_before_the_deadline_is_made():
+    outcomes = [KeyError("first"), "done"]
+    sleeps: list[float] = []
+
+    def call():
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    result = call_with_retry(
+        call,
+        retryable=lambda exc: True,
+        policy=RetryPolicy(jitter=0),
+        sleep=sleeps.append,
+        deadline=time.monotonic() + 60,
+    )
+
+    assert result == "done"
+    assert sleeps == [0.2]
+
+
+def test_a_retry_that_could_not_start_before_the_deadline_is_not_made():
+    sleeps: list[float] = []
+
+    with pytest.raises(CallTimeoutError) as raised:
+        call_with_retry(
+            failing_call,
+            retryable=lambda exc: True,
+            policy=RetryPolicy(jitter=0),
+            sleep=sleeps.append,
+            what="a lookup",
+            deadline=time.monotonic() + 0.1,
+        )
+
+    assert str(raised.value) == (
+        "a lookup did not finish in time; the last attempt failed with KeyError"
+    )
+    assert isinstance(raised.value.__cause__, KeyError)
+    assert sleeps == []
+
+
+def test_an_error_that_is_not_retryable_is_raised_as_is_after_the_deadline():
+    with pytest.raises(KeyError):
+        call_with_retry(
+            failing_call,
+            retryable=lambda exc: False,
+            policy=RetryPolicy(),
+            sleep=lambda _: None,
+            deadline=time.monotonic() - 1,
+        )
+
+
+def test_the_last_error_is_raised_as_is_when_attempts_run_out_before_the_deadline():
+    with pytest.raises(KeyError):
+        call_with_retry(
+            failing_call,
+            retryable=lambda exc: True,
+            policy=RetryPolicy(attempts=2),
+            sleep=lambda _: None,
+            deadline=time.monotonic() + 60,
+        )
 
 
 # -- REST -----------------------------------------------------------------
@@ -264,3 +367,46 @@ def test_the_event_stream_is_not_available_over_rest(rest):
     config = StreamingConfiguration(chain_events_request=api_pb2.ChainEventsRequest())
     with rest_client(rest) as client, pytest.raises(RequestError, match="not available over REST"):
         client.stream_chain_events(config)
+
+
+def test_a_rest_call_within_its_timeout_is_retried_as_usual(rest):
+    rest.answers.extend([(503, ""), (200, '{"height": "5"}')])
+    sleeps: list[float] = []
+
+    with rest_client(rest, sleeps) as client:
+        assert client.get_latest_block(timeout=30) == 5
+
+    assert len(sleeps) == 1
+
+
+def test_a_rest_timeout_stops_a_retry_that_could_not_start_in_time(rest):
+    rest.answers.append((503, ""))
+    slow = RetryPolicy(initial_interval=60, jitter=0, max_interval=60)
+    sleeps: list[float] = []
+
+    with rest_client(rest, sleeps, retry=slow) as client:
+        with pytest.raises(CallTimeoutError, match="the last attempt failed with HTTP 503"):
+            client.get_latest_block(timeout=5)
+
+    assert len(rest.requests) == 1
+    assert sleeps == []
+
+
+def test_a_rest_timeout_that_has_run_out_fails_before_the_server_is_asked(rest):
+    with rest_client(rest) as client, pytest.raises(CallTimeoutError):
+        client.get_latest_block(timeout=0)
+
+    assert rest.requests == []
+
+
+def test_a_rest_call_that_gets_no_response_is_logged_without_its_error(rest, caplog):
+    rest.close()
+
+    with caplog.at_level("WARNING", logger="chainstorage_sdk.retry"):
+        with rest_client(rest, retry=RetryPolicy(attempts=2, jitter=0)) as client:
+            with pytest.raises(RequestError):
+                client.get_latest_block()
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "GetLatestBlock failed with no valid response on attempt 1 of 2; trying again in 0.2 s"
+    ]

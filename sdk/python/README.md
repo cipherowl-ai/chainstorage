@@ -42,6 +42,11 @@ with Client(config) as client:
     for raw in client.iter_raw_block_payloads(height - 10_000, height):
         handle(raw.block_file.height, raw.payload)  # or client.parse_raw_block(raw)
 
+    # Where blocks are stored, without downloading them.
+    latest = client.get_latest_block_info()  # tag, hash, parent hash, height, time
+    file = client.get_block_file(height)
+    files = client.get_block_files_by_range(height - 10, height, timeout=30)
+
     # Chain events, each with its block, resuming after a position.
     request = api_pb2.ChainEventsRequest(sequence_num=last_sequence_num)
     for result in client.stream_chain_events(StreamingConfiguration(request)):
@@ -75,9 +80,16 @@ with Client(config) as client:
   chunks, so reading the blocks of one chunk one by one fetches it once.
 - **Retries.** A call or a download that fails for a temporary reason is
   repeated with backoff: 4 attempts, starting at 200 ms. Set `retry` to change
-  it.
+  it. Every retry is logged as a warning by the logger `chainstorage_sdk.retry`.
+- **Time limits.** `client_timeout` (2 s by default) limits one attempt of a
+  call; calls that return more get longer (`2t + 1` and `4t + 3` seconds). The calls that
+  download nothing also take `timeout`, a limit in seconds for the whole call
+  with its retries: `get_latest_block`, `get_latest_block_info`,
+  `get_block_file`, `get_block_files_by_range`, `get_chain_events` and
+  `get_chain_metadata`.
 - **Fallback.** A read from consolidated files that fails continues from
-  single-block objects.
+  single-block objects. `get_block_file` and `get_block_files_by_range` do
+  not: they answer for the read source they were asked for.
 - **Expired links.** When storage refuses a signed link, the client asks the
   server for a fresh one.
 - **One chain per range.** A range is requested 1,000 blocks at a time. The
@@ -95,6 +107,7 @@ A failed call, download or check raises a `ChainStorageError`:
 | --- | --- |
 | `RequestError` | A call to the server failed. `code` holds the status. |
 | `NotFoundError` | The server has no such block, transaction or event. |
+| `CallTimeoutError` | A call did not finish within its `timeout`. It is a `RequestError` and a built-in `TimeoutError`. |
 | `DownloadError` | Fetching a block file from storage failed. `status_code` holds the HTTP status and `error_code` the store's own code, such as `ExpiredToken`, or nothing when the store gave none. |
 | `BlockFormatError` | A block file is malformed or fails a check. |
 | `ConfigError` | The configuration or an argument is invalid. |
@@ -105,7 +118,8 @@ A block file's link is signed, so it must not be printed. The SDK leaves the
 signature out of its error messages and log lines, and out of the `repr` of a
 `RawBlockPayload`. Two things remain yours to watch:
 
-- `raw.block_file.file_url` is the full link.
+- `file_url` is the full link, in `raw.block_file` and in every block file
+  that `get_block_file` and `get_block_files_by_range` return.
 - With `DEBUG` logging turned on for `urllib3`, that library logs every
   request line, signature included.
 
@@ -113,9 +127,16 @@ signature out of its error messages and log lines, and out of the `repr` of a
 
 - The server address is a required argument. There are no built-in per-chain
   configurations.
-- `client_timeout` is applied to every call.
+- `client_timeout` limits each attempt of a call. The Go SDK applies it to
+  the whole operation, downloads included.
+- A caller limits a whole call with `timeout`. The Go SDK takes a context.
 - One retry policy covers every call: 4 attempts from 200 ms. The Go SDK
   retries gRPC calls up to 5 times from 500 ms.
+- A call whose connection was reset is repeated: gRPC reports that as
+  `UNKNOWN` with the text "Stream removed" or "RST_STREAM". The Go SDK does
+  not retry `UNKNOWN`.
+- Block files can be asked for without downloading them. The Go SDK keeps
+  them internal.
 - The event stream raises an error when it fails. It does not yield an error
   value.
 - Expired links are refreshed.
