@@ -102,7 +102,8 @@ class Client:
     When it runs out the call raises ``CallTimeoutError``. Without it, each
     attempt is limited by ``client_timeout`` and the retries by ``retry``.
     With little time left, a retry is not made when the wait before it would
-    not end in time.
+    not end in time. Over REST the limit is looser: an attempt whose answer
+    arrives slowly is not cut off, but its answer is not returned.
     """
 
     def __init__(

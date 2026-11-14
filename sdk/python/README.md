@@ -91,8 +91,10 @@ with Client(config) as client:
   raises `CallTimeoutError`. Two limits of the limit:
   - With little time left, a retry is not made when the wait before it would
     not end in time.
-  - Over REST, an attempt can outlast the limit when the gateway sends its
-    answer slowly. The answer is then not returned.
+  - Over REST, the limit is looser than over gRPC. No attempt starts after
+    it, and each wait on the connection is cut to the time left. But an
+    attempt whose answer keeps arriving slowly is not cut off: the call then
+    ends late, and raises `CallTimeoutError` in place of the answer.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.

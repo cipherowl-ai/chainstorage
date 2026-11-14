@@ -449,11 +449,20 @@ def test_a_rest_timeout_cuts_an_attempt_short(rest):
     assert time.monotonic() - started < 1.5
 
 
-def test_a_rest_answer_that_arrives_after_the_timeout_is_not_returned(rest):
-    # Each byte arrives in time for the connection, the whole answer does not.
-    rest.answers.append((200, '{"height": "5"}'))
+def test_a_rest_answer_that_keeps_arriving_past_the_timeout_is_not_returned(rest):
+    # The answer drips in for about 0.5 s: every byte arrives well within the
+    # wait the connection allows, the whole answer does not arrive in time.
+    answer = '{"height": "5"}'
+    rest.answers.append((200, answer))
     rest.drip = 0.03
+    started = time.monotonic()
 
     with rest_client(rest, client_timeout=30) as client:
-        with pytest.raises(CallTimeoutError, match="GetLatestBlock did not finish in time"):
+        with pytest.raises(CallTimeoutError) as raised:
             client.get_latest_block(timeout=0.2)
+
+    assert str(raised.value) == "GetLatestBlock did not finish in time"
+    # The limit of the guarantee over REST: the attempt was not cut off at
+    # the timeout. It ran until the answer was complete, and was not retried.
+    assert time.monotonic() - started >= rest.drip * (len(answer) - 1)
+    assert len(rest.requests) == 1

@@ -35,6 +35,9 @@ class CallTimeoutError(RequestError, TimeoutError):
     The limit covers the whole call, its retries included. One attempt that
     runs past ``client_timeout`` is a different error: a ``RequestError``
     that is retried.
+
+    Over gRPC the call ends when the limit does. Over REST it can end later:
+    see ``RestTransport``.
     """
 
 

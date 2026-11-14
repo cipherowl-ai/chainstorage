@@ -143,7 +143,16 @@ class _GrpcEventStream:
 
 
 class RestTransport:
-    """Unary calls as ``POST <address>/<service>/<method>`` with JSON bodies."""
+    """Unary calls as ``POST <address>/<service>/<method>`` with JSON bodies.
+
+    A ``deadline`` is enforced less strictly than over gRPC. The HTTP library
+    limits each wait on the connection, not a whole response, so an attempt
+    whose answer keeps arriving, however slowly, is not cut off. What holds:
+    no attempt starts after the deadline, each wait on the connection is at
+    most the time that was left when its attempt started, and an answer that
+    is complete only after the deadline is not returned: the call raises
+    ``CallTimeoutError``.
+    """
 
     def __init__(
         self,
@@ -183,9 +192,8 @@ class RestTransport:
                 raise RequestError(
                     f"{method} failed: {type(exc).__name__}", retryable=True
                 ) from exc
-            # requests limits each wait on the connection, not the whole
-            # response, so an answer can arrive after the deadline. It is
-            # not returned.
+            # The answer may have taken longer than the deadline allows (see
+            # the class docstring). It is then not returned.
             _attempt_timeout(method, timeout, deadline)
             status = response.status_code
             if status != 200:
