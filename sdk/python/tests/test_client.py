@@ -833,6 +833,183 @@ def test_an_error_never_shows_the_signature_of_a_link(deployment):
     assert "sig=" not in str(raised.value)
 
 
+# What a store answers a refused link with. Only the code may be kept: the
+# rest of such a body can repeat parts of the request.
+STORE_REFUSAL = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<Error><Code>ExpiredToken</Code>"
+    b"<Message>The provided token has expired.</Message>"
+    b"<Token-0>sig=secret</Token-0></Error>"
+)
+
+
+def test_a_refused_link_reports_the_code_the_store_gave(deployment):
+    deployment.server.add_block(5)
+    deployment.storage.expired.add("s1")
+    deployment.storage.error_body = STORE_REFUSAL
+
+    with pytest.raises(DownloadError) as raised:
+        deployment.client().get_block(5, read_source=SINGLE_BLOCK)
+
+    assert raised.value.status_code == 403
+    assert raised.value.error_code == "ExpiredToken"
+    assert "received status 403 (ExpiredToken) for " in str(raised.value)
+    assert "has expired" not in str(raised.value)
+    assert "secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"",
+        b"<html>Forbidden</html>",
+        b"<Code>not a code</Code>",
+        b"<Code>" + b"A" * 65 + b"</Code>",
+        # Only the first 2 KiB of a refusal are looked at.
+        b" " * 2048 + b"<Code>ExpiredToken</Code>",
+    ],
+)
+def test_a_refusal_without_a_code_at_its_start_reports_none(deployment, body):
+    deployment.server.add_block(5)
+    deployment.storage.expired.add("s1")
+    deployment.storage.error_body = body
+
+    with pytest.raises(DownloadError) as raised:
+        deployment.client().get_block(5, read_source=SINGLE_BLOCK)
+
+    assert raised.value.status_code == 403
+    assert raised.value.error_code == ""
+    assert "received status 403 for " in str(raised.value)
+
+
+def test_a_missing_object_reports_the_stores_code(deployment):
+    deployment.server.add_block(5)
+    del deployment.storage.objects["blocks/5"]
+    deployment.storage.error_body = b"<Error><Code>NoSuchKey</Code></Error>"
+
+    with pytest.raises(DownloadError) as raised:
+        deployment.client().get_block(5, read_source=SINGLE_BLOCK)
+
+    assert (raised.value.status_code, raised.value.error_code) == (404, "NoSuchKey")
+
+
+def test_a_temporary_failure_with_a_code_is_still_retried(deployment):
+    deployment.server.add_block(5)
+    deployment.storage.failures["blocks/5"].extend([503] * 10)
+    deployment.storage.error_body = b"<Error><Code>SlowDown</Code></Error>"
+
+    with pytest.raises(DownloadError) as raised:
+        deployment.client(retry=RetryPolicy(attempts=3)).get_block(5, read_source=SINGLE_BLOCK)
+
+    assert (raised.value.status_code, raised.value.error_code) == (503, "SlowDown")
+    assert raised.value.retryable
+    assert len(deployment.storage.requests_for("blocks/5")) == 3
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_a_refused_read_of_a_consolidated_file_reports_the_stores_code(deployment, codec):
+    height = deployment.server.add_consolidated(codec)[0]["height"]
+    deployment.storage.expired.add("s1")
+    deployment.storage.error_body = STORE_REFUSAL
+    file = api_pb2.BlockFile()
+    file.CopyFrom(deployment.server.consolidated[height])
+    file.file_url = deployment.storage.url(file.file_url)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(DownloadError) as raised:
+            downloader.download(file)
+    finally:
+        downloader.close()
+
+    assert (raised.value.status_code, raised.value.error_code) == (403, "ExpiredToken")
+    assert "sig=" not in str(raised.value)
+
+
+class _UnreadableRefusal:
+    """A refusal whose body fails while it is read, naming the signed link."""
+
+    status_code = 403
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def iter_content(self, chunk_size=None):
+        raise OSError("connection lost reading http://store/blocks/5?sig=secret")
+
+
+class _RefusingSession:
+    def get(self, url, headers=None, timeout=None, stream=False):
+        return _UnreadableRefusal()
+
+    def close(self):
+        pass
+
+
+def test_a_refusal_whose_body_cannot_be_read_still_reports_its_status(deployment):
+    downloader = BlockDownloader(deployment.config(), session=_RefusingSession())
+    file = api_pb2.BlockFile(height=5, file_url="http://store/blocks/5?sig=secret")
+
+    try:
+        with pytest.raises(DownloadError) as raised:
+            downloader.download(file)
+    finally:
+        downloader.close()
+
+    assert (raised.value.status_code, raised.value.error_code) == (403, "")
+    assert "secret" not in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_a_refusal_is_read_in_small_pieces(deployment):
+    """A store may answer a refusal with a large body; little of it is taken."""
+    asked = []
+
+    class Refusal(_UnreadableRefusal):
+        def iter_content(self, chunk_size=None):
+            asked.append(chunk_size)
+            while True:
+                yield b"x" * chunk_size
+
+    class Session(_RefusingSession):
+        def get(self, url, headers=None, timeout=None, stream=False):
+            return Refusal()
+
+    downloader = BlockDownloader(deployment.config(), session=Session())
+
+    try:
+        with pytest.raises(DownloadError) as raised:
+            downloader.download(api_pb2.BlockFile(height=5, file_url="http://store/blocks/5"))
+    finally:
+        downloader.close()
+
+    assert asked == [2048]
+    assert raised.value.error_code == ""
+
+
+@pytest.mark.parametrize(
+    "method, asking",
+    [("get_block", "asking for a fresh one"), ("get_blocks_by_range", "asking for fresh ones")],
+)
+def test_asking_for_fresh_links_logs_the_status_and_the_stores_code(
+    deployment, caplog, method, asking
+):
+    deployment.server.add_block(5)
+    deployment.storage.expired.add("s1")
+    deployment.storage.error_body = STORE_REFUSAL
+
+    with caplog.at_level("INFO", logger="chainstorage_sdk.client"):
+        with pytest.raises(DownloadError):
+            getattr(deployment.client(), method)(5, read_source=SINGLE_BLOCK)
+
+    refusals = [r.getMessage() for r in caplog.records if "was refused" in r.getMessage()]
+    assert refusals == [f"a block file link was refused (403 ExpiredToken); {asking}"] * 2
+    assert "secret" not in caplog.text
+
+
 # -- server calls: retries, timeouts, headers -----------------------------
 
 

@@ -17,6 +17,7 @@ decompressed once.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import OrderedDict, deque
@@ -50,6 +51,12 @@ _UNKNOWN_BLOCK_BYTES = 8 * 1024 * 1024
 
 # Responses are read in pieces of this size, and never past what is needed.
 _RESPONSE_PIECE = 1024 * 1024
+
+# A store explains a refusal in a short XML body. Only its error code is
+# taken, and no more than these first bytes are read: the rest of the body
+# can repeat the request, and it may be large.
+_ERROR_BODY_BYTES = 2048
+_ERROR_CODE = re.compile(rb"<Code>([A-Za-z0-9.]{1,64})</Code>")
 
 # Parsed indexes and decompressed chunks kept for the next read. The chunk
 # cache is capped in bytes (Config.chunk_cache_bytes), and a chunk larger
@@ -307,9 +314,12 @@ class BlockDownloader:
                 ) as response:
                     status = response.status_code
                     if status not in (200, 206):
+                        code = _error_code(response)
                         raise DownloadError(
-                            f"received status {status} for {_redact(url)}",
+                            f"received status {status}{f' ({code})' if code else ''} "
+                            f"for {_redact(url)}",
                             status_code=status,
+                            error_code=code,
                             retryable=status in (408, 429) or status >= 500,
                         )
                     body = _read_at_most(response, limit + 1)
@@ -346,6 +356,25 @@ def _read_at_most(response: requests.Response, size: int) -> bytes:
             break
     body = b"".join(pieces)
     return body if len(body) <= size else body[:size]
+
+
+def _error_code(response: requests.Response) -> str:
+    """Returns the store's error code from a refusal, or "" when it has none.
+
+    A body that cannot be read changes nothing: the status is still reported.
+    """
+    body = b""
+    try:
+        # Small pieces: a large body is not pulled in to read its first bytes.
+        for piece in response.iter_content(chunk_size=_ERROR_BODY_BYTES):
+            body += piece
+            if len(body) >= _ERROR_BODY_BYTES:
+                break
+    except Exception:
+        # Whatever went wrong, its text may hold the signed link.
+        return ""
+    match = _ERROR_CODE.search(body[:_ERROR_BODY_BYTES])
+    return match.group(1).decode("ascii") if match else ""
 
 
 def is_consolidated(block_file: api_pb2.BlockFile) -> bool:
