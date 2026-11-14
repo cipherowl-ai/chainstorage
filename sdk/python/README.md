@@ -95,7 +95,7 @@ A failed call, download or check raises a `ChainStorageError`:
 | --- | --- |
 | `RequestError` | A call to the server failed. `code` holds the status. |
 | `NotFoundError` | The server has no such block, transaction or event. |
-| `DownloadError` | Fetching a block file from storage failed. |
+| `DownloadError` | Fetching a block file from storage failed. `status_code` holds the HTTP status and `error_code` the store's own code, such as `ExpiredToken`, or nothing when the store gave none. |
 | `BlockFormatError` | A block file is malformed or fails a check. |
 | `ConfigError` | The configuration or an argument is invalid. |
 

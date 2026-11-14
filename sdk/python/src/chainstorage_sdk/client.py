@@ -185,7 +185,9 @@ class Client:
                 except DownloadError as exc:
                     if not _is_expired_link(exc) or attempt == _LINK_ATTEMPTS:
                         raise
-                    logger.info("a block file link was refused; asking for a fresh one")
+                    logger.info(
+                        "a block file link was refused (%s); asking for a fresh one", _refusal(exc)
+                    )
                     continue
                 return RawBlockPayload(block_file=block_file, payload=payload)
             raise AssertionError("unreachable")
@@ -276,7 +278,10 @@ class Client:
                         source = self._fallback_source(source, exc)
                         refusals = 0
                     else:
-                        logger.info("a block file link was refused; asking for fresh ones")
+                        logger.info(
+                            "a block file link was refused (%s); asking for fresh ones",
+                            _refusal(exc),
+                        )
             except ChainStorageError as exc:
                 source = self._fallback_source(source, exc)
             else:
@@ -487,3 +492,8 @@ class Client:
 
 def _is_expired_link(exc: DownloadError) -> bool:
     return exc.status_code in _EXPIRED_LINK_STATUSES
+
+
+def _refusal(exc: DownloadError) -> str:
+    """The status and the store's error code, for a log line."""
+    return f"{exc.status_code} {exc.error_code}".rstrip()

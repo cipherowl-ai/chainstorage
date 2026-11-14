@@ -34,6 +34,7 @@ class FakeStorage:
     A link carries a ``sig`` query parameter, like a signed link. With
     ``rotate`` set, every link gets its own signature, as real signed links
     do. Signatures listed in ``expired`` are refused with ``expired_status``.
+    Every answer that is not the object carries ``error_body``.
     """
 
     def __init__(self) -> None:
@@ -45,6 +46,9 @@ class FakeStorage:
         self.truncations: dict[str, deque[int]] = defaultdict(deque)
         self.expired: set[str] = set()
         self.expired_status = 403
+        # What a failure, a refused link and a missing object are answered
+        # with, as a store explains itself.
+        self.error_body = b""
         self.ignore_ranges = False
         self.signature = "s1"
         self.rotate = False
@@ -76,11 +80,11 @@ class FakeStorage:
                 storage.requests.append((name, range_header))
                 signature = parse_qs(parts.query).get("sig", [""])[0]
                 if storage.failures[name]:
-                    return self._reply(storage.failures[name].popleft(), b"")
+                    return self._reply(storage.failures[name].popleft(), storage.error_body)
                 if signature in storage.expired:
-                    return self._reply(storage.expired_status, b"")
+                    return self._reply(storage.expired_status, storage.error_body)
                 if name not in storage.objects:
-                    return self._reply(404, b"")
+                    return self._reply(404, storage.error_body)
                 body = storage.objects[name]
                 if range_header and not storage.ignore_ranges:
                     first, last = range_header.removeprefix("bytes=").split("-")

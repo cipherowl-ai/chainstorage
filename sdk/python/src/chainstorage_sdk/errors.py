@@ -33,13 +33,23 @@ class DownloadError(ChainStorageError):
     """Fetching a block file from storage failed.
 
     ``status_code`` is the HTTP status, or ``None`` when no response arrived.
+    ``error_code`` is the store's own code for a refusal, such as S3's
+    ``ExpiredToken`` or ``AccessDenied``, and empty when the store gave none.
+    It can help tell why a link was refused; stores differ in the codes they
+    give.
     """
 
     def __init__(
-        self, message: str, *, status_code: int | None = None, retryable: bool = False
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        error_code: str = "",
+        retryable: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
         self.retryable = retryable
 
 
