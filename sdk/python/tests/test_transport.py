@@ -33,6 +33,10 @@ from coinbase.chainstorage import api_pb2
         ({"tag": -1}, "tag must not be negative"),
         ({"client_timeout": 0}, "timeouts must be positive"),
         ({"http_timeout": -1}, "timeouts must be positive"),
+        ({"client_timeout": float("inf")}, "timeouts must be positive"),
+        ({"client_timeout": float("nan")}, "timeouts must be positive"),
+        ({"http_timeout": float("inf")}, "timeouts must be positive"),
+        ({"http_timeout": float("nan")}, "timeouts must be positive"),
         ({"num_workers": 0}, "num_workers must be at least 1"),
         ({"chunk_cache_bytes": -1}, "chunk_cache_bytes must not be negative"),
         ({"auth_header": "x-api-key"}, "must be set together"),
@@ -466,3 +470,22 @@ def test_a_rest_answer_that_keeps_arriving_past_the_timeout_is_not_returned(rest
     # the timeout. It ran until the answer was complete, and was not retried.
     assert time.monotonic() - started >= rest.drip * (len(answer) - 1)
     assert len(rest.requests) == 1
+
+
+def test_a_rest_call_with_a_timeout_without_end_is_limited_by_the_client_timeout(rest):
+    # The connection never gets the endless value: an attempt is given the
+    # smaller of client_timeout and the time left.
+    rest.answers.append((200, '{"height": "5"}'))
+
+    with rest_client(rest) as client:
+        assert client.get_latest_block(timeout=float("inf")) == 5
+
+    rest.answers.append((200, '{"height": "5"}'))
+    rest.delay = 2.0
+    started = time.monotonic()
+    with rest_client(rest, client_timeout=0.2, retry=RetryPolicy(attempts=1)) as client:
+        with pytest.raises(RequestError) as raised:
+            client.get_latest_block(timeout=float("inf"))
+
+    assert not isinstance(raised.value, CallTimeoutError)
+    assert time.monotonic() - started < 1.5
