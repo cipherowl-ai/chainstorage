@@ -1601,17 +1601,21 @@ def test_a_call_within_its_timeout_is_retried_as_usual(deployment):
 
 def test_a_timeout_cuts_an_attempt_short(deployment):
     deployment.server.add_block(4)
-    deployment.server.delays["GetLatestBlock"] = 0.6
+    deployment.server.delays["GetLatestBlock"] = 2.0
     client = deployment.client(client_timeout=30)
     started = time.monotonic()
 
-    with pytest.raises(CallTimeoutError, match="DEADLINE_EXCEEDED") as raised:
-        client.get_latest_block(timeout=0.1)
+    with pytest.raises(CallTimeoutError) as raised:
+        client.get_latest_block(timeout=0.3)
 
-    assert time.monotonic() - started < 0.5
+    assert time.monotonic() - started < 1.5
+    assert str(raised.value) == (
+        "GetLatestBlock did not finish in time; the last attempt failed with DEADLINE_EXCEEDED"
+    )
     # Both, so that code written for either kind of error handles it.
     assert isinstance(raised.value, RequestError)
     assert isinstance(raised.value, TimeoutError)
+    assert raised.value.code == "DEADLINE_EXCEEDED"
     assert not raised.value.retryable
     assert len(deployment.server.calls_to("GetLatestBlock")) == 1
     assert deployment.sleeps == []
@@ -1637,6 +1641,86 @@ def test_a_timeout_that_has_run_out_fails_before_the_server_is_asked(deployment,
         deployment.client().get_latest_block(timeout=timeout)
 
     assert deployment.server.calls == []
+
+
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_a_timeout_that_runs_out_on_the_last_attempt_is_a_timeout_error(deployment, attempts):
+    deployment.server.add_block(4)
+    # The attempts before the last fail at once; the last one is cut short.
+    deployment.server.failures["GetLatestBlock"].extend(
+        [grpc.StatusCode.UNAVAILABLE] * (attempts - 1)
+    )
+    deployment.server.delays["GetLatestBlock"] = 1.0
+    policy = RetryPolicy(attempts=attempts, initial_interval=0.01, jitter=0)
+    client = deployment.client(client_timeout=30, retry=policy)
+
+    with pytest.raises(CallTimeoutError, match="the last attempt failed with DEADLINE_EXCEEDED"):
+        client.get_latest_block(timeout=0.3)
+
+    assert len(deployment.server.calls_to("GetLatestBlock")) == attempts
+
+
+def test_the_client_timeout_still_limits_an_attempt_of_a_call_with_a_timeout(deployment):
+    deployment.server.add_block(4)
+    deployment.server.delays["GetLatestBlock"] = 2.0
+    client = deployment.client(client_timeout=0.2, retry=RetryPolicy(attempts=1))
+    started = time.monotonic()
+
+    with pytest.raises(RequestError) as raised:
+        client.get_latest_block(timeout=30)
+
+    # The attempt ran out, not the call: the caller's limit was far away.
+    assert not isinstance(raised.value, CallTimeoutError)
+    assert raised.value.code == "DEADLINE_EXCEEDED"
+    assert time.monotonic() - started < 1.5
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), "5", True])
+def test_a_timeout_that_is_not_a_number_of_seconds_is_refused(deployment, timeout):
+    deployment.server.add_block(4)
+
+    with pytest.raises(ConfigError, match="timeout must be a number of seconds"):
+        deployment.client().get_latest_block(timeout=timeout)
+
+    assert deployment.server.calls == []
+
+
+def test_a_timeout_without_end_is_no_limit(deployment):
+    deployment.server.add_block(4)
+
+    assert deployment.client().get_latest_block(timeout=float("inf")) == 4
+
+
+def test_a_transport_without_deadlines_gets_the_time_left_for_each_attempt():
+    # StubTransport.call takes no deadline, like a transport written before
+    # deadlines existed.
+    transport = StubTransport(range_answer)
+    client = Client(
+        Config(server_address="unused:1", client_timeout=30),
+        transport=transport,
+        downloader=StubDownloader(),
+    )
+
+    client.get_block_files_by_range(0, 5, timeout=7)
+    client.get_block_files_by_range(0, 5)
+
+    with_timeout, without = [timeout for _, _, timeout in transport.calls]
+    assert 6 < with_timeout <= 7
+    assert without == 30 * 4 + 3
+
+
+@pytest.mark.parametrize("transport_type", ["old", "new"])
+def test_a_timeout_that_runs_out_between_two_requests_stops_the_range(transport_type):
+    def slow_answer(method, request):
+        time.sleep(0.06)
+        return range_answer(method, request)
+
+    transport = (StubTransport if transport_type == "old" else DeadlineTransport)(slow_answer)
+
+    with pytest.raises(CallTimeoutError, match="GetBlockFilesByRange did not finish in time"):
+        stub_client(transport).get_block_files_by_range(0, 5000, timeout=0.1)
+
+    assert len(transport.calls) == 2
 
 
 def test_every_call_that_does_not_download_takes_a_timeout(deployment):
@@ -1710,6 +1794,16 @@ def test_a_call_is_not_retried_on_another_unknown_failure(deployment):
     assert len(deployment.server.calls_to("GetLatestBlock")) == 1
 
 
+def test_a_stream_whose_connection_was_reset_is_reopened(deployment):
+    add_blocks_with_events(deployment, range(1, 4))
+    deployment.server.stream_plans.append((1, grpc.StatusCode.UNKNOWN, "Stream removed"))
+
+    results = list(stream(deployment, number_of_events=3))
+
+    assert [result.event.sequence_num for result in results] == [1, 2, 3]
+    assert len(deployment.server.calls_to("StreamChainEvents")) == 2
+
+
 def test_a_retried_call_is_logged(deployment, caplog):
     deployment.server.add_block(4)
     failures = [grpc.StatusCode.UNAVAILABLE, (grpc.StatusCode.UNKNOWN, "Stream removed")]
@@ -1720,8 +1814,8 @@ def test_a_retried_call_is_logged(deployment, caplog):
         assert client.get_latest_block() == 4
 
     assert [record.getMessage() for record in caplog.records] == [
-        "GetLatestBlock failed with UNAVAILABLE on attempt 1 of 4; trying again in 0.2 s",
-        "GetLatestBlock failed with UNKNOWN on attempt 2 of 4; trying again in 0.4 s",
+        "GetLatestBlock failed with UNAVAILABLE on attempt 1 of 4; trying again in 0.20 s",
+        "GetLatestBlock failed with UNKNOWN on attempt 2 of 4; trying again in 0.40 s",
     ]
 
 
@@ -1746,7 +1840,7 @@ def test_a_retried_download_is_logged_without_its_link(deployment, caplog):
 
     assert [record.getMessage() for record in caplog.records] == [
         "a block file download failed with status 503 ExpiredToken on attempt 1 of 4; "
-        "trying again in 0.2 s"
+        "trying again in 0.20 s"
     ]
     assert "secret" not in caplog.text
     assert "blocks/5" not in caplog.text

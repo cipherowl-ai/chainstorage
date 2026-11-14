@@ -7,7 +7,9 @@ block parser turns them into native blocks.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import math
 import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -16,6 +18,7 @@ from typing import Any, TypeVar
 from chainstorage_sdk.config import Config
 from chainstorage_sdk.downloader import BlockDownloader
 from chainstorage_sdk.errors import (
+    CallTimeoutError,
     ChainStorageError,
     ConfigError,
     DownloadError,
@@ -98,6 +101,8 @@ class Client:
     ``timeout``: a limit in seconds for the whole call, retries included.
     When it runs out the call raises ``CallTimeoutError``. Without it, each
     attempt is limited by ``client_timeout`` and the retries by ``retry``.
+    With little time left, a retry is not made when the wait before it would
+    not end in time.
     """
 
     def __init__(
@@ -111,6 +116,7 @@ class Client:
         self._config = config
         self._sleep = sleep
         self._transport = transport or new_transport(config, sleep=sleep)
+        self._transport_takes_deadline = _takes_deadline(self._transport)
         self._downloader = downloader or BlockDownloader(config, sleep=sleep)
 
     def __enter__(self) -> Client:
@@ -177,7 +183,8 @@ class Client:
 
         A range of any length is accepted, requested from the server 1,000
         blocks at a time and checked as ``iter_raw_block_payloads`` checks it:
-        every height is present, and consecutive requests connect.
+        every height is present, and consecutive requests connect. The block
+        files of the whole range are held in memory at once.
 
         The answer is for ``read_source`` as asked: unlike
         ``iter_raw_block_payloads``, this does not try single-block objects
@@ -513,9 +520,15 @@ class Client:
         """Sends one call. ``timeout`` limits each attempt; ``deadline``, a
         ``time.monotonic()`` value, limits the call as a whole."""
         if deadline is None:
-            # A transport written before deadlines existed still works.
             return self._transport.call(method, request, timeout=timeout)
-        return self._transport.call(method, request, timeout=timeout, deadline=deadline)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise CallTimeoutError(f"{method} did not finish in time", code="DEADLINE_EXCEEDED")
+        if self._transport_takes_deadline:
+            return self._transport.call(method, request, timeout=timeout, deadline=deadline)
+        # A transport written before deadlines existed: the time left limits
+        # each of its attempts, and its retries are its own.
+        return self._transport.call(method, request, timeout=min(timeout, left))
 
     def _block_files(
         self,
@@ -569,7 +582,24 @@ def _range(start_height: int, end_height: int) -> tuple[int, int]:
 
 def _deadline(timeout: float | None) -> float | None:
     """Turns a caller's ``timeout`` into the moment the call must be done by."""
-    return None if timeout is None else time.monotonic() + timeout
+    if timeout is None:
+        return None
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or math.isnan(timeout):
+        raise ConfigError(f"timeout must be a number of seconds, got {timeout!r}")
+    return time.monotonic() + timeout
+
+
+def _takes_deadline(transport: Transport) -> bool:
+    """Whether a transport's ``call`` accepts ``deadline``. One written
+    before deadlines existed does not."""
+    try:
+        parameters = inspect.signature(transport.call).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "deadline" or parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
 
 
 def _check_connects(

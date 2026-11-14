@@ -80,13 +80,19 @@ with Client(config) as client:
   chunks, so reading the blocks of one chunk one by one fetches it once.
 - **Retries.** A call or a download that fails for a temporary reason is
   repeated with backoff: 4 attempts, starting at 200 ms. Set `retry` to change
-  it. Every retry is logged as a warning by the logger `chainstorage_sdk.retry`.
+  it. A repeated call or download is logged as a warning by the logger
+  `chainstorage_sdk.retry`.
 - **Time limits.** `client_timeout` (2 s by default) limits one attempt of a
-  call; calls that return more get longer (`2t + 1` and `4t + 3` seconds). The calls that
-  download nothing also take `timeout`, a limit in seconds for the whole call
-  with its retries: `get_latest_block`, `get_latest_block_info`,
-  `get_block_file`, `get_block_files_by_range`, `get_chain_events` and
-  `get_chain_metadata`.
+  call; calls that return more get longer (`2t + 1` and `4t + 3` seconds).
+  The calls that download nothing also take `timeout`, a limit in seconds
+  for the whole call with its retries: `get_latest_block`,
+  `get_latest_block_info`, `get_block_file`, `get_block_files_by_range`,
+  `get_chain_events` and `get_chain_metadata`. When it runs out, the call
+  raises `CallTimeoutError`. Two limits of the limit:
+  - With little time left, a retry is not made when the wait before it would
+    not end in time.
+  - Over REST, an attempt can outlast the limit when the gateway sends its
+    answer slowly. The answer is then not returned.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.

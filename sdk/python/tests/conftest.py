@@ -147,9 +147,9 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
         self.failures: dict[str, deque] = defaultdict(deque)
         self.delays: dict[str, float] = {}
         # One entry per stream the server will open: how many events to send
-        # before it fails with the given code. Streams beyond the plan send
-        # every event and then end.
-        self.stream_plans: deque[tuple[int, grpc.StatusCode]] = deque()
+        # before it fails with the given code, and optionally the details of
+        # that failure. Streams beyond the plan send every event and then end.
+        self.stream_plans: deque[tuple] = deque()
 
     # -- test setup -------------------------------------------------------
 
@@ -231,12 +231,14 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
             # A retry loop that never ends should fail a test, not hang it.
             context.abort(grpc.StatusCode.FAILED_PRECONDITION, "too many calls in one test")
         self.metadata.append((method, dict(context.invocation_metadata())))
-        if method in self.delays:
-            time.sleep(self.delays[method])
         if self.failures[method]:
             failure = self.failures[method].popleft()
             code, details = failure if isinstance(failure, tuple) else (failure, "injected failure")
             context.abort(code, details)
+        # A queued failure is answered at once; the delay is for a call that
+        # is served.
+        if method in self.delays:
+            time.sleep(self.delays[method])
 
     def _block_file(self, height: int, hash: str, read_source: int, context) -> api_pb2.BlockFile:
         if hash and hash != block_hash(height):
@@ -318,17 +320,19 @@ class FakeChainStorage(api_pb2_grpc.ChainStorageServicer):
 
     def StreamChainEvents(self, request, context):
         self._enter("StreamChainEvents", request, context)
-        limit, code = self.stream_plans.popleft() if self.stream_plans else (None, None)
+        plan = self.stream_plans.popleft() if self.stream_plans else (None, None)
+        limit, code = plan[:2]
+        details = plan[2] if len(plan) > 2 else "injected stream failure"
         sent = 0
         for event in self.events:
             if event.sequence_num <= request.sequence_num:
                 continue
             if limit is not None and sent == limit:
-                context.abort(code, "injected stream failure")
+                context.abort(code, details)
             yield api_pb2.ChainEventsResponse(event=event)
             sent += 1
         if limit is not None:
-            context.abort(code, "injected stream failure")
+            context.abort(code, details)
 
     def GetChainMetadata(self, request, context):
         self._enter("GetChainMetadata", request, context)

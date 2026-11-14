@@ -68,8 +68,11 @@ def call_with_retry(
     ``reason`` turns the error into the few words that are logged. The error
     itself is not logged, because its text may hold a signed link.
 
-    ``deadline`` is a ``time.monotonic()`` value. A retry that could not
-    start before it is not made: ``CallTimeoutError`` is raised instead.
+    ``deadline`` is a ``time.monotonic()`` value. ``CallTimeoutError`` is
+    raised when an attempt fails for a temporary reason and the deadline has
+    passed, or the wait before the next attempt would not end before it. The
+    wait is not shortened to fit: with little time left, whether one more
+    attempt is made depends on the wait the policy draws.
     """
     waits = policy.waits()
     attempt = 1
@@ -77,17 +80,19 @@ def call_with_retry(
         try:
             return fn()
         except Exception as exc:
-            wait = next(waits, None)
-            if wait is None or not retryable(exc):
+            if not retryable(exc):
                 raise
+            wait = next(waits, None)
             left = time_left(deadline)
-            if left is not None and wait >= left:
+            if left is not None and (left <= 0 or (wait is not None and wait >= left)):
                 raise CallTimeoutError(
                     f"{what} did not finish in time; the last attempt failed with {reason(exc)}",
                     code="DEADLINE_EXCEEDED",
                 ) from exc
+            if wait is None:
+                raise
             logger.warning(
-                "%s failed with %s on attempt %d of %d; trying again in %.1f s",
+                "%s failed with %s on attempt %d of %d; trying again in %.2f s",
                 what,
                 reason(exc),
                 attempt,

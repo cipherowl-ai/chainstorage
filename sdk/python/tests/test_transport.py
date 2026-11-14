@@ -158,7 +158,7 @@ def test_a_retry_is_logged_with_what_failed_and_why(caplog):
         )
 
     assert [record.getMessage() for record in caplog.records] == [
-        "a lookup failed with a reason on attempt 1 of 4; trying again in 0.2 s"
+        "a lookup failed with a reason on attempt 1 of 4; trying again in 0.20 s"
     ]
     # The error itself is not logged: its text could hold a signed link.
     assert "the text of the error" not in caplog.text
@@ -202,8 +202,21 @@ def test_a_retry_that_could_not_start_before_the_deadline_is_not_made():
     assert str(raised.value) == (
         "a lookup did not finish in time; the last attempt failed with KeyError"
     )
+    assert raised.value.code == "DEADLINE_EXCEEDED"
     assert isinstance(raised.value.__cause__, KeyError)
     assert sleeps == []
+
+
+def test_a_last_attempt_that_fails_after_the_deadline_is_a_timeout_error():
+    with pytest.raises(CallTimeoutError, match="the last attempt failed with KeyError"):
+        call_with_retry(
+            failing_call,
+            retryable=lambda exc: True,
+            policy=RetryPolicy(attempts=1),
+            sleep=lambda _: None,
+            what="a lookup",
+            deadline=time.monotonic() - 1,
+        )
 
 
 def test_an_error_that_is_not_retryable_is_raised_as_is_after_the_deadline():
@@ -237,6 +250,9 @@ class RestServer:
     def __init__(self) -> None:
         self.requests: list[tuple[str, dict, dict]] = []
         self.answers: list[tuple[int, str]] = []
+        # Seconds to wait before answering, and between the bytes of the answer.
+        self.delay = 0.0
+        self.drip = 0.0
         rest = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -246,10 +262,19 @@ class RestServer:
                 rest.requests.append((self.path, dict(self.headers.items()), body))
                 status, answer = rest.answers.pop(0)
                 payload = answer.encode("utf-8", "surrogateescape")
+                time.sleep(rest.delay)
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
-                self.wfile.write(payload)
+                try:
+                    for position in range(len(payload)) if rest.drip else ():
+                        self.wfile.write(payload[position : position + 1])
+                        self.wfile.flush()
+                        time.sleep(rest.drip)
+                    if not rest.drip:
+                        self.wfile.write(payload)
+                except OSError:
+                    pass  # the client gave up
 
             def log_message(self, *args: object) -> None:
                 pass
@@ -408,5 +433,27 @@ def test_a_rest_call_that_gets_no_response_is_logged_without_its_error(rest, cap
                 client.get_latest_block()
 
     assert [record.getMessage() for record in caplog.records] == [
-        "GetLatestBlock failed with no valid response on attempt 1 of 2; trying again in 0.2 s"
+        "GetLatestBlock failed with no valid response on attempt 1 of 2; trying again in 0.20 s"
     ]
+
+
+def test_a_rest_timeout_cuts_an_attempt_short(rest):
+    rest.answers.append((200, '{"height": "5"}'))
+    rest.delay = 2.0
+    started = time.monotonic()
+
+    with rest_client(rest, client_timeout=30, retry=RetryPolicy(attempts=1)) as client:
+        with pytest.raises(CallTimeoutError, match="the last attempt failed with"):
+            client.get_latest_block(timeout=0.3)
+
+    assert time.monotonic() - started < 1.5
+
+
+def test_a_rest_answer_that_arrives_after_the_timeout_is_not_returned(rest):
+    # Each byte arrives in time for the connection, the whole answer does not.
+    rest.answers.append((200, '{"height": "5"}'))
+    rest.drip = 0.03
+
+    with rest_client(rest, client_timeout=30) as client:
+        with pytest.raises(CallTimeoutError, match="GetLatestBlock did not finish in time"):
+            client.get_latest_block(timeout=0.2)

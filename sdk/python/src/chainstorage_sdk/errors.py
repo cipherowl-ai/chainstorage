@@ -32,9 +32,9 @@ class NotFoundError(RequestError):
 class CallTimeoutError(RequestError, TimeoutError):
     """A call did not finish within the ``timeout`` the caller gave it.
 
-    The limit covers the whole call, its retries included. This is not the
-    error of one attempt that ran past ``client_timeout``: that one is a
-    ``RequestError`` with the code ``DEADLINE_EXCEEDED``, and it is retried.
+    The limit covers the whole call, its retries included. One attempt that
+    runs past ``client_timeout`` is a different error: a ``RequestError``
+    that is retried.
     """
 
 

@@ -183,6 +183,10 @@ class RestTransport:
                 raise RequestError(
                     f"{method} failed: {type(exc).__name__}", retryable=True
                 ) from exc
+            # requests limits each wait on the connection, not the whole
+            # response, so an answer can arrive after the deadline. It is
+            # not returned.
+            _attempt_timeout(method, timeout, deadline)
             status = response.status_code
             if status != 200:
                 message = f"{method} failed with HTTP {status}"
