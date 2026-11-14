@@ -384,6 +384,26 @@ def test_data_after_an_empty_zstd_frame_is_refused(bound, extra):
         cscb.decompress(empty + extra, api_pb2.ZSTD, **bound)
 
 
+@pytest.mark.parametrize("size", [100, 131_072, 131_073, 1_000_000])
+@pytest.mark.parametrize("extra", [b"x", zstandard.ZstdCompressor().compress(b"second frame")])
+def test_data_after_a_chunk_frame_that_does_not_declare_its_size_is_refused(size, extra):
+    """The chunk path: the server writes a chunk as a stream, so the frame
+    does not declare its size, and the reader passes the chunk's exact
+    length as ``max_size``."""
+    data, _ = load("zstd")
+    payload = random.Random(size).randbytes(size)
+    writer = zstandard.ZstdCompressor(write_content_size=False).compressobj()
+    frame = writer.compress(payload) + writer.flush()
+    assert zstandard.frame_content_size(frame) == -1
+    chunk = dataclasses.replace(
+        cscb.parse_index(data).chunks[0], uncompressed_length=size, crc32=zlib.crc32(payload)
+    )
+    assert bytes(cscb.decode_chunk(frame, api_pb2.ZSTD, chunk)) == payload
+
+    with pytest.raises(BlockFormatError, match="failed to decompress block data"):
+        cscb.decode_chunk(frame + extra, api_pb2.ZSTD, chunk)
+
+
 def test_gzip_data_of_several_members_is_read_whole():
     data = gzip.compress(b"first-") + gzip.compress(b"second")
     for bound in ({}, {"max_size": 12}, {"limit": 12}):
