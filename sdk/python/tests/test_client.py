@@ -461,6 +461,26 @@ def test_a_single_block_of_unknown_length_may_not_grow_past_the_cap(
         downloader.close()
 
 
+@pytest.mark.parametrize("declares_its_size", [True, False])
+def test_a_single_block_file_with_a_second_zstd_frame_is_refused(deployment, declares_its_size):
+    compressor = zstandard.ZstdCompressor(write_content_size=declares_its_size)
+    deployment.storage.objects["two-frames"] = compressor.compress(
+        b"first frame, "
+    ) + compressor.compress(b"second frame")
+    # The server does not say how long the block is, so nothing else would
+    # show that the first frame is not all of it.
+    file = api_pb2.BlockFile(
+        height=5, file_url=deployment.storage.url("two-frames"), compression=api_pb2.ZSTD
+    )
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(BlockFormatError, match="unused data|more data follows"):
+            downloader.download(file)
+    finally:
+        downloader.close()
+
+
 def test_a_single_block_object_larger_than_the_cap_is_not_read_whole(deployment, monkeypatch):
     deployment.storage.objects["huge"] = b"x" * 10_000
     monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)

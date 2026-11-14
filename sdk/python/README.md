@@ -126,6 +126,9 @@ signature out of its error messages and log lines, and out of the `repr` of a
   The Go SDK starts the range again from single-block objects.
 - Over REST, only a `NOT_FOUND` reported in the gateway's error body counts as
   "not found". A bare 404 is an error.
+- Zstd block data must be exactly one frame, which is what the server writes.
+  Data after the frame is an error. The Go SDK would decode a second frame
+  and append it, and would skip a skippable frame.
 - Not available yet, because they need the parser: block validation, the
   native block streams and static chain metadata.
 

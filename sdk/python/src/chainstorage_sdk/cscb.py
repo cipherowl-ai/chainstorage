@@ -343,6 +343,13 @@ def decompress(
     is written straight into one buffer of that size. Use it when the length
     is known. When it is not, ``limit`` refuses output longer than ``limit``
     without setting any memory aside for it: the output grows as it is made.
+
+    Zstd data must be exactly one frame. Bytes after it are refused, since
+    the first frame would otherwise be returned as if it were the whole
+    block. One case may not be caught here: with ``max_size``, a frame that
+    does not declare its size and holds fewer than ``max_size`` bytes. The
+    result is then shorter than ``max_size``, which the caller must check, as
+    the callers in this package do.
     """
     if max_size is not None and limit is not None:
         raise ValueError("pass max_size or limit, not both")
@@ -367,7 +374,7 @@ def decompress(
                 declared = zstandard.frame_content_size(data)
                 if declared > limit:
                     raise _TooLong
-                if declared >= 0:
+                if declared > 0:
                     # A frame that declares its size is read in one pass.
                     max_size, limit = declared, None
             if limit is not None:
@@ -379,16 +386,26 @@ def decompress(
                     # A stream that was cut off decompresses without an
                     # error, to whatever it held up to the cut.
                     raise BlockFormatError("failed to decompress block data: it is cut off")
+                if stream.unused_data:
+                    raise BlockFormatError(_DATA_AFTER_FRAME)
             else:
                 # In one pass the output buffer doubles as the window, which a
                 # streaming read would allocate on top (up to hundreds of MB).
                 # A frame that declares its size is trusted over the buffer
                 # size by the library, so the declared size is checked first.
-                if zstandard.frame_content_size(data) > max_size:
+                declared = zstandard.frame_content_size(data)
+                if declared > max_size:
                     raise _TooLong
-                payload = decompressor.decompress(data, max_output_size=max(max_size, 1))
-                if len(payload) > max_size:
-                    raise _TooLong
+                if declared == 0:
+                    # The library answers an empty frame without looking at
+                    # what follows it, so this one is read as a stream.
+                    payload = _decompress_zstd_limited(decompressor, data, max_size)
+                else:
+                    payload = decompressor.decompress(
+                        data, max_output_size=max(max_size, 1), allow_extra_data=False
+                    )
+                    if len(payload) > max_size:
+                        raise _TooLong
         else:
             raise BlockFormatError(f"unsupported compression: {compression}")
     except _TooLong:
@@ -404,6 +421,9 @@ def decompress(
 
 class _TooLong(Exception):
     pass
+
+
+_DATA_AFTER_FRAME = "failed to decompress block data: more data follows its zstd frame"
 
 
 def _read(reader: io.BufferedIOBase, max_size: int | None) -> bytes | bytearray:
@@ -448,8 +468,10 @@ def _decompress_zstd_limited(
     stream = decompressor.decompressobj()
     view = memoryview(data)
     payload = bytearray()
+    given = 0
     for start in range(0, len(view), _ZSTD_INPUT_SLICE):
         payload += stream.decompress(view[start : start + _ZSTD_INPUT_SLICE])
+        given = start + _ZSTD_INPUT_SLICE
         if len(payload) > limit:
             raise _TooLong
         if stream.eof:
@@ -458,6 +480,8 @@ def _decompress_zstd_limited(
         # A stream that was cut off decompresses without an error, to
         # whatever it held up to the cut.
         raise BlockFormatError("failed to decompress block data: it is cut off")
+    if stream.unused_data or given < len(view):
+        raise BlockFormatError(_DATA_AFTER_FRAME)
     return payload
 
 

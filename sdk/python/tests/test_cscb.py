@@ -10,6 +10,7 @@ import dataclasses
 import gzip
 import hashlib
 import json
+import random
 import struct
 import zlib
 
@@ -308,6 +309,105 @@ def test_cut_off_or_empty_data_is_never_a_block(compress, bound):
     for damaged in (b"", data[:-1], data[: len(data) // 2]):
         with pytest.raises(BlockFormatError):
             cscb.decompress(damaged, compression, **bound)
+
+
+@pytest.mark.parametrize(
+    "compress",
+    [zstandard.ZstdCompressor().compress, zstd_without_a_declared_size],
+    ids=["zstd", "zstd without a declared size"],
+)
+@pytest.mark.parametrize(
+    "bound",
+    [{}, {"max_size": 50_000}, {"limit": 100_000}],
+    ids=["unbounded", "bounded", "limited"],
+)
+@pytest.mark.parametrize(
+    "extra",
+    [zstandard.ZstdCompressor().compress(b"second frame"), b"x", b"\x00" * 5000],
+    ids=["a second frame", "one byte", "padding"],
+)
+def test_data_after_a_zstd_frame_is_refused_not_dropped(compress, bound, extra):
+    # Data that does not compress, so the limited reader, which takes its
+    # input in slices, meets the end of the frame in a late slice.
+    payload = random.Random(0).randbytes(50_000)
+    frame = compress(payload)
+    assert len(frame) > 20_000
+    assert bytes(cscb.decompress(frame, api_pb2.ZSTD, **bound)) == payload
+
+    with pytest.raises(BlockFormatError, match="failed to decompress block data"):
+        cscb.decompress(frame + extra, api_pb2.ZSTD, **bound)
+
+
+def test_a_short_unsized_zstd_frame_with_data_after_it_is_never_taken_for_whole():
+    """The one case that may not be refused: the result is then shorter than
+    ``max_size``, and the caller's length check reports it (see
+    ``decode_chunk``)."""
+    payload = random.Random(0).randbytes(50_000)
+    data = zstd_without_a_declared_size(payload) + b"more"
+
+    try:
+        result = cscb.decompress(data, api_pb2.ZSTD, max_size=50_001)
+    except BlockFormatError:
+        return
+    assert len(result) == 50_000 < 50_001
+
+
+@pytest.mark.parametrize("slices", [1, 2, 4])
+def test_a_frame_that_ends_on_an_input_slice_boundary_is_read_and_its_extra_refused(slices):
+    """The limited reader takes its input in slices of 1024 bytes."""
+    rng = random.Random(slices)
+    for size in range(900, 6000):
+        payload = rng.randbytes(size)
+        frame = zstd_without_a_declared_size(payload)
+        if len(frame) == slices * 1024:
+            break
+    else:
+        pytest.fail("no frame of the wanted length")
+
+    assert bytes(cscb.decompress(frame, api_pb2.ZSTD, limit=size)) == payload
+    with pytest.raises(BlockFormatError, match="more data follows its zstd frame"):
+        cscb.decompress(frame + b"x", api_pb2.ZSTD, limit=size)
+
+
+@pytest.mark.parametrize("bound", [{}, {"max_size": 0}, {"max_size": 10}, {"limit": 10}], ids=str)
+@pytest.mark.parametrize(
+    "extra",
+    [zstandard.ZstdCompressor().compress(b"real block"), b"x"],
+    ids=["a second frame", "one byte"],
+)
+def test_data_after_an_empty_zstd_frame_is_refused(bound, extra):
+    empty = zstandard.ZstdCompressor().compress(b"")
+    assert zstandard.frame_content_size(empty) == 0
+    assert bytes(cscb.decompress(empty, api_pb2.ZSTD, **bound)) == b""
+
+    with pytest.raises(BlockFormatError, match="failed to decompress block data"):
+        cscb.decompress(empty + extra, api_pb2.ZSTD, **bound)
+
+
+@pytest.mark.parametrize("size", [100, 131_072, 131_073, 1_000_000])
+@pytest.mark.parametrize("extra", [b"x", zstandard.ZstdCompressor().compress(b"second frame")])
+def test_data_after_a_chunk_frame_that_does_not_declare_its_size_is_refused(size, extra):
+    """The chunk path: the server writes a chunk as a stream, so the frame
+    does not declare its size, and the reader passes the chunk's exact
+    length as ``max_size``."""
+    data, _ = load("zstd")
+    payload = random.Random(size).randbytes(size)
+    writer = zstandard.ZstdCompressor(write_content_size=False).compressobj()
+    frame = writer.compress(payload) + writer.flush()
+    assert zstandard.frame_content_size(frame) == -1
+    chunk = dataclasses.replace(
+        cscb.parse_index(data).chunks[0], uncompressed_length=size, crc32=zlib.crc32(payload)
+    )
+    assert bytes(cscb.decode_chunk(frame, api_pb2.ZSTD, chunk)) == payload
+
+    with pytest.raises(BlockFormatError, match="failed to decompress block data"):
+        cscb.decode_chunk(frame + extra, api_pb2.ZSTD, chunk)
+
+
+def test_gzip_data_of_several_members_is_read_whole():
+    data = gzip.compress(b"first-") + gzip.compress(b"second")
+    for bound in ({}, {"max_size": 12}, {"limit": 12}):
+        assert bytes(cscb.decompress(data, api_pb2.GZIP, **bound)) == b"first-second"
 
 
 @pytest.mark.parametrize(
