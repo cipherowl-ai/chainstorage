@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from chainstorage_sdk.errors import ConfigError
@@ -69,8 +70,10 @@ class Config:
             raise ConfigError(f"transport must be 'grpc' or 'rest', got {self.transport!r}")
         if self.tag < 0:
             raise ConfigError("tag must not be negative")
-        if self.client_timeout <= 0 or self.http_timeout <= 0:
-            raise ConfigError("timeouts must be positive")
+        for timeout in (self.client_timeout, self.http_timeout):
+            # A timeout without end is not one the connection can be given.
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ConfigError("timeouts must be positive")
         if self.num_workers < 1:
             raise ConfigError("num_workers must be at least 1")
         if self.chunk_cache_bytes < 0:

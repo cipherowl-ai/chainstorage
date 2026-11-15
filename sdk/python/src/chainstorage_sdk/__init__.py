@@ -21,6 +21,7 @@ from chainstorage_sdk.client import (
 from chainstorage_sdk.config import Config
 from chainstorage_sdk.errors import (
     BlockFormatError,
+    CallTimeoutError,
     ChainStorageError,
     ConfigError,
     DownloadError,
@@ -30,10 +31,11 @@ from chainstorage_sdk.errors import (
 from chainstorage_sdk.retry import RetryPolicy
 from chainstorage_sdk.session import Session
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "BlockFormatError",
+    "CallTimeoutError",
     "ChainEventResult",
     "ChainStorageError",
     "Client",

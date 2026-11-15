@@ -342,7 +342,18 @@ class BlockDownloader:
             retryable=lambda exc: isinstance(exc, DownloadError) and exc.retryable,
             policy=self._config.retry,
             sleep=self._sleep,
+            what="a block file download",
+            reason=_reason,
         )
+
+
+def _reason(exc: Exception) -> str:
+    """The few words about a failed attempt that go into the retry log line.
+    Never the error text: it names the object, and may hold a signed link."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return "no response"
+    return f"status {status} {getattr(exc, 'error_code', '')}".rstrip()
 
 
 def _read_at_most(response: requests.Response, size: int) -> bytes:

@@ -29,6 +29,18 @@ class NotFoundError(RequestError):
     """The server has no such block, transaction or event."""
 
 
+class CallTimeoutError(RequestError, TimeoutError):
+    """A call did not finish within the ``timeout`` the caller gave it.
+
+    The limit covers the whole call, its retries included. One attempt that
+    runs past ``client_timeout`` is a different error: a ``RequestError``
+    that is retried.
+
+    Over gRPC the call ends when the limit does. Over REST it can end later:
+    see ``RestTransport``.
+    """
+
+
 class DownloadError(ChainStorageError):
     """Fetching a block file from storage failed.
 
