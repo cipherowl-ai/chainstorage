@@ -10,6 +10,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import operator
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,9 @@ T = TypeVar("T")
 
 # The server refuses a request for more block files than this.
 MAX_BLOCK_FILES_PER_REQUEST = 1000
+
+# A height is a 64-bit number in a request.
+_MAX_HEIGHT = 2**64 - 1
 
 # Storage refuses a signed link with 400 or 403. The client then asks the
 # server for fresh links. It gives up after this many refusals in a row.
@@ -124,7 +128,9 @@ class Client:
     """Reads blocks and chain events from one ChainStorage deployment.
 
     A client holds a connection and a download pool. Close it when done, or
-    use it as a context manager. It may be shared between threads.
+    use it as a context manager. It may be shared between threads. A
+    ``downloader`` that was passed in is not closed with the client: it is
+    the caller's, and may serve other clients.
 
     Every method but ``stream_chain_events`` takes ``timeout``: a limit in
     seconds for the whole call, with its downloads, retries, new links and
@@ -142,9 +148,10 @@ class Client:
       two blocks.
 
     The methods that download take ``max_response_bytes``: the most bytes one
-    request to storage may return (a single-block object, the index of a
-    consolidated object, or one of its chunks). A larger one raises
-    ``ResponseTooLargeError``, and nothing more is tried.
+    request to storage may return (a single-block object, a read of the index
+    of a consolidated object, or one of its chunks). A larger one raises
+    ``ResponseTooLargeError``, and nothing more is tried. See
+    ``chainstorage_sdk.downloader`` for the details.
     """
 
     def __init__(
@@ -420,6 +427,9 @@ class Client:
         downloaded. Each stretch describes one consistent chain. Heights that
         lie far apart are asked for separately, so a reorganization between
         two requests is not noticed here as it is in a range.
+
+        A height the server does not have fails the read when its stretch is
+        reached. The blocks of earlier stretches have been yielded by then.
         """
         wanted = _heights(heights)
         limits = _limits(timeout, max_response_bytes)
@@ -759,9 +769,14 @@ def _heights(heights: Iterable[int]) -> list[int]:
     """Returns the heights a caller asked for, each once, in order."""
     wanted = set()
     for height in heights:
-        if isinstance(height, bool) or not isinstance(height, int) or height < 0:
+        try:
+            # Any integer type, such as a NumPy one, but not True or False.
+            number = -1 if isinstance(height, bool) else operator.index(height)
+        except TypeError:
+            number = -1
+        if not 0 <= number <= _MAX_HEIGHT:
             raise ConfigError(f"a height must be a whole number, 0 or more, got {height!r}")
-        wanted.add(height)
+        wanted.add(number)
     return sorted(wanted)
 
 
@@ -800,8 +815,8 @@ def _limits(timeout: float | None, max_response_bytes: int | None) -> _Limits:
 
 
 def _is_callers_limit(exc: ChainStorageError) -> bool:
-    """Whether a read stopped at a limit the caller set. Another source would
-    meet the same limit, so nothing more is tried."""
+    """Whether a read stopped at a limit the caller set. The limit is for the
+    read, whatever it reads from, so nothing more is tried."""
     return isinstance(exc, (CallTimeoutError, ResponseTooLargeError))
 
 

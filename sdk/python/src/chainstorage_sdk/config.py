@@ -43,7 +43,8 @@ class Config:
 
     ``dead_link_wait``: seconds to wait before asking for a new link after
     storage answered 400 to a link the server had just issued. The second
-    wait in a row is twice as long. 0 does not wait.
+    wait in a row is twice as long. 0 does not wait. A call whose ``timeout``
+    leaves less time than the wait raises ``CallTimeoutError`` at once.
 
     ``num_workers``: how many block files are downloaded at once.
 

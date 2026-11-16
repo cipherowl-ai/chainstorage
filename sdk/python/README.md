@@ -77,7 +77,9 @@ with Client(config) as client:
 ### What the client does for you
 
 - **Parallel downloads.** Block files are downloaded `num_workers` at a time
-  (10 by default) and handed over in height order.
+  (10 by default) and handed over in height order. A `BlockDownloader` passed
+  to `Client(..., downloader=...)` is used in place of the client's own, and
+  is not closed with the client.
 - **Bounded memory.** A range is downloaded a little ahead of the caller, not
   all at once. About 256 MB of decompressed data may be on its way at a
   time; while a chunk is being cut into blocks it is held twice.
@@ -110,20 +112,28 @@ with Client(config) as client:
     caller spends between two blocks.
 - **Size limit.** The methods that download take `max_response_bytes`: the
   most bytes one request to storage may return. That is a single-block
-  object, the index of a consolidated file (read 64 KiB at a time), or one
-  of its chunks. A read known to be longer is refused before it is sent,
-  and any other stops at the limit. Both raise `ResponseTooLargeError`, and
-  nothing more is tried. It limits what is fetched, not the decompressed
-  size, which the file format limits to 1 GiB per block or chunk.
+  object, one of the two reads of a consolidated file's index (its first
+  64 KiB, then the rest), or one of its chunks. A read that asks for more is
+  refused before it is sent, and any other stops at the limit. Both raise
+  `ResponseTooLargeError`, and nothing more is tried. Three things to know:
+  - A limit below 64 KiB refuses every consolidated file.
+  - It limits what is fetched, not the decompressed size, which the file
+    format limits to 1 GiB per block or chunk.
+  - A block whose index and chunk the client still holds needs no request,
+    and is returned whatever the limit.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.
 - **Refused links.** When storage refuses a signed link, the client asks the
-  server for a fresh one, up to three times in a row. A link refused with
-  403 has expired, and its replacement works at once. One refused with 400
-  never worked: the server signed it with credentials that were about to
-  expire. The client then waits `dead_link_wait` (15 s by default, twice
-  that the second time) before it asks again.
+  server for a fresh one. After three refusals in a row it gives up on that
+  source. A link refused with 403 has expired, and its replacement works at
+  once. One refused with 400 never worked: the server signed it with
+  credentials that were about to expire. The client then waits
+  `dead_link_wait` (15 s by default, twice that the second time) before it
+  asks again. So links that stay refused with 400 fail after 45 s of waits,
+  or 90 s when the read then tries single-block objects. Set
+  `dead_link_wait=0` to fail at once. A call whose `timeout` leaves less
+  time than the wait raises `CallTimeoutError` without waiting.
 - **Chosen heights.** Heights are asked for in stretches of up to 1,000,
   each just before its blocks are downloaded, so the links are fresh. The
   server checks the chain within a stretch. Between two stretches there is

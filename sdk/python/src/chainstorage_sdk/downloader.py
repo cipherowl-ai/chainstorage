@@ -21,10 +21,13 @@ A caller can limit a download in two ways:
   the download raises ``CallTimeoutError``. A store that keeps sending a body
   very slowly can hold one piece past the deadline.
 - ``max_response_bytes``, the most bytes one request to the store may return:
-  a single-block object, the index of a consolidated object, or one of its
-  chunks. A read known to be longer is refused before it is sent, and any
-  other stops at the limit. Both raise ``ResponseTooLargeError``. It limits
-  what is fetched, not the decompressed size, which the file format limits.
+  a single-block object, one of the two reads of a consolidated object's
+  index (its first 64 KiB, then the rest), or one of its chunks. A read that
+  asks for more is refused before it is sent, and any other stops at the
+  limit. Both raise ``ResponseTooLargeError``. So a limit below 64 KiB
+  refuses every consolidated object. It limits what is fetched, not the
+  decompressed size, which the file format limits. A block whose index and
+  chunk are still in the cache needs no request, and is returned.
 """
 
 from __future__ import annotations
@@ -35,7 +38,8 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, TypeVar
@@ -469,9 +473,12 @@ def _check_in_time(limits: _Limits) -> None:
 def _attempt_timeout(timeout: float, limits: _Limits) -> float:
     """Returns how long one wait on the connection may take: ``timeout``, or
     the time left until the deadline when that is less."""
-    _check_in_time(limits)
     left = time_left(limits.deadline)
-    return timeout if left is None else min(timeout, left)
+    if left is None:
+        return timeout
+    if left <= 0:
+        raise _out_of_time()
+    return min(timeout, left)
 
 
 def _result(task: Future[T], limits: _Limits) -> T:
@@ -480,11 +487,19 @@ def _result(task: Future[T], limits: _Limits) -> T:
     The download itself stops at the deadline. This wait also ends then, for
     a download that is still queued behind those of other callers.
     """
-    finished, _ = wait([task], timeout=time_left(limits.deadline))
-    if not finished:
+    left = time_left(limits.deadline)
+    if left is None:
+        return task.result()
+    try:
+        # The longest wait a lock takes: a deadline without end is no limit.
+        return task.result(timeout=min(left, threading.TIMEOUT_MAX))
+    except FutureTimeoutError:
+        if task.done():
+            # Not this wait: the download ended meanwhile, or ran out of
+            # time itself. Its own result or error is the answer.
+            return task.result()
         task.cancel()
-        raise _out_of_time()
-    return task.result()
+        raise _out_of_time() from None
 
 
 def _read_at_most(response: requests.Response, size: int, limits: _Limits = _NO_LIMITS) -> bytes:

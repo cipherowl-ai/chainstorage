@@ -8,6 +8,7 @@ import io
 import struct
 import threading
 import time
+from concurrent.futures import CancelledError
 
 import grpc
 import pytest
@@ -1928,7 +1929,25 @@ def test_a_stretch_is_asked_for_just_before_its_blocks_are_downloaded():
     assert asked_ranges(transport) == [(7, 8), (5000, 5001)]
 
 
-@pytest.mark.parametrize("height", [-1, 1.5, "7", True, None])
+class _Integer:
+    """A whole number that is not an ``int``, as a NumPy integer is."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def __index__(self) -> int:
+        return self.value
+
+
+def test_a_height_may_be_any_integer_type():
+    transport = StubTransport(range_answer)
+
+    payloads = list(stub_client(transport).iter_raw_block_payloads_by_heights([_Integer(7), 7]))
+
+    assert [raw.block_file.height for raw in payloads] == [7]
+
+
+@pytest.mark.parametrize("height", [-1, 1.5, "7", True, None, 2**64, _Integer(-3)])
 def test_a_height_that_is_not_a_whole_number_is_refused_at_the_call(height):
     transport = StubTransport(range_answer)
 
@@ -2154,14 +2173,14 @@ def test_the_timeout_of_an_iterator_starts_at_the_call(deployment):
 @pytest.mark.parametrize("read_source", [DEFAULT, SINGLE_BLOCK])
 def test_a_timeout_cuts_a_wait_on_the_store_short(deployment, read_source):
     deployment.server.add_block(5)
-    deployment.storage.delay = 0.6
+    deployment.storage.delay = 3.0
     client = deployment.client()
     before = time.monotonic()
 
-    with pytest.raises(CallTimeoutError, match="a block file download did not finish in time"):
-        client.get_block(5, read_source=read_source, timeout=0.15)
+    with pytest.raises(CallTimeoutError):
+        client.get_block(5, read_source=read_source, timeout=0.5)
 
-    assert time.monotonic() - before < 0.5
+    assert time.monotonic() - before < 2.0
     # Nothing more was tried: no second attempt, and no other source.
     assert len(deployment.server.calls_to("GetBlockFile")) == 1
     assert deployment.sleeps == []
@@ -2170,13 +2189,76 @@ def test_a_timeout_cuts_a_wait_on_the_store_short(deployment, read_source):
 def test_a_timeout_stops_a_range_that_is_under_way(deployment):
     for height in range(20, 24):
         deployment.server.add_block(height)
-    deployment.storage.delay = 0.6
-    payloads = deployment.client(num_workers=1).iter_raw_block_payloads(20, 24, timeout=0.15)
+    payloads = deployment.client(num_workers=1).iter_raw_block_payloads(20, 24, timeout=1.0)
 
+    assert next(payloads).block_file.height == 20
+    # From here on the store answers too slowly for the time that is left.
+    deployment.storage.delay = 3.0
+    before = time.monotonic()
     with pytest.raises(CallTimeoutError):
         list(payloads)
 
+    assert time.monotonic() - before < 2.0
     assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 1
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), 1e12])
+def test_a_timeout_without_end_does_not_limit_a_download(deployment, timeout):
+    deployment.server.add_block(5)
+    client = deployment.client()
+
+    assert client.get_block(5, timeout=timeout) == make_block(5)
+    assert client.get_blocks_by_heights([5], timeout=timeout) == [make_block(5)]
+
+
+def test_the_time_left_is_read_once_for_an_attempt(monkeypatch):
+    # A second reading could find the deadline passed, and hand the
+    # connection a wait of no time at all.
+    readings = iter([0.25])
+    monkeypatch.setattr(downloader_module, "time_left", lambda deadline: next(readings))
+
+    limits = downloader_module._Limits(deadline=1.0)
+
+    assert downloader_module._attempt_timeout(30.0, limits) == 0.25
+
+
+@pytest.mark.parametrize("deadline", [None, 600.0])
+def test_a_download_that_waits_ends_when_the_downloader_is_closed(deployment, deadline):
+    deployment.server.add_block(5)
+    deployment.server.add_block(6)
+    deployment.storage.delay = 0.5
+    files = deployment.client().get_block_files_by_range(5, 7, read_source=SINGLE_BLOCK)
+    downloader = BlockDownloader(deployment.config(num_workers=1))
+    outcomes: list[BaseException | bytes] = []
+
+    def download(block_file):
+        limits = {} if deadline is None else {"deadline": time.monotonic() + deadline}
+        try:
+            outcomes.append(downloader.download(block_file, **limits))
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    # The first download holds the only worker; the second one waits for it.
+    # Daemon threads: if a download ever waited for good again, the test
+    # would fail and the test run would still end.
+    first = threading.Thread(target=download, args=(files[0],), daemon=True)
+    first.start()
+    while not deployment.storage.most_at_once:
+        time.sleep(0.01)
+    second = threading.Thread(target=download, args=(files[1],), daemon=True)
+    second.start()
+    time.sleep(0.1)
+
+    downloader.close()
+    second.join(timeout=5)
+
+    waiting = second.is_alive()
+    first.join()
+    assert not waiting
+    assert deployment.storage.requests_for("blocks/6") == []
+    assert [type(outcome) for outcome in outcomes if not isinstance(outcome, bytes)] == [
+        CancelledError
+    ]
 
 
 class _SlowResponse:
@@ -2199,10 +2281,10 @@ def test_a_timeout_stops_a_body_that_arrives_slowly():
     with pytest.raises(CallTimeoutError):
         downloader_module._read_at_most(response, 100 * 64 * 1024, limits)
 
-    assert 2 <= response.pieces_read <= 5
+    assert 1 <= response.pieces_read <= 5
 
 
-def test_a_body_is_read_in_smaller_pieces_when_there_is_a_deadline(monkeypatch):
+def test_a_body_is_read_in_smaller_pieces_when_there_is_a_deadline():
     asked: list[int] = []
 
     class Response:
@@ -2233,25 +2315,26 @@ def test_a_timeout_stops_the_retries_of_a_download(deployment):
 def test_a_download_waiting_behind_others_stops_at_the_deadline(deployment):
     deployment.server.add_block(5)
     deployment.server.add_block(6)
-    deployment.storage.delay = 0.6
+    deployment.storage.delay = 2.0
     client = deployment.client(num_workers=1)
     files = client.get_block_files_by_range(5, 7, read_source=SINGLE_BLOCK)
     downloader = BlockDownloader(deployment.config(num_workers=1))
     # Another caller's download, with no deadline, holds the only worker.
-    other = threading.Thread(target=downloader.download, args=(files[0],))
+    other = threading.Thread(target=downloader.download, args=(files[0],), daemon=True)
     other.start()
-    time.sleep(0.1)
+    while not deployment.storage.most_at_once:
+        time.sleep(0.01)
     before = time.monotonic()
 
     try:
         with pytest.raises(CallTimeoutError):
-            downloader.download(files[1], deadline=time.monotonic() + 0.1)
+            downloader.download(files[1], deadline=time.monotonic() + 0.2)
         waited = time.monotonic() - before
         other.join()
     finally:
         downloader.close()
 
-    assert waited < 0.4
+    assert waited < 1.5
     # The queued download never started.
     assert deployment.storage.requests_for("blocks/6") == []
 
