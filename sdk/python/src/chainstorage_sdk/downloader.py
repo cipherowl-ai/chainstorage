@@ -18,8 +18,9 @@ A caller can limit a download in two ways:
 - ``deadline``, a ``time.monotonic()`` value the download must be done by.
   No request starts after it, each wait on the connection is cut to the time
   left, and the clock is read between the pieces of a body. When it passes,
-  the download raises ``CallTimeoutError``. A store that keeps sending a body
-  very slowly can hold one piece past the deadline.
+  the download raises ``CallTimeoutError``, and no payload is handed over any
+  more, not even one that was downloaded ahead in time. A store that keeps
+  sending a body very slowly can hold one piece past the deadline.
 - ``max_response_bytes``, the most bytes one request to the store may return:
   a single-block object, one of the two reads of a consolidated object's
   index (its first 64 KiB, then the rest), or one of its chunks. A read that
@@ -221,6 +222,9 @@ class BlockDownloader:
                 # alive, through these names, while the next ones arrive.
                 del unit, task
                 while position in ready:
+                    # The caller may have taken its time since the last one:
+                    # a payload that is ready is not handed over late either.
+                    _check_in_time(limits)
                     yield ready.pop(position)
                     position += 1
         finally:

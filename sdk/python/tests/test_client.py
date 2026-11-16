@@ -2212,6 +2212,37 @@ def test_a_timeout_stops_a_range_that_is_under_way(deployment):
     assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 1
 
 
+def test_a_block_downloaded_ahead_is_not_yielded_after_the_timeout(deployment):
+    for height in range(20, 24):
+        deployment.server.add_block(height)
+    payloads = deployment.client(num_workers=4).iter_raw_block_payloads(20, 24, timeout=0.5)
+
+    assert next(payloads).block_file.height == 20
+    # The caller takes its time. The other blocks were downloaded meanwhile.
+    time.sleep(0.7)
+    assert len(deployment.storage.requests) == 4
+    with pytest.raises(CallTimeoutError):
+        next(payloads)
+
+    assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 1
+    assert deployment.sleeps == []
+
+
+def test_a_block_of_a_chunk_already_read_is_not_yielded_after_the_timeout(deployment):
+    deployment.server.add_consolidated("zstd")
+    payloads = deployment.client().iter_raw_block_payloads(1000, 1006, timeout=0.5)
+
+    assert next(payloads).block_file.height == 1000
+    requests = len(deployment.storage.requests)
+    time.sleep(0.7)
+    with pytest.raises(CallTimeoutError):
+        next(payloads)
+
+    # The next block came with the first one's chunk: nothing was left to read.
+    assert len(deployment.storage.requests) == requests
+    assert deployment.sleeps == []
+
+
 @pytest.mark.parametrize("timeout", [float("inf"), 1e12])
 def test_a_timeout_without_end_does_not_limit_a_download(deployment, timeout):
     deployment.server.add_block(5)
