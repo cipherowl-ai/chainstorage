@@ -116,7 +116,7 @@ with Client(config) as client:
   object, one of the two reads of a consolidated file's index (its first
   64 KiB, then the rest), or one of its chunks. A read that asks for more is
   refused before it is sent, and any other stops at the limit. Both raise
-  `ResponseTooLargeError`, and nothing more is tried. Three things to know:
+  `ResponseTooLargeError`, and nothing more is tried. Things to know:
   - A limit below 64 KiB refuses every consolidated file.
   - It limits what is fetched, not the decompressed size, which the file
     format limits to 1 GiB per block or chunk.
@@ -124,6 +124,11 @@ with Client(config) as client:
     and is returned whatever the limit.
   - The body of a refusal is read within the limit too. Under a limit of
     less than 2 KiB, `error_code` can be empty.
+  - Reading stops with the piece that passes the limit, and pieces are
+    sized to end there. A body sent with its length is read a few bytes
+    past the limit at most. A body the store sends in chunks of its own can
+    be read up to one piece past it: 1 MiB, 64 KiB with a `timeout`, and
+    never more than the limit itself.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.

@@ -2368,11 +2368,84 @@ def test_a_body_is_read_in_smaller_pieces_when_there_is_a_deadline():
             asked.append(chunk_size)
             yield b"x"
 
-    downloader_module._read_at_most(Response(), 10)
+    size = 100 * 1024 * 1024
+    downloader_module._read_at_most(Response(), size)
     limits = downloader_module._Limits(deadline=time.monotonic() + 60)
-    downloader_module._read_at_most(Response(), 10, limits)
+    downloader_module._read_at_most(Response(), size, limits)
 
     assert asked == [1024 * 1024, 64 * 1024]
+
+
+class _CountingResponse:
+    """A streamed response with an endless body; records what is asked and read."""
+
+    def __init__(self) -> None:
+        self.piece_sizes: list[int] = []
+        self.bytes_read = 0
+
+    def iter_content(self, chunk_size: int):
+        self.piece_sizes.append(chunk_size)
+        while True:
+            self.bytes_read += chunk_size
+            yield b"x" * chunk_size
+
+
+@pytest.mark.parametrize("deadline", [None, 60.0], ids=["no deadline", "a deadline"])
+@pytest.mark.parametrize(
+    ("size", "most_read"),
+    [
+        (1, 1),
+        (65, 65),
+        (64 * 1024, 64 * 1024),
+        # Longer than a piece: at most one byte per piece is read beyond it.
+        (64 * 1024 + 1, 64 * 1024 + 2),
+        (3 * 1024 * 1024 + 1, 3 * 1024 * 1024 + 1 + 49),
+    ],
+)
+def test_a_body_is_read_no_further_than_the_bytes_wanted(deadline, size, most_read):
+    response = _CountingResponse()
+    limits = downloader_module._Limits(
+        deadline=None if deadline is None else time.monotonic() + deadline
+    )
+
+    body = downloader_module._read_at_most(response, size, limits)
+
+    assert len(body) == size
+    assert size <= response.bytes_read <= most_read
+    assert len(response.piece_sizes) == 1
+
+
+def test_a_store_that_sends_short_pieces_passes_the_bytes_wanted_by_less_than_a_piece():
+    class Response:
+        def iter_content(self, chunk_size: int):
+            yield b"x" * (chunk_size - 1)
+            yield b"x" * chunk_size
+
+    body = downloader_module._read_at_most(Response(), 65)
+
+    assert len(body) == 65
+
+
+@pytest.mark.parametrize("timeout", [None, 60.0], ids=["no timeout", "a timeout"])
+def test_a_small_size_limit_reads_only_that_much_of_a_large_object(deployment, timeout):
+    deployment.server.add_block(5)
+    deployment.storage.objects["blocks/5"] = b"x" * (2 * 1024 * 1024)
+    read: list[int] = []
+    real = requests.Response.iter_content
+
+    def recording(self, chunk_size=1, decode_unicode=False):
+        for piece in real(self, chunk_size, decode_unicode):
+            read.append(len(piece))
+            yield piece
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(requests.Response, "iter_content", recording)
+        with pytest.raises(ResponseTooLargeError):
+            deployment.client().get_block(
+                5, read_source=SINGLE_BLOCK, timeout=timeout, max_response_bytes=64
+            )
+
+    assert read == [65]
 
 
 def test_a_timeout_stops_the_retries_of_a_download(deployment):

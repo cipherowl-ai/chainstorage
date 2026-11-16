@@ -26,8 +26,13 @@ A caller can limit a download in two ways:
   index (its first 64 KiB, then the rest), or one of its chunks. A read that
   asks for more is refused before it is sent, and any other stops at the
   limit. Both raise ``ResponseTooLargeError``. So a limit below 64 KiB
-  refuses every consolidated object. It limits what is fetched, not the
-  decompressed size, which the file format limits. A block whose index and
+  refuses every consolidated object. Reading stops with the piece that
+  passes the limit. Pieces are at most 1 MiB (64 KiB under a deadline) and
+  are sized to end there: a body sent with its length is read a few bytes
+  past the limit at most, one per piece, and a body the store sends in
+  chunks of its own less than one piece past it. It limits what is fetched,
+  not the decompressed size, which the file format limits. A block whose
+  index and
   chunk are still in the cache needs no request, and is returned. The body of
   a refusal is read within the limit as well: under a limit of less than
   2 KiB, the store's error code can be missing from the ``DownloadError``.
@@ -512,8 +517,18 @@ def _result(task: Future[T], limits: _Limits) -> T:
 
 
 def _read_at_most(response: requests.Response, size: int, limits: _Limits = _NO_LIMITS) -> bytes:
-    """Reads the body of a streamed response, stopping after ``size`` bytes."""
+    """Reads the body of a streamed response, stopping after ``size`` bytes.
+
+    The body arrives in pieces of one length, set when the read starts.
+    That length is chosen so that whole pieces end at ``size``, or at most
+    one byte per piece after it: a small ``size`` is not answered with a
+    large piece. A store that sends shorter pieces of its own can make the
+    last one pass ``size`` by less than a piece. What passes is dropped.
+    """
     piece_size = _RESPONSE_PIECE if limits.deadline is None else _RESPONSE_PIECE_WITH_DEADLINE
+    # As many pieces as the full length needs, all of the same length.
+    pieces_wanted = -(-size // piece_size)
+    piece_size = -(-size // pieces_wanted)
     pieces: list[bytes] = []
     read = 0
     for piece in response.iter_content(chunk_size=piece_size):
