@@ -12,6 +12,19 @@ has no stored content, so its payload is empty.
 Several block files are downloaded in parallel and their payloads are handed
 back in order. A chunk that holds several of the wanted blocks is fetched and
 decompressed once.
+
+A caller can limit a download in two ways:
+
+- ``deadline``, a ``time.monotonic()`` value the download must be done by.
+  No request starts after it, each wait on the connection is cut to the time
+  left, and the clock is read between the pieces of a body. When it passes,
+  the download raises ``CallTimeoutError``. A store that keeps sending a body
+  very slowly can hold one piece past the deadline.
+- ``max_response_bytes``, the most bytes one request to the store may return:
+  a single-block object, the index of a consolidated object, or one of its
+  chunks. A read known to be longer is refused before it is sent, and any
+  other stops at the limit. Both raise ``ResponseTooLargeError``. It limits
+  what is fetched, not the decompressed size, which the file format limits.
 """
 
 from __future__ import annotations
@@ -22,10 +35,10 @@ import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Hashable, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
@@ -34,11 +47,19 @@ from requests.adapters import HTTPAdapter
 
 from chainstorage_sdk import cscb
 from chainstorage_sdk.config import Config
-from chainstorage_sdk.errors import BlockFormatError, DownloadError
-from chainstorage_sdk.retry import call_with_retry
+from chainstorage_sdk.errors import (
+    BlockFormatError,
+    CallTimeoutError,
+    ConfigError,
+    DownloadError,
+    ResponseTooLargeError,
+)
+from chainstorage_sdk.retry import call_with_retry, time_left
 from coinbase.chainstorage import api_pb2, blockchain_pb2
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # How much decompressed data may be on its way at once. One download is
 # always allowed, however large. While a chunk is being cut into blocks it is
@@ -50,7 +71,10 @@ _IN_FLIGHT_BYTES = 256 * 1024 * 1024
 _UNKNOWN_BLOCK_BYTES = 8 * 1024 * 1024
 
 # Responses are read in pieces of this size, and never past what is needed.
+# With a deadline the pieces are smaller, because the clock is read between
+# them.
 _RESPONSE_PIECE = 1024 * 1024
+_RESPONSE_PIECE_WITH_DEADLINE = 64 * 1024
 
 # A store explains a refusal in a short XML body. Only its error code is
 # taken, and no more than these first bytes are read: the rest of the body
@@ -63,6 +87,17 @@ _ERROR_CODE = re.compile(rb"<Code>([A-Za-z0-9.]{1,64})</Code>")
 # than the cap is not kept.
 _INDEX_CACHE_ENTRIES = 8
 _CHUNK_CACHE_ENTRIES = 4
+
+
+@dataclass(frozen=True)
+class _Limits:
+    """What the caller allows one download: see the module docstring."""
+
+    deadline: float | None = None
+    max_response_bytes: int | None = None
+
+
+_NO_LIMITS = _Limits()
 
 
 @dataclass
@@ -102,20 +137,60 @@ class BlockDownloader:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._session.close()
 
-    def download(self, block_file: api_pb2.BlockFile) -> bytes:
-        return self.download_many([block_file])[0]
+    def download(
+        self,
+        block_file: api_pb2.BlockFile,
+        *,
+        deadline: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> bytes:
+        return self.download_many(
+            [block_file], deadline=deadline, max_response_bytes=max_response_bytes
+        )[0]
 
-    def download_many(self, block_files: Sequence[api_pb2.BlockFile]) -> list[bytes]:
+    def download_many(
+        self,
+        block_files: Sequence[api_pb2.BlockFile],
+        *,
+        deadline: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> list[bytes]:
         """Returns one payload per block file, in the order given."""
-        return list(self.iter_download(block_files))
+        return list(
+            self.iter_download(
+                block_files, deadline=deadline, max_response_bytes=max_response_bytes
+            )
+        )
 
-    def iter_download(self, block_files: Sequence[api_pb2.BlockFile]) -> Iterator[bytes]:
+    def iter_download(
+        self,
+        block_files: Sequence[api_pb2.BlockFile],
+        *,
+        deadline: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> Iterator[bytes]:
         """Yields one payload per block file, in the order given.
 
         Downloads run ahead of the caller, up to ``num_workers`` at a time and
         within a memory budget, so a long list never has to fit in memory.
+
+        ``deadline`` and ``max_response_bytes`` are described at the top of
+        this module.
         """
-        units = iter(self._plan(block_files))
+        if max_response_bytes is not None and (
+            isinstance(max_response_bytes, bool)
+            or not isinstance(max_response_bytes, int)
+            or max_response_bytes < 1
+        ):
+            raise ConfigError(
+                f"max_response_bytes must be a positive number of bytes, got {max_response_bytes!r}"
+            )
+        return self._iter_download(block_files, _Limits(deadline, max_response_bytes))
+
+    def _iter_download(
+        self, block_files: Sequence[api_pb2.BlockFile], limits: _Limits
+    ) -> Iterator[bytes]:
+        units = iter(self._plan(block_files, limits))
         upcoming = next(units, None)
         in_flight: deque[tuple[_Unit, Future[list[bytes]]]] = deque()
         in_flight_bytes = 0
@@ -134,7 +209,7 @@ class BlockDownloader:
                     in_flight_bytes += upcoming.cost
                     upcoming = next(units, None)
                 unit, task = in_flight.popleft()
-                ready.update(zip(unit.positions, task.result(), strict=True))
+                ready.update(zip(unit.positions, _result(task, limits), strict=True))
                 in_flight_bytes -= unit.cost
                 # Drop the finished download now: its payloads must not stay
                 # alive, through these names, while the next ones arrive.
@@ -173,7 +248,7 @@ class BlockDownloader:
             block.metadata.CopyFrom(_metadata_from_block_file(block_file))
         return block
 
-    def _plan(self, block_files: Sequence[api_pb2.BlockFile]) -> list[_Unit]:
+    def _plan(self, block_files: Sequence[api_pb2.BlockFile], limits: _Limits) -> list[_Unit]:
         """Groups the block files into downloads, in the order of their first
         block: one per single-block object, and one per chunk of a
         consolidated object."""
@@ -182,9 +257,12 @@ class BlockDownloader:
         for block_file in block_files:
             if not block_file.skipped and is_consolidated(block_file):
                 urls.setdefault(_object_key(block_file.file_url), block_file.file_url)
-        indexes = dict(
-            zip(urls, self._executor.map(self._index, urls.keys(), urls.values()), strict=True)
-        )
+        tasks = [self._executor.submit(self._index, key, url, limits) for key, url in urls.items()]
+        try:
+            indexes = dict(zip(urls, [_result(task, limits) for task in tasks], strict=True))
+        finally:
+            for task in tasks:
+                task.cancel()
 
         units: list[_Unit] = []
         chunk_units: dict[tuple[str, int], tuple[_Unit, list[cscb.BlockRecord]]] = {}
@@ -192,7 +270,7 @@ class BlockDownloader:
             if block_file.skipped:
                 units.append(_Unit([position], 0, lambda: [b""]))
             elif not is_consolidated(block_file):
-                run = partial(self._download_single, block_file)
+                run = partial(self._download_single, block_file, limits)
                 cost = block_file.uncompressed_length or _UNKNOWN_BLOCK_BYTES
                 units.append(_Unit([position], cost, run))
             else:
@@ -203,7 +281,13 @@ class BlockDownloader:
                 if planned is None:
                     records: list[cscb.BlockRecord] = []
                     run = partial(
-                        self._download_chunk, key, urls[key], index.header.codec, chunk, records
+                        self._download_chunk,
+                        key,
+                        urls[key],
+                        index.header.codec,
+                        chunk,
+                        records,
+                        limits,
                     )
                     unit = _Unit([], chunk.uncompressed_length, run)
                     units.append(unit)
@@ -212,7 +296,8 @@ class BlockDownloader:
                 planned[1].append(record)
         return units
 
-    def _download_single(self, block_file: api_pb2.BlockFile) -> list[bytes]:
+    def _download_single(self, block_file: api_pb2.BlockFile, limits: _Limits) -> list[bytes]:
+        _check_in_time(limits)
         # No block is larger than the largest chunk. The server does not
         # always say how long the block is; when it does not, the output may
         # still not grow past that.
@@ -222,7 +307,7 @@ class BlockDownloader:
             raise BlockFormatError(
                 f"block {block_file.height} declares {declared} bytes, more than the {cap} allowed"
             )
-        body = self._request(block_file.file_url, None, limit=cap)
+        body = self._request(block_file.file_url, None, limit=cap, limits=limits)
         if declared is not None:
             payload = cscb.decompress(body, block_file.compression, max_size=declared)
         else:
@@ -235,13 +320,14 @@ class BlockDownloader:
             )
         return [payload]
 
-    def _index(self, key: str, url: str) -> cscb.Index:
+    def _index(self, key: str, url: str, limits: _Limits) -> cscb.Index:
+        _check_in_time(limits)
         index = self._indexes.get(key)
         if index is None:
-            first = self._get_range(url, 0, cscb.INITIAL_INDEX_READ_SIZE - 1)
+            first = self._get_range(url, 0, cscb.INITIAL_INDEX_READ_SIZE - 1, limits)
             needed = cscb.parse_header(first).index_length
             if needed > len(first):
-                first += self._get_range(url, len(first), needed - 1)
+                first += self._get_range(url, len(first), needed - 1, limits)
             index = cscb.parse_index(first[:needed])
             self._indexes.put(key, index)
         return index
@@ -253,21 +339,28 @@ class BlockDownloader:
         codec: int,
         chunk: cscb.ChunkRecord,
         records: Sequence[cscb.BlockRecord],
+        limits: _Limits,
     ) -> list[bytes]:
+        _check_in_time(limits)
         cache_key = (key, chunk.index)
         chunk_payload = self._chunks.get(cache_key)
         if chunk_payload is None:
             if chunk.compressed_length <= 0:
                 raise BlockFormatError(f"CSCB chunk {chunk.index} has no data")
             start = chunk.compressed_payload_offset
-            frame = self._get_range(url, start, start + chunk.compressed_length - 1)
+            frame = self._get_range(url, start, start + chunk.compressed_length - 1, limits)
             chunk_payload = cscb.decode_chunk(frame, codec, chunk)
             self._chunks.put(cache_key, chunk_payload, size=len(chunk_payload))
         return cscb.extract_blocks(chunk_payload, chunk, records)
 
-    def _get_range(self, url: str, start: int, end: int) -> bytes:
+    def _get_range(self, url: str, start: int, end: int, limits: _Limits) -> bytes:
         """Reads bytes ``start..end`` (inclusive) of an object."""
         expected = end - start + 1
+        allowed = limits.max_response_bytes
+        if allowed is not None and expected > allowed:
+            raise ResponseTooLargeError(
+                f"a read of {expected} bytes of {_redact(url)} is more than the {allowed} allowed"
+            )
 
         def check(status: int, body: bytes) -> bytes:
             if status == 200:
@@ -289,7 +382,9 @@ class BlockDownloader:
             return body
 
         # One byte more than wanted shows a store that sent too much.
-        return self._request(url, {"Range": f"bytes={start}-{end}"}, check, limit=expected)
+        return self._request(
+            url, {"Range": f"bytes={start}-{end}"}, check, limit=expected, limits=limits
+        )
 
     def _request(
         self,
@@ -298,6 +393,7 @@ class BlockDownloader:
         check: Callable[[int, bytes], bytes] | None = None,
         *,
         limit: int,
+        limits: _Limits,
     ) -> bytes:
         """Gets ``url`` and returns its body, read up to ``limit`` + 1 bytes.
 
@@ -305,9 +401,13 @@ class BlockDownloader:
         object never makes us hold more. Without ``check``, a longer body is
         refused.
         """
-        timeout = self._config.http_timeout
+        allowed = limits.max_response_bytes
+        too_long: type[DownloadError] = DownloadError
+        if allowed is not None and allowed < limit:
+            limit, too_long = allowed, ResponseTooLargeError
 
         def attempt() -> bytes:
+            timeout = _attempt_timeout(self._config.http_timeout, limits)
             try:
                 with self._session.get(
                     url, headers=headers, timeout=timeout, stream=True
@@ -322,7 +422,7 @@ class BlockDownloader:
                             error_code=code,
                             retryable=status in (408, 429) or status >= 500,
                         )
-                    body = _read_at_most(response, limit + 1)
+                    body = _read_at_most(response, limit + 1, limits)
             except requests.RequestException as exc:
                 # The exception text can hold the signed link, so only its
                 # type is reported, and it is not chained.
@@ -332,7 +432,7 @@ class BlockDownloader:
             if check is not None:
                 return check(status, body)
             if len(body) > limit:
-                raise DownloadError(
+                raise too_long(
                     f"{_redact(url)} is longer than the {limit} bytes allowed", status_code=status
                 )
             return body
@@ -344,6 +444,7 @@ class BlockDownloader:
             sleep=self._sleep,
             what="a block file download",
             reason=_reason,
+            deadline=limits.deadline,
         )
 
 
@@ -356,15 +457,50 @@ def _reason(exc: Exception) -> str:
     return f"status {status} {getattr(exc, 'error_code', '')}".rstrip()
 
 
-def _read_at_most(response: requests.Response, size: int) -> bytes:
+def _out_of_time() -> CallTimeoutError:
+    return CallTimeoutError(
+        "a block file download did not finish in time", code="DEADLINE_EXCEEDED"
+    )
+
+
+def _check_in_time(limits: _Limits) -> None:
+    left = time_left(limits.deadline)
+    if left is not None and left <= 0:
+        raise _out_of_time()
+
+
+def _attempt_timeout(timeout: float, limits: _Limits) -> float:
+    """Returns how long one wait on the connection may take: ``timeout``, or
+    the time left until the deadline when that is less."""
+    _check_in_time(limits)
+    left = time_left(limits.deadline)
+    return timeout if left is None else min(timeout, left)
+
+
+def _result(task: Future[T], limits: _Limits) -> T:
+    """Waits for a download, no longer than the deadline allows.
+
+    The download itself stops at the deadline. This wait also ends then, for
+    a download that is still queued behind those of other callers.
+    """
+    finished, _ = wait([task], timeout=time_left(limits.deadline))
+    if not finished:
+        task.cancel()
+        raise _out_of_time()
+    return task.result()
+
+
+def _read_at_most(response: requests.Response, size: int, limits: _Limits = _NO_LIMITS) -> bytes:
     """Reads the body of a streamed response, stopping after ``size`` bytes."""
+    piece_size = _RESPONSE_PIECE if limits.deadline is None else _RESPONSE_PIECE_WITH_DEADLINE
     pieces: list[bytes] = []
     read = 0
-    for piece in response.iter_content(chunk_size=_RESPONSE_PIECE):
+    for piece in response.iter_content(chunk_size=piece_size):
         pieces.append(piece)
         read += len(piece)
         if read >= size:
             break
+        _check_in_time(limits)
     body = b"".join(pieces)
     return body if len(body) <= size else body[:size]
 

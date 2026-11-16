@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import struct
+import threading
 import time
 
 import grpc
@@ -21,6 +22,7 @@ from chainstorage_sdk import (
     DownloadError,
     NotFoundError,
     RequestError,
+    ResponseTooLargeError,
     RetryPolicy,
     Session,
     StreamingConfiguration,
@@ -522,8 +524,8 @@ def test_a_store_that_ignores_ranges_is_read_only_as_far_as_the_range(deployment
     read: list[int] = []
     real = downloader_module._read_at_most
 
-    def recording(response, size):
-        body = real(response, size)
+    def recording(response, size, limits):
+        body = real(response, size, limits)
         read.append(len(body))
         return body
 
@@ -1844,3 +1846,510 @@ def test_a_retried_download_is_logged_without_its_link(deployment, caplog):
     ]
     assert "secret" not in caplog.text
     assert "blocks/5" not in caplog.text
+
+
+# -- blocks at chosen heights ----------------------------------------------
+
+
+class LimitedDownloader(StubDownloader):
+    """A stub that takes the limits of a download, and records them."""
+
+    def __init__(self, errors=()) -> None:
+        super().__init__(errors)
+        self.limits: list[dict] = []
+        self.closed = False
+
+    def iter_download(self, block_files, **limits):
+        self.limits.append(limits)
+        return super().iter_download(block_files)
+
+    def download(self, block_file, **limits):
+        return list(self.iter_download([block_file], **limits))[0]
+
+    def close(self):
+        self.closed = True
+
+
+def asked_ranges(transport) -> list[tuple[int, int]]:
+    return [(request.start_height, request.end_height) for _, request, _ in transport.calls]
+
+
+def test_blocks_at_heights_come_in_height_order_each_once(deployment):
+    for height in range(10, 20):
+        deployment.server.add_block(height)
+    client = deployment.client()
+
+    blocks = client.get_blocks_by_heights([15, 11, 15, 19], read_source=SINGLE_BLOCK)
+
+    assert blocks == [make_block(11), make_block(15), make_block(19)]
+    (asked,) = deployment.server.calls_to("GetBlockFilesByRange")
+    assert (asked.start_height, asked.end_height) == (11, 20)
+    # Only the wanted blocks were downloaded.
+    assert sorted(name for name, _ in deployment.storage.requests) == [
+        "blocks/11",
+        "blocks/15",
+        "blocks/19",
+    ]
+
+
+def test_no_heights_ask_the_server_nothing():
+    transport = StubTransport(range_answer)
+
+    assert list(stub_client(transport).iter_raw_block_payloads_by_heights([])) == []
+    assert stub_client(transport).get_blocks_by_heights(iter(())) == []
+    assert transport.calls == []
+
+
+def test_heights_are_asked_for_in_stretches_the_server_allows():
+    transport = StubTransport(range_answer)
+
+    payloads = list(
+        stub_client(transport).iter_raw_block_payloads_by_heights([3000, 5, 1004, 1005])
+    )
+
+    assert [raw.block_file.height for raw in payloads] == [5, 1004, 1005, 3000]
+    # 5 to 1004 is the 1,000 heights one request may span. 1005 is one more.
+    assert asked_ranges(transport) == [(5, 1005), (1005, 1006), (3000, 3001)]
+
+
+def test_a_stretch_is_asked_for_just_before_its_blocks_are_downloaded():
+    transport = StubTransport(range_answer)
+    payloads = stub_client(transport).iter_raw_block_payloads_by_heights([7, 5000, 9000])
+
+    assert transport.calls == []
+    assert next(payloads).block_file.height == 7
+    assert asked_ranges(transport) == [(7, 8)]
+    assert next(payloads).block_file.height == 5000
+    assert asked_ranges(transport) == [(7, 8), (5000, 5001)]
+
+
+@pytest.mark.parametrize("height", [-1, 1.5, "7", True, None])
+def test_a_height_that_is_not_a_whole_number_is_refused_at_the_call(height):
+    transport = StubTransport(range_answer)
+
+    with pytest.raises(ConfigError, match="a height must be a whole number"):
+        stub_client(transport).iter_raw_block_payloads_by_heights([3, height])
+
+    assert transport.calls == []
+
+
+def test_a_skipped_block_among_the_heights_has_an_empty_payload(deployment):
+    deployment.server.add_block(10)
+    deployment.server.add_block(12)
+    deployment.server.skipped.add(11)
+    client = deployment.client()
+
+    payloads = list(client.iter_raw_block_payloads_by_heights([12, 11], read_source=SINGLE_BLOCK))
+
+    assert [(raw.block_file.height, raw.block_file.skipped) for raw in payloads] == [
+        (11, True),
+        (12, False),
+    ]
+    assert payloads[0].payload == b""
+    assert client.parse_raw_block(payloads[0]).metadata.skipped
+
+
+def test_a_height_the_server_does_not_have_is_not_found(deployment):
+    deployment.server.add_block(10)
+
+    with pytest.raises(NotFoundError):
+        deployment.client().get_blocks_by_heights([10, 14], read_source=SINGLE_BLOCK)
+
+
+@pytest.mark.parametrize("codec", ["gzip", "zstd"])
+def test_heights_in_a_consolidated_object_fetch_each_chunk_once(deployment, codec):
+    entries = deployment.server.add_consolidated(codec)
+
+    payloads = list(deployment.client().iter_raw_block_payloads_by_heights([1004, 1000, 1002]))
+
+    assert [raw.block_file.height for raw in payloads] == [1000, 1002, 1004]
+    assert [sha256(raw.payload) for raw in payloads] == [
+        entries[position]["payload_sha256"] for position in (0, 2, 4)
+    ]
+    # The index, the chunk of 1000 and 1002, and the chunk of 1004.
+    assert len(deployment.storage.requests_for(f"consolidated/cscb_{codec}.bin")) == 3
+
+
+def test_heights_fall_back_to_single_block(deployment):
+    deployment.server.add_consolidated("zstd")
+    deployment.storage.objects[CONSOLIDATED_OBJECT] = b"damaged"
+
+    blocks = deployment.client().get_blocks_by_heights([1001, 1005])
+
+    assert blocks == [make_block(1001), make_block(1005)]
+    asked = deployment.server.calls_to("GetBlockFilesByRange")
+    assert [(r.start_height, r.end_height, r.read_source) for r in asked] == [
+        (1001, 1006, DEFAULT),
+        (1001, 1006, SINGLE_BLOCK),
+    ]
+
+
+def test_refused_links_of_heights_are_replaced_from_the_first_missing_block():
+    class OneBlockThenRefused(LimitedDownloader):
+        """Hands over one block, then meets an expired link, every time."""
+
+        def iter_download(self, block_files, **limits):
+            self.downloads.append([file.height for file in block_files])
+            yield b""
+            raise DownloadError("refused", status_code=403)
+
+    transport = StubTransport(range_answer)
+    downloader = OneBlockThenRefused()
+    client = Client(Config(server_address="unused:1"), transport=transport, downloader=downloader)
+
+    payloads = list(
+        client.iter_raw_block_payloads_by_heights([10, 13, 17], read_source=SINGLE_BLOCK)
+    )
+
+    assert [raw.block_file.height for raw in payloads] == [10, 13, 17]
+    # No block is downloaded twice, and only wanted blocks are downloaded.
+    assert downloader.downloads == [[10, 13, 17], [13, 17], [17]]
+    assert asked_ranges(transport) == [(10, 18), (13, 18), (17, 18)]
+
+
+def test_heights_stop_when_a_wanted_block_is_replaced_under_them():
+    forks = ["a-", "b-"]
+
+    def answer(method, request):
+        return api_pb2.GetBlockFilesByRangeResponse(
+            files=chain_files(request.start_height, request.end_height, fork=forks.pop(0))
+        )
+
+    client = Client(
+        Config(server_address="unused:1"),
+        transport=StubTransport(answer),
+        downloader=StubDownloader([DownloadError("refused", status_code=403)]),
+    )
+
+    with pytest.raises(RequestError, match="block 10 was replaced"):
+        list(client.iter_raw_block_payloads_by_heights([10, 12]))
+
+
+# -- limits on a read: time and size ---------------------------------------
+
+
+def downloading_calls(client, **limits):
+    """Every call that downloads, each reading block 4."""
+    return [
+        lambda: client.get_block(4, **limits),
+        lambda: client.get_blocks_by_range(4, 5, **limits),
+        lambda: client.get_blocks_by_heights([4], **limits),
+        lambda: client.open_raw_block_payload(4, **limits),
+        lambda: list(client.iter_raw_block_payloads(4, 5, **limits)),
+        lambda: list(client.iter_raw_block_payloads_by_heights([4], **limits)),
+        lambda: client.get_block_by_transaction("0xabc", **limits),
+        lambda: client.get_block_by_timestamp(40, **limits),
+    ]
+
+
+def test_every_call_that_downloads_takes_a_timeout(deployment):
+    deployment.server.add_block(4)
+    deployment.server.transactions["0xabc"] = [4]
+    client = deployment.client()
+
+    for call in downloading_calls(client, timeout=30):
+        call()
+    for call in downloading_calls(client, timeout=0):
+        with pytest.raises(CallTimeoutError):
+            call()
+
+
+def test_a_call_and_its_downloads_share_one_timeout():
+    transport = DeadlineTransport(range_answer)
+    downloader = LimitedDownloader()
+    client = Client(Config(server_address="unused:1"), transport=transport, downloader=downloader)
+    before = time.monotonic()
+
+    list(client.iter_raw_block_payloads_by_heights([1, 5000], timeout=20, max_response_bytes=64))
+
+    deadlines = {*transport.deadlines, *(limits["deadline"] for limits in downloader.limits)}
+    assert len(transport.deadlines) == len(downloader.limits) == 2
+    assert len(deadlines) == 1
+    assert before + 20 <= deadlines.pop() <= time.monotonic() + 20
+    assert [limits["max_response_bytes"] for limits in downloader.limits] == [64, 64]
+
+
+def test_a_read_without_limits_gives_the_downloader_none():
+    downloader = LimitedDownloader()
+    client = Client(
+        Config(server_address="unused:1"),
+        transport=StubTransport(range_answer),
+        downloader=downloader,
+    )
+
+    list(client.iter_raw_block_payloads(1, 3))
+
+    assert downloader.limits == [{}]
+
+
+def test_the_timeout_of_an_iterator_starts_at_the_call(deployment):
+    deployment.server.add_block(4)
+    payloads = deployment.client().iter_raw_block_payloads(4, 5, timeout=0.05)
+
+    time.sleep(0.1)
+
+    with pytest.raises(CallTimeoutError):
+        next(payloads)
+    assert deployment.server.calls == []
+
+
+@pytest.mark.parametrize("read_source", [DEFAULT, SINGLE_BLOCK])
+def test_a_timeout_cuts_a_wait_on_the_store_short(deployment, read_source):
+    deployment.server.add_block(5)
+    deployment.storage.delay = 0.6
+    client = deployment.client()
+    before = time.monotonic()
+
+    with pytest.raises(CallTimeoutError, match="a block file download did not finish in time"):
+        client.get_block(5, read_source=read_source, timeout=0.15)
+
+    assert time.monotonic() - before < 0.5
+    # Nothing more was tried: no second attempt, and no other source.
+    assert len(deployment.server.calls_to("GetBlockFile")) == 1
+    assert deployment.sleeps == []
+
+
+def test_a_timeout_stops_a_range_that_is_under_way(deployment):
+    for height in range(20, 24):
+        deployment.server.add_block(height)
+    deployment.storage.delay = 0.6
+    payloads = deployment.client(num_workers=1).iter_raw_block_payloads(20, 24, timeout=0.15)
+
+    with pytest.raises(CallTimeoutError):
+        list(payloads)
+
+    assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 1
+
+
+class _SlowResponse:
+    """A streamed response whose body arrives one slow piece at a time."""
+
+    def __init__(self) -> None:
+        self.pieces_read = 0
+
+    def iter_content(self, chunk_size: int):
+        while True:
+            time.sleep(0.03)
+            self.pieces_read += 1
+            yield b"x" * chunk_size
+
+
+def test_a_timeout_stops_a_body_that_arrives_slowly():
+    response = _SlowResponse()
+    limits = downloader_module._Limits(deadline=time.monotonic() + 0.1)
+
+    with pytest.raises(CallTimeoutError):
+        downloader_module._read_at_most(response, 10**9, limits)
+
+    assert 2 <= response.pieces_read <= 5
+
+
+def test_a_body_is_read_in_smaller_pieces_when_there_is_a_deadline(monkeypatch):
+    asked: list[int] = []
+
+    class Response:
+        def iter_content(self, chunk_size: int):
+            asked.append(chunk_size)
+            yield b"x"
+
+    downloader_module._read_at_most(Response(), 10)
+    limits = downloader_module._Limits(deadline=time.monotonic() + 60)
+    downloader_module._read_at_most(Response(), 10, limits)
+
+    assert asked == [1024 * 1024, 64 * 1024]
+
+
+def test_a_timeout_stops_the_retries_of_a_download(deployment):
+    deployment.server.add_block(5)
+    deployment.storage.failures["blocks/5"].extend([503] * 3)
+    # The first wait before a retry is at least 5 s: more than is left.
+    client = deployment.client(retry=RetryPolicy(attempts=4, initial_interval=10.0))
+
+    with pytest.raises(CallTimeoutError, match="the last attempt failed with status 503"):
+        client.get_block(5, read_source=SINGLE_BLOCK, timeout=2)
+
+    assert len(deployment.storage.requests_for("blocks/5")) == 1
+    assert deployment.sleeps == []
+
+
+def test_a_download_waiting_behind_others_stops_at_the_deadline(deployment):
+    deployment.server.add_block(5)
+    deployment.server.add_block(6)
+    deployment.storage.delay = 0.6
+    client = deployment.client(num_workers=1)
+    files = client.get_block_files_by_range(5, 7, read_source=SINGLE_BLOCK)
+    downloader = BlockDownloader(deployment.config(num_workers=1))
+    # Another caller's download, with no deadline, holds the only worker.
+    other = threading.Thread(target=downloader.download, args=(files[0],))
+    other.start()
+    time.sleep(0.1)
+    before = time.monotonic()
+
+    try:
+        with pytest.raises(CallTimeoutError):
+            downloader.download(files[1], deadline=time.monotonic() + 0.1)
+        waited = time.monotonic() - before
+        other.join()
+    finally:
+        downloader.close()
+
+    assert waited < 0.4
+    # The queued download never started.
+    assert deployment.storage.requests_for("blocks/6") == []
+
+
+@pytest.mark.parametrize("method", ["get_block", "get_blocks_by_range"])
+@pytest.mark.parametrize(
+    ("status", "dead_link_wait", "waits"),
+    [(400, 15.0, [15.0, 30.0]), (400, 0.0, []), (403, 15.0, [])],
+)
+def test_a_link_that_never_worked_waits_before_a_new_one(
+    deployment, method, status, dead_link_wait, waits
+):
+    deployment.server.add_block(5)
+    deployment.storage.expired.add("s1")
+    deployment.storage.expired_status = status
+    client = deployment.client(dead_link_wait=dead_link_wait)
+
+    with pytest.raises(DownloadError) as raised:
+        getattr(client, method)(5, read_source=SINGLE_BLOCK)
+
+    assert raised.value.status_code == status
+    # A wait before the second and the third link, and none after the last.
+    assert deployment.sleeps == waits
+
+
+def test_the_wait_for_a_new_link_starts_over_after_a_block_arrives():
+    class OneBlockThenDead(LimitedDownloader):
+        def iter_download(self, block_files, **limits):
+            yield b""
+            raise DownloadError("refused", status_code=400)
+
+    sleeps: list[float] = []
+    client = Client(
+        Config(server_address="unused:1"),
+        transport=StubTransport(range_answer),
+        downloader=OneBlockThenDead(),
+        sleep=sleeps.append,
+    )
+
+    list(client.iter_raw_block_payloads(10, 14, read_source=SINGLE_BLOCK))
+
+    assert sleeps == [15.0, 15.0, 15.0, 15.0]
+
+
+@pytest.mark.parametrize("method", ["get_block", "get_blocks_by_range"])
+def test_a_timeout_stops_the_wait_for_a_new_link(deployment, method):
+    deployment.server.add_block(5)
+    deployment.storage.expired.add("s1")
+    deployment.storage.expired_status = 400
+    deployment.storage.error_body = STORE_REFUSAL
+
+    with pytest.raises(CallTimeoutError) as raised:
+        getattr(deployment.client(), method)(5, timeout=10)
+
+    assert "its link was refused (400 ExpiredToken)" in str(raised.value)
+    assert "secret" not in str(raised.value)
+    assert deployment.sleeps == []
+    # No new link was asked for, from this source or another.
+    assert len(deployment.server.calls) == 1
+
+
+def test_every_call_that_downloads_takes_a_size_limit(deployment):
+    deployment.server.add_block(4, compression=api_pb2.NONE, size=4096)
+    deployment.server.transactions["0xabc"] = [4]
+    client = deployment.client()
+
+    for call in downloading_calls(client, max_response_bytes=10_000):
+        call()
+    for call in downloading_calls(client, max_response_bytes=1000):
+        with pytest.raises(ResponseTooLargeError):
+            call()
+
+
+@pytest.mark.parametrize("read_source", [DEFAULT, SINGLE_BLOCK])
+def test_an_object_above_the_size_limit_is_read_no_further_and_not_tried_again(
+    deployment, read_source
+):
+    deployment.server.add_block(5, compression=api_pb2.NONE, size=4096)
+    client = deployment.client()
+
+    with pytest.raises(ResponseTooLargeError, match="longer than the 1000 bytes allowed") as raised:
+        client.get_block(5, read_source=read_source, max_response_bytes=1000)
+
+    assert isinstance(raised.value, DownloadError)
+    assert "sig=" not in str(raised.value)
+    assert len(deployment.storage.requests_for("blocks/5")) == 1
+    assert len(deployment.server.calls_to("GetBlockFile")) == 1
+    assert deployment.sleeps == []
+
+
+def test_a_size_limit_is_the_size_an_object_may_just_reach(deployment):
+    deployment.server.add_block(5, compression=api_pb2.NONE, size=4096)
+    stored = len(deployment.storage.objects["blocks/5"])
+    client = deployment.client()
+
+    assert client.get_block(5, max_response_bytes=stored) == make_block(5, 4096)
+    with pytest.raises(ResponseTooLargeError):
+        client.get_block(5, max_response_bytes=stored - 1)
+
+
+def test_a_chunk_above_the_size_limit_is_refused_before_it_is_asked_for(deployment):
+    deployment.server.add_consolidated("zstd")
+    chunk = cscb.parse_index(deployment.storage.objects[CONSOLIDATED_OBJECT]).chunks[1]
+    client = deployment.client()
+    # Reads the index and the first chunk, and keeps the index.
+    client.get_block(1000)
+    requests = len(deployment.storage.requests)
+
+    with pytest.raises(ResponseTooLargeError, match="is more than the") as raised:
+        client.get_block(1004, max_response_bytes=chunk.compressed_length - 1)
+
+    assert "sig=" not in str(raised.value)
+    assert len(deployment.storage.requests) == requests
+    # The single-block object of 1004 is small enough, but is not tried.
+    assert [r.read_source for r in deployment.server.calls_to("GetBlockFile")] == [DEFAULT] * 2
+
+    block = client.get_block(1004, max_response_bytes=chunk.compressed_length)
+    assert block.metadata.height == 1004
+
+
+def test_a_size_limit_below_the_index_read_refuses_a_consolidated_object(deployment):
+    deployment.server.add_consolidated("zstd")
+
+    with pytest.raises(ResponseTooLargeError):
+        deployment.client().get_block(1000, max_response_bytes=cscb.INITIAL_INDEX_READ_SIZE - 1)
+
+    assert deployment.storage.requests == []
+
+
+@pytest.mark.parametrize("max_response_bytes", [0, -1, 1.5, "64", True])
+def test_a_size_limit_that_is_not_a_positive_number_of_bytes_is_refused(
+    deployment, max_response_bytes
+):
+    client = deployment.client()
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        for call in downloading_calls(client, max_response_bytes=max_response_bytes):
+            with pytest.raises(ConfigError, match="max_response_bytes must be a positive number"):
+                call()
+        with pytest.raises(ConfigError, match="max_response_bytes must be a positive number"):
+            downloader.iter_download([], max_response_bytes=max_response_bytes)
+    finally:
+        downloader.close()
+
+    assert deployment.server.calls == []
+
+
+def test_a_client_does_not_close_a_downloader_it_was_given():
+    downloader = LimitedDownloader()
+    client = Client(
+        Config(server_address="unused:1"),
+        transport=StubTransport(range_answer),
+        downloader=downloader,
+    )
+
+    client.close()
+
+    assert not downloader.closed
