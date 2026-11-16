@@ -1957,7 +1957,21 @@ def test_a_height_may_be_any_integer_type():
     assert [raw.block_file.height for raw in payloads] == [7]
 
 
-@pytest.mark.parametrize("height", [-1, 1.5, "7", True, None, 2**64, _Integer(-3)])
+def test_the_largest_height_is_one_whose_range_end_still_fits_a_request(deployment):
+    largest = 2**64 - 2
+    client = deployment.client()
+
+    # The server is asked, and answers that it has no such block.
+    with pytest.raises(RequestError):
+        client.get_blocks_by_heights([largest], read_source=SINGLE_BLOCK)
+
+    (asked,) = deployment.server.calls_to("GetBlockFilesByRange")
+    assert (asked.start_height, asked.end_height) == (largest, 2**64 - 1)
+
+
+@pytest.mark.parametrize(
+    "height", [-1, 1.5, "7", True, None, 2**64 - 1, 2**64, _Integer(-3), _Integer(2**64 - 1)]
+)
 def test_a_height_that_is_not_a_whole_number_is_refused_at_the_call(height):
     transport = StubTransport(range_answer)
 

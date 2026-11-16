@@ -38,8 +38,9 @@ T = TypeVar("T")
 # The server refuses a request for more block files than this.
 MAX_BLOCK_FILES_PER_REQUEST = 1000
 
-# A height is a 64-bit number in a request.
-_MAX_HEIGHT = 2**64 - 1
+# A height is a 64-bit number in a request. A block is asked for as the range
+# that ends one after it, and that end has to fit as well.
+_MAX_HEIGHT = 2**64 - 2
 
 # Storage refuses a signed link with 400 or 403. The client then asks the
 # server for fresh links. It gives up after this many refusals in a row.
@@ -791,7 +792,9 @@ def _heights(heights: Iterable[int], deadline: float | None = None) -> list[int]
         except TypeError:
             number = -1
         if not 0 <= number <= _MAX_HEIGHT:
-            raise ConfigError(f"a height must be a whole number, 0 or more, got {height!r}")
+            raise ConfigError(
+                f"a height must be a whole number from 0 to {_MAX_HEIGHT}, got {height!r}"
+            )
         wanted.add(number)
     return sorted(wanted)
 
