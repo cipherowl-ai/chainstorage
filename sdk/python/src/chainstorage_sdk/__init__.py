@@ -27,11 +27,12 @@ from chainstorage_sdk.errors import (
     DownloadError,
     NotFoundError,
     RequestError,
+    ResponseTooLargeError,
 )
 from chainstorage_sdk.retry import RetryPolicy
 from chainstorage_sdk.session import Session
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "BlockFormatError",
@@ -45,6 +46,7 @@ __all__ = [
     "NotFoundError",
     "RawBlockPayload",
     "RequestError",
+    "ResponseTooLargeError",
     "RetryPolicy",
     "Session",
     "StreamingConfiguration",

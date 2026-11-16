@@ -41,6 +41,11 @@ class Config:
 
     ``http_timeout``: seconds allowed for one block file request.
 
+    ``dead_link_wait``: seconds to wait before asking for a new link after
+    storage answered 400 to a link the server had just issued. The second
+    wait in a row is twice as long. 0 does not wait. A call whose ``timeout``
+    leaves less time than the wait raises ``CallTimeoutError`` at once.
+
     ``num_workers``: how many block files are downloaded at once.
 
     ``chunk_cache_bytes``: how much decompressed data of consolidated files
@@ -59,6 +64,7 @@ class Config:
     transport: str = TRANSPORT_GRPC
     client_timeout: float = 2.0
     http_timeout: float = 30.0
+    dead_link_wait: float = 15.0
     num_workers: int = 10
     chunk_cache_bytes: int = 128 * 1024 * 1024
     retry: RetryPolicy = field(default_factory=RetryPolicy)
@@ -74,6 +80,8 @@ class Config:
             # A timeout without end is not one the connection can be given.
             if not math.isfinite(timeout) or timeout <= 0:
                 raise ConfigError("timeouts must be positive")
+        if not math.isfinite(self.dead_link_wait) or self.dead_link_wait < 0:
+            raise ConfigError("dead_link_wait must not be negative")
         if self.num_workers < 1:
             raise ConfigError("num_workers must be at least 1")
         if self.chunk_cache_bytes < 0:

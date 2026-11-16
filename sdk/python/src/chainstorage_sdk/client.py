@@ -10,8 +10,9 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+import operator
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 
@@ -24,7 +25,9 @@ from chainstorage_sdk.errors import (
     DownloadError,
     NotFoundError,
     RequestError,
+    ResponseTooLargeError,
 )
+from chainstorage_sdk.retry import time_left
 from chainstorage_sdk.transport import EventStream, Transport, new_transport
 from coinbase.chainstorage import api_pb2, blockchain_pb2
 
@@ -35,10 +38,19 @@ T = TypeVar("T")
 # The server refuses a request for more block files than this.
 MAX_BLOCK_FILES_PER_REQUEST = 1000
 
-# A signed link that has expired answers 400 or 403. The client then asks the
+# A height is a 64-bit number in a request. A block is asked for as the range
+# that ends one after it, and that end has to fit as well.
+_MAX_HEIGHT = 2**64 - 2
+
+# Storage refuses a signed link with 400 or 403. The client then asks the
 # server for fresh links. It gives up after this many refusals in a row.
 _LINK_ATTEMPTS = 3
 _EXPIRED_LINK_STATUSES = (400, 403)
+# A link that has expired answers 403, and its replacement works at once. A
+# 400 is a link that never worked: the server signed it with credentials that
+# were about to expire, and needs a moment to get new ones
+# (Config.dead_link_wait).
+_DEAD_LINK_STATUS = 400
 
 _SOURCES_WITH_FALLBACK = (
     api_pb2.BLOCK_READ_SOURCE_DEFAULT,
@@ -63,6 +75,28 @@ class RawBlockPayload:
             f"RawBlockPayload(height={self.block_file.height}, "
             f"hash={self.block_file.hash!r}, bytes={len(self.payload)})"
         )
+
+
+@dataclass(frozen=True)
+class _Limits:
+    """What the caller allows one read.
+
+    ``deadline``: the ``time.monotonic()`` value the read must be done by.
+    ``max_response_bytes``: the most bytes one request to storage may return.
+    """
+
+    deadline: float | None = None
+    max_response_bytes: int | None = None
+
+    def for_download(self) -> dict[str, Any]:
+        """The limits as arguments of a download. Without limits there are
+        none, so a downloader written before limits existed still works."""
+        if self == _NO_LIMITS:
+            return {}
+        return {"deadline": self.deadline, "max_response_bytes": self.max_response_bytes}
+
+
+_NO_LIMITS = _Limits()
 
 
 @dataclass(frozen=True)
@@ -95,15 +129,30 @@ class Client:
     """Reads blocks and chain events from one ChainStorage deployment.
 
     A client holds a connection and a download pool. Close it when done, or
-    use it as a context manager. It may be shared between threads.
+    use it as a context manager. It may be shared between threads. A
+    ``downloader`` that was passed in is not closed with the client: it is
+    the caller's, and may serve other clients.
 
-    The methods that only ask the server, and download nothing, take
-    ``timeout``: a limit in seconds for the whole call, retries included.
-    When it runs out the call raises ``CallTimeoutError``. Without it, each
-    attempt is limited by ``client_timeout`` and the retries by ``retry``.
-    With little time left, a retry is not made when the wait before it would
-    not end in time. Over REST the limit is looser: an attempt whose answer
-    arrives slowly is not cut off, but its answer is not returned.
+    Every method but ``stream_chain_events`` takes ``timeout``: a limit in
+    seconds for the whole call, with its downloads, retries, new links and
+    waits. When it runs out the call raises ``CallTimeoutError``, and nothing
+    more is tried. Without it, each attempt is limited by ``client_timeout``
+    or ``http_timeout``, and the retries by ``retry``.
+
+    - With little time left, a retry is not made when the wait before it
+      would not end in time.
+    - Over REST, and while a block file downloads, the limit is looser: an
+      answer that keeps arriving slowly can run past it, and is then not
+      returned.
+    - For the methods that return an iterator, the time starts when the
+      method is called, so it includes the time the caller spends between
+      two blocks.
+
+    The methods that download take ``max_response_bytes``: the most bytes one
+    request to storage may return (a single-block object, a read of the index
+    of a consolidated object, or one of its chunks). A larger one raises
+    ``ResponseTooLargeError``, and nothing more is tried. See
+    ``chainstorage_sdk.downloader`` for the details.
     """
 
     def __init__(
@@ -118,6 +167,8 @@ class Client:
         self._sleep = sleep
         self._transport = transport or new_transport(config, sleep=sleep)
         self._transport_takes_deadline = _takes_deadline(self._transport)
+        # A downloader that was passed in is the caller's to close.
+        self._owns_downloader = downloader is None
         self._downloader = downloader or BlockDownloader(config, sleep=sleep)
 
     def __enter__(self) -> Client:
@@ -127,7 +178,8 @@ class Client:
         self.close()
 
     def close(self) -> None:
-        self._downloader.close()
+        if self._owns_downloader:
+            self._downloader.close()
         self._transport.close()
 
     @property
@@ -212,10 +264,19 @@ class Client:
         *,
         tag: int | None = None,
         read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> blockchain_pb2.Block:
         """Returns one block. Pass ``hash`` to read a block that a
         reorganization has since replaced at that height."""
-        raw = self.open_raw_block_payload(height, hash, tag=tag, read_source=read_source)
+        raw = self.open_raw_block_payload(
+            height,
+            hash,
+            tag=tag,
+            read_source=read_source,
+            timeout=timeout,
+            max_response_bytes=max_response_bytes,
+        )
         return self.parse_raw_block(raw)
 
     def get_blocks_by_range(
@@ -225,6 +286,8 @@ class Client:
         *,
         tag: int | None = None,
         read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> list[blockchain_pb2.Block]:
         """Returns the blocks in ``[start_height, end_height)`` on the current
         chain. ``end_height == 0`` means one block.
@@ -235,7 +298,38 @@ class Client:
         return [
             self.parse_raw_block(raw)
             for raw in self.iter_raw_block_payloads(
-                start_height, end_height, tag=tag, read_source=read_source
+                start_height,
+                end_height,
+                tag=tag,
+                read_source=read_source,
+                timeout=timeout,
+                max_response_bytes=max_response_bytes,
+            )
+        ]
+
+    def get_blocks_by_heights(
+        self,
+        heights: Iterable[int],
+        *,
+        tag: int | None = None,
+        read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> list[blockchain_pb2.Block]:
+        """Returns the blocks at ``heights`` on the current chain, in height
+        order. A height given twice is returned once.
+
+        Every block is held in memory at once; for many heights, iterate
+        ``iter_raw_block_payloads_by_heights`` instead.
+        """
+        return [
+            self.parse_raw_block(raw)
+            for raw in self.iter_raw_block_payloads_by_heights(
+                heights,
+                tag=tag,
+                read_source=read_source,
+                timeout=timeout,
+                max_response_bytes=max_response_bytes,
             )
         ]
 
@@ -246,24 +340,31 @@ class Client:
         *,
         tag: int | None = None,
         read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> RawBlockPayload:
         """Returns one block as stored, without parsing it."""
-        resolved_tag = self._tag(tag)
+        return self._open_raw_block_payload(
+            height, hash, self._tag(tag), read_source, _limits(timeout, max_response_bytes)
+        )
 
+    def _open_raw_block_payload(
+        self, height: int, hash: str, tag: int, read_source: int, limits: _Limits
+    ) -> RawBlockPayload:
         def read(source: int) -> RawBlockPayload:
             request = api_pb2.GetBlockFileRequest(
-                tag=resolved_tag, height=height, hash=hash, read_source=source
+                tag=tag, height=height, hash=hash, read_source=source
             )
             for attempt in range(1, _LINK_ATTEMPTS + 1):
-                block_file = self._call("GetBlockFile", request, self._short_timeout).file
+                block_file = self._call(
+                    "GetBlockFile", request, self._short_timeout, limits.deadline
+                ).file
                 try:
-                    payload = self._downloader.download(block_file)
+                    payload = self._downloader.download(block_file, **limits.for_download())
                 except DownloadError as exc:
                     if not _is_expired_link(exc) or attempt == _LINK_ATTEMPTS:
                         raise
-                    logger.info(
-                        "a block file link was refused (%s); asking for a fresh one", _refusal(exc)
-                    )
+                    self._before_fresh_links(exc, attempt, limits, "asking for a fresh one")
                     continue
                 return RawBlockPayload(block_file=block_file, payload=payload)
             raise AssertionError("unreachable")
@@ -277,6 +378,8 @@ class Client:
         *,
         tag: int | None = None,
         read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> Iterator[RawBlockPayload]:
         """Yields the blocks in ``[start_height, end_height)`` as stored, in
         height order, without parsing them.
@@ -289,32 +392,77 @@ class Client:
         chain, and the client checks that consecutive requests connect.
         """
         start_height, end_height = _range(start_height, end_height)
-        return self._iter_raw_block_payloads(start_height, end_height, self._tag(tag), read_source)
+        limits = _limits(timeout, max_response_bytes)
+        return self._iter_raw_block_payloads(
+            start_height, end_height, self._tag(tag), read_source, limits
+        )
 
     def _iter_raw_block_payloads(
-        self, start_height: int, end_height: int, tag: int, read_source: int
+        self, start_height: int, end_height: int, tag: int, read_source: int, limits: _Limits
     ) -> Iterator[RawBlockPayload]:
         previous: api_pb2.BlockFile | None = None
         for first in range(start_height, end_height, MAX_BLOCK_FILES_PER_REQUEST):
             last = min(first + MAX_BLOCK_FILES_PER_REQUEST, end_height)
-            source, files = self._page(tag, first, last, read_source)
+            source, files = self._page(tag, first, last, read_source, limits)
             previous = _check_connects(previous, files)
-            yield from self._download_page(tag, files, source)
+            yield from self._download_page(tag, files, source, limits)
+
+    def iter_raw_block_payloads_by_heights(
+        self,
+        heights: Iterable[int],
+        *,
+        tag: int | None = None,
+        read_source: int = api_pb2.BLOCK_READ_SOURCE_DEFAULT,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
+    ) -> Iterator[RawBlockPayload]:
+        """Yields the blocks at ``heights`` as stored, in height order, without
+        parsing them. A height given twice is yielded once. A skipped block
+        is yielded with an empty payload.
+
+        Blocks are downloaded ahead of the caller, a bounded number at a time,
+        so many heights never have to fit in memory.
+
+        The server is asked for a stretch of up to 1,000 heights at a time,
+        just before its blocks are downloaded, and only the wanted ones are
+        downloaded. Each stretch describes one consistent chain. Heights that
+        lie far apart are asked for separately, so a reorganization between
+        two requests is not noticed here as it is in a range.
+
+        A height the server does not have fails the read when its stretch is
+        reached. The blocks of earlier stretches have been yielded by then.
+
+        ``heights`` is read to its end before this method returns. With a
+        ``timeout``, the time it takes to arrive counts, and the method
+        raises ``CallTimeoutError`` when it runs out meanwhile.
+        """
+        # The limits first: the clock starts before the heights are read.
+        limits = _limits(timeout, max_response_bytes)
+        wanted = _heights(heights, limits.deadline)
+        return self._iter_raw_block_payloads_by_heights(wanted, self._tag(tag), read_source, limits)
+
+    def _iter_raw_block_payloads_by_heights(
+        self, heights: list[int], tag: int, read_source: int, limits: _Limits
+    ) -> Iterator[RawBlockPayload]:
+        for stretch in _stretches(heights):
+            source, files = self._page(tag, stretch[0], stretch[-1] + 1, read_source, limits)
+            yield from self._download_page(tag, _at(files, stretch), source, limits)
 
     def _page(
-        self, tag: int, start_height: int, end_height: int, read_source: int
+        self, tag: int, start_height: int, end_height: int, read_source: int, limits: _Limits
     ) -> tuple[int, list[api_pb2.BlockFile]]:
         """Returns the block files of one request, and the source they are for."""
 
         def read(source: int) -> tuple[int, list[api_pb2.BlockFile]]:
-            return source, self._block_files(tag, start_height, end_height, source)
+            files = self._block_files(tag, start_height, end_height, source, limits.deadline)
+            return source, files
 
         return self._with_fallback(read, read_source)
 
     def _download_page(
-        self, tag: int, files: list[api_pb2.BlockFile], source: int
+        self, tag: int, files: list[api_pb2.BlockFile], source: int, limits: _Limits
     ) -> Iterator[RawBlockPayload]:
-        """Downloads one request's block files, in order.
+        """Downloads block files of one request, in order.
 
         A failure does not start over: the blocks not yet yielded are asked
         for again, with fresh links when a link has expired, and from
@@ -325,7 +473,8 @@ class Client:
         while done < len(files):
             progress = done
             try:
-                for payload in self._downloader.iter_download(files[done:]):
+                downloads = self._downloader.iter_download(files[done:], **limits.for_download())
+                for payload in downloads:
                     yield RawBlockPayload(block_file=files[done], payload=payload)
                     done += 1
             except DownloadError as exc:
@@ -338,30 +487,51 @@ class Client:
                         source = self._fallback_source(source, exc)
                         refusals = 0
                     else:
-                        logger.info(
-                            "a block file link was refused (%s); asking for fresh ones",
-                            _refusal(exc),
-                        )
+                        self._before_fresh_links(exc, refusals, limits, "asking for fresh ones")
             except ChainStorageError as exc:
                 source = self._fallback_source(source, exc)
             else:
                 return
             if done < len(files):
-                files[done:] = self._same_blocks(files[done:], tag, source)
+                files[done:] = self._same_blocks(files[done:], tag, source, limits)
+
+    def _before_fresh_links(
+        self, exc: DownloadError, refusals: int, limits: _Limits, asking: str
+    ) -> None:
+        """Logs a refused link and, for one that never worked, waits before
+        new links are asked for. ``refusals`` counts the refusals in a row."""
+        # A warning, like a retry: refused links say how the server's signing
+        # is doing, and each one can cost a wait.
+        logger.warning("a block file link was refused (%s); %s", _refusal(exc), asking)
+        if exc.status_code != _DEAD_LINK_STATUS:
+            return
+        wait = self._config.dead_link_wait * refusals
+        left = time_left(limits.deadline)
+        if left is not None and wait >= left:
+            raise CallTimeoutError(
+                "a block read did not finish in time; its link was refused "
+                f"({_refusal(exc)}) and the wait for a new one would not end in time",
+                code="DEADLINE_EXCEEDED",
+            ) from exc
+        if wait > 0:
+            self._sleep(wait)
 
     def _fallback_source(self, source: int, exc: ChainStorageError) -> int:
         """Returns the source to continue with after ``exc``, or raises it."""
-        if source not in _SOURCES_WITH_FALLBACK:
+        if source not in _SOURCES_WITH_FALLBACK or _is_callers_limit(exc):
             raise exc
         logger.warning("block read failed (%s); continuing from single-block objects", exc)
         return api_pb2.BLOCK_READ_SOURCE_SINGLE_BLOCK
 
     def _same_blocks(
-        self, files: Sequence[api_pb2.BlockFile], tag: int, source: int
+        self, files: Sequence[api_pb2.BlockFile], tag: int, source: int, limits: _Limits
     ) -> list[api_pb2.BlockFile]:
         """Asks again for the block files of ``files`` and checks that they
         still describe the same blocks."""
-        fresh = self._block_files(tag, files[0].height, files[-1].height + 1, source)
+        stretch = [block_file.height for block_file in files]
+        fresh = _at(
+            self._block_files(tag, stretch[0], stretch[-1] + 1, source, limits.deadline), stretch
+        )
         for old, new in zip(files, fresh, strict=True):
             if (old.height, old.hash, old.skipped) != (new.height, new.hash, new.skipped):
                 raise RequestError(
@@ -375,28 +545,50 @@ class Client:
         return self._downloader.to_block(raw.block_file, raw.payload)
 
     def get_block_by_transaction(
-        self, transaction_hash: str, *, tag: int | None = None
+        self,
+        transaction_hash: str,
+        *,
+        tag: int | None = None,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> list[blockchain_pb2.Block]:
         """Returns the blocks that hold the transaction, or an empty list when
         the server does not know it."""
+        limits = _limits(timeout, max_response_bytes)
         request = api_pb2.GetBlockByTransactionRequest(
             tag=self._tag(tag), transaction_hash=transaction_hash
         )
         try:
-            response = self._call("GetBlockByTransaction", request, self._short_timeout)
+            response = self._call(
+                "GetBlockByTransaction", request, self._short_timeout, limits.deadline
+            )
         except NotFoundError:
             return []
         return [
-            self.get_block(block.height, block.hash, tag=block.tag) for block in response.blocks
+            self._get_block(block.height, block.hash, block.tag, limits)
+            for block in response.blocks
         ]
 
     def get_block_by_timestamp(
-        self, timestamp: int, *, tag: int | None = None
+        self,
+        timestamp: int,
+        *,
+        tag: int | None = None,
+        timeout: float | None = None,
+        max_response_bytes: int | None = None,
     ) -> blockchain_pb2.Block:
         """Returns the block the server finds for ``timestamp`` (Unix seconds)."""
+        limits = _limits(timeout, max_response_bytes)
         request = api_pb2.GetBlockByTimestampRequest(tag=self._tag(tag), timestamp=timestamp)
-        found = self._call("GetBlockByTimestamp", request, self._short_timeout)
-        return self.get_block(found.height, found.hash, tag=found.tag)
+        found = self._call("GetBlockByTimestamp", request, self._short_timeout, limits.deadline)
+        return self._get_block(found.height, found.hash, found.tag, limits)
+
+    def _get_block(self, height: int, hash: str, tag: int, limits: _Limits) -> blockchain_pb2.Block:
+        """Returns one block from the default source, within ``limits``."""
+        raw = self._open_raw_block_payload(
+            height, hash, tag, api_pb2.BLOCK_READ_SOURCE_DEFAULT, limits
+        )
+        return self.parse_raw_block(raw)
 
     # -- chain events -----------------------------------------------------
 
@@ -563,7 +755,7 @@ class Client:
         try:
             return read(read_source)
         except ChainStorageError as exc:
-            if read_source not in _SOURCES_WITH_FALLBACK:
+            if read_source not in _SOURCES_WITH_FALLBACK or _is_callers_limit(exc):
                 raise
             logger.warning("block read failed (%s); retrying from single-block objects", exc)
             try:
@@ -579,6 +771,72 @@ def _range(start_height: int, end_height: int) -> tuple[int, int]:
     if end_height <= start_height:
         raise ConfigError(f"invalid range: start_height={start_height} end_height={end_height}")
     return start_height, end_height
+
+
+def _heights(heights: Iterable[int], deadline: float | None = None) -> list[int]:
+    """Returns the heights a caller asked for, each once, in order.
+
+    They can come from a generator that takes its time: no further height is
+    taken once ``deadline`` has passed.
+    """
+    wanted = set()
+    for height in heights:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise CallTimeoutError(
+                "a block read did not start in time: its heights were still arriving",
+                code="DEADLINE_EXCEEDED",
+            )
+        try:
+            # Any integer type, such as a NumPy one, but not True or False.
+            number = -1 if isinstance(height, bool) else operator.index(height)
+        except TypeError:
+            number = -1
+        if not 0 <= number <= _MAX_HEIGHT:
+            raise ConfigError(
+                f"a height must be a whole number from 0 to {_MAX_HEIGHT}, got {height!r}"
+            )
+        wanted.add(number)
+    return sorted(wanted)
+
+
+def _stretches(heights: Sequence[int]) -> Iterator[list[int]]:
+    """Splits sorted heights into the stretches the server is asked for: each
+    spans no more heights than one request may."""
+    stretch: list[int] = []
+    for height in heights:
+        if stretch and height - stretch[0] >= MAX_BLOCK_FILES_PER_REQUEST:
+            yield stretch
+            stretch = []
+        stretch.append(height)
+    if stretch:
+        yield stretch
+
+
+def _at(files: Sequence[api_pb2.BlockFile], heights: Sequence[int]) -> list[api_pb2.BlockFile]:
+    """Returns the block files at ``heights`` out of those of one request."""
+    if len(files) == len(heights):
+        return list(files)
+    wanted = set(heights)
+    return [block_file for block_file in files if block_file.height in wanted]
+
+
+def _limits(timeout: float | None, max_response_bytes: int | None) -> _Limits:
+    """Turns what a caller allows a read into the limits it runs under."""
+    if max_response_bytes is not None and (
+        isinstance(max_response_bytes, bool)
+        or not isinstance(max_response_bytes, int)
+        or max_response_bytes < 1
+    ):
+        raise ConfigError(
+            f"max_response_bytes must be a positive number of bytes, got {max_response_bytes!r}"
+        )
+    return _Limits(_deadline(timeout), max_response_bytes)
+
+
+def _is_callers_limit(exc: ChainStorageError) -> bool:
+    """Whether a read stopped at a limit the caller set. The limit is for the
+    read, whatever it reads from, so nothing more is tried."""
+    return isinstance(exc, (CallTimeoutError, ResponseTooLargeError))
 
 
 def _deadline(timeout: float | None) -> float | None:

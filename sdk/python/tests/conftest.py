@@ -98,7 +98,11 @@ class FakeStorage:
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    # A client that has read as much as it wants hangs up.
+                    pass
 
             def log_message(self, *args: object) -> None:
                 pass

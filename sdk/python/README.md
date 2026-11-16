@@ -42,6 +42,14 @@ with Client(config) as client:
     for raw in client.iter_raw_block_payloads(height - 10_000, height):
         handle(raw.block_file.height, raw.payload)  # or client.parse_raw_block(raw)
 
+    # Blocks at chosen heights, in height order. Only these are downloaded.
+    blocks = client.get_blocks_by_heights([height - 5_000, height - 40, height])
+    for raw in client.iter_raw_block_payloads_by_heights(wanted_heights):
+        handle(raw.block_file.height, raw.payload)
+
+    # A read with limits: 60 s for the whole call, 64 MiB for one download.
+    block = client.get_block(height, timeout=60, max_response_bytes=64 * 1024 * 1024)
+
     # Where blocks are stored, without downloading them.
     latest = client.get_latest_block_info()  # tag, hash, parent hash, height, time
     file = client.get_block_file(height)
@@ -69,7 +77,9 @@ with Client(config) as client:
 ### What the client does for you
 
 - **Parallel downloads.** Block files are downloaded `num_workers` at a time
-  (10 by default) and handed over in height order.
+  (10 by default) and handed over in height order. A `BlockDownloader` passed
+  to `Client(..., downloader=...)` is used in place of the client's own, and
+  is not closed with the client.
 - **Bounded memory.** A range is downloaded a little ahead of the caller, not
   all at once. About 256 MB of decompressed data may be on its way at a
   time; while a chunk is being cut into blocks it is held twice.
@@ -84,22 +94,62 @@ with Client(config) as client:
   `chainstorage_sdk.retry`.
 - **Time limits.** `client_timeout` (2 s by default) limits one attempt of a
   call; calls that return more get longer (`2t + 1` and `4t + 3` seconds).
-  The calls that download nothing also take `timeout`, a limit in seconds
-  for the whole call with its retries: `get_latest_block`,
-  `get_latest_block_info`, `get_block_file`, `get_block_files_by_range`,
-  `get_chain_events` and `get_chain_metadata`. When it runs out, the call
-  raises `CallTimeoutError`. Two limits of the limit:
+  `http_timeout` (30 s by default) limits each wait on a download. Every
+  method but `stream_chain_events` also takes `timeout`, a limit in seconds
+  for the whole call: its requests to the server, its downloads, their
+  retries, new links and waits. When it runs out, the call raises
+  `CallTimeoutError` and nothing more is tried. The limits of the limit:
   - With little time left, a retry is not made when the wait before it would
     not end in time.
-  - Over REST, the limit is looser than over gRPC. No attempt starts after
-    it, and each wait on the connection is cut to the time left. But an
-    attempt whose answer keeps arriving slowly is not cut off: the call then
-    ends late, and raises `CallTimeoutError` in place of the answer.
+  - Over REST, and while a block file downloads, the limit is looser than
+    for a gRPC call. No attempt starts after it, and each wait on the
+    connection is cut to the time left. But an answer that keeps arriving
+    slowly is not cut off at once: a REST call ends late, and a download
+    ends when the piece it is reading (64 KiB) is complete. Both then raise
+    `CallTimeoutError` in place of the answer.
+  - For `iter_raw_block_payloads` and `iter_raw_block_payloads_by_heights`,
+    the time starts when the method is called. It includes the time the
+    caller spends between two blocks: once it has run out, the next block
+    raises, even one that was already downloaded. It also includes the time
+    the heights take to arrive, when they come from a generator: the method
+    itself raises if it runs out before they are all there.
+- **Size limit.** The methods that download take `max_response_bytes`: the
+  most bytes one request to storage may return. That is a single-block
+  object, one of the two reads of a consolidated file's index (its first
+  64 KiB, then the rest), or one of its chunks. A read that asks for more is
+  refused before it is sent, and any other stops at the limit. Both raise
+  `ResponseTooLargeError`, and nothing more is tried. Things to know:
+  - A limit below 64 KiB refuses every consolidated file.
+  - It limits what is fetched, not the decompressed size, which the file
+    format limits to 1 GiB per block or chunk.
+  - A block whose index and chunk the client still holds needs no request,
+    and is returned whatever the limit.
+  - The body of a refusal is read within the limit too. Under a limit of
+    less than 2 KiB, `error_code` can be empty.
+  - Reading stops with the piece that passes the limit, and pieces are
+    sized to end there. A body sent with its length is read a few bytes
+    past the limit at most. A body the store sends in chunks of its own can
+    be read up to one piece past it: 1 MiB, 64 KiB with a `timeout`, and
+    never more than the limit itself.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.
-- **Expired links.** When storage refuses a signed link, the client asks the
-  server for a fresh one.
+- **Refused links.** When storage refuses a signed link, the client asks the
+  server for a fresh one. After three refusals in a row it gives up on that
+  source. A link refused with 403 has expired, and its replacement works at
+  once. One refused with 400 never worked: the server signed it with
+  credentials that were about to expire. The client then waits
+  `dead_link_wait` (15 s by default, twice that the second time) before it
+  asks again. So links that stay refused with 400 fail after 45 s of waits,
+  or 90 s when the read then tries single-block objects. Set
+  `dead_link_wait=0` to fail at once. A call whose `timeout` leaves less
+  time than the wait raises `CallTimeoutError` without waiting. Every
+  refused link is logged as a warning by the logger `chainstorage_sdk.client`,
+  with the status and the store's error code, and without the link.
+- **Chosen heights.** Heights are asked for in stretches of up to 1,000,
+  each just before its blocks are downloaded, so the links are fresh. The
+  server checks the chain within a stretch. Between two stretches there is
+  no such check, because the blocks between them are not read.
 - **One chain per range.** A range is requested 1,000 blocks at a time. The
   server checks the chain within each request, and the client checks that
   consecutive requests connect. If a reorganization happens in between, the
@@ -117,6 +167,7 @@ A failed call, download or check raises a `ChainStorageError`:
 | `NotFoundError` | The server has no such block, transaction or event. |
 | `CallTimeoutError` | A call did not finish within its `timeout`. It is a `RequestError` and a built-in `TimeoutError`. |
 | `DownloadError` | Fetching a block file from storage failed. `status_code` holds the HTTP status and `error_code` the store's own code, such as `ExpiredToken`, or nothing when the store gave none. |
+| `ResponseTooLargeError` | A download is larger than the `max_response_bytes` of the call. It is a `DownloadError`. |
 | `BlockFormatError` | A block file is malformed or fails a check. |
 | `ConfigError` | The configuration or an argument is invalid. |
 
@@ -138,6 +189,8 @@ signature out of its error messages and log lines, and out of the `repr` of a
 - `client_timeout` limits each attempt of a call. The Go SDK applies it to
   the whole operation, downloads included.
 - A caller limits a whole call with `timeout`. The Go SDK takes a context.
+- A caller can limit the size of a download, and can read blocks at chosen
+  heights. The Go SDK has neither.
 - One retry policy covers every call: 4 attempts from 200 ms. The Go SDK
   retries gRPC calls up to 5 times from 500 ms.
 - A call whose connection was reset is repeated: gRPC reports that as
@@ -147,7 +200,7 @@ signature out of its error messages and log lines, and out of the `repr` of a
   them internal.
 - The event stream raises an error when it fails. It does not yield an error
   value.
-- Expired links are refreshed.
+- Refused links are replaced by fresh ones.
 - A range of any length can be read, in requests of 1,000 blocks that are
   checked to connect. The Go SDK leaves ranges above the server limit to the
   caller.

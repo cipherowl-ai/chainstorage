@@ -32,12 +32,14 @@ class NotFoundError(RequestError):
 class CallTimeoutError(RequestError, TimeoutError):
     """A call did not finish within the ``timeout`` the caller gave it.
 
-    The limit covers the whole call, its retries included. One attempt that
-    runs past ``client_timeout`` is a different error: a ``RequestError``
-    that is retried.
+    The limit covers the whole call: its requests to the server, its
+    downloads, and their retries. One attempt that runs past
+    ``client_timeout`` or ``http_timeout`` is a different error, which is
+    retried.
 
-    Over gRPC the call ends when the limit does. Over REST it can end later:
-    see ``RestTransport``.
+    Over gRPC the call ends when the limit does. Over REST, and while a block
+    file downloads, it can end later: see ``RestTransport`` and
+    ``BlockDownloader``.
     """
 
 
@@ -63,6 +65,11 @@ class DownloadError(ChainStorageError):
         self.status_code = status_code
         self.error_code = error_code
         self.retryable = retryable
+
+
+class ResponseTooLargeError(DownloadError):
+    """A block file request would return, or returned, more bytes than the
+    ``max_response_bytes`` the caller allowed. It is not tried again."""
 
 
 class BlockFormatError(ChainStorageError, ValueError):
