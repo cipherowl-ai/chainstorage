@@ -133,7 +133,9 @@ with Client(config) as client:
   asks again. So links that stay refused with 400 fail after 45 s of waits,
   or 90 s when the read then tries single-block objects. Set
   `dead_link_wait=0` to fail at once. A call whose `timeout` leaves less
-  time than the wait raises `CallTimeoutError` without waiting.
+  time than the wait raises `CallTimeoutError` without waiting. Every
+  refused link is logged as a warning by the logger `chainstorage_sdk.client`,
+  with the status and the store's error code, and without the link.
 - **Chosen heights.** Heights are asked for in stretches of up to 1,000,
   each just before its blocks are downloaded, so the links are fresh. The
   server checks the chain within a stretch. Between two stretches there is

@@ -1032,8 +1032,11 @@ def test_asking_for_fresh_links_logs_the_status_and_the_stores_code(
         with pytest.raises(DownloadError):
             getattr(deployment.client(), method)(5, read_source=SINGLE_BLOCK)
 
-    refusals = [r.getMessage() for r in caplog.records if "was refused" in r.getMessage()]
-    assert refusals == [f"a block file link was refused (403 ExpiredToken); {asking}"] * 2
+    refused = [r for r in caplog.records if "was refused" in r.getMessage()]
+    assert [r.getMessage() for r in refused] == [
+        f"a block file link was refused (403 ExpiredToken); {asking}"
+    ] * 2
+    assert {r.levelname for r in refused} == {"WARNING"}
     assert "secret" not in caplog.text
 
 

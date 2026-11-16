@@ -494,7 +494,9 @@ class Client:
     ) -> None:
         """Logs a refused link and, for one that never worked, waits before
         new links are asked for. ``refusals`` counts the refusals in a row."""
-        logger.info("a block file link was refused (%s); %s", _refusal(exc), asking)
+        # A warning, like a retry: refused links say how the server's signing
+        # is doing, and each one can cost a wait.
+        logger.warning("a block file link was refused (%s); %s", _refusal(exc), asking)
         if exc.status_code != _DEAD_LINK_STATUS:
             return
         wait = self._config.dead_link_wait * refusals
