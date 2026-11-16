@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import io
 import struct
 import threading
 import time
 
 import grpc
 import pytest
+import requests
 import zstandard
 from conftest import TAG, block_hash, block_time, make_block
 
@@ -1866,6 +1868,9 @@ class LimitedDownloader(StubDownloader):
     def download(self, block_file, **limits):
         return list(self.iter_download([block_file], **limits))[0]
 
+    def to_block(self, block_file, payload):
+        return blockchain_pb2.Block()
+
     def close(self):
         self.closed = True
 
@@ -2069,6 +2074,59 @@ def test_a_call_and_its_downloads_share_one_timeout():
     assert [limits["max_response_bytes"] for limits in downloader.limits] == [64, 64]
 
 
+@pytest.mark.parametrize("method", ["get_block", "open_raw_block_payload"])
+def test_one_block_and_its_download_share_one_timeout(method):
+    def answer(method, request):
+        return api_pb2.GetBlockFileResponse(file=chain_files(4, 5)[0])
+
+    transport = DeadlineTransport(answer)
+    downloader = LimitedDownloader()
+    client = Client(Config(server_address="unused:1"), transport=transport, downloader=downloader)
+    before = time.monotonic()
+
+    getattr(client, method)(4, timeout=20, max_response_bytes=64)
+
+    (deadline,) = transport.deadlines
+    assert before + 20 <= deadline <= time.monotonic() + 20
+    assert downloader.limits == [{"deadline": deadline, "max_response_bytes": 64}]
+
+
+class _RecordingSession:
+    """Records the wait each request allows, and answers with a small object."""
+
+    def __init__(self) -> None:
+        self.timeouts: list[float] = []
+
+    def get(self, url, headers=None, timeout=None, stream=False):
+        self.timeouts.append(timeout)
+        response = requests.Response()
+        response.status_code = 200
+        response.raw = io.BytesIO(gzip.compress(make_block(5).SerializeToString()))
+        return response
+
+    def close(self):
+        pass
+
+
+def test_a_wait_on_the_store_is_cut_to_the_time_left(deployment):
+    session = _RecordingSession()
+    downloader = BlockDownloader(deployment.config(http_timeout=30.0), session=session)
+    file = api_pb2.BlockFile(height=5, file_url="http://store/blocks/5", compression=api_pb2.GZIP)
+
+    try:
+        downloader.download(file)
+        downloader.download(file, deadline=time.monotonic() + 4)
+        downloader.download(file, deadline=time.monotonic() + 400)
+    finally:
+        downloader.close()
+
+    without, short, long = session.timeouts
+    assert without == 30.0
+    assert 3 < short <= 4
+    # A deadline far away leaves the usual wait.
+    assert long == 30.0
+
+
 def test_a_read_without_limits_gives_the_downloader_none():
     downloader = LimitedDownloader()
     client = Client(
@@ -2139,7 +2197,7 @@ def test_a_timeout_stops_a_body_that_arrives_slowly():
     limits = downloader_module._Limits(deadline=time.monotonic() + 0.1)
 
     with pytest.raises(CallTimeoutError):
-        downloader_module._read_at_most(response, 10**9, limits)
+        downloader_module._read_at_most(response, 100 * 64 * 1024, limits)
 
     assert 2 <= response.pieces_read <= 5
 
@@ -2282,6 +2340,35 @@ def test_an_object_above_the_size_limit_is_read_no_further_and_not_tried_again(
     assert len(deployment.storage.requests_for("blocks/5")) == 1
     assert len(deployment.server.calls_to("GetBlockFile")) == 1
     assert deployment.sleeps == []
+
+
+@pytest.mark.parametrize("method", ["get_blocks_by_range", "get_blocks_by_heights"])
+def test_a_range_above_the_size_limit_is_not_read_from_another_source(deployment, method):
+    deployment.server.add_block(5, compression=api_pb2.NONE, size=4096)
+    wanted = (5, 6) if method == "get_blocks_by_range" else ([5],)
+
+    with pytest.raises(ResponseTooLargeError):
+        getattr(deployment.client(), method)(*wanted, max_response_bytes=1000)
+
+    assert len(deployment.storage.requests_for("blocks/5")) == 1
+    assert [r.read_source for r in deployment.server.calls_to("GetBlockFilesByRange")] == [DEFAULT]
+
+
+def test_a_range_that_runs_out_of_time_is_not_read_from_another_source():
+    class OutOfTime(LimitedDownloader):
+        def iter_download(self, block_files, **limits):
+            raise CallTimeoutError("a block file download did not finish in time")
+            yield b""
+
+    transport = StubTransport(range_answer)
+    client = Client(Config(server_address="unused:1"), transport=transport, downloader=OutOfTime())
+
+    # The time is not checked again by this stub, so only the error itself
+    # can stop the read.
+    with pytest.raises(CallTimeoutError):
+        list(client.iter_raw_block_payloads(10, 14, timeout=600))
+
+    assert [request.read_source for _, request, _ in transport.calls] == [DEFAULT]
 
 
 def test_a_size_limit_is_the_size_an_object_may_just_reach(deployment):

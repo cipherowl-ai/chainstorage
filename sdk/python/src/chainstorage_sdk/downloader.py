@@ -297,7 +297,6 @@ class BlockDownloader:
         return units
 
     def _download_single(self, block_file: api_pb2.BlockFile, limits: _Limits) -> list[bytes]:
-        _check_in_time(limits)
         # No block is larger than the largest chunk. The server does not
         # always say how long the block is; when it does not, the output may
         # still not grow past that.
@@ -321,7 +320,6 @@ class BlockDownloader:
         return [payload]
 
     def _index(self, key: str, url: str, limits: _Limits) -> cscb.Index:
-        _check_in_time(limits)
         index = self._indexes.get(key)
         if index is None:
             first = self._get_range(url, 0, cscb.INITIAL_INDEX_READ_SIZE - 1, limits)
@@ -341,7 +339,6 @@ class BlockDownloader:
         records: Sequence[cscb.BlockRecord],
         limits: _Limits,
     ) -> list[bytes]:
-        _check_in_time(limits)
         cache_key = (key, chunk.index)
         chunk_payload = self._chunks.get(cache_key)
         if chunk_payload is None:
