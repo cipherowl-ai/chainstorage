@@ -27,7 +27,9 @@ A caller can limit a download in two ways:
   limit. Both raise ``ResponseTooLargeError``. So a limit below 64 KiB
   refuses every consolidated object. It limits what is fetched, not the
   decompressed size, which the file format limits. A block whose index and
-  chunk are still in the cache needs no request, and is returned.
+  chunk are still in the cache needs no request, and is returned. The body of
+  a refusal is read within the limit as well: under a limit of less than
+  2 KiB, the store's error code can be missing from the ``DownloadError``.
 """
 
 from __future__ import annotations
@@ -415,7 +417,10 @@ class BlockDownloader:
                 ) as response:
                     status = response.status_code
                     if status not in (200, 206):
-                        code = _error_code(response)
+                        code = _error_code(response, limits)
+                        # A refusal that arrives after the deadline is a
+                        # timeout, like an answer that does.
+                        _check_in_time(limits)
                         raise DownloadError(
                             f"received status {status}{f' ({code})' if code else ''} "
                             f"for {_redact(url)}",
@@ -513,26 +518,34 @@ def _read_at_most(response: requests.Response, size: int, limits: _Limits = _NO_
         if read >= size:
             break
         _check_in_time(limits)
+    # The last piece counts too: a body that is complete only after the
+    # deadline is not returned.
+    _check_in_time(limits)
     body = b"".join(pieces)
     return body if len(body) <= size else body[:size]
 
 
-def _error_code(response: requests.Response) -> str:
+def _error_code(response: requests.Response, limits: _Limits = _NO_LIMITS) -> str:
     """Returns the store's error code from a refusal, or "" when it has none.
 
     A body that cannot be read changes nothing: the status is still reported.
+    The caller's ``max_response_bytes`` holds for this body too, so under a
+    small limit the code can lie beyond what is read.
     """
+    wanted = _ERROR_BODY_BYTES
+    if limits.max_response_bytes is not None:
+        wanted = min(wanted, limits.max_response_bytes)
     body = b""
     try:
         # Small pieces: a large body is not pulled in to read its first bytes.
-        for piece in response.iter_content(chunk_size=_ERROR_BODY_BYTES):
+        for piece in response.iter_content(chunk_size=wanted):
             body += piece
-            if len(body) >= _ERROR_BODY_BYTES:
+            if len(body) >= wanted:
                 break
     except Exception:
         # Whatever went wrong, its text may hold the signed link.
         return ""
-    match = _ERROR_CODE.search(body[:_ERROR_BODY_BYTES])
+    match = _ERROR_CODE.search(body[:wanted])
     return match.group(1).decode("ascii") if match else ""
 
 

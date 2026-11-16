@@ -991,8 +991,13 @@ def test_a_refusal_whose_body_cannot_be_read_still_reports_its_status(deployment
     assert raised.value.__cause__ is None and raised.value.__context__ is None
 
 
-def test_a_refusal_is_read_in_small_pieces(deployment):
-    """A store may answer a refusal with a large body; little of it is taken."""
+@pytest.mark.parametrize(
+    ("limits", "read"),
+    [({}, 2048), ({"max_response_bytes": 64}, 64), ({"max_response_bytes": 10**6}, 2048)],
+)
+def test_a_refusal_is_read_in_small_pieces(deployment, limits, read):
+    """A store may answer a refusal with a large body; little of it is taken,
+    and no more than the caller allows a response."""
     asked = []
 
     class Refusal(_UnreadableRefusal):
@@ -1009,11 +1014,13 @@ def test_a_refusal_is_read_in_small_pieces(deployment):
 
     try:
         with pytest.raises(DownloadError) as raised:
-            downloader.download(api_pb2.BlockFile(height=5, file_url="http://store/blocks/5"))
+            downloader.download(
+                api_pb2.BlockFile(height=5, file_url="http://store/blocks/5"), **limits
+            )
     finally:
         downloader.close()
 
-    assert asked == [2048]
+    assert asked == [read]
     assert raised.value.error_code == ""
 
 
@@ -2285,6 +2292,41 @@ def test_a_timeout_stops_a_body_that_arrives_slowly():
         downloader_module._read_at_most(response, 100 * 64 * 1024, limits)
 
     assert 1 <= response.pieces_read <= 5
+
+
+@pytest.mark.parametrize("ends", ["at the size wanted", "before it"])
+def test_a_body_whose_last_piece_arrives_late_is_not_returned(ends):
+    class Response:
+        def iter_content(self, chunk_size: int):
+            time.sleep(0.2)
+            yield b"x" * 10
+
+    limits = downloader_module._Limits(deadline=time.monotonic() + 0.05)
+    size = 10 if ends == "at the size wanted" else 100
+
+    with pytest.raises(CallTimeoutError):
+        downloader_module._read_at_most(Response(), size, limits)
+
+
+def test_a_refusal_that_arrives_late_is_a_timeout(deployment):
+    class Session(_RefusingSession):
+        def get(self, url, headers=None, timeout=None, stream=False):
+            time.sleep(0.2)
+            return super().get(url, headers=headers, timeout=timeout, stream=stream)
+
+    downloader = BlockDownloader(deployment.config(), session=Session())
+    file = api_pb2.BlockFile(height=5, file_url="http://store/blocks/5")
+
+    try:
+        with pytest.raises(DownloadError):
+            downloader.download(file)
+        # The download itself, not the wait for it, which ends at the
+        # deadline whatever the download does.
+        limits = downloader_module._Limits(deadline=time.monotonic() + 0.05)
+        with pytest.raises(CallTimeoutError):
+            downloader._download_single(file, limits)
+    finally:
+        downloader.close()
 
 
 def test_a_body_is_read_in_smaller_pieces_when_there_is_a_deadline():

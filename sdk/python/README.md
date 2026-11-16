@@ -121,6 +121,8 @@ with Client(config) as client:
     format limits to 1 GiB per block or chunk.
   - A block whose index and chunk the client still holds needs no request,
     and is returned whatever the limit.
+  - The body of a refusal is read within the limit too. Under a limit of
+    less than 2 KiB, `error_code` can be empty.
 - **Fallback.** A read from consolidated files that fails continues from
   single-block objects. `get_block_file` and `get_block_files_by_range` do
   not: they answer for the read source they were asked for.
