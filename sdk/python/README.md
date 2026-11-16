@@ -110,7 +110,9 @@ with Client(config) as client:
   - For `iter_raw_block_payloads` and `iter_raw_block_payloads_by_heights`,
     the time starts when the method is called. It includes the time the
     caller spends between two blocks: once it has run out, the next block
-    raises, even one that was already downloaded.
+    raises, even one that was already downloaded. It also includes the time
+    the heights take to arrive, when they come from a generator: the method
+    itself raises if it runs out before they are all there.
 - **Size limit.** The methods that download take `max_response_bytes`: the
   most bytes one request to storage may return. That is a single-block
   object, one of the two reads of a consolidated file's index (its first

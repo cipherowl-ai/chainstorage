@@ -2212,6 +2212,43 @@ def test_a_timeout_stops_a_range_that_is_under_way(deployment):
     assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 1
 
 
+def test_the_timeout_of_a_read_at_heights_starts_before_the_heights_are_read(deployment):
+    deployment.server.add_block(4)
+    taken: list[int] = []
+
+    def heights():
+        for height in range(4, 104):
+            time.sleep(0.05)
+            taken.append(height)
+            yield height
+
+    before = time.monotonic()
+    with pytest.raises(CallTimeoutError):
+        deployment.client().iter_raw_block_payloads_by_heights(heights(), timeout=0.12)
+
+    # The heights were not read to their end, which takes 5 seconds.
+    assert time.monotonic() - before < 2.0
+    assert 1 <= len(taken) <= 10
+    assert deployment.server.calls == []
+
+
+def test_heights_that_arrive_in_time_leave_the_rest_of_the_timeout_to_the_read(deployment):
+    for height in (4, 6):
+        deployment.server.add_block(height)
+
+    def heights():
+        time.sleep(0.3)
+        yield from (4, 6)
+
+    payloads = deployment.client().iter_raw_block_payloads_by_heights(heights(), timeout=0.6)
+    time.sleep(0.4)
+
+    # 0.7 s after the call: the time did not start over when the heights were in.
+    with pytest.raises(CallTimeoutError):
+        next(payloads)
+    assert deployment.server.calls == []
+
+
 def test_a_block_downloaded_ahead_is_not_yielded_after_the_timeout(deployment):
     for height in range(20, 24):
         deployment.server.add_block(height)
@@ -2230,16 +2267,16 @@ def test_a_block_downloaded_ahead_is_not_yielded_after_the_timeout(deployment):
 
 def test_a_block_of_a_chunk_already_read_is_not_yielded_after_the_timeout(deployment):
     deployment.server.add_consolidated("zstd")
-    payloads = deployment.client().iter_raw_block_payloads(1000, 1006, timeout=0.5)
+    # Three blocks of one chunk: one download holds them all.
+    payloads = deployment.client().iter_raw_block_payloads(1000, 1003, timeout=0.5)
 
     assert next(payloads).block_file.height == 1000
-    requests = len(deployment.storage.requests)
     time.sleep(0.7)
     with pytest.raises(CallTimeoutError):
         next(payloads)
 
-    # The next block came with the first one's chunk: nothing was left to read.
-    assert len(deployment.storage.requests) == requests
+    # The index and the chunk: the next block was there, with nothing to read.
+    assert len(deployment.storage.requests_for(CONSOLIDATED_OBJECT)) == 2
     assert deployment.sleeps == []
 
 

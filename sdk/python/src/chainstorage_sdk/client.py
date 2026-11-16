@@ -430,9 +430,14 @@ class Client:
 
         A height the server does not have fails the read when its stretch is
         reached. The blocks of earlier stretches have been yielded by then.
+
+        ``heights`` is read to its end before this method returns. With a
+        ``timeout``, the time it takes to arrive counts, and the method
+        raises ``CallTimeoutError`` when it runs out meanwhile.
         """
-        wanted = _heights(heights)
+        # The limits first: the clock starts before the heights are read.
         limits = _limits(timeout, max_response_bytes)
+        wanted = _heights(heights, limits.deadline)
         return self._iter_raw_block_payloads_by_heights(wanted, self._tag(tag), read_source, limits)
 
     def _iter_raw_block_payloads_by_heights(
@@ -767,10 +772,19 @@ def _range(start_height: int, end_height: int) -> tuple[int, int]:
     return start_height, end_height
 
 
-def _heights(heights: Iterable[int]) -> list[int]:
-    """Returns the heights a caller asked for, each once, in order."""
+def _heights(heights: Iterable[int], deadline: float | None = None) -> list[int]:
+    """Returns the heights a caller asked for, each once, in order.
+
+    They can come from a generator that takes its time: no further height is
+    taken once ``deadline`` has passed.
+    """
     wanted = set()
     for height in heights:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise CallTimeoutError(
+                "a block read did not start in time: its heights were still arriving",
+                code="DEADLINE_EXCEEDED",
+            )
         try:
             # Any integer type, such as a NumPy one, but not True or False.
             number = -1 if isinstance(height, bool) else operator.index(height)
