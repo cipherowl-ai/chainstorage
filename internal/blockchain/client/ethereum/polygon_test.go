@@ -26,10 +26,35 @@ import (
 )
 
 const (
-	blockAuthorResponse = `"0xa863dd63d894f058a8f62c51e575d0364d3c885d1e2049da96a43d19f9e29939"`
-
-	nilAddress = `"0x0000000000000000000000000000000000000000"`
+	// Producer of Polygon mainnet block 11322000, as returned by bor_getAuthor.
+	polygonFixtureAuthor = `"0xf84c74dea96df0ec22e11e7c33996c73fcc2d822"`
 )
+
+// polygonSealFields are the header fields the Bor block producer signs.
+var polygonSealFields = []string{
+	"parentHash", "sha3Uncles", "miner", "stateRoot", "transactionsRoot", "receiptsRoot", "logsBloom",
+	"difficulty", "number", "gasLimit", "gasUsed", "timestamp", "extraData", "mixHash", "nonce",
+}
+
+// withPolygonSealFields copies the signed header fields of the real Polygon mainnet block 11322000 onto block,
+// so the client can recover a real producer from it. The other fields of block, such as its transactions, are kept.
+func withPolygonSealFields(t *testing.T, block string) json.RawMessage {
+	require := testutil.Require(t)
+
+	var sealed map[string]json.RawMessage
+	require.NoError(json.Unmarshal(fixtures.MustReadFile("client/polygon/polygon_header_11322000.json"), &sealed))
+
+	var result map[string]json.RawMessage
+	require.NoError(json.Unmarshal([]byte(block), &result))
+	for _, field := range polygonSealFields {
+		result[field] = sealed[field]
+	}
+	delete(result, "baseFeePerGas")
+
+	data, err := json.Marshal(result)
+	require.NoError(err)
+	return data
+}
 
 type (
 	polygonClientTestSuite struct {
@@ -99,7 +124,7 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight() {
 	require := testutil.Require(s.T())
 
 	blockResponse := &jsonrpc.Response{
-		Result: json.RawMessage(fixtureBlock),
+		Result: withPolygonSealFields(s.T(), fixtureBlock),
 	}
 	s.rpcClient.EXPECT().Call(
 		gomock.Any(), gomock.Any(), gomock.Any(),
@@ -126,17 +151,6 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight() {
 				}
 
 				return nil, xerrors.Errorf("unknown tracer: %v", tracer)
-			}
-
-			if method == ethBorGetAuthorMethod {
-				expectedParams := jsonrpc.Params{
-					"0xbaa42c87b7c764c548fa37e61e9764415fd4a79d7e073d4f92a456698002016b",
-				}
-				require.Equal(expectedParams, params)
-
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
-				}, nil
 			}
 
 			return nil, xerrors.Errorf("unknown method: %v", method)
@@ -156,6 +170,7 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight() {
 	blobdata := block.GetEthereum()
 	require.NotNil(blobdata)
 	require.NotNil(blobdata.Header)
+	require.Equal(polygonFixtureAuthor, string(blobdata.GetPolygon().GetAuthor()))
 	require.NotNil(blobdata.TransactionReceipts)
 	require.Equal(2, len(blobdata.TransactionReceipts))
 	require.NotNil(blobdata.TransactionTraces)
@@ -169,7 +184,7 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight_TransactionWit
 	require := testutil.Require(s.T())
 
 	blockResponse := &jsonrpc.Response{
-		Result: json.RawMessage(fixtureBlockWithNullAddressTransactions),
+		Result: withPolygonSealFields(s.T(), fixtureBlockWithNullAddressTransactions),
 	}
 	s.rpcClient.EXPECT().Call(
 		gomock.Any(), gomock.Any(), gomock.Any(),
@@ -196,12 +211,6 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight_TransactionWit
 				}
 
 				return nil, xerrors.Errorf("unknown tracer: %v", tracer)
-			}
-
-			if method == ethBorGetAuthorMethod {
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
-				}, nil
 			}
 
 			return nil, xerrors.Errorf("unknown method: %v", method)
@@ -234,7 +243,7 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight_TransactionWit
 	require := testutil.Require(s.T())
 
 	blockResponse := &jsonrpc.Response{
-		Result: json.RawMessage(fixtureBlockWithNullAddressTransactions),
+		Result: withPolygonSealFields(s.T(), fixtureBlockWithNullAddressTransactions),
 	}
 	s.rpcClient.EXPECT().Call(
 		gomock.Any(), gomock.Any(), gomock.Any(),
@@ -255,12 +264,6 @@ func (s *polygonClientTestSuite) TestPolygonTest_GetBlockByHeight_TransactionWit
 				}
 
 				return nil, xerrors.Errorf("unknown tracer: %v", tracer)
-			}
-
-			if method == ethBorGetAuthorMethod {
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
-				}, nil
 			}
 
 			return nil, xerrors.Errorf("unknown method: %v", method)
@@ -337,79 +340,6 @@ func (s *polygonClientTestSuite) TestPolygonClient_UpgradeBlock_2_2_HeaderUpdate
 	require.Equal(existingBlobdata.Header, upgradedBlobdata.Header)
 }
 
-func (s *polygonClientTestSuite) TestPolygonTest_RetryBorAuthor_ServerErr() {
-	require := testutil.Require(s.T())
-
-	retryAttempts := 0
-	s.rpcClient.EXPECT().Call(
-		gomock.Any(), gomock.Any(), gomock.Any(),
-	).
-		AnyTimes().
-		DoAndReturn(func(ctx context.Context, method *jsonrpc.RequestMethod, params jsonrpc.Params, opts ...jsonrpc.Option) (*jsonrpc.Response, error) {
-			switch method {
-			case ethGetBlockByNumberMethod:
-				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethTraceTransactionMethod:
-				opts := params[1].(map[string]string)
-				tracer := opts["tracer"]
-				if tracer == ethOpCountTracer {
-					return &jsonrpc.Response{
-						Result: []byte("123"),
-					}, nil
-				}
-
-				if tracer == ethCallTracer {
-					return &jsonrpc.Response{
-						Result: []byte(fixtureTransactionTrace),
-					}, nil
-				}
-
-				return nil, xerrors.Errorf("unknown tracer: %v", tracer)
-
-			case ethBorGetAuthorMethod:
-				retryAttempts += 1
-				if retryAttempts < retry.DefaultMaxAttempts {
-					return nil, &jsonrpc.RPCError{
-						Code:    -32000,
-						Message: "unknown block",
-					}
-				}
-
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
-				}, nil
-
-			default:
-				return nil, xerrors.Errorf("unknown method: %v", method)
-			}
-		})
-
-	receiptResponse := []*jsonrpc.Response{
-		{Result: json.RawMessage(fixtureReceipt)},
-		{Result: json.RawMessage(fixtureReceipt)},
-	}
-	s.rpcClient.EXPECT().BatchCall(
-		gomock.Any(), ethGetTransactionReceiptMethod, gomock.Any(),
-	).Return(receiptResponse, nil)
-
-	block, err := s.client.GetBlockByHeight(context.Background(), tag, 11322000, internal.WithBestEffort())
-	require.NoError(err)
-	require.NotNil(block)
-	blobdata := block.GetEthereum()
-	require.NotNil(blobdata)
-	require.NotNil(blobdata.Header)
-	require.NotNil(blobdata.TransactionReceipts)
-	require.Equal(2, len(blobdata.TransactionReceipts))
-	require.NotNil(blobdata.TransactionTraces)
-	require.Equal(2, len(blobdata.TransactionTraces))
-	for _, transactionTrace := range blobdata.TransactionTraces {
-		require.Equal(fixtureTransactionTrace, string(transactionTrace))
-	}
-}
-
 func (s *polygonClientTestSuite) TestRetryTraceBlock_NotFound() {
 	require := testutil.Require(s.T())
 
@@ -422,12 +352,7 @@ func (s *polygonClientTestSuite) TestRetryTraceBlock_NotFound() {
 			switch method {
 			case ethGetBlockByHashMethod:
 				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethBorGetAuthorMethod:
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
+					Result: withPolygonSealFields(s.T(), fixtureBlock),
 				}, nil
 
 			case ethTraceBlockByHashMethod:
@@ -472,12 +397,7 @@ func (s *polygonClientTestSuite) TestRetryTraceBlock_ExecutionAborted() {
 			switch method {
 			case ethGetBlockByHashMethod:
 				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethBorGetAuthorMethod:
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
+					Result: withPolygonSealFields(s.T(), fixtureBlock),
 				}, nil
 
 			case ethTraceBlockByHashMethod:
@@ -521,12 +441,7 @@ func (s *polygonClientTestSuite) TestRetryTraceBlock_RetryLimitExceeded() {
 			switch method {
 			case ethGetBlockByHashMethod:
 				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethBorGetAuthorMethod:
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
+					Result: withPolygonSealFields(s.T(), fixtureBlock),
 				}, nil
 
 			case ethTraceBlockByHashMethod:
@@ -565,12 +480,7 @@ func (s *polygonClientTestSuite) TestRetryTraceTransaction() {
 			switch method {
 			case ethGetBlockByNumberMethod:
 				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethBorGetAuthorMethod:
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
+					Result: withPolygonSealFields(s.T(), fixtureBlock),
 				}, nil
 
 			case ethTraceTransactionMethod:
@@ -636,12 +546,7 @@ func (s *polygonClientTestSuite) TestRetryTraceTransaction_RetryLimitExceeded() 
 			switch method {
 			case ethGetBlockByNumberMethod:
 				return &jsonrpc.Response{
-					Result: json.RawMessage(fixtureBlock),
-				}, nil
-
-			case ethBorGetAuthorMethod:
-				return &jsonrpc.Response{
-					Result: []byte(blockAuthorResponse),
+					Result: withPolygonSealFields(s.T(), fixtureBlock),
 				}, nil
 
 			case ethTraceTransactionMethod:
