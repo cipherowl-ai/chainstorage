@@ -93,8 +93,7 @@ const (
 
 	ethBlockTransactionReceiptBatchSize = 100
 
-	ethNullAddress     = "0x0000000000000000000000000000000000000000"
-	genesisBlockNumber = "0x0"
+	ethNullAddress = "0x0000000000000000000000000000000000000000"
 
 	arbitrumNITROUpgradeBlockNumber = 22_207_818
 
@@ -198,12 +197,6 @@ var (
 	ethGetUncleByBlockHashAndIndex = &jsonrpc.RequestMethod{
 		Name:    "eth_getUncleByBlockHashAndIndex",
 		Timeout: time.Second * 10,
-	}
-
-	// JSON RPC method from bor client to get author(validator) of a block
-	ethBorGetAuthorMethod = &jsonrpc.RequestMethod{
-		Name:    "bor_getAuthor",
-		Timeout: time.Second * 5,
 	}
 
 	ethParityTraceBlockByNumber = map[common.Blockchain]*jsonrpc.RequestMethod{
@@ -562,7 +555,7 @@ func (c *EthereumClient) getBlockFromHeader(ctx context.Context, tag uint32, hea
 	}
 
 	if c.config.Blockchain() == common.Blockchain_BLOCKCHAIN_POLYGON {
-		author, err := c.getBorAuthor(ctx, headerResult.header.Hash.Value())
+		author, err := recoverBorAuthor(headerResult.rawJson)
 		if err != nil {
 			return nil, xerrors.Errorf("failed to get block author: %w", err)
 		}
@@ -670,43 +663,6 @@ func (c *EthereumClient) deleteDuplicateTxn(response *jsonrpc.Response, header e
 		header:  &header,
 		rawJson: result,
 	}, nil
-}
-
-// getBorAuthor Get author(validator) for polygon blocks.
-//
-// bor_getAuthor endpoint now accepts blockHash as the request input, see this issue for more details: https://github.com/maticnetwork/bor/issues/582
-// blockHashOrNumber can be either a blockHash string or blockNumber string in hexadecimal.
-func (c *EthereumClient) getBorAuthor(ctx context.Context, blockHashOrNumber string) (json.RawMessage, error) {
-	if blockHashOrNumber == genesisBlockNumber {
-		nilAddress, _ := json.Marshal(ethNullAddress)
-		return nilAddress, nil
-	}
-
-	params := jsonrpc.Params{
-		blockHashOrNumber,
-	}
-
-	response, err := retry.WrapWithResult(ctx, func(ctx context.Context) (*jsonrpc.Response, error) {
-		response, err := c.client.Call(ctx, ethBorGetAuthorMethod, params)
-		if err != nil {
-			var rpcErr *jsonrpc.RPCError
-			if xerrors.As(err, &rpcErr) && rpcErr.Code == -32000 && rpcErr.Message == "unknown block" {
-				// The nodes may be temporarily out of sync and the block may not be available in the node we just queried.
-				// Retry with a different node proactively.
-				// If all the retry attempts fail, return ErrBlockNotFound so that syncer may fall back to the master node.
-				return nil, retry.Retryable(xerrors.Errorf("got unknown block error while querying author: %v: %w", rpcErr, internal.ErrBlockNotFound))
-			}
-
-			return nil, xerrors.Errorf("failed to call %s to get block author(blockHashOrNumber:%v): %w", ethBorGetAuthorMethod.Name, blockHashOrNumber, err)
-		}
-
-		return response, nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return response.Result, nil
 }
 
 func (c *EthereumClient) getBlockTransactionReceipts(ctx context.Context, block *ethereum.EthereumBlockLit) ([][]byte, error) {
