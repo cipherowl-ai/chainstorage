@@ -386,12 +386,27 @@ func TestDecodeCSCBChunk(t *testing.T) {
 		require.NoError(cscb.ValidateChunkPayload(payload, &chunk))
 	})
 
-	t.Run("reads no more than one byte past the chunk length", func(t *testing.T) {
+	t.Run("decodes into a buffer of exactly the chunk length", func(t *testing.T) {
+		require := testutil.Require(t)
+		payload, err := decodeCSCBChunk(bytes.NewReader(frame), codec, &chunk)
+		require.NoError(err)
+		require.Equal(int(chunk.UncompressedLength), cap(payload))
+	})
+
+	t.Run("refuses a frame that inflates past the chunk length", func(t *testing.T) {
 		require := testutil.Require(t)
 		short := chunk
 		short.UncompressedLength = 1
 		_, err := decodeCSCBChunk(bytes.NewReader(frame), codec, &short)
-		require.ErrorContains(err, "CSCB chunk length mismatch: got 2 want 1")
+		require.ErrorContains(err, "inflates past its length 1")
+	})
+
+	t.Run("refuses a frame shorter than the chunk length", func(t *testing.T) {
+		require := testutil.Require(t)
+		long := chunk
+		long.UncompressedLength++
+		_, err := decodeCSCBChunk(bytes.NewReader(frame), codec, &long)
+		require.ErrorIs(err, io.ErrUnexpectedEOF)
 	})
 
 	t.Run("refuses a chunk whose CRC does not match", func(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"hash/crc32"
 	"io"
+	"math"
 	"net/url"
 	"sync"
 
@@ -71,7 +72,8 @@ func (c *cscbCache) index(fileURL string) (*cscb.Index, bool) {
 	if !ok {
 		return nil, false
 	}
-	return value.(*cscb.Index), true
+	index, ok := value.(*cscb.Index)
+	return index, ok
 }
 
 func (c *cscbCache) putIndex(fileURL string, index *cscb.Index) {
@@ -93,7 +95,8 @@ func (c *cscbCache) chunk(fileURL string, chunkIndex uint32) ([]byte, bool) {
 	if !ok {
 		return nil, false
 	}
-	return value.([]byte), true
+	payload, ok := value.([]byte)
+	return payload, ok
 }
 
 func (c *cscbCache) putChunk(fileURL string, chunkIndex uint32, payload []byte) {
@@ -156,22 +159,31 @@ func (c *lruCache) removeElement(element *list.Element) {
 	c.bytes -= entry.size
 }
 
-// decodeCSCBChunk decompresses a whole chunk frame and validates its length
-// and CRC. It reads at most one byte past the expected length, so a frame
-// that inflates further is refused rather than buffered.
+// decodeCSCBChunk decompresses a whole chunk frame into a buffer of exactly
+// the chunk's length and validates its CRC. A frame that inflates past that
+// length is refused, so the buffer, and the memory the chunk cache counts,
+// is never larger than the descriptor says. The caller bounds the length
+// (cachesChunk).
 func decodeCSCBChunk(frame io.Reader, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+	if chunk.UncompressedLength > math.MaxInt32 {
+		return nil, xerrors.Errorf("CSCB chunk %d length %d is too large to decode whole", chunk.Index, chunk.UncompressedLength)
+	}
 	decompressor, err := cscb.NewChunkDecompressor(frame, codec)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = decompressor.Close() }()
 
-	limit, err := limitReaderByLength(decompressor, chunk.UncompressedLength+1)
-	if err != nil {
-		return nil, err
+	payload := make([]byte, int(chunk.UncompressedLength))
+	if _, err := io.ReadFull(decompressor, payload); err != nil {
+		return nil, xerrors.Errorf("failed to decompress CSCB chunk %d: %w", chunk.Index, err)
 	}
-	payload, err := io.ReadAll(limit)
-	if err != nil {
+	var extra [1]byte
+	switch _, err := io.ReadFull(decompressor, extra[:]); {
+	case err == io.EOF:
+	case err == nil:
+		return nil, xerrors.Errorf("CSCB chunk %d inflates past its length %d", chunk.Index, chunk.UncompressedLength)
+	default:
 		return nil, xerrors.Errorf("failed to decompress CSCB chunk %d: %w", chunk.Index, err)
 	}
 	if err := cscb.ValidateChunkPayload(payload, chunk); err != nil {
