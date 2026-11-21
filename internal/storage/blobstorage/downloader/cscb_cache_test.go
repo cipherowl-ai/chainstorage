@@ -565,3 +565,51 @@ func TestCSCBBlockPayloadFromChunk(t *testing.T) {
 		testutil.Require(t).ErrorContains(err, "CSCB block CRC mismatch")
 	})
 }
+
+func TestCSCBCacheLoadChunkSurvivesFirstCallerCancel(t *testing.T) {
+	require := testutil.Require(t)
+	cache := newCSCBCache(1, 1, 1024)
+	const fileURL = "https://bucket.example/object.zstd?X-Amz-Signature=x"
+	want := []byte("chunk")
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var fetches atomic.Int32
+	fetch := func(ctx context.Context) ([]byte, error) {
+		fetches.Add(1)
+		close(started)
+		<-release
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return want, nil
+	}
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := cache.loadChunk(firstCtx, fileURL, 0, fetch)
+		firstErr <- err
+	}()
+	<-started
+
+	second := make(chan []byte, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		payload, err := cache.loadChunk(context.Background(), fileURL, 0, fetch)
+		second <- payload
+		secondErr <- err
+	}()
+
+	// The first caller gives up; the shared fetch and the second caller do not.
+	cancelFirst()
+	require.ErrorIs(<-firstErr, context.Canceled)
+	close(release)
+	require.NoError(<-secondErr)
+	require.Equal(want, <-second)
+	require.Equal(int32(1), fetches.Load())
+
+	payload, ok := cache.chunk(fileURL, 0)
+	require.True(ok)
+	require.Equal(want, payload)
+}

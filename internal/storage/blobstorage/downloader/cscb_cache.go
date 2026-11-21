@@ -2,6 +2,7 @@ package downloader
 
 import (
 	"container/list"
+	"context"
 	"hash/crc32"
 	"io"
 	"math"
@@ -109,30 +110,41 @@ func (c *cscbCache) putChunk(fileURL string, chunkIndex uint32, payload []byte) 
 }
 
 // loadChunk returns the cached chunk, or fetches it once for all concurrent
-// callers and caches it. A failed fetch is not cached; callers that joined it
-// get its error, including one caused by the first caller's context ending.
-func (c *cscbCache) loadChunk(fileURL string, chunkIndex uint32, fetch func() ([]byte, error)) ([]byte, error) {
+// callers and caches it. A failed fetch is not cached. The shared fetch runs
+// on a context detached from the caller that started it (context values are
+// kept), so one caller's cancellation does not fail the others; each caller
+// stops waiting when its own context ends. The fetch stays bounded without
+// the caller's deadline: every request it makes carries the HTTP client's
+// timeout, and its retries are capped.
+func (c *cscbCache) loadChunk(ctx context.Context, fileURL string, chunkIndex uint32, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
 	if payload, ok := c.chunk(fileURL, chunkIndex); ok {
 		return payload, nil
 	}
 	key := cscbObjectKey(fileURL) + "#" + strconv.FormatUint(uint64(chunkIndex), 10)
-	value, err, _ := c.chunkFetches.Do(key, func() (any, error) {
+	fetchCtx := context.WithoutCancel(ctx)
+	results := c.chunkFetches.DoChan(key, func() (any, error) {
 		if payload, ok := c.chunk(fileURL, chunkIndex); ok {
 			return payload, nil
 		}
-		payload, err := fetch()
+		payload, err := fetch(fetchCtx)
 		if err != nil {
 			return nil, err
 		}
 		c.putChunk(fileURL, chunkIndex, payload)
 		return payload, nil
 	})
-	if err != nil {
-		return nil, err
+	var result singleflight.Result
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result = <-results:
 	}
-	payload, ok := value.([]byte)
+	if result.Err != nil {
+		return nil, result.Err
+	}
+	payload, ok := result.Val.([]byte)
 	if !ok {
-		return nil, xerrors.Errorf("unexpected CSCB chunk cache value %T", value)
+		return nil, xerrors.Errorf("unexpected CSCB chunk cache value %T", result.Val)
 	}
 	return payload, nil
 }

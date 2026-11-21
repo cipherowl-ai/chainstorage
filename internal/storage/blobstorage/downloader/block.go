@@ -484,7 +484,7 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 		}
 		return blockPayloads[0], nil
 	}
-	chunkPayload, err := d.cscbCache.loadChunk(fileURL, chunk.Index, func() ([]byte, error) {
+	chunkPayload, err := d.cscbCache.loadChunk(ctx, fileURL, chunk.Index, func(ctx context.Context) ([]byte, error) {
 		return d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
 	})
 	if err != nil {
