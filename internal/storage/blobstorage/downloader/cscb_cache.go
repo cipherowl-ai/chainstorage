@@ -7,10 +7,8 @@ import (
 	"io"
 	"math"
 	"net/url"
-	"strconv"
 	"sync"
 
-	"golang.org/x/sync/singleflight"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
@@ -39,7 +37,18 @@ type (
 		chunks  *lruCache
 		// chunkFetches lets concurrent misses on one chunk share a single
 		// fetch, so the chunk is downloaded and held once, not per caller.
-		chunkFetches singleflight.Group
+		fetchMu      sync.Mutex
+		chunkFetches map[cscbChunkKey]*cscbChunkFetch
+	}
+
+	// cscbChunkFetch is one in-flight chunk fetch and the callers waiting
+	// on it. Its context is canceled when the last waiter leaves.
+	cscbChunkFetch struct {
+		done    chan struct{}
+		payload []byte
+		err     error
+		waiters int
+		cancel  context.CancelFunc
 	}
 
 	cscbChunkKey struct {
@@ -68,8 +77,9 @@ type (
 
 func newCSCBCache(indexEntries int, chunkEntries int, chunkBytes int64) *cscbCache {
 	return &cscbCache{
-		indexes: newLRUCache(indexEntries, 0),
-		chunks:  newLRUCache(chunkEntries, chunkBytes),
+		indexes:      newLRUCache(indexEntries, 0),
+		chunks:       newLRUCache(chunkEntries, chunkBytes),
+		chunkFetches: make(map[cscbChunkKey]*cscbChunkFetch),
 	}
 }
 
@@ -105,48 +115,65 @@ func (c *cscbCache) chunk(fileURL string, chunkIndex uint32) ([]byte, bool) {
 	return payload, ok
 }
 
-func (c *cscbCache) putChunk(fileURL string, chunkIndex uint32, payload []byte) {
-	c.chunks.put(cscbChunkKey{object: cscbObjectKey(fileURL), chunk: chunkIndex}, payload, int64(len(payload)))
-}
-
 // loadChunk returns the cached chunk, or fetches it once for all concurrent
 // callers and caches it. A failed fetch is not cached. The shared fetch runs
 // on a context detached from the caller that started it (context values are
 // kept), so one caller's cancellation does not fail the others; each caller
-// stops waiting when its own context ends. The fetch stays bounded without
-// the caller's deadline: every request it makes carries the HTTP client's
-// timeout, and its retries are capped.
+// stops waiting when its own context ends, and the fetch is canceled when
+// the last waiter leaves, so no fetch outlives every caller.
 func (c *cscbCache) loadChunk(ctx context.Context, fileURL string, chunkIndex uint32, fetch func(context.Context) ([]byte, error)) ([]byte, error) {
 	if payload, ok := c.chunk(fileURL, chunkIndex); ok {
 		return payload, nil
 	}
-	key := cscbObjectKey(fileURL) + "#" + strconv.FormatUint(uint64(chunkIndex), 10)
-	fetchCtx := context.WithoutCancel(ctx)
-	results := c.chunkFetches.DoChan(key, func() (any, error) {
+	key := cscbChunkKey{object: cscbObjectKey(fileURL), chunk: chunkIndex}
+
+	c.fetchMu.Lock()
+	f, ok := c.chunkFetches[key]
+	if !ok {
+		// A fetch caches its chunk before it leaves chunkFetches, so a
+		// chunk that one finished since the check above is found here.
 		if payload, ok := c.chunk(fileURL, chunkIndex); ok {
+			c.fetchMu.Unlock()
 			return payload, nil
 		}
-		payload, err := fetch(fetchCtx)
-		if err != nil {
-			return nil, err
-		}
-		c.putChunk(fileURL, chunkIndex, payload)
-		return payload, nil
-	})
-	var result singleflight.Result
+		fetchCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		f = &cscbChunkFetch{done: make(chan struct{}), cancel: cancel}
+		c.chunkFetches[key] = f
+		go c.runChunkFetch(fetchCtx, key, f, fetch)
+	}
+	f.waiters++
+	c.fetchMu.Unlock()
+
 	select {
+	case <-f.done:
+		return f.payload, f.err
 	case <-ctx.Done():
+		c.fetchMu.Lock()
+		f.waiters--
+		if f.waiters == 0 {
+			// Nobody is waiting: stop the fetch, and let the next caller
+			// start a fresh one rather than join a canceled one.
+			f.cancel()
+			if c.chunkFetches[key] == f {
+				delete(c.chunkFetches, key)
+			}
+		}
+		c.fetchMu.Unlock()
 		return nil, ctx.Err()
-	case result = <-results:
 	}
-	if result.Err != nil {
-		return nil, result.Err
+}
+
+func (c *cscbCache) runChunkFetch(ctx context.Context, key cscbChunkKey, f *cscbChunkFetch, fetch func(context.Context) ([]byte, error)) {
+	defer f.cancel()
+	if f.payload, f.err = fetch(ctx); f.err == nil {
+		c.chunks.put(key, f.payload, int64(len(f.payload)))
 	}
-	payload, ok := result.Val.([]byte)
-	if !ok {
-		return nil, xerrors.Errorf("unexpected CSCB chunk cache value %T", result.Val)
+	c.fetchMu.Lock()
+	if c.chunkFetches[key] == f {
+		delete(c.chunkFetches, key)
 	}
-	return payload, nil
+	c.fetchMu.Unlock()
+	close(f.done)
 }
 
 // cscbObjectKey identifies the object behind a presigned link by dropping

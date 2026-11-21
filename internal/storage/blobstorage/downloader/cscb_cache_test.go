@@ -601,6 +601,8 @@ func TestCSCBCacheLoadChunkSurvivesFirstCallerCancel(t *testing.T) {
 		secondErr <- err
 	}()
 
+	waitForChunkFetchWaiters(t, cache, fileURL, 0, 2)
+
 	// The first caller gives up; the shared fetch and the second caller do not.
 	cancelFirst()
 	require.ErrorIs(<-firstErr, context.Canceled)
@@ -612,4 +614,66 @@ func TestCSCBCacheLoadChunkSurvivesFirstCallerCancel(t *testing.T) {
 	payload, ok := cache.chunk(fileURL, 0)
 	require.True(ok)
 	require.Equal(want, payload)
+}
+
+func TestCSCBCacheLoadChunkCancelsFetchWhenLastWaiterLeaves(t *testing.T) {
+	require := testutil.Require(t)
+	cache := newCSCBCache(1, 1, 1024)
+	const fileURL = "https://bucket.example/object.zstd"
+
+	started := make(chan struct{})
+	fetchErr := make(chan error, 1)
+	fetch := func(ctx context.Context) ([]byte, error) {
+		close(started)
+		<-ctx.Done()
+		fetchErr <- ctx.Err()
+		return nil, ctx.Err()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	callerErr := make(chan error, 1)
+	go func() {
+		_, err := cache.loadChunk(ctx, fileURL, 0, fetch)
+		callerErr <- err
+	}()
+	<-started
+	cancel()
+	require.ErrorIs(<-callerErr, context.Canceled)
+
+	select {
+	case err := <-fetchErr:
+		require.ErrorIs(err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the fetch kept running after its only waiter left")
+	}
+	_, ok := cache.chunk(fileURL, 0)
+	require.False(ok)
+
+	// The next caller starts a fresh fetch instead of joining the canceled one.
+	payload, err := cache.loadChunk(context.Background(), fileURL, 0, func(context.Context) ([]byte, error) {
+		return []byte("chunk"), nil
+	})
+	require.NoError(err)
+	require.Equal([]byte("chunk"), payload)
+}
+
+func waitForChunkFetchWaiters(t *testing.T, cache *cscbCache, fileURL string, chunkIndex uint32, want int) {
+	t.Helper()
+	key := cscbChunkKey{object: cscbObjectKey(fileURL), chunk: chunkIndex}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		cache.fetchMu.Lock()
+		waiters := 0
+		if f, ok := cache.chunkFetches[key]; ok {
+			waiters = f.waiters
+		}
+		cache.fetchMu.Unlock()
+		if waiters == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("chunk fetch has %d waiters, want %d", waiters, want)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
