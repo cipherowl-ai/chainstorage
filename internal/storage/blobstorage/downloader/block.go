@@ -123,6 +123,7 @@ type (
 		retryBytes    retry.RetryWithResult[[]byte]
 		retryPayloads retry.RetryWithResult[[][]byte]
 		retryRaw      retry.RetryWithResult[*RawBlockPayload]
+		cscbCache     *cscbCache
 	}
 
 	downloadRef struct {
@@ -169,6 +170,7 @@ func NewBlockDownloader(params BlockDownloaderParams) BlockDownloader {
 		retryBytes:    retry.NewWithResult[[]byte](retry.WithLogger(logger)),
 		retryPayloads: retry.NewWithResult[[][]byte](retry.WithLogger(logger)),
 		retryRaw:      retry.NewWithResult[*RawBlockPayload](retry.WithLogger(logger)),
+		cscbCache:     newCSCBCache(cscbIndexCacheEntries, cscbChunkCacheEntries, cscbChunkCacheBytes),
 	}
 }
 
@@ -399,8 +401,9 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 // spoolDecompressedToFile performs a (retryable) HTTP GET, wraps the
 // response body in the appropriate decompressor, and writes the
 // decompressed block payload to dst. Single-block objects are streamed into
-// dst. CSCB objects buffer one decompressed chunk in memory for chunk
-// CRC validation, then write only the requested block payload to dst.
+// dst. A CSCB block comes from downloadCSCBBlockPayload: from a cached,
+// CRC-checked chunk when the chunk fits the cache, otherwise streamed up to
+// the block with a block CRC check.
 // The file is truncated + rewound on each retry attempt. This combines
 // download + decompression into a single pass with only one tempfile,
 // reducing per-block I/O cost under concurrent workloads compared to
@@ -458,8 +461,15 @@ func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, block
 	return err
 }
 
+// downloadCSCBBlockPayload returns one consolidated block's payload. A chunk
+// that fits the chunk cache is fetched and decompressed whole and kept, so
+// the next heights in it need no request while it stays cached; concurrent
+// misses on one chunk share a single fetch. The payload then shares memory
+// with the cached chunk and must not be modified. A larger chunk is streamed
+// up to the block, as before.
 func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, blockFile *api.BlockFile) ([]byte, error) {
-	index, err := d.readCSCBIndex(ctx, nil, blockFile.GetFileUrl())
+	fileURL := blockFile.GetFileUrl()
+	index, err := d.readCSCBIndex(ctx, nil, fileURL)
 	if err != nil {
 		return nil, err
 	}
@@ -467,11 +477,42 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 	if err != nil {
 		return nil, err
 	}
-	blockPayloads, err := d.downloadCSCBChunkPayloads(ctx, blockFile.GetFileUrl(), index.Header.Codec, chunk, []*cscb.BlockDescriptor{block})
+	if !d.cscbCache.cachesChunk(chunk) {
+		blockPayloads, err := d.downloadCSCBChunkPayloads(ctx, fileURL, index.Header.Codec, chunk, []*cscb.BlockDescriptor{block})
+		if err != nil {
+			return nil, err
+		}
+		return blockPayloads[0], nil
+	}
+	chunkPayload, err := d.cscbCache.loadChunk(ctx, fileURL, chunk.Index, func(ctx context.Context) ([]byte, error) {
+		return d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
+	})
 	if err != nil {
 		return nil, err
 	}
-	return blockPayloads[0], nil
+	return cscbBlockPayloadFromChunk(chunkPayload, chunk, block)
+}
+
+// downloadCSCBChunk fetches one compressed chunk and returns it
+// decompressed and validated.
+func (d *blockDownloaderImpl) downloadCSCBChunk(ctx context.Context, fileURL string, codec api.Compression, chunk *cscb.ChunkDescriptor) ([]byte, error) {
+	return d.retryBytes.Retry(ctx, func(ctx context.Context) ([]byte, error) {
+		body, err := d.openHTTPRangeByLengthUnthrottled(ctx, fileURL, chunk.CompressedPayloadOffset, chunk.CompressedLength)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = body.Close() }()
+
+		limitedBody, err := limitReaderByLength(body, chunk.CompressedLength)
+		if err != nil {
+			return nil, err
+		}
+		payload, err := decodeCSCBChunk(limitedBody, codec, chunk)
+		if err != nil && (xerrors.Is(err, io.EOF) || xerrors.Is(err, io.ErrUnexpectedEOF)) {
+			return nil, retry.Retryable(err)
+		}
+		return payload, err
+	})
 }
 
 func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, limiter downloadLimiter, fileURL string, refs []downloadRef, result []*api.Block) error {
@@ -532,7 +573,21 @@ func (d *blockDownloaderImpl) downloadCSCBFile(ctx context.Context, limiter down
 	return nil
 }
 
+// readCSCBIndex returns the object's parsed index, from the cache when an
+// earlier read already fetched it. Callers must not modify it.
 func (d *blockDownloaderImpl) readCSCBIndex(ctx context.Context, limiter downloadLimiter, fileURL string) (*cscb.Index, error) {
+	if index, ok := d.cscbCache.index(fileURL); ok {
+		return index, nil
+	}
+	index, err := d.fetchCSCBIndex(ctx, limiter, fileURL)
+	if err != nil {
+		return nil, err
+	}
+	d.cscbCache.putIndex(fileURL, index)
+	return index, nil
+}
+
+func (d *blockDownloaderImpl) fetchCSCBIndex(ctx context.Context, limiter downloadLimiter, fileURL string) (*cscb.Index, error) {
 	first, err := d.readHTTPRange(ctx, limiter, fileURL, 0, cscbInitialIndexReadSize-1)
 	if err != nil {
 		return nil, err
