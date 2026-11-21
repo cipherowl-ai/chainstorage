@@ -401,8 +401,9 @@ func (d *blockDownloaderImpl) DownloadStream(ctx context.Context, blockFile *api
 // spoolDecompressedToFile performs a (retryable) HTTP GET, wraps the
 // response body in the appropriate decompressor, and writes the
 // decompressed block payload to dst. Single-block objects are streamed into
-// dst. CSCB objects buffer one decompressed chunk in memory for chunk
-// CRC validation, then write only the requested block payload to dst.
+// dst. A CSCB block comes from downloadCSCBBlockPayload: from a cached,
+// CRC-checked chunk when the chunk fits the cache, otherwise streamed up to
+// the block with a block CRC check.
 // The file is truncated + rewound on each retry attempt. This combines
 // download + decompression into a single pass with only one tempfile,
 // reducing per-block I/O cost under concurrent workloads compared to
@@ -461,10 +462,11 @@ func (d *blockDownloaderImpl) spoolDecompressedToFile(ctx context.Context, block
 }
 
 // downloadCSCBBlockPayload returns one consolidated block's payload. A chunk
-// that fits the chunk cache is fetched and decompressed whole, once, and
-// kept, so the next heights in it need no request. The payload then shares
-// memory with the cached chunk and must not be modified. A larger chunk is
-// streamed up to the block, as before.
+// that fits the chunk cache is fetched and decompressed whole and kept, so
+// the next heights in it need no request while it stays cached; concurrent
+// misses on one chunk share a single fetch. The payload then shares memory
+// with the cached chunk and must not be modified. A larger chunk is streamed
+// up to the block, as before.
 func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, blockFile *api.BlockFile) ([]byte, error) {
 	fileURL := blockFile.GetFileUrl()
 	index, err := d.readCSCBIndex(ctx, nil, fileURL)
@@ -482,13 +484,11 @@ func (d *blockDownloaderImpl) downloadCSCBBlockPayload(ctx context.Context, bloc
 		}
 		return blockPayloads[0], nil
 	}
-	chunkPayload, ok := d.cscbCache.chunk(fileURL, chunk.Index)
-	if !ok {
-		chunkPayload, err = d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
-		if err != nil {
-			return nil, err
-		}
-		d.cscbCache.putChunk(fileURL, chunk.Index, chunkPayload)
+	chunkPayload, err := d.cscbCache.loadChunk(fileURL, chunk.Index, func() ([]byte, error) {
+		return d.downloadCSCBChunk(ctx, fileURL, index.Header.Codec, chunk)
+	})
+	if err != nil {
+		return nil, err
 	}
 	return cscbBlockPayloadFromChunk(chunkPayload, chunk, block)
 }

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"go.uber.org/fx"
 	"golang.org/x/xerrors"
@@ -45,17 +46,51 @@ func chunkRangeHeader(fixture *cscbDownloaderFixture, chunkIndex int) string {
 }
 
 func (s *blockDownloaderTestSuite) TestDownload_CSCBSequentialHeightsFetchEachChunkOnce() {
+	for _, codec := range []api.Compression{api.Compression_ZSTD, api.Compression_GZIP} {
+		s.Run(codec.String(), func() {
+			require := testutil.Require(s.T())
+			fixture := newCSCBDownloaderFixtureWithCodec(s.T(), 6, 3, 0, codec)
+			defer fixture.close()
+			require.Equal(codec, fixture.index.Header.Codec)
+			require.Len(fixture.index.Chunks, 2)
+
+			server, recorder := newRangeHTTPServer(fixture.data)
+			defer server.Close()
+			for _, file := range fixture.blockFiles {
+				file.FileUrl = server.URL
+			}
+			s.newCSCBCacheTestDownloader(server)
+
+			for _, blockFile := range fixture.blockFiles {
+				rawBlock, err := s.downloader.Download(context.Background(), blockFile)
+				require.NoError(err)
+				s.requireCSCBBlock(fixture, blockFile, rawBlock)
+			}
+
+			// One index read and one read per chunk, where the uncached path
+			// read the index and the chunk again for each of the six blocks.
+			require.Equal([]string{
+				"bytes=0-65535",
+				chunkRangeHeader(fixture, 0),
+				chunkRangeHeader(fixture, 1),
+			}, recorder.rangesSnapshot())
+		})
+	}
+}
+
+func (s *blockDownloaderTestSuite) TestDownload_CSCBChunkExactlyAtCacheLimitIsCached() {
 	require := testutil.Require(s.T())
-	fixture := newCSCBDownloaderFixture(s.T(), 6, 3)
+	fixture := newCSCBDownloaderFixture(s.T(), 2, 2)
 	defer fixture.close()
-	require.Len(fixture.index.Chunks, 2)
+	require.Len(fixture.index.Chunks, 1)
 
 	server, recorder := newRangeHTTPServer(fixture.data)
 	defer server.Close()
 	for _, file := range fixture.blockFiles {
 		file.FileUrl = server.URL
 	}
-	s.newCSCBCacheTestDownloader(server)
+	downloader := s.newCSCBCacheTestDownloader(server)
+	downloader.cscbCache = newCSCBCache(cscbIndexCacheEntries, cscbChunkCacheEntries, int64(fixture.index.Chunks[0].UncompressedLength))
 
 	for _, blockFile := range fixture.blockFiles {
 		rawBlock, err := s.downloader.Download(context.Background(), blockFile)
@@ -63,13 +98,49 @@ func (s *blockDownloaderTestSuite) TestDownload_CSCBSequentialHeightsFetchEachCh
 		s.requireCSCBBlock(fixture, blockFile, rawBlock)
 	}
 
-	// One index read and one read per chunk, where the uncached path read
-	// the index and the chunk again for each of the six blocks.
 	require.Equal([]string{
 		"bytes=0-65535",
 		chunkRangeHeader(fixture, 0),
-		chunkRangeHeader(fixture, 1),
 	}, recorder.rangesSnapshot())
+}
+
+func (s *blockDownloaderTestSuite) TestDownload_CSCBConcurrentMissesShareOneChunkFetch() {
+	require := testutil.Require(s.T())
+	fixture := newCSCBDownloaderFixture(s.T(), 4, 4)
+	defer fixture.close()
+	require.Len(fixture.index.Chunks, 1)
+
+	// A slow store keeps every caller's miss in flight at once.
+	server, recorder := newRangeHTTPServerWithTracker(fixture.data, nil, 200*time.Millisecond)
+	defer server.Close()
+	for _, file := range fixture.blockFiles {
+		file.FileUrl = server.URL
+	}
+	s.newCSCBCacheTestDownloader(server)
+
+	errs := make([]error, len(fixture.blockFiles))
+	blocks := make([]*api.Block, len(fixture.blockFiles))
+	var wg sync.WaitGroup
+	for i, blockFile := range fixture.blockFiles {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			blocks[i], errs[i] = s.downloader.Download(context.Background(), blockFile)
+		}()
+	}
+	wg.Wait()
+	for i, blockFile := range fixture.blockFiles {
+		require.NoError(errs[i])
+		s.requireCSCBBlock(fixture, blockFile, blocks[i])
+	}
+
+	chunkReads := 0
+	for _, rangeValue := range recorder.rangesSnapshot() {
+		if rangeValue == chunkRangeHeader(fixture, 0) {
+			chunkReads++
+		}
+	}
+	require.Equal(1, chunkReads)
 }
 
 func (s *blockDownloaderTestSuite) TestDownload_CSCBCacheKeyIgnoresPresignedQuery() {
@@ -372,8 +443,17 @@ func TestLRUCache(t *testing.T) {
 }
 
 func TestDecodeCSCBChunk(t *testing.T) {
-	fixture := newCSCBDownloaderFixture(t, 4, 2)
+	for _, codec := range []api.Compression{api.Compression_ZSTD, api.Compression_GZIP} {
+		t.Run(codec.String(), func(t *testing.T) {
+			testDecodeCSCBChunk(t, codec)
+		})
+	}
+}
+
+func testDecodeCSCBChunk(t *testing.T, fixtureCodec api.Compression) {
+	fixture := newCSCBDownloaderFixtureWithCodec(t, 4, 2, 0, fixtureCodec)
 	defer fixture.close()
+	testutil.Require(t).Equal(fixtureCodec, fixture.index.Header.Codec)
 	codec := fixture.index.Header.Codec
 	chunk := fixture.index.Chunks[1]
 	frame := fixture.data[chunk.CompressedPayloadOffset : chunk.CompressedPayloadOffset+chunk.CompressedLength]

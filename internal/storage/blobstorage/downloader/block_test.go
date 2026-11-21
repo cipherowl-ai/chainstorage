@@ -850,6 +850,10 @@ func newCSCBDownloaderFixture(t *testing.T, blockCount int, chunkBlocks uint64) 
 }
 
 func newCSCBDownloaderFixtureWithPayloadSize(t testing.TB, blockCount int, chunkBlocks uint64, payloadSize int) *cscbDownloaderFixture {
+	return newCSCBDownloaderFixtureWithCodec(t, blockCount, chunkBlocks, payloadSize, api.Compression_ZSTD)
+}
+
+func newCSCBDownloaderFixtureWithCodec(t testing.TB, blockCount int, chunkBlocks uint64, payloadSize int, codec api.Compression) *cscbDownloaderFixture {
 	t.Helper()
 	require := testutil.Require(t)
 
@@ -891,7 +895,7 @@ func newCSCBDownloaderFixtureWithPayloadSize(t testing.TB, blockCount int, chunk
 	object, err := cscb.Encode(context.Background(), cscb.EncodeConfig{
 		Blockchain:             common.Blockchain_BLOCKCHAIN_ETHEREUM,
 		Network:                common.Network_NETWORK_ETHEREUM_MAINNET,
-		Codec:                  api.Compression_ZSTD,
+		Codec:                  codec,
 		CodecLevel:             1,
 		MaxBlocks:              uint64(blockCount),
 		CompressionChunkBlocks: chunkBlocks,
@@ -912,7 +916,7 @@ func newCSCBDownloaderFixtureWithPayloadSize(t testing.TB, blockCount int, chunk
 			ParentHash:         source.GetParentHash(),
 			Height:             source.GetHeight(),
 			ParentHeight:       source.GetParentHeight(),
-			Compression:        api.Compression_ZSTD,
+			Compression:        codec,
 			ObjectFormat:       placement.ObjectFormat,
 			ByteOffset:         placement.ByteOffset,
 			ByteLength:         placement.ByteLength,

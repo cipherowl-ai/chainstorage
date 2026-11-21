@@ -6,8 +6,10 @@ import (
 	"io"
 	"math"
 	"net/url"
+	"strconv"
 	"sync"
 
+	"golang.org/x/sync/singleflight"
 	"golang.org/x/xerrors"
 
 	"github.com/coinbase/chainstorage/internal/storage/blobstorage/cscb"
@@ -34,6 +36,9 @@ type (
 	cscbCache struct {
 		indexes *lruCache
 		chunks  *lruCache
+		// chunkFetches lets concurrent misses on one chunk share a single
+		// fetch, so the chunk is downloaded and held once, not per caller.
+		chunkFetches singleflight.Group
 	}
 
 	cscbChunkKey struct {
@@ -103,8 +108,39 @@ func (c *cscbCache) putChunk(fileURL string, chunkIndex uint32, payload []byte) 
 	c.chunks.put(cscbChunkKey{object: cscbObjectKey(fileURL), chunk: chunkIndex}, payload, int64(len(payload)))
 }
 
+// loadChunk returns the cached chunk, or fetches it once for all concurrent
+// callers and caches it. A failed fetch is not cached; callers that joined it
+// get its error, including one caused by the first caller's context ending.
+func (c *cscbCache) loadChunk(fileURL string, chunkIndex uint32, fetch func() ([]byte, error)) ([]byte, error) {
+	if payload, ok := c.chunk(fileURL, chunkIndex); ok {
+		return payload, nil
+	}
+	key := cscbObjectKey(fileURL) + "#" + strconv.FormatUint(uint64(chunkIndex), 10)
+	value, err, _ := c.chunkFetches.Do(key, func() (any, error) {
+		if payload, ok := c.chunk(fileURL, chunkIndex); ok {
+			return payload, nil
+		}
+		payload, err := fetch()
+		if err != nil {
+			return nil, err
+		}
+		c.putChunk(fileURL, chunkIndex, payload)
+		return payload, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	payload, ok := value.([]byte)
+	if !ok {
+		return nil, xerrors.Errorf("unexpected CSCB chunk cache value %T", value)
+	}
+	return payload, nil
+}
+
 // cscbObjectKey identifies the object behind a presigned link by dropping
-// the query string (which holds the signature) and the fragment.
+// the query string (which holds the signature) and the fragment. It assumes
+// the object is named by the link's host and path, as S3 and GCS presigned
+// links are.
 func cscbObjectKey(fileURL string) string {
 	parsed, err := url.Parse(fileURL)
 	if err != nil {
