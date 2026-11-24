@@ -17,7 +17,7 @@ import (
 	"golang.org/x/xerrors"
 )
 
-const cscbWriteOncePolicyMode = "bucket_deny_unconditional_put_delete_replication_and_lifecycle_mutation_no_matching_lifecycle_actions"
+const cscbWriteOncePolicyMode = "bucket_deny_unconditional_put_delete_replication_and_lifecycle_mutation_no_matching_lifecycle_actions_except_guarded_intelligent_tiering"
 
 type (
 	policyStringList []string
@@ -71,6 +71,7 @@ func (s *S3ObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket
 	writeProtected := false
 	mutationProtected := false
 	lifecycleConfigurationProtected := false
+	intelligentTieringConfigurationProtected := false
 	for _, statement := range policy.Statements {
 		if statementEnforcesCSCBWriteOnce(statement, objectARN) {
 			writeProtected = true
@@ -80,6 +81,9 @@ func (s *S3ObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket
 		}
 		if statementEnforcesLifecycleConfigurationProtection(statement, bucketARN) {
 			lifecycleConfigurationProtected = true
+		}
+		if statementEnforcesIntelligentTieringConfigurationProtection(statement, bucketARN) {
+			intelligentTieringConfigurationProtected = true
 		}
 	}
 	if !writeProtected || !mutationProtected || !lifecycleConfigurationProtected {
@@ -92,10 +96,52 @@ func (s *S3ObjectStore) InspectObjectRetentionSafety(ctx context.Context, bucket
 			key,
 		)
 	}
-	if err := verifyNoMatchingLifecycleActions(bucket, key, lifecycleRules); err != nil {
+	movesToIntelligentTiering, err := verifyNoMatchingLifecycleActions(bucket, key, lifecycleRules)
+	if err != nil {
+		return snapshot, err
+	}
+	if !movesToIntelligentTiering {
+		return snapshot, nil
+	}
+	// An Intelligent-Tiering object stays immediately readable unless the
+	// bucket has an Intelligent-Tiering configuration: that is what switches on
+	// the archive tiers, which need a restore before a read. So the bucket must
+	// have none, and its policy must stop anyone adding one.
+	if !intelligentTieringConfigurationProtected {
+		return snapshot, xerrors.Errorf(
+			"S3 lifecycle rule moves CSCB object data to Intelligent-Tiering, but the bucket policy does not deny s3:PutIntelligentTieringConfiguration to everyone: bucket=%s key=%s",
+			bucket,
+			key,
+		)
+	}
+	if err := s.verifyNoIntelligentTieringConfiguration(ctx, bucket); err != nil {
 		return snapshot, err
 	}
 	return snapshot, nil
+}
+
+func (s *S3ObjectStore) verifyNoIntelligentTieringConfiguration(ctx context.Context, bucket string) error {
+	out, err := s.client.ListBucketIntelligentTieringConfigurations(
+		ctx,
+		&awss3.ListBucketIntelligentTieringConfigurationsInput{Bucket: aws.String(bucket)},
+	)
+	if err != nil {
+		return xerrors.Errorf("failed to list CSCB bucket Intelligent-Tiering configurations (bucket=%s): %w", bucket, err)
+	}
+	if out == nil {
+		return xerrors.Errorf("CSCB bucket Intelligent-Tiering configurations returned an empty response: bucket=%s", bucket)
+	}
+	if len(out.IntelligentTieringConfigurationList) > 0 {
+		return xerrors.Errorf(
+			"CSCB bucket has an Intelligent-Tiering configuration, which can archive CSCB object data: bucket=%s configurations=%d",
+			bucket,
+			len(out.IntelligentTieringConfigurationList),
+		)
+	}
+	if aws.ToBool(out.IsTruncated) {
+		return xerrors.Errorf("CSCB bucket Intelligent-Tiering configurations listing is truncated: bucket=%s", bucket)
+	}
+	return nil
 }
 
 func (s *S3ObjectStore) getLifecycleRules(ctx context.Context, bucket string) ([]awss3types.LifecycleRule, error) {
@@ -115,19 +161,30 @@ func (s *S3ObjectStore) getLifecycleRules(ctx context.Context, bucket string) ([
 	return out.Rules, nil
 }
 
-func verifyNoMatchingLifecycleActions(bucket string, key string, rules []awss3types.LifecycleRule) error {
+// verifyNoMatchingLifecycleActions rejects every enabled rule that can expire a
+// CSCB object or move it to another storage class, with one exception: a rule
+// whose only object data actions are transitions to Intelligent-Tiering. That
+// transition keeps the object, its version and its immediate reads. It reports
+// whether such a rule matched, because the caller must then check the bucket's
+// Intelligent-Tiering configuration.
+func verifyNoMatchingLifecycleActions(bucket string, key string, rules []awss3types.LifecycleRule) (bool, error) {
+	movesToIntelligentTiering := false
 	for _, rule := range rules {
 		if rule.Status != awss3types.ExpirationStatusEnabled || !lifecycleRuleHasObjectDataAction(rule) || !lifecycleRuleMayMatchKey(rule, key) {
 			continue
 		}
-		return xerrors.Errorf(
+		if lifecycleRuleOnlyTransitionsToIntelligentTiering(rule) {
+			movesToIntelligentTiering = true
+			continue
+		}
+		return false, xerrors.Errorf(
 			"enabled S3 lifecycle rule can expire or transition CSCB object data: bucket=%s key=%s rule_id=%q",
 			bucket,
 			key,
 			aws.ToString(rule.ID),
 		)
 	}
-	return nil
+	return movesToIntelligentTiering, nil
 }
 
 func retentionSafetySnapshot(policy bucketPolicyDocument, rules []awss3types.LifecycleRule) (RetentionSafetySnapshot, error) {
@@ -150,6 +207,25 @@ func lifecycleRuleHasObjectDataAction(rule awss3types.LifecycleRule) bool {
 		rule.NoncurrentVersionExpiration != nil ||
 		len(rule.Transitions) > 0 ||
 		len(rule.NoncurrentVersionTransitions) > 0
+}
+
+// lifecycleRuleOnlyTransitionsToIntelligentTiering reports whether the rule has
+// an object data action and every one is a transition to Intelligent-Tiering.
+func lifecycleRuleOnlyTransitionsToIntelligentTiering(rule awss3types.LifecycleRule) bool {
+	if rule.Expiration != nil || rule.NoncurrentVersionExpiration != nil {
+		return false
+	}
+	for _, transition := range rule.Transitions {
+		if transition.StorageClass != awss3types.TransitionStorageClassIntelligentTiering {
+			return false
+		}
+	}
+	for _, transition := range rule.NoncurrentVersionTransitions {
+		if transition.StorageClass != awss3types.TransitionStorageClassIntelligentTiering {
+			return false
+		}
+	}
+	return len(rule.Transitions)+len(rule.NoncurrentVersionTransitions) > 0
 }
 
 func lifecycleRuleMayMatchKey(rule awss3types.LifecycleRule, key string) bool {
@@ -241,6 +317,15 @@ func statementEnforcesLifecycleConfigurationProtection(statement bucketPolicySta
 	}
 	return principalIncludesEveryone(statement.Principal) &&
 		policyPatternsInclude(statement.Action, "s3:PutLifecycleConfiguration") &&
+		policyPatternsInclude(statement.Resource, bucketARN)
+}
+
+func statementEnforcesIntelligentTieringConfigurationProtection(statement bucketPolicyStatement, bucketARN string) bool {
+	if statement.Effect != "Deny" || len(statement.NotPrincipal) != 0 || len(statement.NotAction) != 0 || len(statement.NotResource) != 0 || len(statement.Condition) != 0 {
+		return false
+	}
+	return principalIncludesEveryone(statement.Principal) &&
+		policyPatternsInclude(statement.Action, "s3:PutIntelligentTieringConfiguration") &&
 		policyPatternsInclude(statement.Resource, bucketARN)
 }
 
