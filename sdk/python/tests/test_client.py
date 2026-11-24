@@ -446,16 +446,19 @@ def test_a_single_block_declaring_too_many_bytes_is_refused_before_it_is_read(
     assert deployment.storage.requests_for("blocks/5") == []
 
 
+@pytest.mark.parametrize("budget", [None, 1], ids=["decompressed ahead", "at its turn"])
 @pytest.mark.parametrize(
     ("compression", "compress"),
     [(api_pb2.GZIP, gzip.compress), (api_pb2.ZSTD, zstd_without_a_declared_size)],
     ids=["gzip", "zstd without a declared size"],
 )
 def test_a_single_block_of_unknown_length_may_not_grow_past_the_cap(
-    deployment, monkeypatch, compression, compress
+    deployment, monkeypatch, compression, compress, budget
 ):
     payload = make_block(5, 4096).SerializeToString()
     deployment.storage.objects["unsized"] = compress(payload)
+    if budget is not None:
+        monkeypatch.setattr(downloader_module, "_IN_FLIGHT_BYTES", budget)
     downloader = BlockDownloader(deployment.config())
 
     try:
@@ -486,6 +489,107 @@ def test_a_single_block_may_be_larger_than_the_largest_chunk(
     try:
         file = single_block_file(deployment, "large", compression, len(payload) if declared else 0)
         assert downloader.download(file) == payload
+    finally:
+        downloader.close()
+
+
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [
+        (api_pb2.GZIP, gzip.compress),
+        (api_pb2.ZSTD, zstd_without_a_declared_size),
+        (api_pb2.ZSTD, zstandard.ZstdCompressor().compress),
+        (api_pb2.NONE, bytes),
+    ],
+    ids=["gzip", "zstd without a declared size", "zstd", "none"],
+)
+@pytest.mark.parametrize(
+    ("budget", "ahead"),
+    [(6_000, False), (3_000_000, True)],
+    ids=["larger than its share", "smaller"],
+)
+def test_a_block_of_unknown_length_is_decompressed_ahead_only_within_its_share(
+    deployment, monkeypatch, compression, compress, budget, ahead
+):
+    payloads = [make_block(height, 4096).SerializeToString() for height in range(1, 7)]
+    assert all(2_000 < len(payload) < 6_000 for payload in payloads)
+    for number, payload in enumerate(payloads):
+        deployment.storage.objects[f"unsized-{number}"] = compress(payload)
+    monkeypatch.setattr(downloader_module, "_IN_FLIGHT_BYTES", budget)
+    real, whole = cscb.decompress, []
+
+    def decompress(data, compression, **bound):
+        payload = real(data, compression, **bound)
+        whole.append(threading.get_ident())
+        return payload
+
+    monkeypatch.setattr(cscb, "decompress", decompress)
+    downloader = BlockDownloader(deployment.config(num_workers=3))
+
+    try:
+        files = [
+            single_block_file(deployment, f"unsized-{number}", compression) for number in range(6)
+        ]
+        assert list(downloader.iter_download(files)) == payloads
+    finally:
+        downloader.close()
+    # The caller's own thread decompresses one at a time; the workers, several.
+    caller = threading.get_ident()
+    assert len(whole) == 6
+    assert all((thread != caller) == ahead for thread in whole)
+
+
+def test_a_block_decompressed_at_its_turn_is_let_go_before_the_next(deployment, monkeypatch):
+    for number in range(3):
+        deployment.storage.objects[f"unsized-{number}"] = gzip.compress(
+            make_block(number + 1, 4096).SerializeToString()
+        )
+    monkeypatch.setattr(downloader_module, "_IN_FLIGHT_BYTES", 1)
+    alive: list[int] = []
+    released: list[int] = []
+
+    class Payload(bytes):
+        def __del__(self):
+            released.append(1)
+
+    def unpack(packed):
+        alive.append(len(alive) - len(released))
+        return Payload(b"block")
+
+    monkeypatch.setattr(downloader_module._Packed, "unpack", unpack)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        files = [
+            single_block_file(deployment, f"unsized-{number}", api_pb2.GZIP) for number in range(3)
+        ]
+        for payload in downloader.iter_download(files):
+            assert payload == b"block"
+            del payload
+    finally:
+        downloader.close()
+    assert alive == [0, 0, 0]
+
+
+def test_a_block_decompressed_at_its_turn_is_not_handed_over_late(deployment, monkeypatch):
+    deployment.storage.objects["unsized"] = gzip.compress(make_block(5).SerializeToString())
+    monkeypatch.setattr(downloader_module, "_IN_FLIGHT_BYTES", 1)
+    real = downloader_module._Packed.unpack
+
+    def slow(packed):
+        payload = real(packed)
+        time.sleep(0.6)
+        return payload
+
+    monkeypatch.setattr(downloader_module._Packed, "unpack", slow)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(CallTimeoutError):
+            downloader.download(
+                single_block_file(deployment, "unsized", api_pb2.GZIP),
+                deadline=time.monotonic() + 0.5,
+            )
     finally:
         downloader.close()
 

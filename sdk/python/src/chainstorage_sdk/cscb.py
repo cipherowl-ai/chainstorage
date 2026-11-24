@@ -417,10 +417,14 @@ def decompress(
             message = f"decompressed data is longer than the {limit} bytes allowed"
         else:
             message = f"decompressed data is longer than the declared {max_size} bytes"
-        raise BlockFormatError(message) from None
+        raise DecompressedTooLongError(message) from None
     except (OSError, EOFError, zlib.error, zstandard.ZstdError) as exc:
         raise BlockFormatError(f"failed to decompress block data: {exc}") from exc
     return payload
+
+
+class DecompressedTooLongError(BlockFormatError):
+    """The output is longer than ``decompress`` was told to allow."""
 
 
 class _TooLong(Exception):
