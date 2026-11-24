@@ -435,7 +435,7 @@ def test_a_single_block_declaring_too_many_bytes_is_refused_before_it_is_read(
     deployment, monkeypatch
 ):
     deployment.server.add_block(5)
-    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", 1000)
     downloader = BlockDownloader(deployment.config())
 
     try:
@@ -461,9 +461,31 @@ def test_a_single_block_of_unknown_length_may_not_grow_past_the_cap(
     try:
         file = single_block_file(deployment, "unsized", compression)
         assert downloader.download(file) == payload
-        monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", len(payload) - 1)
+        monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", len(payload) - 1)
         with pytest.raises(BlockFormatError, match="bytes allowed"):
             downloader.download(file)
+    finally:
+        downloader.close()
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["unknown length", "declared length"])
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [(api_pb2.GZIP, gzip.compress), (api_pb2.ZSTD, zstd_without_a_declared_size)],
+    ids=["gzip", "zstd without a declared size"],
+)
+def test_a_single_block_may_be_larger_than_the_largest_chunk(
+    deployment, monkeypatch, compression, compress, declared
+):
+    payload = make_block(5, 4096).SerializeToString()
+    deployment.storage.objects["large"] = compress(payload)
+    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", len(payload))
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        file = single_block_file(deployment, "large", compression, len(payload) if declared else 0)
+        assert downloader.download(file) == payload
     finally:
         downloader.close()
 
@@ -490,7 +512,7 @@ def test_a_single_block_file_with_a_second_zstd_frame_is_refused(deployment, dec
 
 def test_a_single_block_object_larger_than_the_cap_is_not_read_whole(deployment, monkeypatch):
     deployment.storage.objects["huge"] = b"x" * 10_000
-    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", 1000)
     downloader = BlockDownloader(deployment.config())
 
     try:

@@ -49,6 +49,10 @@ _CODECS = {1: api_pb2.GZIP, 2: api_pb2.ZSTD}
 # larger one is refused before any memory is set aside for it.
 MAX_CHUNK_BYTES = 2**30
 
+# A single-block object can hold a larger block than any chunk (a Zcash block
+# of 1.3 GiB exists), but not one protobuf could not parse.
+MAX_BLOCK_BYTES = 2**31 - 1
+
 # The largest window a zstd frame may declare. libzstd refuses larger frames
 # by default at 128 MiB; the server's encoder may use up to 512 MiB. The Go
 # reader uses the same limit.

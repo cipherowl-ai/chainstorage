@@ -120,8 +120,9 @@ with Client(config) as client:
   refused before it is sent, and any other stops at the limit. Both raise
   `ResponseTooLargeError`, and nothing more is tried. Things to know:
   - A limit below 64 KiB refuses every consolidated file.
-  - It limits what is fetched, not the decompressed size, which the file
-    format limits to 1 GiB per block or chunk.
+  - It limits what is fetched, not the decompressed size. That is limited to
+    1 GiB for a chunk and 2 GiB for a single-block object; reading a block of
+    that size takes more than twice its size in memory.
   - A block whose index and chunk the client still holds needs no request,
     and is returned whatever the limit.
   - The body of a refusal is read within the limit too. Under a limit of

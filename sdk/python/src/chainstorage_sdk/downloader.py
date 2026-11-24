@@ -31,8 +31,9 @@ A caller can limit a download in two ways:
   are sized to end there: a body sent with its length is read a few bytes
   past the limit at most, one per piece, and a body the store sends in
   chunks of its own less than one piece past it. It limits what is fetched,
-  not the decompressed size, which the file format limits. A block whose
-  index and
+  not the decompressed size, which is limited to ``cscb.MAX_CHUNK_BYTES`` for
+  a chunk and to ``cscb.MAX_BLOCK_BYTES`` for a single-block object. A block
+  whose index and
   chunk are still in the cache needs no request, and is returned. The body of
   a refusal is read within the limit as well: under a limit of less than
   2 KiB, the store's error code can be missing from the ``DownloadError``.
@@ -312,10 +313,9 @@ class BlockDownloader:
         return units
 
     def _download_single(self, block_file: api_pb2.BlockFile, limits: _Limits) -> list[bytes]:
-        # No block is larger than the largest chunk. The server does not
-        # always say how long the block is; when it does not, the output may
-        # still not grow past that.
-        cap = cscb.MAX_CHUNK_BYTES
+        # The server does not always say how long the block is; when it does
+        # not, the output may still not grow past the largest block.
+        cap = cscb.MAX_BLOCK_BYTES
         declared = block_file.uncompressed_length or None
         if declared is not None and declared > cap:
             raise BlockFormatError(
@@ -326,6 +326,7 @@ class BlockDownloader:
             payload = cscb.decompress(body, block_file.compression, max_size=declared)
         else:
             payload = cscb.decompress(body, block_file.compression, limit=cap)
+        del body  # a large block is copied below: do not hold its object too
         payload = bytes(payload)
         if declared is not None and len(payload) != declared:
             raise BlockFormatError(
