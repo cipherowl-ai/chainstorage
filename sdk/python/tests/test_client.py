@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import random
 import struct
 import threading
 import time
@@ -14,7 +15,7 @@ import grpc
 import pytest
 import requests
 import zstandard
-from conftest import TAG, block_hash, block_time, make_block
+from conftest import TAG, block_hash, block_time, compress, make_block
 
 from chainstorage_sdk import (
     BlockFormatError,
@@ -399,7 +400,8 @@ def test_a_damaged_single_block_object_is_refused(deployment, compression, damag
         deployment.client().get_block(5, read_source=SINGLE_BLOCK)
 
 
-def test_a_single_block_of_the_wrong_length_is_refused(deployment):
+@pytest.mark.parametrize("files", [1, 2], ids=["alone", "one of two"])
+def test_a_single_block_of_the_wrong_length_is_refused(deployment, monkeypatch, files):
     deployment.server.add_block(5)
     file = api_pb2.BlockFile(
         height=5,
@@ -407,19 +409,33 @@ def test_a_single_block_of_the_wrong_length_is_refused(deployment):
         compression=api_pb2.GZIP,
         uncompressed_length=len(make_block(5).SerializeToString()) + 1,
     )
+    work = Work(monkeypatch)
     downloader = BlockDownloader(deployment.config())
 
     try:
         with pytest.raises(BlockFormatError, match="bytes the server reported"):
-            downloader.download(file)
-        file.uncompressed_length -= 1
-        assert downloader.download(file) == make_block(5).SerializeToString()
+            downloader.download_many([file] * files)
+        file.uncompressed_length -= 2
+        with pytest.raises(BlockFormatError, match="longer than the declared"):
+            downloader.download_many([file] * files)
+        file.uncompressed_length += 1
+        blocks = downloader.download_many([file] * files)
+        assert blocks == [make_block(5).SerializeToString()] * files
     finally:
         downloader.close()
+    # It is found ahead of its turn, and not tried again then.
+    assert work.tried and not any(work.tried)
 
 
 def zstd_without_a_declared_size(data: bytes) -> bytes:
     return zstandard.ZstdCompressor(write_content_size=False).compress(data)
+
+
+def wait_until(condition) -> None:
+    end = time.monotonic() + 5
+    while not condition():
+        assert time.monotonic() < end, "it did not happen in time"
+        time.sleep(0.01)
 
 
 def single_block_file(deployment, name: str, compression: int, length: int = 0):
@@ -435,7 +451,7 @@ def test_a_single_block_declaring_too_many_bytes_is_refused_before_it_is_read(
     deployment, monkeypatch
 ):
     deployment.server.add_block(5)
-    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", 1000)
     downloader = BlockDownloader(deployment.config())
 
     try:
@@ -446,26 +462,408 @@ def test_a_single_block_declaring_too_many_bytes_is_refused_before_it_is_read(
     assert deployment.storage.requests_for("blocks/5") == []
 
 
+class Work:
+    """Records what is read from the store and decompressed, and whether the
+    caller's own thread did it."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.caller = threading.get_ident()
+        self.read: list[tuple[bool, int]] = []
+        self.tried: list[bool] = []
+        self.made: list[bool] = []
+        read_at_most, decompress = downloader_module._read_at_most, cscb.decompress
+
+        def read(response, size, limits):
+            body = read_at_most(response, size, limits)
+            self.read.append((self.is_caller(), len(body)))
+            return body
+
+        def make(data, compression, **bound):
+            self.tried.append(self.is_caller())
+            payload = decompress(data, compression, **bound)
+            self.made.append(self.is_caller())
+            return payload
+
+        monkeypatch.setattr(downloader_module, "_read_at_most", read)
+        monkeypatch.setattr(cscb, "decompress", make)
+
+    def is_caller(self) -> bool:
+        return threading.get_ident() == self.caller
+
+
+def set_share(monkeypatch, share: int, downloads: int) -> None:
+    """Lets each of so many downloads hold ``share`` bytes ahead of its turn."""
+    monkeypatch.setattr(downloader_module, "_IN_FLIGHT_BYTES", share * downloads)
+    monkeypatch.setattr(downloader_module, "_UNKNOWN_BLOCK_BYTES", 1)
+
+
+@pytest.mark.parametrize(("share", "files"), [(10_000, 1), (10_000, 2), (2_000, 2)])
 @pytest.mark.parametrize(
     ("compression", "compress"),
     [(api_pb2.GZIP, gzip.compress), (api_pb2.ZSTD, zstd_without_a_declared_size)],
     ids=["gzip", "zstd without a declared size"],
 )
 def test_a_single_block_of_unknown_length_may_not_grow_past_the_cap(
-    deployment, monkeypatch, compression, compress
+    deployment, monkeypatch, compression, compress, share, files
 ):
     payload = make_block(5, 4096).SerializeToString()
     deployment.storage.objects["unsized"] = compress(payload)
+    set_share(monkeypatch, share, files)
     downloader = BlockDownloader(deployment.config())
 
     try:
-        file = single_block_file(deployment, "unsized", compression)
-        assert downloader.download(file) == payload
-        monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", len(payload) - 1)
+        wanted = [single_block_file(deployment, "unsized", compression)] * files
+        assert downloader.download_many(wanted) == [payload] * files
+        monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", len(payload) - 1)
         with pytest.raises(BlockFormatError, match="bytes allowed"):
-            downloader.download(file)
+            downloader.download_many(wanted)
     finally:
         downloader.close()
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["unknown length", "declared length"])
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [(api_pb2.GZIP, gzip.compress), (api_pb2.ZSTD, zstd_without_a_declared_size)],
+    ids=["gzip", "zstd without a declared size"],
+)
+def test_a_single_block_may_be_larger_than_the_largest_chunk(
+    deployment, monkeypatch, compression, compress, declared
+):
+    payload = make_block(5, 4096).SerializeToString()
+    deployment.storage.objects["large"] = compress(payload)
+    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", len(payload))
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        file = single_block_file(deployment, "large", compression, len(payload) if declared else 0)
+        assert downloader.download(file) == payload
+    finally:
+        downloader.close()
+
+
+@pytest.mark.parametrize(
+    ("compression", "compress"),
+    [
+        (api_pb2.GZIP, gzip.compress),
+        (api_pb2.ZSTD, zstd_without_a_declared_size),
+        (api_pb2.ZSTD, zstandard.ZstdCompressor().compress),
+    ],
+    ids=["gzip", "zstd without a declared size", "zstd"],
+)
+@pytest.mark.parametrize(
+    ("share", "ahead"), [(2_000, False), (6_000, True)], ids=["larger than its share", "smaller"]
+)
+def test_a_block_of_unknown_length_is_decompressed_ahead_only_within_its_share(
+    deployment, monkeypatch, compression, compress, share, ahead
+):
+    payloads = [make_block(height, 4096).SerializeToString() for height in range(1, 7)]
+    assert all(2_000 < len(payload) < 6_000 for payload in payloads)
+    objects = [compress(payload) for payload in payloads]
+    assert all(len(stored) < 2_000 for stored in objects)
+    for number, stored in enumerate(objects):
+        deployment.storage.objects[f"unsized-{number}"] = stored
+    set_share(monkeypatch, share, 3)
+    work = Work(monkeypatch)
+    downloader = BlockDownloader(deployment.config(num_workers=3))
+
+    try:
+        files = [
+            single_block_file(deployment, f"unsized-{number}", compression) for number in range(6)
+        ]
+        made = list(downloader.iter_download(files))
+    finally:
+        downloader.close()
+    assert made == payloads
+    assert all(type(payload) is bytes for payload in made)
+    # The caller's own thread makes one block at a time; the workers, several.
+    assert work.made == [not ahead] * 6
+    # Each object is downloaded once, ahead of its turn.
+    assert sorted(work.read) == sorted((False, len(stored)) for stored in objects)
+
+
+@pytest.mark.parametrize(
+    ("compression", "compress", "declared"),
+    [(api_pb2.NONE, bytes, False), (api_pb2.GZIP, gzip.compress, True)],
+    ids=["unknown length", "longer than the declared length"],
+)
+def test_an_object_is_read_ahead_only_within_its_share(
+    deployment, monkeypatch, compression, compress, declared
+):
+    # Random data does not get shorter: the compressed objects are longer.
+    payloads = [random.Random(number).randbytes(5_000) for number in range(6)]
+    objects = [compress(payload) for payload in payloads]
+    for number, stored in enumerate(objects):
+        deployment.storage.objects[f"large-{number}"] = stored
+    set_share(monkeypatch, 2_000, 3)
+    work = Work(monkeypatch)
+    downloader = BlockDownloader(deployment.config(num_workers=3))
+
+    try:
+        files = [
+            single_block_file(
+                deployment, f"large-{number}", compression, len(payload) if declared else 0
+            )
+            for number, payload in enumerate(payloads)
+        ]
+        assert list(downloader.iter_download(files)) == payloads
+    finally:
+        downloader.close()
+    # One byte more than may be held shows that the object is longer.
+    ahead = 5_001 if declared else 2_001
+    assert all(len(stored) > ahead - 1 for stored in objects)
+    assert [length for caller, length in work.read if not caller] == [ahead] * 6
+    assert [length for caller, length in work.read if caller] == [len(one) for one in objects]
+    assert work.made == [True] * 6
+
+
+@pytest.mark.parametrize("compression", [api_pb2.GZIP, api_pb2.ZSTD])
+def test_a_damaged_block_of_unknown_length_is_refused_ahead_of_its_turn(
+    deployment, monkeypatch, compression
+):
+    stored = compress(make_block(5, 4096).SerializeToString(), compression)
+    deployment.storage.objects["damaged"] = stored[:-5]
+    work = Work(monkeypatch)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        with pytest.raises(BlockFormatError):
+            downloader.download_many([single_block_file(deployment, "damaged", compression)] * 2)
+    finally:
+        downloader.close()
+    assert work.tried and not any(work.tried)
+
+
+def test_a_small_object_is_downloaded_once_though_longer_than_its_block(deployment):
+    # A short block gets longer when it is compressed.
+    payload = b"block"
+    stored = gzip.compress(payload)
+    assert len(stored) > len(payload)
+    deployment.storage.objects["small"] = stored
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        files = [single_block_file(deployment, "small", api_pb2.GZIP, len(payload))] * 2
+        assert downloader.download_many(files) == [payload] * 2
+    finally:
+        downloader.close()
+    assert len(deployment.storage.requests_for("small")) == 2
+
+
+def test_what_was_read_ahead_of_a_longer_object_is_not_kept(deployment, monkeypatch):
+    read: list[int] = []
+    let_go: list[int] = []
+    real = downloader_module._read_at_most
+
+    class Body(bytes):
+        def __del__(self):
+            let_go.append(len(self))
+
+    def recording(response, size, limits):
+        body = Body(real(response, size, limits))
+        read.append(len(body))
+        return body
+
+    monkeypatch.setattr(downloader_module, "_read_at_most", recording)
+    for number in range(3):
+        deployment.storage.objects[f"large-{number}"] = b"x" * 5_000
+    set_share(monkeypatch, 2_000, 3)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        files = [
+            single_block_file(deployment, f"large-{number}", api_pb2.NONE) for number in range(3)
+        ]
+        payloads = downloader.iter_download(files)
+        assert next(payloads) == b"x" * 5_000
+        # All three have been read as far as their share, and the first whole.
+        wait_until(lambda: sorted(read) == [2_001, 2_001, 2_001, 5_000])
+        wait_until(lambda: sorted(let_go) == sorted(read))
+        payloads.close()
+    finally:
+        downloader.close()
+
+
+@pytest.mark.parametrize("compression", [api_pb2.NONE, api_pb2.GZIP, api_pb2.ZSTD])
+def test_a_block_that_is_downloaded_alone_may_be_as_large_as_any(
+    deployment, monkeypatch, compression
+):
+    payload = make_block(5, 4096).SerializeToString()
+    stored = compress(payload, compression)
+    deployment.storage.objects["large"] = stored
+    set_share(monkeypatch, 2_000, 1)
+    work = Work(monkeypatch)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        assert downloader.download(single_block_file(deployment, "large", compression)) == payload
+    finally:
+        downloader.close()
+    assert work.read == [(False, len(stored))]
+    assert work.made == [False]
+
+
+@pytest.mark.parametrize(("least", "expected"), [(1, 4), (3_000, 2)])
+def test_a_block_of_unknown_length_counts_for_its_share_of_the_memory_budget(
+    deployment, monkeypatch, least, expected
+):
+    deployment.storage.objects["small"] = make_block(5).SerializeToString()
+    set_share(monkeypatch, 1_500, 4)
+    monkeypatch.setattr(downloader_module, "_UNKNOWN_BLOCK_BYTES", least)
+    deployment.storage.delay = 0.2
+    downloader = BlockDownloader(deployment.config(num_workers=4))
+
+    try:
+        downloader.download_many([single_block_file(deployment, "small", api_pb2.NONE)] * 8)
+    finally:
+        downloader.close()
+    # Four workers, with a share each; a share is never below the least one.
+    assert deployment.storage.most_at_once == expected
+
+
+def test_a_block_of_unknown_length_counts_for_its_share_beside_others(deployment, monkeypatch):
+    payload = b"x" * 3_000
+    deployment.storage.objects["known"] = payload
+    deployment.storage.objects["small"] = make_block(5).SerializeToString()
+    set_share(monkeypatch, 1_500, 4)
+    deployment.storage.delay = 0.2
+    downloader = BlockDownloader(deployment.config(num_workers=4))
+
+    try:
+        known = single_block_file(deployment, "known", api_pb2.NONE, len(payload))
+        unknown = [single_block_file(deployment, "small", api_pb2.NONE)] * 3
+        downloader.download_many([known, *unknown])
+    finally:
+        downloader.close()
+    # The known block is half of the budget: two shares fit beside it.
+    assert deployment.storage.most_at_once == 3
+
+
+def test_a_block_made_at_its_turn_is_let_go_before_the_next(deployment, monkeypatch):
+    for number in range(3):
+        deployment.storage.objects[f"large-{number}"] = b"x" * 5_000
+    set_share(monkeypatch, 2_000, 3)
+    alive: list[int] = []
+    released: list[int] = []
+
+    class Payload(bytes):
+        def __del__(self):
+            released.append(1)
+
+    def download(*_):
+        alive.append(len(alive) - len(released))
+        return Payload(b"block")
+
+    monkeypatch.setattr(BlockDownloader, "_download_whole", download)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        files = [
+            single_block_file(deployment, f"large-{number}", api_pb2.NONE) for number in range(3)
+        ]
+        for payload in downloader.iter_download(files):
+            assert payload == b"block"
+            del payload
+    finally:
+        downloader.close()
+    assert alive == [0, 0, 0]
+
+
+@pytest.mark.parametrize("compression", [api_pb2.NONE, api_pb2.GZIP], ids=["object", "block"])
+def test_a_block_made_at_its_turn_is_not_handed_over_late(deployment, monkeypatch, compression):
+    # An object longer than the share, or one that holds such a block.
+    payload = make_block(5, 4096).SerializeToString()
+    deployment.storage.objects["large"] = compress(payload, compression)
+    set_share(monkeypatch, 2_000, 2)
+    real, caller, slow = cscb.decompress, threading.get_ident(), []
+
+    def decompress(data, compression, **bound):
+        payload = real(data, compression, **bound)
+        if threading.get_ident() == caller:
+            slow.append(len(payload))
+            time.sleep(1.1)
+        return payload
+
+    monkeypatch.setattr(cscb, "decompress", decompress)
+    downloader = BlockDownloader(deployment.config())
+
+    try:
+        files = [single_block_file(deployment, "large", compression)] * 2
+        with pytest.raises(CallTimeoutError):
+            next(downloader.iter_download(files, deadline=time.monotonic() + 1.0))
+    finally:
+        downloader.close()
+    assert slow == [len(payload)]
+
+
+def large_blocks(deployment, monkeypatch, **limits):
+    """The payloads of two blocks whose objects are longer than their share.
+
+    The first has been handed over. The second has been read as far as its
+    share, so its turn, which comes next, is one more request.
+    """
+    for height in (20, 21):
+        deployment.server.add_block(height, compression=api_pb2.NONE, size=4096)
+    set_share(monkeypatch, 2_000, 2)
+    payloads = deployment.client().iter_raw_block_payloads(
+        20, 22, read_source=SINGLE_BLOCK, **limits
+    )
+    assert next(payloads).payload == make_block(20, 4096).SerializeToString()
+    assert deployment.storage.requests_for("blocks/20") == [None, None]
+    wait_until(lambda: deployment.storage.requests_for("blocks/21") == [None])
+    return payloads
+
+
+def test_a_download_at_its_turn_is_retried_on_a_temporary_failure(deployment, monkeypatch):
+    payloads = large_blocks(deployment, monkeypatch)
+
+    deployment.storage.failures["blocks/21"].append(503)
+
+    assert next(payloads).payload == make_block(21, 4096).SerializeToString()
+    assert len(deployment.storage.requests_for("blocks/21")) == 3
+    assert len(deployment.sleeps) == 1
+
+
+def test_a_link_that_expired_before_its_turn_is_replaced(deployment, monkeypatch):
+    payloads = large_blocks(deployment, monkeypatch)
+
+    deployment.storage.expired.add("s1")
+    deployment.storage.signature = "s2"
+
+    assert next(payloads).payload == make_block(21, 4096).SerializeToString()
+    assert len(deployment.server.calls_to("GetBlockFilesByRange")) == 2
+
+
+def test_a_timeout_stops_a_download_at_its_turn(deployment, monkeypatch):
+    payloads = large_blocks(deployment, monkeypatch, timeout=1.0)
+
+    deployment.storage.delay = 4.0
+    before = time.monotonic()
+    with pytest.raises(CallTimeoutError):
+        next(payloads)
+
+    assert time.monotonic() - before < 2.0
+
+
+@pytest.mark.parametrize(("allowed", "requests_sent"), [(1_000, 1), (3_000, 2)])
+def test_a_size_limit_holds_for_a_download_at_its_turn(
+    deployment, monkeypatch, allowed, requests_sent
+):
+    deployment.storage.objects["large"] = b"x" * 5_000
+    set_share(monkeypatch, 2_000, 2)
+    work = Work(monkeypatch)
+    downloader = BlockDownloader(deployment.config())
+    small = api_pb2.BlockFile(height=4, skipped=True)
+
+    try:
+        files = [single_block_file(deployment, "large", api_pb2.NONE), small]
+        with pytest.raises(ResponseTooLargeError, match=f"longer than the {allowed} bytes allowed"):
+            downloader.download_many(files, max_response_bytes=allowed)
+    finally:
+        downloader.close()
+    assert len(deployment.storage.requests_for("large")) == requests_sent
+    assert max(length for _, length in work.read) == allowed + 1
 
 
 @pytest.mark.parametrize("declares_its_size", [True, False])
@@ -490,7 +888,7 @@ def test_a_single_block_file_with_a_second_zstd_frame_is_refused(deployment, dec
 
 def test_a_single_block_object_larger_than_the_cap_is_not_read_whole(deployment, monkeypatch):
     deployment.storage.objects["huge"] = b"x" * 10_000
-    monkeypatch.setattr(cscb, "MAX_CHUNK_BYTES", 1000)
+    monkeypatch.setattr(cscb, "MAX_BLOCK_BYTES", 1000)
     downloader = BlockDownloader(deployment.config())
 
     try:
@@ -498,6 +896,7 @@ def test_a_single_block_object_larger_than_the_cap_is_not_read_whole(deployment,
             downloader.download(single_block_file(deployment, "huge", api_pb2.NONE))
     finally:
         downloader.close()
+    assert len(deployment.storage.requests_for("huge")) == 1
 
 
 class _EndlessResponse:
@@ -2406,7 +2805,7 @@ def test_a_refusal_that_arrives_late_is_a_timeout(deployment):
         # deadline whatever the download does.
         limits = downloader_module._Limits(deadline=time.monotonic() + 0.05)
         with pytest.raises(CallTimeoutError):
-            downloader._download_single(file, limits)
+            downloader._download_whole(file, limits)
     finally:
         downloader.close()
 

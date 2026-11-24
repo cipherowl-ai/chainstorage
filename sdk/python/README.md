@@ -82,7 +82,10 @@ with Client(config) as client:
   is not closed with the client.
 - **Bounded memory.** A range is downloaded a little ahead of the caller, not
   all at once. About 256 MB of decompressed data may be on its way at a
-  time; while a chunk is being cut into blocks it is held twice.
+  time; while a chunk is being cut into blocks it is held twice. A block from
+  a single-block object whose length the server does not say is downloaded
+  and decompressed ahead only up to its share of that (25 MB with 10
+  workers). A larger one waits for its turn, so there is only one at a time.
 - **Consolidated block files.** A file that holds many blocks is read with
   range requests, and a chunk that holds several wanted blocks is fetched
   once. Every block is checked against its length, hash and checksum.
@@ -120,8 +123,9 @@ with Client(config) as client:
   refused before it is sent, and any other stops at the limit. Both raise
   `ResponseTooLargeError`, and nothing more is tried. Things to know:
   - A limit below 64 KiB refuses every consolidated file.
-  - It limits what is fetched, not the decompressed size, which the file
-    format limits to 1 GiB per block or chunk.
+  - It limits what is fetched, not the decompressed size. That is limited to
+    1 GiB for a chunk and 2 GiB for a single-block object; reading a block of
+    that size takes more than twice its size in memory.
   - A block whose index and chunk the client still holds needs no request,
     and is returned whatever the limit.
   - The body of a refusal is read within the limit too. Under a limit of

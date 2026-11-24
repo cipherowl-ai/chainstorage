@@ -20,7 +20,9 @@ A caller can limit a download in two ways:
   left, and the clock is read between the pieces of a body. When it passes,
   the download raises ``CallTimeoutError``, and no payload is handed over any
   more, not even one that was downloaded ahead in time. A store that keeps
-  sending a body very slowly can hold one piece past the deadline.
+  sending a body very slowly can hold one piece past the deadline, and a block
+  that is decompressed at its turn (see ``_Payload``) holds it until it is
+  done.
 - ``max_response_bytes``, the most bytes one request to the store may return:
   a single-block object, one of the two reads of a consolidated object's
   index (its first 64 KiB, then the rest), or one of its chunks. A read that
@@ -31,8 +33,9 @@ A caller can limit a download in two ways:
   are sized to end there: a body sent with its length is read a few bytes
   past the limit at most, one per piece, and a body the store sends in
   chunks of its own less than one piece past it. It limits what is fetched,
-  not the decompressed size, which the file format limits. A block whose
-  index and
+  not the decompressed size, which is limited to ``cscb.MAX_CHUNK_BYTES`` for
+  a chunk and to ``cscb.MAX_BLOCK_BYTES`` for a single-block object. A block
+  whose index and
   chunk are still in the cache needs no request, and is returned. The body of
   a refusal is read within the limit as well: under a limit of less than
   2 KiB, the store's error code can be missing from the ``DownloadError``.
@@ -78,8 +81,10 @@ T = TypeVar("T")
 # held about twice, so the peak is roughly double this.
 _IN_FLIGHT_BYTES = 256 * 1024 * 1024
 
-# What a single-block object counts for when the server does not say how
-# long its block is.
+# A single-block object whose block has a length the server does not say
+# counts for an equal share of that, and for no less than this. Neither the
+# object nor its block is held ahead of its turn when it is longer than the
+# share: see _Payload.
 _UNKNOWN_BLOCK_BYTES = 8 * 1024 * 1024
 
 # Responses are read in pieces of this size, and never past what is needed.
@@ -112,13 +117,22 @@ class _Limits:
 _NO_LIMITS = _Limits()
 
 
+# A block's payload, or, for a block too large to hold ahead of its turn, what
+# makes it then. The caller's own thread runs that, so one block at a time.
+_Payload = bytes | Callable[[], bytes]
+
+
+class _TooLongAhead(DownloadError):
+    """An object is longer than what may be held of it ahead of its turn."""
+
+
 @dataclass
 class _Unit:
     """One download: the payloads at ``positions``, produced by ``run``."""
 
     positions: list[int]
     cost: int
-    run: Callable[[], list[bytes]]
+    run: Callable[[], Sequence[_Payload]]
 
 
 class BlockDownloader:
@@ -204,9 +218,9 @@ class BlockDownloader:
     ) -> Iterator[bytes]:
         units = iter(self._plan(block_files, limits))
         upcoming = next(units, None)
-        in_flight: deque[tuple[_Unit, Future[list[bytes]]]] = deque()
+        in_flight: deque[tuple[_Unit, Future[Sequence[_Payload]]]] = deque()
         in_flight_bytes = 0
-        ready: dict[int, bytes] = {}
+        ready: dict[int, _Payload] = {}
         position = 0
         try:
             while in_flight or upcoming is not None:
@@ -230,7 +244,7 @@ class BlockDownloader:
                     # The caller may have taken its time since the last one:
                     # a payload that is ready is not handed over late either.
                     _check_in_time(limits)
-                    yield ready.pop(position)
+                    yield _at_its_turn(ready.pop(position), limits)
                     position += 1
         finally:
             for _, task in in_flight:
@@ -279,14 +293,20 @@ class BlockDownloader:
             for task in tasks:
                 task.cancel()
 
+        # The downloads that can be on their way at once share the budget. One
+        # that is alone shares it with none: it may be as large as any block.
+        share = cscb.MAX_BLOCK_BYTES
+        if len(block_files) > 1:
+            at_once = min(self._config.num_workers, len(block_files))
+            share = max(_IN_FLIGHT_BYTES // at_once, _UNKNOWN_BLOCK_BYTES)
         units: list[_Unit] = []
         chunk_units: dict[tuple[str, int], tuple[_Unit, list[cscb.BlockRecord]]] = {}
         for position, block_file in enumerate(block_files):
             if block_file.skipped:
                 units.append(_Unit([position], 0, lambda: [b""]))
             elif not is_consolidated(block_file):
-                run = partial(self._download_single, block_file, limits)
-                cost = block_file.uncompressed_length or _UNKNOWN_BLOCK_BYTES
+                run = partial(self._download_single, block_file, limits, share)
+                cost = block_file.uncompressed_length or share
                 units.append(_Unit([position], cost, run))
             else:
                 key = _object_key(block_file.file_url)
@@ -311,28 +331,48 @@ class BlockDownloader:
                 planned[1].append(record)
         return units
 
-    def _download_single(self, block_file: api_pb2.BlockFile, limits: _Limits) -> list[bytes]:
-        # No block is larger than the largest chunk. The server does not
-        # always say how long the block is; when it does not, the output may
-        # still not grow past that.
-        cap = cscb.MAX_CHUNK_BYTES
-        declared = block_file.uncompressed_length or None
-        if declared is not None and declared > cap:
+    def _download_single(
+        self, block_file: api_pb2.BlockFile, limits: _Limits, share: int
+    ) -> list[_Payload]:
+        """Downloads and decompresses a single-block object ahead of its turn.
+
+        Neither the object nor its block is held then when it is longer than
+        the budget has let in: the length the server says the block has, or
+        ``share`` when that is longer. The rest of the work waits for its turn.
+        """
+        cap = cscb.MAX_BLOCK_BYTES
+        declared = block_file.uncompressed_length
+        if declared > cap:
             raise BlockFormatError(
                 f"block {block_file.height} declares {declared} bytes, more than the {cap} allowed"
             )
-        body = self._request(block_file.file_url, None, limit=cap, limits=limits)
-        if declared is not None:
-            payload = cscb.decompress(body, block_file.compression, max_size=declared)
-        else:
-            payload = cscb.decompress(body, block_file.compression, limit=cap)
-        payload = bytes(payload)
-        if declared is not None and len(payload) != declared:
-            raise BlockFormatError(
-                f"block {block_file.height} is {len(payload)} bytes long, not the {declared} "
-                "bytes the server reported"
+        ahead = max(declared, share)
+        if ahead >= cap:
+            return [self._download_whole(block_file, limits)]
+        try:
+            body = self._request(
+                block_file.file_url, None, limit=ahead, limits=limits, too_long=_TooLongAhead
             )
-        return [payload]
+        except _TooLongAhead:
+            # What was read of it is dropped.
+            return [partial(self._download_whole, block_file, limits)]
+        try:
+            payload = _decompress(block_file, body, ahead)
+        except cscb.DecompressedTooLongError:
+            if declared:
+                raise
+            # The object is kept: it is no longer than the share.
+            return [partial(_unpack, block_file, body)]
+        del body  # the payload is copied below: do not hold its object too
+        return [bytes(payload)]
+
+    def _download_whole(self, block_file: api_pb2.BlockFile, limits: _Limits) -> bytes:
+        """Downloads a single-block object of any length a block may have."""
+        cap = cscb.MAX_BLOCK_BYTES
+        body = self._request(block_file.file_url, None, limit=cap, limits=limits)
+        payload = _decompress(block_file, body, cap)
+        del body  # the payload is copied below: do not hold its object too
+        return bytes(payload)
 
     def _index(self, key: str, url: str, limits: _Limits) -> cscb.Index:
         index = self._indexes.get(key)
@@ -406,15 +446,15 @@ class BlockDownloader:
         *,
         limit: int,
         limits: _Limits,
+        too_long: type[DownloadError] = DownloadError,
     ) -> bytes:
         """Gets ``url`` and returns its body, read up to ``limit`` + 1 bytes.
 
         Reading stops there, so a store that ignores a range or sends a huge
         object never makes us hold more. Without ``check``, a longer body is
-        refused.
+        refused with a ``too_long`` error.
         """
         allowed = limits.max_response_bytes
-        too_long: type[DownloadError] = DownloadError
         if allowed is not None and allowed < limit:
             limit, too_long = allowed, ResponseTooLargeError
 
@@ -461,6 +501,36 @@ class BlockDownloader:
             reason=_reason,
             deadline=limits.deadline,
         )
+
+
+def _decompress(block_file: api_pb2.BlockFile, body: bytes, limit: int) -> bytes | bytearray:
+    """Decompresses a single-block object.
+
+    The block must be as long as the server says. When the server does not
+    say, it may be up to ``limit`` bytes long.
+    """
+    declared = block_file.uncompressed_length
+    if not declared:
+        return cscb.decompress(body, block_file.compression, limit=limit)
+    payload = cscb.decompress(body, block_file.compression, max_size=declared)
+    if len(payload) != declared:
+        raise BlockFormatError(
+            f"block {block_file.height} is {len(payload)} bytes long, not the {declared} "
+            "bytes the server reported"
+        )
+    return payload
+
+
+def _unpack(block_file: api_pb2.BlockFile, body: bytes) -> bytes:
+    return bytes(_decompress(block_file, body, cscb.MAX_BLOCK_BYTES))
+
+
+def _at_its_turn(payload: _Payload, limits: _Limits) -> bytes:
+    if isinstance(payload, bytes):
+        return payload
+    made = payload()
+    _check_in_time(limits)
+    return made
 
 
 def _reason(exc: Exception) -> str:
