@@ -308,6 +308,26 @@ func (mr *MockClientMockRecorder) HeadObject(arg0, arg1 any, arg2 ...any) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HeadObject", reflect.TypeOf((*MockClient)(nil).HeadObject), varargs...)
 }
 
+// ListBucketIntelligentTieringConfigurations mocks base method.
+func (m *MockClient) ListBucketIntelligentTieringConfigurations(arg0 context.Context, arg1 *s3.ListBucketIntelligentTieringConfigurationsInput, arg2 ...func(*s3.Options)) (*s3.ListBucketIntelligentTieringConfigurationsOutput, error) {
+	m.ctrl.T.Helper()
+	varargs := []any{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "ListBucketIntelligentTieringConfigurations", varargs...)
+	ret0, _ := ret[0].(*s3.ListBucketIntelligentTieringConfigurationsOutput)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// ListBucketIntelligentTieringConfigurations indicates an expected call of ListBucketIntelligentTieringConfigurations.
+func (mr *MockClientMockRecorder) ListBucketIntelligentTieringConfigurations(arg0, arg1 any, arg2 ...any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]any{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListBucketIntelligentTieringConfigurations", reflect.TypeOf((*MockClient)(nil).ListBucketIntelligentTieringConfigurations), varargs...)
+}
+
 // ListObjectVersions mocks base method.
 func (m *MockClient) ListObjectVersions(arg0 context.Context, arg1 *s3.ListObjectVersionsInput, arg2 ...func(*s3.Options)) (*s3.ListObjectVersionsOutput, error) {
 	m.ctrl.T.Helper()
