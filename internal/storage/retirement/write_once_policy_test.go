@@ -90,6 +90,7 @@ func TestS3ObjectStore_InspectObjectRetentionSafetyRejectsMatchingLifecycleActio
 		tieringConfigured     = "has an Intelligent-Tiering configuration"
 		tieringListFailed     = "failed to list CSCB bucket Intelligent-Tiering configurations"
 		tieringListEmptyReply = "Intelligent-Tiering configurations returned an empty response"
+		tieringListTruncated  = "Intelligent-Tiering configurations listing is truncated"
 	)
 	consolidatedPrefix := &awss3types.LifecycleRuleFilter{Prefix: aws.String("BLOCKCHAIN_SOLANA/NETWORK_SOLANA_MAINNET/consolidated/")}
 	toIntelligentTiering := []awss3types.Transition{{Days: aws.Int32(0), StorageClass: awss3types.TransitionStorageClassIntelligentTiering}}
@@ -161,7 +162,7 @@ func TestS3ObjectStore_InspectObjectRetentionSafetyRejectsMatchingLifecycleActio
 			rules:         []awss3types.LifecycleRule{tieringRule},
 			tieringDenied: true, listsTiering: true,
 			tieringList: &awss3.ListBucketIntelligentTieringConfigurationsOutput{IsTruncated: aws.Bool(true)},
-			wantErr:     tieringConfigured,
+			wantErr:     tieringListTruncated,
 		},
 		{
 			name:          "transition to intelligent tiering when the configurations cannot be read",

@@ -131,12 +131,15 @@ func (s *S3ObjectStore) verifyNoIntelligentTieringConfiguration(ctx context.Cont
 	if out == nil {
 		return xerrors.Errorf("CSCB bucket Intelligent-Tiering configurations returned an empty response: bucket=%s", bucket)
 	}
-	if len(out.IntelligentTieringConfigurationList) > 0 || aws.ToBool(out.IsTruncated) {
+	if len(out.IntelligentTieringConfigurationList) > 0 {
 		return xerrors.Errorf(
 			"CSCB bucket has an Intelligent-Tiering configuration, which can archive CSCB object data: bucket=%s configurations=%d",
 			bucket,
 			len(out.IntelligentTieringConfigurationList),
 		)
+	}
+	if aws.ToBool(out.IsTruncated) {
+		return xerrors.Errorf("CSCB bucket Intelligent-Tiering configurations listing is truncated: bucket=%s", bucket)
 	}
 	return nil
 }
